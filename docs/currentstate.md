@@ -156,10 +156,30 @@ not a speed or capacity claim. CUDA `FLASH_ATTN_EXT` backend cases passed
 2,922/2,922 comparisons, the default-F16 layer-major CTest passed 2/2, and
 the mutex-protected `tools/run-tests.ps1 -Suite all` passed 24/24 in 518.51 s.
 
+The first 40,960-token Q8 attempt exposed a separate linear host-input budget
+defect after dense masks were removed: every persistent chunk graph owns the
+optional F32 `inp_embd` created by `build_inp_embd`, but `buf_inputs` retained
+only a fixed 64 MiB non-mask allowance. The bounds guard reported `inp_embd`
+at offset 64,698,560 with size 10,485,760 in a 67,108,864-byte buffer. The
+layer-major budget now adds one full-prompt F32 embedding allocation
+(`n_embd_inp * pp_tokens * sizeof(float)`), which is 838,860,800 bytes for
+40,960 tokens, while implicit mode still allocates no per-chunk dense masks.
+
+The repaired mutex-protected trace
+`build/llama-cuda/q38ls-pp40k-layer-major-q8.jsonl` processed 40,960 PP tokens
+as 80 chunks with four slots, Q8 K/V, and `implicit_causal_mask: true`. It
+exited 0; the independent checker accepted 1,055 events. Observed PP wall time
+was 55,198.2 ms (742.053 tok/s), summed transfer was 164,931.191 ms, wait was
+0.473 ms, summed compute was 47,643.858 ms, peak VRAM was 7,523.56 MiB, and
+timed graph builds were zero. Excluding the 63.738 ms layer-0/chunk-0 first-use
+event gives 47,580.120 ms summed compute. This is one shared-GPU feasibility
+trace, not a generalized performance or quality claim. The focused default-F16
+layer-major regression remained green (2/2, 16.73 s).
+
 The backend harness currently proves CPU/CUDA agreement for the implicit
 operation, but does not independently retain and compare the equivalent dense
 causal output. T-Q38PERF-05 remains in progress until that direct oracle is
-added. No long-context quality, equivalence, or performance conclusion is made.
+added. No long-context quality or equivalence conclusion is made.
 
 ## Completed
 
