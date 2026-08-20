@@ -1,0 +1,75 @@
+# CMake and native build output
+/build/
+/out/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/compile_commands.json
+/third_party/llama.cpp/build/
+/third_party/llama.cpp/out/
+
+# Ninja
+/.ninja_deps
+/.ninja_log
+/build.ninja
+
+# Windows and MSVC
+/.vs/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.dll
+*.lib
+*.exp
+*.vcxproj.user
+*.VC.db
+*.opendb
+
+# CUDA profiler output
+*.nsys-rep
+*.qdrep
+*.ncu-rep
+
+# Local models and model-conversion artifacts
+/models/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Generated telemetry, logs, and local caches
+/telemetry/
+*.log
+*.trace
+/.cache/
+/.hf/
+
+# Python environments and bytecode used by conversion tooling
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# VS Code: retain shareable workspace configuration when intentionally added
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/launch.json
+!/.vscode/settings.json
+!/.vscode/tasks.json
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
