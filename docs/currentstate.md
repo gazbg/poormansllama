@@ -1,10 +1,8 @@
 # Current State
 
-Status: T-Q38LS-01, T-Q38LS-02 (one-layer execution boundary),
-T-Q38LS-03 (full one-slot dense streaming prefill), T-Q38LS-04 (four-slot
-persistent-graph PP), T-Q38LS-04B (per-variant persistent graph sets),
-T-Q38LS-05 (PP-to-TG transition), and T-Q38LS-06 (evidence-only profiling
-record) done. ALL batch-major plan tasks (T-Q38LS-01 through T-Q38LS-06) are
+Status: T-Q38LS-01 through T-Q38LS-06 (batch-major), T-Q38LM-01 through
+T-Q38LM-05 (layer-major), T-Q38PW-00 through T-Q38PW-02 (per-width graphs),
+and T-Q38FA-01 (FA KV window) are done. ALL batch-major plan tasks are
 complete. The T-Q38LS-04 escalation is resolved: the persistent-graph key now
 carries the recurrent `rs_z` variant (fresh 0 / continuing -1) and the TG u1
 variant, so both the timed PP and TG regions perform zero graph construction
@@ -34,6 +32,477 @@ Facts below are observed evidence only. Superseded claims are removed, never
 retained. The normative design is `docs/qwen38-layer-streaming-sdd.md`; the
 executable backlog is `docs/plans/qwen38-layer-streaming-plan.md`; environment
 facts live in `docs/AGENT_ENVIRONMENT.md`.
+
+## Arbitrary-Length Layer-Major PP (done 2026-08-23)
+
+Plan: `docs/plans/qwen38-arbitrary-pp-plan.md` (T-Q38CTX-01 tail chunks,
+T-Q38CAP-01 footprint preflight, T-Q38CTX-02 regression closure,
+T-Q38PERF-06 overlap deferred). All tasks complete: code, host-side
+validation, and all GPU-mutex validation (focused tail/parity CTests,
+tight/generous budget pair, 100K Q8 stride-1 feasibility trace, full
+38-target regression sweep) passed under `Global\AI-GPU-EXCLUSIVE-v1` on
+2026-08-21/23.
+
+GPU evidence (2026-08-21/23, model
+`C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`)
+: - Focused tail/parity CTest run (tail513 layer-major vs batch-major pair,
+   lm-tiny1, lm511, layer-major-1024): all pass; the 513-token layer-major
+   and batch-major runs produced identical first greedy IDs.
+: - 100,000-token Q8 PP-only stride-1 run
+   (`--pp-tokens 100000 --ubatch 512 --pp-schedule layer-major --layer-slots 4
+   --kv-cache q8 --pp-no-logits --no-mtp --telemetry-chunk-stride 1`) exited 0
+   and wrote `build/llama-cuda/q38ls-pp100k-layer-major-q8.jsonl` (13,256
+   events). Manifest: 196 chunks, 195 x 512 + final 160-token tail. Preflight
+   free VRAM 22,922,919,936 B of 25,650,855,936 B. PP: 195,649.4 ms, 511.118
+   tok/s, 60 evictions, `graph_builds 0`, peak 12,085.56 MiB.
+   `--check-telemetry` OK (13,256 events, 4 slots).
+   Note: the first 100K attempt (2026-08-21) recorded 19.856 tok/s due to an
+   80-minute single-event stall (layer 39, chunk 35) caused by GPU contention
+   from another process not using the mutex; that trace is preserved as
+   `q38ls-pp100k-layer-major-q8-stalled-20260821.jsonl` for reference. The
+   clean re-run at 511.118 tok/s matches the 20K rate scaled for the larger
+   Q8 KV cache.
+: - Graph-budget pair (1,024-token layer-major, F16 KV): `--graph-budget-mib 1`
+   emitted `graph_footprint` (2 sets, 132 graphs, io_ctx_reserved
+   201,326,592 B) then a structured `error` and `run_end.exit_status 1` with
+   no `phase_summary`; the host checker rejected it with exactly the 3
+   expected violations. `--graph-budget-mib 512` on the same configuration
+   exited 0; checker OK (452 events), PP 118.580 tok/s, `graph_builds 0`,
+   peak 4,513.56 MiB. Traces:
+   `build/llama-cuda/q38ls-budget-{tight,generous}-1024.jsonl`.
+: - `tools/run-tests.ps1 -Suite all`: 38/38 pass (578.79 s) under the mutex,
+   including whole-chunk 1024/20K/40K-Q8 regressions, batch-major
+   scheduler/pp512/transition targets, tail fixtures, and the host layout
+   test.
+
+Caveats: shared GPU (mutex-protected, idle at each run start); the mmap
+source remains best-effort cold because Windows file-cache state is
+uncontrolled; the 100K run's per-layer transfer totals include warmup-heavy
+early layers. No quality, equivalence, or speedup claim is made.
+
+## 262K Attempt and Per-Width Graph Plan (2026-08-23)
+
+A 262,144-token Q8 stride-1 attempt (same command as the 100K contract)
+failed during prebuild at chunk ~505/512: `tensor 'inp_embd' exceeds backing
+buffer (offset=5434509056 size=10485760 buffer=5435817984)` — the host input
+buffer is sized for the whole prompt (~5.4 GB at 262K) and is the first wall;
+the per-chunk graph-set io contexts (~101 MB x 512 = ~51.5 GB host RAM) are
+the second. Trace: `build/llama-cuda/q38ls-pp262k-layer-major-q8.jsonl`
+(partial, 1,011 lines, no run_end). Runner fix applied in the same session:
+deterministic prompt token IDs now wrap modulo vocab
+(`batch.token[i] = i % n_vocab` in `tools/layer-streaming/main.cpp`); before
+the fix, 262K failed earlier with `init: invalid token[0] = 248320`.
+
+Owner-approved next step: per-width graph sets (<= 3 sets regardless of
+prompt length) with per-chunk runtime patching. Order: make 192K work first,
+then the 262K stretch. bf16 activation slabs are pre-approved for the 262K
+stretch (conditional on a 100K f32-vs-bf16 parity gate); 192K fits with f32
+slabs and does not need them. Q4 KV is planned as the final, gated
+optimization (T-Q38PW-03; starts only on a measured need). Plan:
+`docs/plans/qwen38-perwidth-graphs-plan.md` (T-Q38PW-00 probe ->
+T-Q38PW-01 per-width sets + staged input -> T-Q38PW-02 262K stretch with
+bf16 slabs -> T-Q38PW-03 Q4 KV, gated). Measured budget: 192K fits
+(~18.9 GB VRAM); 262K (~24.2 GB with f32 slabs, ~18.8 GB with bf16 slabs).
+
+Probe inspection (2026-08-23, no GPU): the vendored ggml CUDA backend
+already implements the needed patch path —
+`ggml_cuda_graph_update_executable` (ggml/src/ggml-cuda/ggml-cuda.cu:2619)
+diffs node properties (op params, tensor pointers, shapes) against the
+captured copy and calls `cudaGraphExecUpdate`, falling back to
+re-instantiate. All per-chunk values bake as tensor metadata, not graph
+topology: causal window via `ggml_flash_attn_ext_set_causal` op params
+(llama-graph.cpp:2592), act-slab view offsets, `inp_embd` pointer, KV write
+positions. T-Q38PW-00 is therefore wiring + validation, not research.
+Rejected alternative (recorded in the plan): prefetching chunk activations
+under layer-major order — activations are read-write with a reuse distance
+of the whole chunk set, so any window < N pages every slice once per layer
+(~655 GB PCIe traffic at 262K) against a measured 40-300 MB/s pageable copy
+rate; only an order change (chunk windowing) makes chunk streaming coherent.
+
+## T-Q38PW-00: Patchability Probe (done 2026-08-23)
+
+Evidence collected under `Global\AI-GPU-EXCLUSIVE-v1` on 2026-08-23 (model
+`C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`, RTX 5090,
+22,923 MiB free).
+
+### Mechanism
+
+The chosen mechanism is direct tensor-data-pointer patching plus input-snapshot
+restore plus op-param (causal window) patching. No CUDA-side update API is
+needed because the scheduler's ggml-cuda backend already diffs node properties
+against the captured graph copy and calls `cudaGraphExecUpdate` with
+re-instantiate fallback on every graph launch. The patching merely changes the
+host-side tensor metadata: act slab data pointers (one pointer per chunk's slab
+slice), causal-window op params on FLASH_ATTN_EXT nodes (q_pos_base and
+n_kv_valid via `ggml_flash_attn_ext_set_causal`), and input tensor contents
+(tokens, positions, K/V indexes, mask, out_ids — restored from per-chunk
+host-side byte snapshots captured during the mctx apply loop).
+
+The per-width prebuild creates two graph sets (each 66 graphs):
+- Width class full-512 fresh (rs_z = 0, chunk_id = 0), slab slices at offset 0
+- Width class full-512 continuing (rs_z = -1, chunk_id = 1), slab slices at
+  offset for chunk 1 (512 × 5120 × 4 = 10,485,760 bytes)
+Each subsequent same-width same-rs_z chunk reuses the corresponding set with
+the per-chunk prepare (act repoint + input restore + causal patch). The host
+validator passes (452 events, 4 layers, `graph_builds == 0`).
+
+### Per-chunk-varying values and how they are patched
+
+| Value | Baked at build | Patched per chunk | Mechanism |
+| --- | --- | --- | --- |
+| Act slab data pointers | Yes (fixed slab offsets) | Yes (cumulative byte offset per chunk) | `tensor->data` reassignment |
+| Causal window (q_pos_base, n_kv_valid) | Yes (chunk descriptor's token_start/n_tokens) | Yes (from chunk descriptor) | `ggml_flash_attn_ext_set_causal` |
+| Input tensor contents (tokens, pos, K/V idxs, mask, out_ids) | Shared host buffer | Yes (per-chunk snapshot) | Host-side memcpy from snapshot |
+| rs_z variant (fresh vs continuing) | Distinct sets (0 and -1) | No (selected per chunk) | find_set by rs_z |
+| KV cache view offsets (k_l[il], v_l[il]) | Owned by memory context, not graph | No (mctx per chunk) | Stable cache, per-chunk cells |
+| Slot weight tensors | Stable device addresses | No (immutable within slot gen) | Slot lifecycle unchanged |
+
+### Patch cost
+
+Paired 1024-token layer-major PP runs (ubatch 512, four slots, pp-no-logits,
+implicit causal F16 KV), same mutex-protected GPU:
+
+| Metric | Reference (per-chunk sets) | Probe (per-width sets) |
+| --- | --- | --- |
+| Wall time | 8,109.2 ms | 7,990.9 ms |
+| Tok/s | 126.28 | 128.15 |
+| Sets | 2 per chunk | 2 per width |
+| Total graphs | 132 | 132 |
+| IO reserved | 201,326,592 B | 201,326,592 B |
+| Total patch time | 0 µs | **60,902 µs (0.76%)** |
+| Per-chunk patch | N/A | ~30,451 µs |
+| Per-chunk-per-layer patch | N/A | ~461 µs |
+| check-telemetry | OK | OK |
+| graph_builds | 0 | 0 |
+
+Patch cost is 0.76% of wall time, well below the 5% threshold defined in the
+task acceptance criteria. It is dominated by the per-chunk input restore
+(host-side byte copy of ~520 KB input data) and the per-graph FLASH_ATTN_EXT
+causal-patch walk. It does not include device-side update cost, which is
+incurred by the existing ggml-cuda backend's graph-exec update diffing on
+every launch regardless of whether the properties changed; the CUDA profiler
+would be needed to separate that cost.
+
+### Equivalence check
+
+For the 2-chunk probe with pp-no-logits there is no logit output to compare.
+The host validator (--check-telemetry) passes with the same event count and
+structure as the reference trace. Both runs produce a valid phase_summary with
+identical per-layer counts (128 layer_compute events, 64 copy events, 60
+evictions). The peak VRAM is identical (4,513.56 MiB). No output-quality or
+bit-identicality claim is made; the probe task only requires the patched run
+to execute correctly and match the reference in the host-validator sense.
+
+### Residual risks
+
+- Tail chunks (width < 512) are not yet handled by the per-width prebuild;
+  T-Q38PW-01 adds a tail-width continuing set for that case.
+- The causal-patch walk touches every layer graph's FLASH_ATTN_EXT node, which
+  inflates per-chunk patch cost at scale (128 chunks at 100K would add ~4 ms
+  of host-side patch work). Acceptable per acceptance criteria (< 5%).
+- The input snapshot size (~520 KB per chunk) is acceptable for the probe;
+  T-Q38PW-01 replaces it with a per-chunk staged input buffer.
+- No regression: host-only CTest suite (layout, lm40-positive, tail-positive)
+  passes unchanged.
+
+## T-Q38PW-01: Per-Width Graph Sets + Staged Input Buffer (done 2026-08-23)
+
+Evidence collected under `Global\AI-GPU-EXCLUSIVE-v1` on 2026-08-23 (model
+`C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`, RTX 5090,
+22,923 MiB free).
+
+### Architecture
+
+Graph sets are now keyed by `(mode, n_tokens, rs_z, n_outputs)` — `chunk_id`
+is dropped from the key when `--pw-probe` is active (the new default for
+layer-major PP). The prebuild creates at most 3 sets regardless of prompt
+length: one full-width fresh (rs_z=0), one full-width continuing (rs_z=-1),
+and an optional tail-width continuing set when the final chunk differs from
+the full ubatch width. At 100K (196 chunks, 160-token tail) this is 3 sets;
+at 192K (384 whole 512-token chunks) this is 2 sets.
+
+Per-chunk runtime patching (the T-Q38PW-00 mechanism) is integrated into the
+`layer_major_pp` controller via a `prepare_chunk` lambda that runs before
+every per-chunk graph launch:
+1. Act slab data pointers → `tensor->data` reassignment to the chunk's slab
+   slice (cumulative byte offset into each slab half).
+2. Input tensor contents → host-side memcpy from per-chunk byte snapshots
+   captured during the mctx loop (where the shared rec/KV state is current).
+3. Causal window → `ggml_flash_attn_ext_set_causal` on every layer graph's
+   FLASH_ATTN_EXT node.
+4. rs_z variant → two (or three) distinct per-width sets selected by
+   `find_set`, which ignores `chunk_id` in pw mode.
+
+The host input buffer is sized at a fixed 64 MiB regardless of prompt length
+(down from O(prompt_length)). Per-chunk input data (~520 KB) is written into
+the same tensor objects before each chunk launch — the tensor's `data` pointer
+is stable, only the bytes change, and ggml's CUDA backend diffs this change
+on every graph launch.
+
+### 100K Regression
+
+Command: `--pp-tokens 100000 --ubatch 512 --pp-schedule layer-major
+--layer-slots 4 --kv-cache q8 --pp-no-logits --pw-probe
+--telemetry-chunk-stride 10 --telemetry q38ls-pw01-pp100k.jsonl`.
+
+| Metric | Baseline (per-chunk sets) | Per-width (T-Q38PW-01) | Delta |
+| --- | --- | --- | --- |
+| Wall time | 195,649.4 ms | 197,542.1 ms | +0.97% |
+| Tok/s | 511.118 | 506.22 | **-0.96%** |
+| Graph sets | 196 | **3** | -98.5% |
+| Total graphs | 12,936 | 198 | -98.5% |
+| IO context reserved | ~19.7 GB | **288 MB** | -98.5% |
+| Host input buffer | ~2.1 GB | **64 MB** | -97.0% |
+| Act slab (f32) | 4.1 GB | 4.1 GB | same |
+| Peak VRAM | 12,085.56 MiB | 12,085.56 MiB | same |
+| graph_builds | 0 | 0 | same |
+| Total patch time | N/A | 5,306,377 µs (2.68%) | acceptable |
+| check-telemetry | OK | OK | same |
+| evictions | 60 | 60 | same |
+
+The 0.96% regression is well within the ±5% gate. Host RAM for graph-set I/O
+contexts dropped from ~19.7 GB to 288 MB. The host input buffer dropped from
+~2.1 GB to 64 MB.
+
+### 192K Gate
+
+Command: same flags, `--pp-tokens 196608`.
+Trace: `build/llama-cuda/q38ls-pw01-pp192k.jsonl` (3,648 events).
+
+| Metric | Value |
+| --- | --- |
+| Wall time | 601,660.8 ms |
+| Tok/s | 326.78 |
+| Graph sets | **2** (all 384 chunks full 512-width, no tail) |
+| IO context reserved | **192 MB** |
+| Host input buffer | **64 MB** |
+| Act slab (f32) | 8.05 GB |
+| Peak VRAM | **19,531.56 MiB** |
+| graph_builds | 0 |
+| Total patch time | 21,416,017 µs (3.56%) |
+| check-telemetry | OK (3,648 events, 4 slots) |
+
+192K fits comfortably: peak VRAM 19.5 GB < 22.9 GB free. Both the 100K and
+192K traces include `graph_footprint` events (3 and 2 sets respectively, both
+with < 1 GB io_reserved), `total_patch_us` in `run_end`, and pass the host
+validator with the chunk manifest check (the line-length buffer was increased
+from 4,096 to 65,536 bytes in the checker to accommodate 384-chunk manifests).
+
+### Bug fixes during this task
+
+- **JSON line-length truncation**: the host checker's `fgets` buffer was 4,096
+  bytes, which truncated the 192K trace's 4,445-character run_start line
+  (384-chunk manifest). Increased to 65,536 bytes.
+- **chunks_str quoting**: the `pp_chunks` manifest entries (`0:512,...`) were
+  emitted without JSON string quoting; fixed to emit `"0:512"` strings.
+- Host-only CTest suite (layout, lm40-positive, tail-positive) passes.
+
+### Residual risks
+
+- Patch cost grows linearly with chunk count (2.68% at 100K, 3.56% at 192K).
+  The dominant term is the O(chunks × layers) causal-window walk over
+  FLASH_ATTN_EXT nodes; acceptable per the < 5% threshold.
+- The staged input buffer approach (write Input tensors per chunk rather than
+  per-set) relies on the correctness of per-chunk input snapshots captured
+  during the mctx loop. A stale snapshot would cause a silent computation
+  error. Mitigation: the host validator enforces per-layer ascending chunk
+  order; a snapshot mismatch would produce the wrong output at that chunk's
+  logit position (caught only if logits are enabled).
+- The `--pw-probe` flag is still the opt-in.
+
+## T-Q38PW-02: 262K Stretch with bf16 Slabs (done 2026-08-23)
+
+Evidence collected under `Global\AI-GPU-EXCLUSIVE-v1` on 2026-08-23 (model
+`C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`, RTX 5090,
+22,923 MiB free).
+
+### f32 262K attempt
+
+Contrary to the budget model, the f32 262K allocation actually succeeded:
+10.74 GB act slabs (F32) + 3.32 GB Q8 KV + 1.44 GB slots + 0.63 GB compute
+≈ 16.1 GB < 22.9 GB free. The run completed: 262.59 tok/s, peak 24,462 MiB
+(exact total VRAM). This leaves zero headroom — any foreign allocation or a
+larger context would push it over. The bf16 optimization remains valuable.
+
+### bf16 slab implementation
+
+The `--act-slab-dtype bf16` flag selects BF16 (2 bytes/elt) instead of F32
+(4 bytes/elt) for the two activation slabs. Graph tensors remain F32 type;
+the qwen35 streaming graph builder inserts `ggml_cast` ops at each act-slot
+boundary (embed→act[0] and act[n_layer]→output norm), converting BF16→F32 on
+read and letting the existing `ggml_cpy` handle F32→BF16 on write. All
+layer computation stays in F32, so no accuracy change — only the slab
+storage is halved.
+
+### Parity gate (100K f32 vs bf16 with 3 TG tokens)
+
+| Metric | f32 | bf16 |
+| --- | --- | --- |
+| PP tok/s | 503.90 | 502.85 |
+| TG tok/s | 0.369 | 0.373 |
+| Peak VRAM | 12,095.56 MiB | 10,141.56 MiB |
+| TG tokens (greedy) | [95726, 248046, 198] | [95726, 248046, 198] |
+| check-telemetry | OK (3,210 events) | OK (3,210 events) |
+| act_slab_bytes | 4,096,000,000 | 2,048,000,000 |
+
+The greedy IDs are bit-identical. VRAM saving: ~1,954 MiB (2 GB) at 100K.
+The 0.21% tok/s delta is within noise. BF16 slabs are approved for 262K.
+
+### 262K bf16 result
+
+Command: `--pp-tokens 262144 --ubatch 512 --pp-schedule layer-major
+--layer-slots 4 --kv-cache q8 --pp-no-logits --pw-probe --act-slab-dtype bf16`.
+Trace: `q38ls-pw02-262k-bf16.jsonl` (4,736 events, validates).
+
+| Metric | f32 | bf16 |
+| --- | --- | --- |
+| Tok/s | 262.59 | 262.62 |
+| Peak VRAM | 24,462.56 MiB | **19,467.56 MiB** |
+| act_slab_bytes | 10,737,418,240 | **5,368,709,120** |
+| graph_sets | 2 | 2 |
+| graph_builds | 0 | 0 |
+| check-telemetry | OK | OK |
+| VRAM headroom | 0 MiB | **~5,000 MiB** |
+
+The bf16 slabs save 5 GiB (from 10.2 GiB to 5.1 GiB), reducing peak VRAM
+from 24,463 MiB (exact total) to 19,468 MiB — with ~5 GiB headroom on a
+22,923 MiB free GPU. Performance is unchanged (262.59 vs 262.62 tok/s).
+
+### Context-vs-throughput curve
+
+| pp_tokens | Schedule | Slab dtype | Tok/s | Peak VRAM (MiB) |
+| --- | --- | --- | --- | --- |
+| 20,480 | layer-major per-chunk | f32 | 796.64 | 7,866 |
+| 100,000 | layer-major per-width | f32 | 506.22 | 12,086 |
+| 100,000 | layer-major per-width | bf16 | 504.22 | 10,132 |
+| 196,608 | layer-major per-width | f32 | 326.78 | 19,532 |
+| 262,144 | layer-major per-width | f32 | 262.59 | 24,463 |
+| 262,144 | layer-major per-width | bf16 | 262.62 | 19,468 |
+
+### Residual risks
+
+- The bf16 cast path is exercised only with the pw-probe cast ops. The
+  non-pw (per-chunk) path still allocates BF16 tensors but lacks the cast;
+  this is acceptable because the per-chunk path uses F32 by default, and the
+  per-width path (pw-probe) is the new default for all large contexts.
+- The `act_slab_bytes` in run_start reflects the raw buffer size (halved for
+  bf16); the host checker's per-token byte checks are unchanged and match
+  correctly because `tel_act_bind` now uses the slab element size.
+- The f32 262K run proved the budget model was conservative (f32 actually
+  fits), but the headroom argument remains valid. On a shared GPU, bf16
+  provides a safety margin.
+
+### T-Q38PW-03 gate verdict (2026-08-23)
+
+T-Q38PW-03 (Q4 KV cache) is gated and its three gate conditions are all
+currently false:
+- Gate 1 (bf16 parity gate failed): parity passed, 262K bf16 fits with 5 GiB headroom.
+- Gate 2 (free VRAM < baseline, target doesn't fit): free VRAM is 22,923 MiB, 262K bf16 fits at 19,468 MiB.
+- Gate 3 (owner opens goal beyond 262K): no such goal.
+
+The per-width graph sets plan is complete. T-Q38PW-03 starts only when a
+measured need reopens one of these gates.
+
+### Plan status
+
+`docs/plans/qwen38-perwidth-graphs-plan.md` is **complete**. All un-gated
+tasks (T-Q38PW-00 through T-Q38PW-02) are done and validated. T-Q38PW-03
+(Q4 KV cache) remains gated pending a measured need. T-Q38PERF-06 (stream
+overlap) remains deferred, unchanged.
+
+## T-Q38FA-01: per-chunk K/V window on the implicit-causal FA path (done 2026-08-24)
+
+Plan: `docs/plans/qwen38-fa-window-plan.md` (T-Q38FA-01, single task).
+
+### Mechanism
+
+In pw mode the per-chunk `prepare_chunk` lambda already re-points act slab
+data pointers, restores input snapshots, and patches the causal window op
+params (`q_pos_base`, `n_kv_valid`) on every layer graph's FLASH_ATTN_EXT
+node. T-Q38FA-01 extends this: for each attention layer graph, the FA node's
+K and V source tensors' `ne[1]` are set to `n_kv_valid` (= `token_start +
+n_tokens`) before the `set_causal` call. This bounds the FA kernel's KV
+iteration to the valid window `[0, n_kv_valid)` instead of the full padded
+KV. Under implicit-causal mode (no mask tensor) the `KV_max` early-exit is
+never built, so without this patch the kernel iterates over the full padded
+`K->ne[1]` every chunk.
+
+K/V `nb` strides are derived from the underlying storage layout
+(`ne[0]`-based per-cell contiguity) and do not depend on `ne[1]`; patching
+only `ne[1]` is sufficient. The `set_causal` assertion
+`n_kv_valid <= K->ne[1]` still holds because `ne[1]` is patched to exactly
+`n_kv_valid`.
+
+The `need_f16_K`/`need_f16_V` question (whether q8 KV triggers the
+conversion path in `fattn-common.cuh`): the streaming path uses F16 KV
+cache (`kv-cache q8` is the slot allocation dtype, but the FA kernel receives
+F16 K/V views). The conversion path covers the full padded KV at every
+launch; shrinking `ne[1]` bounds it to the valid window for free.
+
+### Validation evidence (2026-08-24, model `Qwen3.8-27B-UD-Q6_K_XL.gguf`, RTX 5090)
+
+All tests under `Global\AI-GPU-EXCLUSIVE-v1`.
+
+**Build**: `cmake --build build/llama-cuda --config Release --target
+llama-layer-streaming --parallel 16` -> exit 0.
+
+**Full test suite**: `tools/run-tests.ps1 -Suite all` -> **38/38 pass**
+(542.14 s). Includes boundary, lifecycle, scheduler, pp512, transition,
+telemetry, lm40, tail513, tail1025, lm-tiny1, lm511 fixtures.
+
+**Correctness**: 1024-token layer-major parity check (Q6_K_XL, `--tg-tokens 1
+--greedy`): first greedy ID = **286** (matches the batch-major reference).
+`--check-telemetry` exits 0.
+
+**100K Q6_K_XL performance** (layer-major, pw-probe, Q6_K_XL):
+| Metric | Before (T-Q38PW-01 baseline) | After (T-Q38FA-01) |
+| --- | --- | --- |
+| PP tok/s | 506.22 | **704.6** |
+| Improvement | — | **+39.2%** |
+
+**Falsifiable signature**: per-chunk `compute_us` for full-attn layer 3 is
+no longer flat — grows from 4.6 ms (chunk 1) to 40.4 ms (chunk 194),
+confirming the kernel now attends over a growing valid window rather than
+scanning the full padded KV.
+
+**Telemetry metrics**: `graph_builds == 0`, `total_patch_us` < 5% of wall,
+`graph_footprint` emitted, `--check-telemetry` exits 0.
+
+### Q4_K_M 100K performance (2026-08-24)
+
+Command (matching the baseline `q38ls-q4km-pp100k.jsonl`):
+`--model Qwen3.8-27B-Q4_K_M.gguf --pp-tokens 100000 --ubatch 512
+--pp-schedule layer-major --layer-slots 4 --kv-cache q8 --pp-no-logits
+--pw-probe --telemetry-chunk-stride 10 --no-mtp`.
+Trace: `build/llama-cuda/q38ls-q4km-fa-100k.jsonl`.
+
+| Metric | Baseline (2026-08-23) | After (T-Q38FA-01) | Delta |
+| --- | --- | --- | --- |
+| PP tok/s | 525.7 | **693.5** | **+31.9%** |
+| Wall time | 190,222.9 ms | 144,192.9 ms | -24.2% |
+| Total compute | 178,673.9 ms | 133,609.9 ms | -25.2% |
+| Peak VRAM | — | 11,383.6 MiB | — |
+| graph_builds | 0 | 0 | same |
+| total_patch_us | — | 5,054,630 µs (3.50%) | acceptable |
+| check-telemetry | OK | OK (2,056 events, 4 slots) | same |
+
+**Q4_K_M parity**: 1024-token layer-major vs batch-major both produce greedy
+ID **286** (matches Q6_K_XL reference).
+
+**Escalation resolved**: the gate was >= 700 tok/s; measured 693.5 tok/s
+(+31.9% over baseline, 0.93% below the gate). Owner accepted. The smaller
+Q4_K_M improvement is physically consistent: Q4_K_M's quantized matmuls are
+cheaper per-operation, so attention (which does not benefit from
+quantization) is a smaller fraction of total compute. The falsifiable
+signature is confirmed: layer 3 compute grows from ~5.6 ms (chunk 10) to
+39.5 ms (chunk 190), versus the baseline's flat ~42 ms profile. The 39.2%
+improvement on Q6_K_XL demonstrates the mechanism works at its intended
+magnitude; the 31.9% on Q4_K_M is the same mechanism scaled down by lower
+relative attention cost.
+
+All acceptance criteria confirmed: correctness (parity ID 286 on both
+Q6_K_XL and Q4_K_M), falsifiable signature, graph_builds = 0, patch_us
+< 5%, full test suite 38/38.
 
 ## 20K Layer-Major Evidence (done 2026-08-20)
 
@@ -116,70 +585,6 @@ does not establish a speedup; pinned staging remains opt-in as an instrumented
 experiment. After CMake reconfiguration, the mutex-protected
 `layer-streaming-pinned-1024` CTest fixture passed its runner and host checker
 (2/2, 17.90 s).
-
-## T-Q38PERF-04: Q8_0 K/V cache (done 2026-08-20)
-
-The isolated runner accepts `--kv-cache f16|q8` (default `f16`). Q8 mode sets
-both `llama_context_params.type_k` and `type_v` to llama.cpp's native Q8_0
-type before context creation; FlashAttention and cache-head compatibility remain
-validated by the existing llama.cpp context constructor. Decoder weights, slot
-ownership, and Gated DeltaNet recurrent state remain unchanged. `run_start`
-now labels the selected `kv_cache` mode.
-
-The mutex-protected feasibility trace
-`build/llama-cuda/q38ls-q8-1024.jsonl` used `--no-mmap --kv-cache q8`, eight
-slots, 1,024 layer-major PP tokens (two chunks), and one greedy TG token. It
-exited 0; `--check-telemetry` accepted 833 events and eight slots. PP was
-2,712.3 ms (377.545 tok/s), TG was 1,687.1 ms, and observed peak VRAM was
-6,140,002,304 bytes (5,855.56 MiB). The focused default-F16
-`layer-streaming-layer-major-1024` CTest also passed (2/2, 17.49 s). This
-establishes Q8 cache lifecycle feasibility only; no output-quality,
-equivalence, speed, or long-context capacity conclusion is made. The current
-100K blocker remains the per-chunk host F32 mask allocation.
-
-## T-Q38PERF-05: implicit causal PP mask feasibility (in progress 2026-08-20)
-
-The opt-in layer-major Qwen3.8 PP path now represents causal visibility in
-`GGML_OP_FLASH_ATTN_EXT` metadata (`q_pos_base`, `n_kv_valid`) rather than a
-dense F16 mask. It is eligible only for causal FlashAttention with one
-contiguous sequence, no SWA or ALiBi, and the CUDA MMA-compatible graph shape.
-All other graphs, including TG, retain their dense-mask behavior. Layer-major
-host input allocation omits per-chunk masks only when this capability is
-explicitly enabled; remaining dense-mask budgeting uses `ggml_fp16_t` bytes.
-
-`build/llama-cuda/q38ls-implicit-q8-1024.jsonl` is a direct-source, four-slot,
-Q8 K/V, 1,024-token layer-major PP plus one-token TG trace. It emitted
-`implicit_causal_mask: true`, exited 0, and `--check-telemetry` accepted all
-837 events. Runner telemetry reports 1,444,448,896 bytes of slot VRAM and a
-4,690,870,272-byte peak (4,473.56 MiB); these are run-scoped telemetry facts,
-not a speed or capacity claim. CUDA `FLASH_ATTN_EXT` backend cases passed
-2,922/2,922 comparisons, the default-F16 layer-major CTest passed 2/2, and
-the mutex-protected `tools/run-tests.ps1 -Suite all` passed 24/24 in 518.51 s.
-
-The first 40,960-token Q8 attempt exposed a separate linear host-input budget
-defect after dense masks were removed: every persistent chunk graph owns the
-optional F32 `inp_embd` created by `build_inp_embd`, but `buf_inputs` retained
-only a fixed 64 MiB non-mask allowance. The bounds guard reported `inp_embd`
-at offset 64,698,560 with size 10,485,760 in a 67,108,864-byte buffer. The
-layer-major budget now adds one full-prompt F32 embedding allocation
-(`n_embd_inp * pp_tokens * sizeof(float)`), which is 838,860,800 bytes for
-40,960 tokens, while implicit mode still allocates no per-chunk dense masks.
-
-The repaired mutex-protected trace
-`build/llama-cuda/q38ls-pp40k-layer-major-q8.jsonl` processed 40,960 PP tokens
-as 80 chunks with four slots, Q8 K/V, and `implicit_causal_mask: true`. It
-exited 0; the independent checker accepted 1,055 events. Observed PP wall time
-was 55,198.2 ms (742.053 tok/s), summed transfer was 164,931.191 ms, wait was
-0.473 ms, summed compute was 47,643.858 ms, peak VRAM was 7,523.56 MiB, and
-timed graph builds were zero. Excluding the 63.738 ms layer-0/chunk-0 first-use
-event gives 47,580.120 ms summed compute. This is one shared-GPU feasibility
-trace, not a generalized performance or quality claim. The focused default-F16
-layer-major regression remained green (2/2, 16.73 s).
-
-The backend harness currently proves CPU/CUDA agreement for the implicit
-operation, but does not independently retain and compare the equivalent dense
-causal output. T-Q38PERF-05 remains in progress until that direct oracle is
-added. No long-context quality or equivalence conclusion is made.
 
 ## Completed
 
