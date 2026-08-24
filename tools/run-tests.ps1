@@ -10,14 +10,18 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite quick     # everything except the 350s transition run
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite boundary  # boundary + slot lifecycle (~35s, GPU)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite telemetry # host-only JSONL validation (no GPU, seconds)
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite host      # host-only chunk-layout + telemetry fixture tests (no GPU, seconds)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k   # 20K-token PP + 3-token TG experiment (~10-20 min, GPU)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k-layer-major # 20K layer-major PP (T-Q38LM-03, ~10-20 min, GPU)
 #
 # Suites:
-#   all               - all 12 layer-streaming / lifecycle / boundary / telemetry targets
+#   all               - all layer-streaming / lifecycle / boundary / telemetry targets
+#                       (includes the T-Q38CTX-01 tail runs: tail513 lm/bm, lm-tiny1, lm511)
 #   quick             - scheduler + pp512 + boundary + lifecycle (no transition/telemetry targets)
 #   boundary          - qwen38-layer-boundary + layer-slot-lifecycle only
 #   telemetry         - host-side telemetry validator targets only (no GPU, no lock)
+#   host              - host-only chunk-layout unit test + lm40/tail513/tail1025
+#                       telemetry fixtures (T-Q38CTX-01/02, no GPU, no lock)
 #   pp20k             - one experimental run: PP 20480 tokens (ubatch 512) + TG 3 tokens,
 #                       --pp-no-logits, ~10-20 min, GPU (BLOCKED/superseded by
 #                       layer-major; kept for the owner to remove explicitly)
@@ -30,7 +34,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'quick', 'boundary', 'telemetry', 'pp20k', 'pp20k-layer-major')]
+    [ValidateSet('all', 'quick', 'boundary', 'telemetry', 'host', 'pp20k', 'pp20k-layer-major')]
     [string] $Suite = 'all',
 
     [string] $BuildDir = '',
@@ -79,6 +83,19 @@ $suites = @{
         Gpu = $false
         Host = $true
         TimeoutSeconds = 120
+    }
+    'host' = @{
+        # T-Q38CTX-01/02: host-only unit + fixture tests (no GPU, no lock):
+        # the chunk-layout unit test and the lm40/tail513/tail1025 telemetry
+        # fixtures (positive + WILL_FAIL negatives).
+        Gpu = $false
+        # Host-only: the layout unit test + the fixture JSONL checks (lm40,
+        # tail513, tail1025). Exclude the tail513 GPU run targets AND the
+        # tail513-lm / tail513-bm host checks that FIXTURES-require those GPU
+        # runs (the fixture files under fixtures/ are what the host suite uses).
+        Include = 'layer-streaming-(lm40|tail513|tail1025)-|test-layer-streaming-layout'
+        Exclude = 'tail513-(lm|bm)(-run)?$'
+        TimeoutSeconds = 300
     }
     'pp20k' = @{
         # Experimental: large-prompt PP (20480 tokens, ubatch 512 = 40 whole

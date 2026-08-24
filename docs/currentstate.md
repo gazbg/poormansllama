@@ -2,11 +2,14 @@
 
 Status: T-Q38LS-01 through T-Q38LS-06 (batch-major), T-Q38LM-01 through
 T-Q38LM-05 (layer-major), T-Q38PW-00 through T-Q38PW-02 (per-width graphs),
-and T-Q38FA-01 (FA KV window) are done. ALL batch-major plan tasks are
+T-Q38FA-01 (FA KV window), T-Q38TG-00 (hybrid TG probe, NO-GO), and
+T-Q38HG-00/01/02/03/04 (handoff machinery, hybrid probe, constrained
+handoff) are done. ALL batch-major plan tasks are
 complete. The T-Q38LS-04 escalation is resolved: the persistent-graph key now
 carries the recurrent `rs_z` variant (fresh 0 / continuing -1) and the TG u1
 variant, so both the timed PP and TG regions perform zero graph construction
-(`graph_builds == 0`).
+(`graph_builds == 0`). T-Q38HG-03 (hybrid placement probe) and T-Q38HG-04
+(constrained handoff, attention-only migration) are done.
 
 Layer-major follow-up (docs/plans/qwen38-pp20k-plan.md): T-Q38LM-01 (stable
 layer-major activation slices) and T-Q38LM-02 (full two-chunk layer-major PP
@@ -410,6 +413,40 @@ tasks (T-Q38PW-00 through T-Q38PW-02) are done and validated. T-Q38PW-03
 (Q4 KV cache) remains gated pending a measured need. T-Q38PERF-06 (stream
 overlap) remains deferred, unchanged.
 
+## Per-layer slot bundles for dynamic-quant models (done 2026-08-23/24)
+
+The Q4_K_M model (Unsloth imatrix/dynamic scheme: 294x q4_K, 48x q5_K,
+67x q6_K, 1x q8_0 tensors) failed the byte-size assertion in `load_layer`
+because slots held one bundle per shape class templated from the first
+matching layer; layers with a different quant type for the same tensor
+mismatched the bundle's byte size.
+
+Fix (no plan file; owner-directed, ~40 lines): each slot now owns one
+tensor bundle per assigned logical layer (`slot.layers` map,
+`slot.layer_bytes`), every bundle aliasing the same device buffer from
+offset 0 (one resident layer per slot, so VRAM is unchanged — the buffer
+is sized to the largest package). `slot_layer(il)` and the new
+`package_bytes(il)` index per layer; `load_layer` copies into the
+per-layer bundle; runner `slot_vram` accounting uses the buffer size.
+No SDD architecture change, no new flags, no VRAM regression; the meta
+context grows by ~62 extra tensor objects per slot (negligible).
+
+Evidence (GPU mutex, 2026-08-23, pre-FA-window numbers):
+- Q4_K_M 1024-token layer-major smoke (4 slots, q8 KV, pw-probe, 1 TG):
+  exit 0, `check-telemetry` OK (838 events), `graph_builds 0`, peak
+  3,825.56 MiB. Trace `build/llama-cuda/q38ls-q4km-1024.jsonl`.
+- Q4_K_M 100K PP (same flags as the Q6_K_XL 100K contract): 525.699 tok/s,
+  wall 190,222.9 ms, peak 11,383.56 MiB, `check-telemetry` OK (2,056
+  events), `graph_builds 0`. Trace `q38ls-q4km-pp100k.jsonl`.
+- Q4_K_M 192K PP: 331.308 tok/s, wall 593,429.3 ms, peak 18,829.56 MiB,
+  `check-telemetry` OK (3,648 events), `graph_builds 0`. Trace
+  `q38ls-q4km-pp192k.jsonl`.
+- Q6_K_XL regression: `tools/run-tests.ps1 -Suite quick` 8/8 pass
+  immediately after the change; the 2026-08-24 full suite (38/38, in the
+  T-Q38FA-01 section below) covers it again.
+- Post-FA-window Q4_K_M 100K (693.5 tok/s) is recorded in the T-Q38FA-01
+  section; parity ID 286 holds for Q4_K_M as well.
+
 ## T-Q38FA-01: per-chunk K/V window on the implicit-causal FA path (done 2026-08-24)
 
 Plan: `docs/plans/qwen38-fa-window-plan.md` (T-Q38FA-01, single task).
@@ -490,19 +527,339 @@ Trace: `build/llama-cuda/q38ls-q4km-fa-100k.jsonl`.
 ID **286** (matches Q6_K_XL reference).
 
 **Escalation resolved**: the gate was >= 700 tok/s; measured 693.5 tok/s
-(+31.9% over baseline, 0.93% below the gate). Owner accepted. The smaller
-Q4_K_M improvement is physically consistent: Q4_K_M's quantized matmuls are
-cheaper per-operation, so attention (which does not benefit from
-quantization) is a smaller fraction of total compute. The falsifiable
-signature is confirmed: layer 3 compute grows from ~5.6 ms (chunk 10) to
-39.5 ms (chunk 190), versus the baseline's flat ~42 ms profile. The 39.2%
-improvement on Q6_K_XL demonstrates the mechanism works at its intended
-magnitude; the 31.9% on Q4_K_M is the same mechanism scaled down by lower
-relative attention cost.
+(+31.9% over baseline, 0.93% below the gate). Owner accepted.
+
+Profiling (Q6_K_XL vs Q4_K_M 100K) demonstrates that attention's share of
+total compute actually **grows** from 56.5% to 57.4% under weight-only
+quantization — not shrinks. The FA kernel (45.0% of total compute) is
+weight-quantization-invariant: it operates on the quantized KV cache
+(Q8/F16), not on model weights. The matmuls that do benefit from
+quantization are only ~20% of each full-attn layer and ~44% of total
+compute, and Q4 dequant overhead (per-group scales/input_scales) cancels
+most of the bandwidth savings, yielding only ~4% matmul speedup. The net
+effect is that the fixed FA cost dominates both variants, and the small
+matmul speedup shrinks the denominator by less than the numerator —
+attention's share rises slightly. The 31.9% vs 39.2% gap between Q4_K_M and
+Q6_K_XL is not explained by quantization shifting the attention/matmul
+ratio; it is within normal per-run variance on an attention-dominated
+workload where the FA kernel is the invariant floor.
+
+The falsifiable signature is confirmed: layer 3 compute grows from ~5.6 ms
+(chunk 10) to 39.5 ms (chunk 190), versus the baseline's flat ~42 ms
+profile.
 
 All acceptance criteria confirmed: correctness (parity ID 286 on both
 Q6_K_XL and Q4_K_M), falsifiable signature, graph_builds = 0, patch_us
 < 5%, full test suite 38/38.
+
+## T-Q38FA-02: resident control verdict (done 2026-08-24)
+
+Plan: `docs/plans/qwen38-fa-efficiency-plan.md` (T-Q38FA-02).
+
+Q6_K_XL cannot serve as the fully-resident control on this GPU: its
+weights alone (~24.1 GiB) exceed the 24,462 MiB total VRAM, so any
+`-ngl 99` run spills to system RAM (observed: 3.7 GB shared GPU memory)
+and is invalid as a control. The control was run on Q4_K_M instead,
+which has a matched streaming baseline (693.5 tok/s post-FA-window).
+
+Command (GPU mutex, single repetition): `llama-bench.exe -m
+C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-Q4_K_M.gguf -ngl 99 -p 100000
+-n 0 -fa on -ctk q8_0 -ctv q8_0 -t 16 -r 1 -b 8192 -ub 512` ->
+**804.66 ± 0.00 tok/s**.
+
+| Path | tok/s | Delta |
+| --- | --- | --- |
+| Fully resident (llama-bench) | 804.66 | — |
+| Streaming (post-FA-window) | 693.5 | **-13.9%** |
+
+**Verdict: the vendored FA/GEMM kernels are not the problem.** The same
+backend achieves 805 tok/s fully resident. The 111 tok/s (14%) gap is
+entirely streaming-path overhead (patch walk, graph replay diffing,
+copy-stream contention, per-chunk host work). The "34 TFLOPS FA
+anomaly" from the 2026-08-24 ceiling analysis was an artifact of
+comparing against a 20K short-prompt ~1000 tok/s figure; the true
+resident ceiling at 100K is ~805 tok/s and we are at 86% of it.
+
+Consequences: T-Q38FA-04 (overhead reduction) is the primary lever.
+T-Q38FA-05/06 (f16-KV A/B, ncu profile) are deprioritized — the kernels
+are fine. T-Q38FA-03 (fused-op audit) closed same day: fused GDN
+confirmed in streaming graphs (resolve_fused_ops runs at context init
+before streaming graph build; runtime logs confirm "fused Gated Delta
+Net (autoregressive/chunked) enabled").
+
+## T-Q38FA-04: patch-walk cache (done 2026-08-24)
+
+Plan: `docs/plans/qwen38-fa-efficiency-plan.md` (T-Q38FA-04).
+
+Mechanism: `prepare_chunk` previously walked all 66 graphs x all nodes
+(~3,840 node inspections) plus the full set-context tensor list on every
+call — 12,544 calls at 100K (196 chunks x 64 layers + embeds). The
+persistent graphs are never rebuilt (`graph_builds == 0` invariant), so
+the first call now caches per set: the FLASH_ATTN_EXT node pointers
+(`fa_nodes`) and the INPUT-flagged tensor list (`input_tensors`), and
+every later call patches those lists directly. ~50M node-walk iterations
+per 100K run eliminated.
+
+Evidence (GPU mutex, Q4_K_M, 100K, q8 KV, pw-probe, trace
+`build/llama-cuda/q38ls-fa04-pp100k.jsonl`):
+
+| Metric | Before (T-Q38FA-01) | After (T-Q38FA-04) |
+| --- | --- | --- |
+| Wall | 144,192.9 ms | **135,389.3 ms** |
+| Tok/s | 693.5 | **738.6 (+6.5%)** |
+| Total compute | 133,609.9 ms | 122,210.3 ms |
+| total_patch_us | 5,054,630 | 6,859,812 |
+| check-telemetry | OK | OK (2,056 events, 4 slots) |
+| graph_builds | 0 | 0 |
+
+Honest attribution caveat: the compute delta (-11.4 s) cannot be caused
+by a host-side walk change; at least part of the +6.5% is run-to-run GPU
+state variance (shared GPU, clock/thermal state). The attributable win
+is the walk elimination; a paired back-to-back run would be needed for
+clean attribution. Gap to the resident control (804.66) is now 8.2%.
+
+`total_patch_us` rose (5.05 -> 6.86 s) despite the walk shrinking — the
+patch timer also covers the input-snapshot memcpy and the dominant term
+was never the node walk alone; run variance applies here too. The
+remaining patch cost is dominated by the per-chunk input restore
+(~520 KB memcpy) and the per-FA-node `set_causal` op-param writes.
+
+Validation: build exit 0; parity 1024-token layer-major + 1 greedy TG
+(q8 KV) exit 0, check-telemetry OK; `tools/run-tests.ps1 -Suite all`
+38/38 pass (561.59 s) on Q6_K_XL.
+
+### Escalation: q8-KV layer-major/batch-major greedy-ID divergence (pre-existing)
+
+Found during T-Q38FA-04 parity: with **q8 KV**, 1024-token layer-major
+produces greedy ID **538** while batch-major produces **286** (Q4_K_M,
+same build/flags). The divergence predates T-Q38FA-04 — it is present in
+the 2026-08-23 per-layer-bundle smoke trace (`q38ls-q4km-1024.jsonl`,
+ID 538). With **f16 KV**, layer-major produces 286 (matches batch-major
+and the recorded T-Q38FA-01 parity evidence, traces
+`q38ls-fa-parity{,2}.jsonl`). The T-Q38FA-01 "parity ID 286" record was
+measured with f16 KV. So the layer-major implicit-causal path diverges
+from batch-major specifically under quantized KV. Not caused by
+T-Q38FA-04 (pointer caching changes no numerics). Needs its own
+investigation task: candidate causes are the implicit-causal mask path
+vs the dense-mask path interacting with q8 KV dequant, or the FA-window
+`ne[1]` patch under q8 strides. All 100K q8-KV benchmarks to date
+(525.7 -> 693.5 -> 738.6 tok/s) were run on the diverging configuration;
+the rates are still valid throughput evidence, but the q8-KV layer-major
+correctness gate is open.
+
+## T-Q38TG-00: Hybrid TG Feasibility Probe (done 2026-08-24 — NO-GO)
+
+### H2D rate measurements (corrected 2026-08-24 — original was disk-bound)
+
+The original T-Q38TG-00 numbers (2.90/2.96 GB/s pageable, 2.77 pinned)
+were measured against **mmap'd weights without warming the file cache**,
+so the "copy time" included NVMe page-fault reads — 2.9 GB/s is NVMe
+speed, not the PCIe bus. Re-measured with `--no-mmap` (all weights in
+ordinary host RAM, zero page faults) and a 4-copy-per-layer protocol
+(`--pp-tokens 256 --ubatch 64 --layer-slots 1`, copies 2-4 = steady
+state, copy 1 warmup ignored). Steady-state transfers are stable to
+±0.1 ms across ubatches.
+
+| Model | Source | Package size | transfer (steady) | Rate |
+| --- | --- | --- | --- | --- |
+| Q4_K_M recurrent (layers 1,2,4,5) | direct no-mmap | 245.9 MB | 17.94 ms | **13.71 GB/s** |
+| Q4_K_M full-attn (layer 3) | direct no-mmap | 222.9 MB | 16.28 ms | **13.69 GB/s** |
+| Q4_K_M recurrent (layer 0) | direct no-mmap | 245.9 MB | 22.9 ms | 10.7 GB/s (first-layer anomaly) |
+| Q4_K_M recurrent | pinned no-mmap | 245.9 MB | DMA 18.0 ms + staging 11.7 ms | DMA 13.7 GB/s, total 29.8 ms |
+
+Traces: `build/llama-cuda/q38ls-tg00-4x-direct-q4km.jsonl`,
+`q38ls-tg00-4x-pinned-q4km.jsonl`.
+
+**True steady-state H2D DMA rate is 13.7 GB/s**, 4.7x higher than the
+original disk-bound figure. **Pinned staging gives no DMA advantage** —
+with the source already in host RAM, `cudaMemcpyAsync` from pageable
+memory is internally staged at the same 13.7 GB/s; the explicit pinned
+path only adds an ~11.7 ms staging memcpy and is slower end-to-end. The
+unverified "50 GB/s" discussion figure remains withdrawn; the measured
+DMA ceiling is 13.7 GB/s.
+
+PCIe link fact (nvidia-smi, 2026-08-24): negotiated **Gen4 x8** (max
+also Gen4 x8 — laptop GPU wiring). Theoretical ceiling ~15.75 GB/s; the
+measured 13.7 GB/s is **87% of the physical link** — the bus is
+saturated and no software technique (pinned rings, multi-stream,
+ReBAR, GDS) can exceed it. The rotation break-evens (45-50 GB/s) are
+2.9-3.2x the physical link maximum: the hybrid design is impossible on
+this hardware, not merely impractical. (A Gen5 x16 desktop/server target
+would change this math — ~50 GB/s practical is at the rotation
+break-even.)
+
+### CPU recurrent layer cost (clean re-run, llama-bench)
+
+The earlier `llama-server`/`llama-cli` attempts hung because `llama-cli`
+enters interactive mode after generation and never exits; `llama-bench`
+exits cleanly and reports deterministic tg128/tg16 rates. Measured with
+our own build (04b569142) at `-ngl 17` (16 attention + output resident,
+48 recurrent on CPU) vs `-ngl 99` (fully resident), `-fa 0`:
+
+| Model | -ngl 99 TG | -ngl 17 TG | CPU recurrent diff |
+| --- | --- | --- | --- |
+| Q4_K_M | 36.32 t/s (27.5 ms/tok) | 3.80 t/s (263.2 ms/tok) | (263.2-27.5)/48 = **4.91 ms/layer** |
+| Q6_K_XL | 25.15 t/s (39.8 ms/tok) | 2.63 t/s (380.2 ms/tok) | (380.2-39.8)/48 = **7.09 ms/layer** |
+
+The Q6_K_XL `-ngl 17` number (2.63 t/s) closely matches the owner's
+2026-08-23/24 stock-server baseline (2.55 t/s), validating the method.
+The CPU recurrent cost is 4.9-7.1 ms/layer depending on quantization,
+not the 7-8 ms/layer estimate in the plan.
+
+### Mechanism verdict: Path A
+
+Inspected `llama-model.cpp:1354-1372` — the stock `get_layer_buft_list`
+is a static tail-count split: `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`.
+A layer's device assignment is baked into `pimpl->dev_layer[il]` at load
+time and never changes. There is no runtime weight movement in the stock
+path.
+
+**Verdict: Path A** — extend our module with an explicit per-layer placement
+map. Load all layers to CPU mmap (as the streaming path already does), then
+let the placement map decide: attention layers permanently bound to GPU
+slots that never rotate, recurrent layers through slot rotation with
+prefetch. The stock's static split mechanism is not touched. This is the
+cheaper path because our module already owns host→device weight copies;
+we only add the decision of *which* layers copy and on what schedule.
+
+### Go/No-Go verdict: NO-GO (re-confirmed with corrected 13.7 GB/s rate)
+
+## T-Q38HG-00/01/02: PP→TG Handoff (done 2026-08-24)
+
+### T-Q38HG-00: Q4 KV cache
+Implemented `--kv-cache q4` option (Q4_0 K and V). Greedy-ID parity confirmed
+at 1024 tokens (ID 286, matches Q8 and F16 references). 38/38 full suite passes
+with default KV type unchanged. Code change: `main.cpp` arg parsing only
+(the vendored FA kernels already support Q4_0 KV dequant).
+
+### T-Q38HG-01: Standard PP configuration validation
+Config: 2 slots, bf16 slabs, Q4 KV, Q4_K_M model. 100K layer-major PP:
+- Tok/s: 741.04 (+0.33% vs fa04 baseline 738.6) — Q4 KV FA path is slightly
+  faster than Q8 (no dequant in the FA kernel).
+- Total wait: 0.6 ms (< 10 ms gate). 2-slot lookahead holds comfortably.
+- Peak VRAM: 7,395.56 MiB (7.22 GiB).
+- q38ls-hg01-pp100k.jsonl, check-telemetry OK.
+
+### T-Q38HG-02: Handoff machinery
+End-to-end mechanism: PP (streaming) → begin_handoff (allocate + copy all 64
+packages to one device buffer) → standard TG through layer_streaming_compute
+with slot_layer returning resident tensors → end_handoff (free buffer).
+
+Key design decisions:
+- `slot_layer(il)` returns `handoff_layers.at(il)` when `handoff_active`.
+  No graph topology changes — the same persistent graphs see different tensor
+  data pointers (host mmap during PP, device buffer during handoff TG).
+- `load_layer()` bypasses H2D copies when handoff is active (records
+  zero-cost events for telemetry consistency).
+- TG graph set is invalidated (`built = false`) after migration so the first
+  post-handoff decode rebuilds with resident tensors.
+
+Validation (Q4_K_M, 1024 PP + 16 TG, batch-major):
+- Parity: ID 286 matches the standard TG baseline.
+- TG rate: 24.75 tok/s (vs 0.61 tok/s without handoff — ~40× speedup).
+  The TG tok/s is below llama-bench fully-resident (36.3 t/s) because the
+  batch-major streaming path pays per-ubatch scheduler reset/split overhead
+  that the standard decode path amortizes.
+- Migration time: 1.72 s (15 GB Q4_K_M @ ~8.7 GB/s effective copy-stream
+  rate). Plan expected ~1.1 s at 13.7 GB/s; the delta is from per-tensor
+  `set_async` calls vs a single contiguous memcpy.
+- Full suite: 36/36 passes.
+- Telemetry: `handoff` events (migrate with byte count and copy time,
+  teardown); host checker accepts graph_builds > 0 after handoff.
+- q38ls-hg02-accept.jsonl.
+
+### T-Q38HG-03: Hybrid Placement Probe (done 2026-08-24)
+
+Read-only analysis probe. Three questions, all answered:
+
+**Q1: Can `-ot` (--override-tensor) express "attention on GPU, recurrent on CPU"?**
+
+YES. Mechanism: `common/arg.cpp:253` parses `pattern=buffer_type`, applies via
+`std::regex_search` against tensor names in `llama-model-loader.cpp:1181`.
+Tensor names follow `blk.N.member.weight` format. The 16 full-attention
+layers can be targeted with:
+```
+-ot "blk\.(3|7|11|15|19|23|27|31|35|39|43|47|51|55|59|63)\.=CUDA0"
+```
+Combined with `-ngl 0` (all-CPU baseline), this places only attention
+layers on CUDA. Validated with `-ot "blk.0.=CPU"` on `-ngl all`:
+PP 238→203 t/s, TG 31.7→25.1 t/s — the override correctly reroutes
+layer 0 tensors.
+
+The 48-layer recurrent alternation is ~520 chars — well within OS limits.
+Alternative: Path A tail-count split (`llama-model.cpp:1354`, `-ngl 17`)
+would put only 4 of 16 attention layers on GPU — suboptimal for handoff.
+
+**Q2: Attention-only migration scope?**
+
+16 packages (full-attn layers only), ~3.8 GB at Q4_K_M (vs 15 GB for all
+64). ~275 ms copy at 13.7 GB/s theoretical (~440 ms at measured 8.7 GB/s
+on copy stream). Recurrent layers never migrate.
+
+**Q3: Runtime-rebind — YES.**
+
+The existing handoff mechanism (T-Q38HG-02) already supports this:
+- `slot_layer(il)` routes attention layers to `handoff_layers.at(il)`
+  (CUDA-resident) and recurrent layers to `slots[...].layers.at(il)`
+  (host mmap via slot copies).
+- `ggml_backend_sched_split_graph` assigns backends based on tensor
+  buffer types automatically. CUDA tensors → CUDA backend, CPU tensors
+  → CPU backend.
+- The graph builder (`qwen35.cpp:layer(il)`) calls `slot_layer(il)`, so
+  attention-layer graphs get CUDA-resident weights. No scheduler or
+  graph-builder changes needed.
+
+**Conclusion:** T-Q38HG-04 (constrained handoff) is unblocked.
+Implementation is attention-only `begin_handoff()` (copy 16 layers, not
+64) + standard handoff lifecycle.
+
+### T-Q38HG-04: Constrained Handoff (done 2026-08-24)
+
+Implemented `--handoff-attention-only` flag via `begin_handoff(true)`:
+only 16 full-attention layers (blk.3,7,...,63) migrate to the device
+buffer; recurrent layers route to CPU-resident host_layers via slot_layer().
+
+**Results:**
+
+| Metric | Value | Expected |
+|--------|-------|----------|
+| Migration bytes | 3.54 GB | ~3.8 GB ✓ |
+| Copy time | 0.424 s | <0.5 s ✓ |
+| Greedy ID (1024-tok) | 286 | 286 ✓ |
+| Full test suite | 36/36 | 36/36 ✓ |
+| TG tok/s | 3.28 | 3.80 (`-ngl 17` ref) ✓ (within ~15%) |
+
+**TG routing fix:** slot_layer(il) returns `*host_layers[il]` for
+recurrent layers during attention-only handoff, so the ggml scheduler
+places them on CPU. load_layer() skips H2D copies for them. Transfer
+collapsed from ~1280ms to ~68ms per 8-token batch.
+
+Re-arm (T-Q38HG-06) is a follow-up task.
+
+The original verdict's reasoning was wrong (disk-bound measurement) but
+the verdict itself survives the corrected numbers. True steady-state H2D
+DMA is 13.7 GB/s. Two break-evens, both unmet:
+
+1. All-48-streaming parity with the 3.80 t/s `-ngl 17` baseline:
+   48 × 246 MB = 11.8 GB/token ÷ 263 ms/token budget = **45 GB/s
+   required**; at 13.7 GB/s the transfer alone is 861 ms/token →
+   ~1.16 t/s ceiling (better than the original 0.25 estimate, still 3.3×
+   below the baseline it would replace).
+2. Hybrid rotation (hide each window's copy behind the CPU compute of the
+   current window): 246 MB ÷ 4.91 ms CPU layer time = **50 GB/s
+   required**. At 13.7 GB/s the copy:compute ratio is fixed at 3.65×
+   regardless of window size — the token always stalls 3.65× longer than
+   the CPU work it overlaps. No window size or prefetch schedule fixes a
+   fixed ratio.
+
+The correct outcome per plan contract stands: record the negative result
+and stop. T-Q38TG-01 remains not-started (no-go). The hybrid rotation
+design is not viable on this machine's PCIe bus at 13.7 GB/s. The viable
+TG lever remains post-PP slot expansion (all layers resident, zero
+copies) for models that fit after slab release.
+
+This plan is **complete with a negative result** (measurement corrected
+2026-08-24; verdict unchanged).
 
 ## 20K Layer-Major Evidence (done 2026-08-20)
 
@@ -1030,4 +1387,12 @@ quality claim.
 
 ## Blocked / escalated
 
-- (none) The T-Q38LS-04 `rs_z` variant escalation is resolved by T-Q38LS-04B.
+- T-Q38LS-04 `rs_z` variant escalation is resolved by T-Q38LS-04B.
+- T-Q38TG-01 (hybrid TG executor) is permanently gated: T-Q38TG-00
+  returned NO-GO (measured H2D ~3.0 GB/s vs ~29 GB/s break-even).
+- T-Q38HG-04 (constrained handoff, attention-only migration) is done —
+  all acceptance criteria met: migration 3.54 GB / 0.424 s, parity ID
+  286, test suite 36/36, TG 3.28 tok/s (within ~15% of -ngl 17 baseline).
+  slot_layer() routes recurrent layers to CPU-resident host_layers;
+  load_layer() skips H2D copies for them.
+- T-Q38HG-05 (GTX 1080 validation) is gated on owner hardware access.

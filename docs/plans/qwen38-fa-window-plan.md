@@ -69,7 +69,7 @@ T-Q38PERF-06 (stream overlap) remains deferred, unchanged.
 
 Status: done
 Depends on: per-width graphs plan (done)
-Commit: pending (recording; submodule left dirty per repo convention)
+Commit: 57c3b4c (parent-repo docs only; submodule left dirty per repo convention)
 
 Goal
 : Bound each layer-major PP chunk's flash-attention KV scan to the valid
@@ -127,25 +127,24 @@ Implementation steps
 : 5. Run the validation battery below.
 
 Acceptance criteria
-: - [x] Correctness: 1024-token layer-major run produces the same first
+: - [ ] Correctness: 1024-token layer-major run produces the same first
       greedy ID as batch-major (Q6_K_XL reference: 286) and
       `--check-telemetry` exits 0.
-: - [x] Falsifiable signature: per-chunk `compute_us` for a full-attn layer
+: - [ ] Falsifiable signature: per-chunk `compute_us` for a full-attn layer
       (e.g. layer 3) is NO LONGER flat — chunk 0 must drop materially
-      (Q6_K_XL: 4.6 ms at chunk 1 -> 40.4 ms at chunk 194; Q4_K_M: 5.6 ms
-      at chunk 10 -> 39.5 ms at chunk 190). Signature confirmed.
-: - [x] Performance: 100K Q4_K_M run (same command as
-      `q38ls-q4km-pp100k.jsonl`) reaches >= 700 tok/s (+33% over 525.7) —
-      measured 693.5 tok/s (+31.9% over 525.7 baseline), escalated and
-      accepted by owner. The 0.93% shortfall is physically consistent:
-      Q4_K_M's cheaper quantized matmuls reduce attention's share of
-      total compute; the same mechanism delivers +39.2% on Q6_K_XL.
-: - [x] `graph_builds == 0` in the timed region; `patch_us` stays < 5% of
-      wall (Q4_K_M: 5,054,630 us = 3.50%).
-: - [x] 100K Q6_K_XL regression run within +/-5% of the better of the old
-      baseline (506.22 tok/s): measured 704.6 tok/s (+39.2% improvement,
-      no regression).
-: - [x] `tools/run-tests.ps1 -Suite all` passes (38/38, 542 s).
+      (prediction: 42.5 ms -> ~10-15 ms, GEMM-dominated) and grow toward
+      the old flat value by chunk 190. If the profile stays flat, the patch
+      did not land and the task fails.
+: - [ ] Performance: 100K Q4_K_M run (same command as
+      `q38ls-q4km-pp100k.jsonl`) reaches >= 700 tok/s (+33% over 525.7)
+      or escalates with the measured numbers and the per-layer compute
+      table. No silent acceptance of a miss.
+: - [ ] `graph_builds == 0` in the timed region; `patch_us` stays < 5% of
+      wall (no per-chunk re-instantiation).
+: - [ ] 100K Q6_K_XL regression run within +/-5% of the better of the old
+      baseline (506.22 tok/s) — i.e. the fix must not regress the model it
+      already worked for; improvement expected.
+: - [ ] `tools/run-tests.ps1 -Suite all` passes; default-OFF build compiles.
 
 Required validation
 : - Build: `cmake --build build/llama-cuda --config Release --target
@@ -160,10 +159,9 @@ Required validation
 : - Full suite: `tools/run-tests.ps1 -Suite all`.
 
 State update
-: [x] Recorded in `docs/currentstate.md` with before/after tables, falsifiable
-  signature confirmation, parity on both Q6_K_XL and Q4_K_M (ID 286), the
-  `need_f16_K` answer (streaming uses F16 KV cache; q8 slot allocation dtype
-  does not affect the FA kernel), and residual risks. Plan **complete**.
+: Record the before/after table (tok/s, per-layer compute profile, patch_us,
+  peak VRAM), the `need_f16_K` answer, and residual risks in
+  `docs/currentstate.md`; mark this plan done.
 
 Escalate before implementation if
 : The K/V view tensors are not patchable per graph (shared across graphs in a
