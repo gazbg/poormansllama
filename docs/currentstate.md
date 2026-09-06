@@ -3,6 +3,11 @@
 Vendored llama.cpp state: `169ab086e` — layer-streaming: generic MoE
 residency, long-PP sizing fix, off first-class, resident MTP (2026-09-06).
 
+Milestone tag `layer-residency-plan-complete` (2026-09-06): this repo →
+27514d1dabeef7119b53241aad65167ae2a410d8; vendored llama.cpp →
+169ab086e857d287daac626dc7eda6a4f9764efe. Both annotated, local only
+(not pushed).
+
 ## T-GPLR-05 Complete: Capability Registry + Regression Closure — Plan Done (2026-09-05)
 
 The generic prefill layer-residency plan is complete: every loaded model now
