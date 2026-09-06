@@ -1,5 +1,377 @@
 # Current State
 
+Vendored llama.cpp state: `169ab086e` — layer-streaming: generic MoE
+residency, long-PP sizing fix, off first-class, resident MTP (2026-09-06).
+
+## T-GPLR-05 Complete: Capability Registry + Regression Closure — Plan Done (2026-09-05)
+
+The generic prefill layer-residency plan is complete: every loaded model now
+receives a deterministic host-only capability result, only adapter-declared
+policies can be selected, and the tested support matrix is published without
+any performance claim.
+
+Capability registry. `llama_ls_probe_capability(path)` reads only the GGUF
+header KV (no CUDA enumeration, no model load, no placement change) and
+returns a deterministic result: `qwen35` -> adapter `qwen35`, policy
+`dense-layer`; `qwen35moe` -> adapter `qwen35moe`, policy `moe-expert-bank`;
+anything else -> `off` with the stable reason `no layer-residency adapter for
+this architecture`. The runner exposes `--probe-capability` (host-only JSON)
+and defers `llama_backend_init` until after policy resolution, so all refusal
+paths are strictly host-only.
+
+Policy modes. `auto` selects only adapter-declared policies; on an
+unsupported architecture it runs `off` and explains why on stderr (exit 0,
+SDD 8) — only a FORCED policy/arch mismatch refuses host-only (exit 2).
+Forced `off` runs
+the normal llama.cpp path inside the runner (no tensor-buft overrides, no
+streaming init, batch-major `llama_decode`) and writes an audit telemetry
+record (`policy":"off"` + `capability_reason`). Forced `dense-layer` /
+`moe-expert-bank` are validated against the probed architecture.
+
+Post-audit hardening (residency off first-class): the normal path lives in
+`run_residency_off()`; `off` combined with streaming-only flags (layer-major,
+mtp, handoff, explicit pp-schedule, layer-slots, residency-budget) is rejected
+loudly before CUDA (exit 2); off audit traces are validated by the telemetry
+checker (policy `off` rules: run_start/run_end/meta consistency, no slot
+events) via checked-in fixtures; and all 16 run tests pass
+`--allow-full-residency` explicitly, removing ambient-VRAM flakiness.
+
+Telemetry single-owner refactor (2026-09-05, post-audit): the run_start
+identity head (event/run_id/t0_us) lives in one shared builder
+(`tel_run_start_head`) used by both the streaming and off-run emitters;
+the off-trace rules (policy-off classification, run_start metadata rule,
+streaming-event rejection) live in one shared helper set used by BOTH
+`check-telemetry` and `validate-telemetry` with byte-identical message
+text. Intended behavior delta only: a healthy off run_end now emits
+`"error":"none"` (failed:false) instead of placing the non-error string
+"off mode: normal llama.cpp placement" in the error field. Validation:
+host suite green; full layer-streaming suite 44/44 under the GPU mutex
+with the final binary; emitted run_start field order verified identical
+to the pre-refactor contract on both trace classes (fixtures updated for
+the error-field delta); MoE forced-off vs layer-major streaming parity on
+the final binary: identical first 3 generated IDs (19241 13 561) on the same
+12-token prompt, both traces check-telemetry OK (dense-model parity runs are
+superseded; MoE is the governing workload). Post-audit hardening: the six
+off-incompatible flag conditions now live in one flag-to-reason table (single
+exit code 2) evaluated after argv parsing and before the host-only model-arch
+read, so a gate rejection wins over any later failure class; verified host-only
+for every entry, including auto-resolved off.
+
+Long-context layer-major PP measured (MoE, 2 slots, Q8 KV @ 262144, ubatch 512,
+--pp-no-logits, direct staging, GPU mutex, 2026-09-06): 50,000 tok -> 69.7 s
+wall / 69.6 s transfer / 62.6 s compute = 717.8 tok/s; 100,000 tok -> 135.0 s /
+129.3 / 126.6 = 740.7 tok/s; 262,144 tok -> 351.9 s / 327.6 / 338.6 = 745.0
+tok/s. 38 bank evictions and graph_builds 0 in every run; compute overlaps
+transfer (~97%), so long-prefill throughput is transfer-bound and roughly flat
+in prompt length once chunks amortize the per-layer expert-bank pass. 262K
+confirmation and variants (all exit 0, check-telemetry OK): rerun 350.6 s =
+747.7 tok/s (reproducible within 0.4%); pinned staging 352.1 s = 744.4 tok/s
+(identical to direct -- the bottleneck is the mmap read, not the staging
+copy; wait 0.6 s); 4 slots 352.3 s = 744.2 tok/s (36 evictions, slot window
+1.82 GiB; cumulative transfer time tripled to 967.8 s yet wall unchanged --
+wide-window copies run concurrently behind compute, leaving wall bound by
+the host read stream). Traces: build/gplr-longpp-*.jsonl, all
+check-telemetry OK.
+
+Open performance frontier: TG remains a full 40-bank pass per token
+(0.26-0.52 tok/s measured). Draft task T-GPLR-06 (MTP draft + layer-major
+burst verify, falsifiable 2x-tok/s hypothesis at k=4, exact greedy-prefix
+parity) is appended to the plan as draft, awaiting owner review before any
+implementation. A pre-implementation probe already triggered the draft's
+first escalation condition: --mtp --handoff on the MoE loads the draft head
+(blk.40) but begin_handoff is unsupported for the moe-expert-bank policy
+(loud TG decode -3, exit 1; build/gplr06-mtp-probe.jsonl) -- the MoE MTPacceptance
+rate is unmeasurable with the current binary. Owner decision taken: redesign
+the draft leg. Step 1 landed: --mtp without --handoff is now legal under
+moe-expert-bank (MTP package is GPU-resident there; single gate moved after
+policy resolution; dense-layer still requires handoff). First MoE MTP run
+completed (exit 0): drafted 16 accepted 9 = 0.562 accept rate, and greedy IDs
+exactly match the sequential no-MTP baseline on the same 512-token prompt
+(build/gplr06-{seq-baseline,mtp-resident}.jsonl). Wall unchanged (0.474 vs
+0.493 tok/s) because the existing loop verifies serially -- one full bank
+pass per draft; the remaining T-GPLR-06 work is the layer-major batch verify
+that amortizes one bank pass across k drafts. Acceptance measured over 128
+tokens (all legs exit 0, greedy IDs identical everywhere): sequential 0.522
+tok/s; draft 4 -> rate 0.479, 1.91 accepted/round; draft 8 -> rate 0.250,
+2.00 accepted/round -- accepted tokens per bank pass saturate near 2, so the
+step-2 batch-verify projection is ~2.7-3.0x wall (2x hypothesis reachable
+with margin). En-route defect found and
+fixed: the layer-major graph-input buffer was sized embd-bytes-exact plus a
+flat 64 MiB slack, which exhausted at chunk 493/512 on the 262K run (two
+deterministic loud aborts, never silent corruption); sizing now adds 1 MiB
+headroom per chunk (host-side buffer, no VRAM cost). Failed attempt traces
+archived in build/gplr-attempt1/.
+
+Normal-path parity closed. A forced-off run (GPU mutex, MoE model, 9-token
+prompt) produced PP-logits first greedy ID 13 and first generated ID 5388 —
+identical to the streaming layer-major run. This converts the T-GPLR-03/04
+"router parity proven between residency configurations" caveat into a direct
+stock-path comparison. A read defect was caught by exactly this check: index
+0 of `llama_get_logits_ith` resolves to the FIRST batch token's row
+(`output_resolve_row(i >= 0) = output_ids[i]`), reporting 2614; the correct
+read is -1 (last output row), now fixed in the off path.
+
+Refusal fixtures. New host-only CTests `layer-streaming-refuse-unsupported-dense`
+(forced policy on an unsupported arch -> exit 2), `layer-streaming-probe-unsupported`,
+off-audit checker tests `layer-streaming-check-off-audit-{valid,rejects-slot-event,rejects-bad-meta}`,
++ fixture generator
+`tests/make-unsupported-fixture.cpp` (tiny `llama`-arch GGUF) all pass in
+0.4 s with no GPU. The insufficient-capacity refusal was already proven by
+the T-GPLR-04 negative fixture (aborts before the timed PP).
+
+Validation: `tools/run-tests.ps1 -Suite host` 13/13 (suite extended to include
+the probe/refusal tests and the extended model-inspect unit test); full
+layer-streaming suite 44/44 under the GPU mutex (2026-09-05 closing run,
+437 s, including the off-audit checker fixtures and the off first-class
+gates); default-off
+`llama-cli`/`llama-server` build exit 0.
+
+Tested support matrix (SDD section 8.1 is the canonical copy): supported =
+`qwen35`/`dense-layer` and `qwen35moe`/`moe-expert-bank` only; unsupported =
+everything else (forced policies refused host-only; `auto` runs `off` and explains);
+correct-but-slower = the validated configurations with no throughput claim;
+unmeasured = MTP/TG expert prediction, weight rotation, multi-GPU, and every
+other architecture. No speedup claim is made anywhere.
+
+Traces: `build/llama-cuda/q36-off-parity.jsonl` (off audit record),
+`out/q36-off-parity.log`, `out/q36-auto2.log`.
+
+## T-GPLR-04 Complete: 262K Q8 Out-of-Core Capacity Proof (2026-09-05)
+
+The 262,144-token Q8 KV capacity configuration is proven: the full model plus
+runtime would not fit under the enforced residency budget, and only the
+bounded 2-slot expert-bank window plus KV/state/act-slabs occupy pageable
+weight VRAM while the 512-token layer-major prefill runs with exact parity
+against the T-GPLR-03 control.
+
+Acceptance run (GPU mutex, Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf,
+`--ctx-size 262144 --kv-cache q8 --pp-tokens 512 --ubatch 512
+--pp-schedule layer-major --layer-slots 2 --no-mtp --reserve-mib 512
+--residency-budget-mib 7000 --prompt "The quick brown fox jumps over the
+lazy dog" --greedy --tg-tokens 1`): exit 0, `check-telemetry: OK` (567
+events), `ctx_size=262144` in run metadata, PP-logits first greedy ID 13 and
+TG continuation 5388 identical to the T-GPLR-03 control, all 40 route-event
+hashes identical to the 4-slot 9-token control, `graph_builds == 0` both
+phases.
+
+Out-of-core proof: full model + KV + state 24,295,318,016 B vs bounded 2-slot
+window 6,517,385,728 B (exact T-GPLR-00 inventory match): static
+957,530,112 + per_layer 1,597,483,520 + slot_window 1,044,381,696 (2 x
+522,190,848) + KV 2,852,126,720 + DeltaNet state 65,863,680 B; act slabs
+8,388,608 B, reserve 536,870,912 B, peak VRAM 7,625.56 MiB.
+
+Negative fixture: `--residency-budget-mib 5000` aborts before the timed PP
+(`bounded 2-slot window 6517385728 B exceeds the residency budget
+5242880000 B`, exit 1, zero timed tokens).
+
+Defect found and fixed during this task: the post-init `byte_account` emitter
+applied MoE arithmetic to dense runs (per_layer counted resident, slot_window
+0), so the dense reference trace reported `bounded_window` 25.7 GB >= free
+VRAM and the new checker invariant failed. The checker caught exactly the
+drift it was designed for. Both the preflight and the emitter now share one
+helper (`ls_bounded_window_for_policy`), dense policy correctly reports
+`per_layer=0` with `slot_window = slots x dense_largest`, and the fresh dense
+262K reference validates (bounded 12.4 GB < full 35.2 GB). All 38
+layer-streaming CTests pass with regenerated traces; default-off
+`llama-cli`/`llama-server` build exit 0. `run_start` now also carries an
+explicit additive `ctx_size` field.
+
+Caveats: full model 24.3 GB fits physical VRAM (25.65 GB), so the out-of-core
+condition is proven by the explicit sub-full-model residency budget plus the
+bounded-window arithmetic, not by physical non-fit; mmap/file-cache source
+state remains uncontrolled Windows behavior; per-layer routing is not
+observable on the normal path, so router parity is between residency
+configurations, not against the server.
+
+Trace: `build/llama-cuda/q36-262k-parity.jsonl`; logs:
+`out/q36-262k-parity.log`, `out/q36-neg-budget2.log`, `out/q38-dense-262k.log`.
+
+## T-GPLR-03 Complete: 512-Token MoE Layer-Major Prefill + Parity Closure (2026-09-05)
+
+The Qwen3.6 MoE 512-token layer-major prefill is complete and the last open
+acceptance item — first-greedy-ID parity with the normal path — is now
+closed with a matched control.
+
+Streaming evidence (GPU mutex, `qwen35moe`, Q8 K/V, ubatch 512, 4 slots):
+all 40 trunk layers in layer-major order, exactly one complete expert-bank
+copy per MoE layer in the PP phase (74 x 452,984,832 B + 6 x 522,190,848 B,
+generations 1-10, no partial/hidden copies), 40 `route` events with
+`top_k=8`, 4-slot rolling vs 16-slot resident runs produce IDENTICAL
+route-hash sequences, layer-major/batch-major/16-slot all agree on greedy
+ID 220 (synthetic deterministic prompt), `graph_builds == 0` for PP and TG,
+`check-telemetry: OK`, exit 0. Partial-package negative still fails loudly
+with zero copies. Dense Qwen3.8 `layer-major-1024` regression: ID 286.
+Traces: `build/llama-cuda/q36-moe-pp512-{rolling,resident16,batchmajor}.jsonl`.
+
+Parity closure (the previously open item). Two false alarms were identified:
+
+1. The `llama-cli` "control" reporting `<think>` was never a raw completion.
+   This vendored `llama-cli` is a chat client: it spawns/uses a server and
+   posts the prompt to `/v1/chat/completions` as a user message, so the Qwen
+   chat template wraps the prompt and the model begins an assistant turn,
+   whose first piece is the special token `<think>` (id 248068; verified with
+   host-only `llama-tokenize`, which also shows the raw prompt is 9 tokens
+   with no BOS and no synthetic padding).
+2. An interim runner reading of 271 (`\n\n`) came from a 10-token prompt
+   (prior trace `run_start.pp_tokens = 10`, i.e. a padded/older run): the
+   T-GPLR-03 PP-logits accessor returns the argmax of the LAST logits row,
+   which was the pad row, not `dog`. On the exact 9-token prompt the accessor
+   returns 13.
+
+Matched control (GPU mutex, same workspace build, `-ngl 99`,
+`--cache-type-k/v q8_0`, `--parallel 1`, temperature 0, `n_probs=5`):
+`llama-server` `/v1/completions` with the raw 9-token prompt reports first
+token id 13 (`.`), logprob -1.138 (then `\n` -1.643, ` is` -2.018,
+`\n\n` -2.274, special -3.17). The streaming layer-major runner on the same
+prompt reports PP-logits first greedy ID 13 — exact first-token parity with
+the normal path. The runner's TG then continues with id 5388 (` dog`), the
+unpicked continuation, consistent with argmax 13 being consumed first.
+Artifacts: runner trace `build/llama-cuda/q36-moe-prompt-ctl.jsonl` (40 PP
+copies, 40 routes, `graph_builds == 0` both phases, telemetry OK), control
+response `build/control-response.json`, server log
+`out/q36-control-server.log`. No quality claim is made beyond first-token
+parity; per-layer routing is not exposed by the normal path, so router
+parity is proven between residency configurations (4-slot vs 16-slot,
+identical hashes), and route hashes are prompt-dependent by construction.
+
+## T-GPLR-02 Complete: MoE Expert-Bank Package Proof (2026-09-04)
+
+The Qwen3.6 MoE expert-bank adapter is proven. `src/models/llama-layer-streaming-qwen35.cpp`
+now registers `qwen35moe_package` (complete routed-expert bank: gate+up+down, or
+fused gate_up+down), `merge_resident=true` (slot bundle = resident model layer with
+only package members replaced by device tensors), and `causal_implicit=true`.
+`qwen35moe::graph` gained the `layer(il)` indirection and a `build_streaming_graphs()`
+mirror of the dense builder; `llama-graph.cpp` causal gate now reads
+`adapter->causal_implicit` (no hard-coded arch). The runner resolves
+`--residency auto|off|dense-layer|moe-expert-bank` from a host-only
+`general.architecture` read before load; MoE loads with expert-bank tensors
+overridden to CPU (pageable) while attention/router/shared/norms stay CUDA-resident.
+Route observation marks the router's selection_probs as a live graph output
+(lifetime only, no arithmetic change); the executor reads the F32 probs after each
+layer compute and derives exact top-k IDs (stable descending sort = CUDA radix
+tie-break), emitting one `route` event (sampled IDs, top-k, route-union, FNV hash).
+Observational only.
+
+Validation (2026-09-04, GPU mutex): one-layer proof layer 0, 64 tokens -> exactly
+one `copy_submit` of 452,984,832 B (the complete bank), slot_vram 522,194,944 B,
+exit 0, `route` event top_k=8 route_union=192 with all IDs in [0,256). Rolling
+(1 slot) vs resident (16 slots) runs produce the IDENTICAL route hash
+(9763251156467869940) and sampled IDs 220,167,131,161,250,237,8,185 — exact router
+parity. Partial-package negative (`--fault-drop-member`) -> loud
+`load_layer: package descriptor/bundle member mismatch`, exit_status 1, zero
+`copy_submit` events. Dense regression `layer-streaming-layer-major-1024` passes
+with greedy ID 286; host trio passes. Host fixtures cover separate/fused positives,
+partial bank and zero-byte negatives; capability probe now selects qwen35moe.
+Escalation conditions cleared: `mmid.cu` reads quantized experts directly (no
+per-load repack); router IDs observable without changing arithmetic.
+
+## T-GPLR-01 Complete: Qwen Package Adapter Extracted (2026-09-04)
+
+The Qwen-specific package lists were extracted behind an architecture-neutral
+descriptor boundary. `src/llama-layer-streaming.{h,cpp}` now defines
+`llama_ls_member`/`llama_ls_package`/`llama_ls_adapter`, the host-testable
+validator `llama_ls_validate_package()`, and the capability probe
+`llama_ls_select_adapter()`. The Qwen3.5 dense member tables (recurrent 22,
+attention 18, MTP 26 members; order preserved) live only in
+`src/models/llama-layer-streaming-qwen35.cpp`. `init()` enumerates and
+validates every trunk package before any device allocation or copy submission;
+slot bundle creation, `load_layer`, and `begin_handoff` (including the MTP
+migration) consume the cached validated descriptors. A new `pkg_member`
+telemetry event emits adapter, policy, class, member count, and package bytes
+per layer.
+
+Validation (2026-09-04): new host CTest `test-layer-streaming-descriptors`
+(reference member-order equality, six invalid-descriptor negatives, capability
+probe with stable unsupported reasons) passes; the full host trio (layout,
+model-inspect, descriptors) passes 3/3. GPU parity under the mutex:
+`layer-streaming-layer-major-1024-run` + host telemetry check pass with
+`graph_builds == 0` in both phases, first greedy ID 286 equal to the
+pre-extraction baseline captured the same day, 64 `pkg_member` events (48
+recurrent + 16 attention) with layer-0 package 364,022,656 B equal to the
+recorded reference size, peak 4,783,144,960 B. Default-off
+(`-DLLAMA_LAYER_STREAMING=OFF`) `llama-cli` builds with exit 0; the flag was
+then restored to ON with a clean rebuild.
+
+`qwen35moe` deliberately has no adapter yet and reports a stable unsupported
+reason; T-GPLR-02 adds the MoE expert-bank adapter. A task-boundary review
+(2026-09-04) confirmed the extraction is behavior-preserving with no Critical
+findings, and its three Important fixes (MTP size guard, handoff failure
+propagation + `abort_handoff()` cleanup, `make_dev_tensor` null checks) were
+revalidated: host trio 3/3, a direct attention-only handoff run under the mutex
+exited 0 with the migrate/teardown events and `check-telemetry: OK`, and the
+fresh `layer-streaming-layer-major-1024` pair passed with greedy ID 286,
+`graph_builds == 0` in both phases, and 64 `pkg_member` events.
+
+## T-GPLR-00 Complete: MoE Artifact Inventory (2026-09-04)
+
+The host-only inventory task is done. `llama-layer-streaming.exe
+--inspect-model <gguf> --ctx-size 262144 --kv-cache q8 --physical-vram-bytes N
+--inspect-json out.json` parses GGUF metadata with `gguf_init_from_file
+(no_alloc=true, ctx=nullptr)` and returns before `llama_backend_init()`; it
+enumerates no CUDA device and reads no tensor data. The shared implementation is
+`llama_ls_model_inventory()` in `src/llama-layer-streaming.cpp`, validated by
+the new host CTest `test-layer-streaming-model-inspect` (synthetic dense/MoE
+GGUF fixtures + malformed-metadata negatives: unsupported arch, missing
+`expert_count`, unclassified tensor, incomplete expert bank, missing file).
+
+Measured facts (full JSON: `build/llama-cuda/q36-moe-inventory.json`, recorded
+in `docs/AGENT_ENVIRONMENT.md`): architecture `qwen35moe` (vendored support
+present: `LLM_ARCH_QWEN35MOE`, `src/models/qwen35moe.cpp`, 40 layers ->
+`LLM_TYPE_35B_A3B`), 41 blocks (40 trunk + 1 MTP), 256 experts, top-8, 753
+tensors, 21,377,327,616 B data. Every routed-expert tensor maps to exactly one
+logical-layer expert-bank package: 37 layers at 452,984,832 B and layers 34/38/39
+at 522,190,848 B (their `ffn_down_exps` are the q6_K tensors). Router, shared-
+expert, attention, recurrent, layer-norm, static and MTP classes are reported
+separately. Q8_0 K/V at capacity 262,144 = 2,852,126,720 B (10 attention
+layers, `n_embd_k_gqa` 512, padded kv_size 262,144); Gated DeltaNet state =
+65,863,680 B (30 recurrent layers).
+
+Capacity finding: `full_model_plus_runtime` = 24,295,318,016 B is BELOW the
+physical total 25,650,855,936 B by ~1.36 GB, so the raw byte sum alone does not
+prove non-fit. The inventory therefore reports `require_sub_full_budget: true`,
+and T-GPLR-04 must enforce and report an explicit residency budget below
+full-model bytes. Against observed free VRAM (22,922,919,936 B at a
+2026-08-21 `run_start`) full residency does not fit, and CUDA-context,
+activation, graph/input and workspace classes are still unmeasured.
+
+Build/verification commands (all host-only, no GPU):
+`cmake --build build/llama-cuda --config Release --target llama-layer-streaming
+--parallel 16` -> exit 0; `ctest --test-dir build/llama-cuda -C Release -R
+test-layer-streaming-model-inspect` -> 100% pass; the `--inspect-model` run
+above -> exit 0.
+
+Incidental build-blocker fix (pre-existing, not task scope): the user's
+uncommitted edit had `slab_off_b` where the committed code has `slab_off_B` in
+`llama_layer_streaming::begin_set`, which failed every compile with C2065.
+Restored to `slab_off_B`; no other user modification was touched.
+
+## Active Generic Prefill Layer Residency Direction (2026-09-04)
+
+The active design is now `docs/layer-residency-sdd.md`; the executable backlog
+is `docs/plans/generic-prefill-layer-residency-plan.md`. No generic source
+implementation has been made under this plan. The existing Qwen3.8 code and
+evidence remain the dense reference implementation.
+
+Observed implementation boundary: the vendored module already owns reusable
+CUDA slots, generation and event ordering, layer-major activation slabs,
+persistent per-width graph sets, preflight, and telemetry. Package member
+arrays and recurrent/attention/MTP classification remain hard-coded in
+`src/llama-layer-streaming.cpp`, and the split graph remains integrated through
+`src/models/qwen35.cpp`. Generic support is therefore not yet proven.
+
+Selected MoE acceptance artifact:
+`C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`. The path was
+observed to exist on 2026-09-04; its byte size, GGUF architecture key,
+layer/expert counts, tensor inventory, package bytes, and vendored support are
+not yet verified. T-GPLR-00 is ready and owns that host-only inventory.
+
+The fixed first out-of-core acceptance shape is CUDA, context capacity 262,144,
+Q8_0 K/V, one 512-token prefill chunk, layer-major schedule, complete routed-
+expert-bank packages, and MTP disabled. The 262,144 value sizes context/KV; it
+does not require processing a 262,144-token prompt. Acceptance must prove that
+full model plus runtime state exceeds physical VRAM while the bounded slot
+configuration fits. No speedup or generic-model-support claim exists yet.
+
 Status: T-Q38LS-01 through T-Q38LS-06 (batch-major), T-Q38LM-01 through
 T-Q38LM-05 (layer-major), T-Q38PW-00 through T-Q38PW-02 (per-width graphs),
 T-Q38FA-01 (FA KV window), T-Q38TG-00 (hybrid TG probe, NO-GO), and
@@ -31,10 +403,12 @@ and greedy IDs 317, 197, 197; host validation passes and the full 19-target
 GPU regression suite passes. The T-Q38LS-07 batch-major 20K task remains
 blocked/superseded by the layer-major design.
 
-Facts below are observed evidence only. Superseded claims are removed, never
-retained. The normative design is `docs/qwen38-layer-streaming-sdd.md`; the
-executable backlog is `docs/plans/qwen38-layer-streaming-plan.md`; environment
-facts live in `docs/AGENT_ENVIRONMENT.md`.
+Facts below are observed Qwen3.8 reference evidence only. Superseded claims are
+removed, never retained. The completed reference design is
+`docs/qwen38-layer-streaming-sdd.md`; its original backlog is
+`docs/plans/qwen38-layer-streaming-plan.md`. Active generic work follows the
+design and plan named above. Environment facts live in
+`docs/AGENT_ENVIRONMENT.md`.
 
 ## Arbitrary-Length Layer-Major PP (done 2026-08-23)
 
@@ -835,6 +1209,36 @@ places them on CPU. load_layer() skips H2D copies for them. Transfer
 collapsed from ~1280ms to ~68ms per 8-token batch.
 
 Re-arm (T-Q38HG-06) is a follow-up task.
+
+### T-Q38HG-06: MTP speculative decoding (done 2026-08-24)
+
+Implemented by a second agent; reviewed and fixed 2026-08-24.
+
+**Bug found during review:** the acceptance check compared
+`draft[a] == prev` (the token *before* the current position) instead of
+`draft[a] == cur` (the gold for the current position). This off-by-one
+caused the reported 0.017-0.053 acceptance rate. Fixed to `draft[a] == cur`.
+
+**Results (Q4_K_M, 1024 PP batch-major, 32 TG, `--handoff --mtp --mtp-draft 2`):**
+
+| Metric | Baseline (no MTP) | MTP |
+|--------|-------------------|-----|
+| TG tok/s | 25.4 | 23.6 |
+| Sequence | `286,220,197,289,...` | **identical** |
+| Acceptance rate | — | 0.4167 (15/36) |
+| check-telemetry | OK | OK |
+
+**Parity: exact.** MTP-on and MTP-off produce identical 32-token greedy
+sequences. The period-3 cycle (`289,197` repeating) is the model's true
+greedy behavior on the synthetic prompt (deterministic token IDs
+`i % n_vocab`), not an MTP defect.
+
+**Acceptance rate 0.4167** is above the 0.3 escalation threshold. At
+n_draft=2 the draft overhead slightly exceeds the acceptance benefit
+(23.6 vs 25.4 tok/s). Higher n_draft or better acceptance would be
+needed for net speedup; the mechanism is proven correct.
+
+Traces: `q38ls-mtp-baseline.jsonl`, `q38ls-mtp-on.jsonl`.
 
 The original verdict's reasoning was wrong (disk-bound measurement) but
 the verdict itself survives the corrected numbers. True steady-state H2D

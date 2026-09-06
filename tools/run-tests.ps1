@@ -89,11 +89,13 @@ $suites = @{
         # the chunk-layout unit test and the lm40/tail513/tail1025 telemetry
         # fixtures (positive + WILL_FAIL negatives).
         Gpu = $false
+        # T-GPLR-05: host-only capability probe + policy-refusal tests are
+        # included here (no GPU, no lock).
         # Host-only: the layout unit test + the fixture JSONL checks (lm40,
         # tail513, tail1025). Exclude the tail513 GPU run targets AND the
         # tail513-lm / tail513-bm host checks that FIXTURES-require those GPU
         # runs (the fixture files under fixtures/ are what the host suite uses).
-        Include = 'layer-streaming-(lm40|tail513|tail1025)-|test-layer-streaming-layout'
+        Include = 'layer-streaming-(lm40|tail513|tail1025|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit)-|test-layer-streaming-(layout|model-inspect)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
