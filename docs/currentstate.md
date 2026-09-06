@@ -66,9 +66,21 @@ Long-context layer-major PP measured (MoE, 2 slots, Q8 KV @ 262144, ubatch 512,
 --pp-no-logits, direct staging, GPU mutex, 2026-09-06): 50,000 tok -> 69.7 s
 wall / 69.6 s transfer / 62.6 s compute = 717.8 tok/s; 100,000 tok -> 135.0 s /
 129.3 / 126.6 = 740.7 tok/s; 262,144 tok -> 351.9 s / 327.6 / 338.6 = 745.0
-tok/s. 38 bank evictions and graph_builds 0 in every run; compute overlaps
-transfer (~97%), so long-prefill throughput is transfer-bound and roughly flat
-in prompt length once chunks amortize the per-layer expert-bank pass. 262K
+tok/s. 38 bank evictions and graph_builds 0 in every run. Decomposition
+(2026-09-06, from per-event trace data): bytes_transferred is constant
+(18.33 GB, 40 copies) and pure per-bank H2D copy cost is flat (layer-0
+copies ~0.26 s in every run, ~10.4 s total), but wall is paced by the host
+page-in stream of those same 18.33 GB: effective feed rate 263 MB/s at 50K
+vs 52 MB/s at 262K (uncontrolled file-cache/HDD behavior) -- that, not copy
+volume, is why the transfer-time column climbs while bytes stay flat. The
+phase transfer/compute fields measure submit->complete windows that include
+overlapped compute (per-copy transfer_us inflates to ~29.5 s exactly on the
+10 copies overlapping the full-attention layers' ~29.7 s compute windows),
+so "compute hidden behind transfer" is not decidable from the phase fields
+alone; sampled layer_compute sums to 41.3 s at 262K. Net: long-PP wall ~
+18.33 GB / effective page-in rate; tok/s rises mildly with length only
+because the fixed byte stream spreads over more tokens (marginal cost
+~1.33 ms/token at 262K). 262K
 confirmation and variants (all exit 0, check-telemetry OK): rerun 350.6 s =
 747.7 tok/s (reproducible within 0.4%); pinned staging 352.1 s = 744.4 tok/s
 (identical to direct -- the bottleneck is the mmap read, not the staging
