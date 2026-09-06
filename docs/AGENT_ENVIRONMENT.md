@@ -114,6 +114,80 @@ runner's preflight; this table only fixes the input sizes. If a foreign
 process occupies VRAM, preflight reports required vs available and aborts
 loudly (no CPU fallback).
 
+## Verified Qwen3.6 MoE Acceptance Artifact (T-GPLR-00, 2026-09-04)
+
+Inventory produced by `llama-layer-streaming.exe --inspect-model` (host-only:
+returns before `llama_backend_init()`, no CUDA device enumeration, GGUF parsed
+with `no_alloc`; no tensor data read). Full JSON:
+`build/llama-cuda/q36-moe-inventory.json`.
+
+| Item | Value (observed) |
+| --- | --- |
+| Path | `C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf` |
+| Byte size | 21,388,319,008 (~21.39 GB) |
+| GGUF version / alignment / data offset | 3 / 32 / 10,991,392 |
+| `general.architecture` | `qwen35moe` (vendored support present: `LLM_ARCH_QWEN35MOE` in `src/llama-arch.cpp`, `src/models/qwen35moe.cpp`, 40-layer -> `LLM_TYPE_35B_A3B`) |
+| `general.name` | Qwen3.6-35B-A3B |
+| Tensor count | 753 |
+| `qwen35moe.block_count` | 41 (40 trunk + 1 MTP/nextn block) |
+| `qwen35moe.nextn_predict_layers` | 1 |
+| `qwen35moe.expert_count` | 256 |
+| `qwen35moe.expert_used_count` | 8 |
+| `qwen35moe.embedding_length` | 2048 |
+| `qwen35moe.attention.head_count_kv` | 2 |
+| `qwen35moe.attention.key_length` / `value_length` | 256 / 256 |
+| `qwen35moe.full_attention_interval` | 4 |
+| `qwen35moe.ssm.*` | conv 4, state 128, inner 4096, group 16, time_step_rank 32 |
+| `qwen35moe.context_length` | 262144 |
+| Tensor types (ggml `ggml_type_name`) | f32 368, q8_0 259, q4_K 120, q6_K 4, bf16 2 |
+| Total tensor-data bytes | 21,377,327,616 |
+
+Byte classes (every tensor assigned exactly once; completeness enforced):
+
+| Class | Bytes |
+| --- | --- |
+| static (`token_embd` 540,344,320 + `output` 417,177,600 + `output_norm` 8,192) | 957,530,112 |
+| per-trunk-layer non-expert total | 1,597,483,520 |
+| - attention (attn_q/k/v/output + q/k norms) | 289,689,600 |
+| - recurrent (attn_qkv, attn_gate, ssm_*) | 1,089,231,360 |
+| - router (`ffn_gate_inp`) | 83,886,080 |
+| - shared expert (`ffn_*_shexp`, `ffn_gate_inp_shexp`) | 134,021,120 |
+| - dense ffn | 0 |
+| - layer norms (`attn_norm`, `post_attention_norm`) | 655,360 |
+| routed-expert banks (40 trunk layers x 3 `*_exps` tensors) | 18,327,011,328 |
+| MTP block non-nextn tensors (blk.40 weights incl. its expert bank) | 486,365,184 |
+| MTP nextn tensors (blk.40.nextn.*) | 8,937,472 |
+
+Per-layer expert-bank packages: 37 layers at 452,984,832 B; layers 34, 38, 39
+at 522,190,848 B (largest = 522,190,848 B, layer 34; their `ffn_down_exps`
+carry the q6_K tensors 220,200,960 B each vs the q4_K 150,994,944 B used by
+the other layers - Unsloth dynamic per-tensor mix). Full dense-style layer
+package max = 563,962,624 B.
+
+Runtime byte classes at context capacity 262,144 (derived from metadata; graph/
+input, activation, workspace and CUDA-context bytes remain unknown until
+runtime preflight):
+
+| Class | Bytes |
+| --- | --- |
+| Q8_0 K/V (10 attention layers x 2 x row(512, q8_0)=544 x 262,144) | 2,852,126,720 |
+| Gated DeltaNet recurrent state (30 layers x (r 24,576 + s 524,288) x F32) | 65,863,680 |
+| full model + KV + state | 24,295,318,016 |
+| bounded 1-slot (static + per-layer + largest expert bank + KV + state) | 5,995,194,880 |
+| bounded 2-slot | 6,517,385,728 |
+
+Capacity finding (measured 2026-09-04): physical VRAM 25,650,855,936 B
+(`nvidia-smi memory.total`, RTX 5090). `full_model_plus_runtime` (24,295,318,016 B)
+is BELOW the physical total by ~1.36 GB - raw weight+KV+state bytes alone would
+fit. Observed free VRAM at `run_start` was 22,922,919,936 B (2026-08-21), and
+CUDA context, activations, graphs, workspaces, and the always-resident static +
+per-layer non-expert classes are not yet in the above sum, so real full
+residency is not expected to fit; the inventory nevertheless reports
+`require_sub_full_budget: true`. T-GPLR-04 must therefore enforce and report an
+explicit residency budget below the full-model size rather than claim an
+accidental out-of-core result.
+
+
 ## Vendored Dependency
 
 | Item | Value |

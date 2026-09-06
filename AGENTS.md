@@ -1,19 +1,48 @@
-# Qwen3.8 Layer Streaming Agent Guide
+# llama.cpp Layer Residency Research Agent Guide
 
 ## Purpose
 
-This repository is a private research workspace for a CUDA-only Qwen3.8-27B dense decoder-layer streaming experiment. The current objective is to measure prompt-processing (PP) and token-generation (TG) behavior with four pageable decoder-layer weight slots.
+This repository is a private research workspace for an opt-in CUDA prefill
+layer-residency mechanism in llama.cpp. The target mechanism stages one
+complete immutable weight package per logical layer through a bounded VRAM
+slot window while logical KV and recurrent state remain owned by the model
+context.
 
-The normative design is [docs/qwen38-layer-streaming-sdd.md](docs/qwen38-layer-streaming-sdd.md). The executable backlog is [docs/plans/qwen38-layer-streaming-plan.md](docs/plans/qwen38-layer-streaming-plan.md). Do not silently redesign either document while implementing a task.
+The existing Qwen3.8-27B implementation is the measured dense reference, not
+the permanent architecture boundary. Its design and completed plans remain
+historical evidence in [docs/qwen38-layer-streaming-sdd.md](docs/qwen38-layer-streaming-sdd.md)
+and `docs/plans/qwen38-*.md`.
+
+The active generic design is
+[docs/layer-residency-sdd.md](docs/layer-residency-sdd.md). The executable
+backlog is
+[docs/plans/generic-prefill-layer-residency-plan.md](docs/plans/generic-prefill-layer-residency-plan.md).
+Do not silently redesign either active document while implementing a task.
 
 `docs/Idea/` is historical research material. It is not the governing workflow.
 
 ## Scope and Boundaries
 
-- The current model is dense Qwen3.8. MoE routing, expert prediction, vision, MTP, YaRN, quality tuning, and quantization comparison are out of scope unless a new approved plan adds them.
-- The layer-streaming path is opt-in and CUDA-only. It does not require a CPU fallback.
+- The current implementation supports dense Qwen3.8 through Qwen-specific
+	package lists and graph construction. Generic support is not complete until
+	another architecture passes the active plan's acceptance gates.
+- For dense models, a pageable package contains the complete immutable decoder
+	layer. For MoE prefill, the first policy pages the complete routed-expert
+	bank for one layer; router, attention, shared-expert, embedding, output, KV,
+	and recurrent state placement is explicit in the architecture adapter.
+- The primary workload is layer-major prefill: load layer L once, execute every
+	prompt chunk for L in causal order, then advance. Token-generation expert
+	prediction and weight rotation are separate experiments and are not implied
+	by generic prefill support.
+- The layer-residency path is opt-in and CUDA-only. An experimental run fails
+	loudly when unsupported; disabling the option preserves normal llama.cpp
+	placement and CPU fallback behavior.
 - Default llama.cpp behavior, including its CPU path, must remain unchanged when the experimental option is disabled.
-- Decoder-layer weights may be pageable. Token embeddings, final norm, LM head, KV cache, and Gated DeltaNet recurrent state remain outside the four weight slots as defined by the SDD.
+- Quantization bytes and tensor semantics are preserved exactly during staging.
+	Residency policy must not alter routing, expert IDs, model arithmetic, or
+	checkpoint metadata.
+- Vision, MTP, YaRN, quality tuning, quantization comparison, multi-GPU, and
+	non-CUDA backends remain out of scope unless an approved task adds them.
 - Do not claim quality, equivalence, or speedup unless the task contract explicitly defines and validates that claim.
 
 ## Repository Layout
@@ -21,6 +50,8 @@ The normative design is [docs/qwen38-layer-streaming-sdd.md](docs/qwen38-layer-s
 - Project-owned design and plans live under `docs/`.
 - Canonical environment facts live in `docs/AGENT_ENVIRONMENT.md`.
 - Canonical current-state facts live in `docs/currentstate.md`.
+- The completed Qwen documents are reference evidence. New generic work updates
+	the active generic SDD and plan rather than rewriting completed Qwen history.
 - Generated build, trace, model, and telemetry output must stay out of version control.
 - `third_party/llama.cpp/` is a vendored private dependency. Read its nested `AGENTS.md` before changing anything in that tree.
 
@@ -83,13 +114,15 @@ For a failure:
 
 Do not broaden a task across an SDD or plan boundary without returning it to the Planner.
 
-## Layer-Streaming Invariants
+## Layer-Residency Invariants
 
 - Logical layer identity and device-slot identity are separate.
-- A slot contains one complete immutable decoder-layer package for one generation.
+- A slot contains one complete immutable architecture-declared package for one generation; package members become ready and retire atomically.
 - A layer graph may consume a slot only after the matching copy event completes.
 - A slot may be reused only after all CUDA consumers of its current generation complete.
-- KV cache and Gated DeltaNet recurrent state remain owned by logical layer, never by the four weight slots.
+- KV cache, recurrent state, and other mutable session state remain owned by logical layer, never by a weight slot.
+- Layer-major prefill processes chunks for each logical layer in ascending token-position order.
+- An MoE full-expert package contains every routed expert for that layer; cache residency never changes the router's exact output.
 - A missing package, stale slot generation, failed CUDA event, or insufficient VRAM must fail loudly with structured telemetry. It must not silently run another layer's data.
 - PP-to-TG retains session state and live weight-slot assignments unless a task explicitly studies reset behavior.
 
@@ -103,7 +136,7 @@ Run the narrowest meaningful validation first:
 4. Run the smallest real-model trace required by the task.
 5. Run a larger real-model trace only when the task contract requires it.
 
-For CUDA/runtime work, use the project CMake build and CTest targets defined by the plan. Do not substitute unrelated `make`, DeepSeek V4, or upstream CI commands.
+For CUDA/runtime work, use the project CMake build and CTest targets defined by the active plan. Do not substitute unrelated `make`, DeepSeek V4, or upstream CI commands. Run the Qwen reference regression before claiming that genericization preserved existing behavior.
 
 ## Shared GPU Coordination
 

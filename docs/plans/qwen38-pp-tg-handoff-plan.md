@@ -1,6 +1,6 @@
 # Qwen3.8 PP→TG Handoff Plan (streaming PP -> standard TG as the new default)
 
-Status: T-Q38HG-00/01/02/03/04 done; T-Q38HG-05 gated
+Status: T-Q38HG-00/01/02/03/04 done; T-Q38HG-06 (MTP) ready; T-Q38HG-05 gated
 (completed 2026-08-24; T-Q38HG-04 fully closed — TG routing fix delivers 3.28 tok/s)
 
 Design: [Qwen3.8 Dense Layer Streaming SDD](../qwen38-layer-streaming-sdd.md)
@@ -384,6 +384,103 @@ Escalate if
 
 - Attention-resident PP optimization (skip slot copies for resident
   attention layers): follow-up only if the constrained budget demands it.
-- MTP: later multiplier lever (~+240 MiB), separate plan.
 - Server-mode continuous batching / multi-request scheduling: this plan
   delivers the single-request PP->TG->re-arm cycle.
+
+### T-Q38HG-06: MTP speculative decoding in the handoff TG path
+
+Status: ready
+Depends on: T-Q38HG-04 (done)
+Commit: pending (no commit authorized)
+
+Goal
+: Enable the model's built-in MTP layer (blk.64, `nextn_predict_layers = 1`)
+  as a speculative draft head during handoff TG, multiplying the 3.28 tok/s
+  base rate by the draft acceptance factor. This is the highest-leverage
+  remaining optimization: a 1.5-2x multiplier dominates any micro-optimization
+  of the 14% hybrid gap.
+
+Background (source inspection, 2026-08-24)
+: The vendored tree's MTP lives in `common/speculative.cpp`
+  (`common_speculative_impl_draft_mtp`, line 1281). It requires:
+  1. `mparams.load_mtp = true` at model load (currently `false` in our
+     runner, line 1208) — loads blk.64 nextn tensors.
+  2. A draft context (`ctx_dft`) that decodes using hidden-state embeddings
+     from the target context via `llama_set_embeddings_nextn(ctx_tgt, true,
+     false)`.
+  3. A draft/verify/accept loop: draft N tokens via MTP head -> verify with
+     `llama_decode(batch.n_tokens = N)` on the target -> accept longest
+     prefix -> rollback KV on rejection (`llama_memory_seq_rm`).
+  Our runner does not link `common/` and has a minimal greedy TG loop
+  (main.cpp:1472-1506). MTP is NOT automatic — it requires integration.
+
+Design decision (recorded)
+: Implement a minimal in-runner MTP loop rather than linking `common/`.
+  Rationale: the experiment is isolated; linking common pulls in sampler,
+  batch, and param infrastructure that couples the runner to llama.cpp's
+  evolving common API. The minimal loop needs only:
+  - `llama_set_embeddings_nextn` (exported API)
+  - `llama_decode` with multi-token batch (existing)
+  - `llama_memory_seq_rm` for KV rollback (existing)
+  - blk.64 migration in the handoff set (extend `begin_handoff`)
+
+Scope
+: `tools/layer-streaming/main.cpp` (MTP loop, `--mtp` flag, blk.64
+  migration), `src/llama-layer-streaming.{h,cpp}` (extend handoff to
+  include blk.64 in the attention-only migration set), telemetry
+  (`mtp_accepted`, `mtp_drafted` counters).
+
+Non-goals
+: Multi-MTP-layer chaining (this model has 1), ngram/Eagle/dflash
+  speculative types, server-mode integration, quality claims beyond
+  greedy-exact acceptance.
+
+Implementation steps
+: 1. Set `mparams.load_mtp = true` when `--mtp` is active. Verify blk.64
+     tensors load (log check).
+: 2. Extend `begin_handoff(attention_only)` to include blk.64 in the
+     migration set (~235 MB, ~17 ms additional copy). blk.64 is
+     attention-based (nextn head) so it belongs in the GPU-resident set.
+: 3. Implement the draft/verify loop in the TG section:
+     a. After each accepted token, call `llama_set_embeddings_nextn(ctx,
+        true, false)` and extract the hidden state row.
+     b. Draft `n_draft` tokens (start with 1, tune to 2-3) by decoding
+        the MTP layer with the hidden-state embedding.
+     c. Verify: build a batch of `n_draft + 1` tokens (last accepted +
+        drafts), call `llama_decode`, compare logits argmax against drafts.
+     d. Accept the longest prefix where draft == target argmax. Rollback
+        KV for rejected positions via `llama_memory_seq_rm`.
+     e. Record `mtp_drafted` and `mtp_accepted` in telemetry.
+: 4. Greedy-exact correctness: with greedy sampling, MTP acceptance is
+     exact — the accepted sequence must be identical to non-MTP greedy.
+     Parity gate: first 32 TG tokens with and without MTP must match.
+
+Acceptance criteria
+: - [ ] `--mtp` flag loads blk.64 and migrates it during handoff
+      (telemetered migration bytes include blk.64).
+: - [ ] Greedy parity: first 32 TG tokens with `--mtp` are identical to
+      the non-MTP run (ID 286 sequence). MTP with greedy verification is
+      exact; any divergence is a correctness failure.
+: - [ ] Acceptance rate measured: `mtp_accepted / mtp_drafted` recorded.
+      Expected 0.5-0.9 depending on content; record the actual number.
+: - [ ] Effective TG tok/s improves over the 3.28 base by at least the
+      measured acceptance factor (e.g. 0.7 acceptance with n_draft=2
+      should give ~1.4x = ~4.6 tok/s). If acceptance is < 0.3, record
+      and escalate (MTP head may not be well-calibrated for this content).
+: - [ ] Existing suite passes with `--mtp` disabled (default unchanged).
+: - [ ] Full suite 36/36 (or updated count) passes.
+
+Required validation
+: Build -> exit 0; parity pair (MTP on vs off, same prompt, greedy);
+  acceptance-rate measurement over >= 64 tokens; full suite. GPU runs
+  under the mutex.
+
+State update
+: Record acceptance rate, effective tok/s, migration overhead, and the
+  greedy-parity result in `docs/currentstate.md`.
+
+Escalate if
+: `llama_set_embeddings_nextn` is not exported or behaves differently
+  than the stock speculative path (then link `common/speculative.cpp`
+  instead); or blk.64 migration breaks the handoff buffer layout; or
+  acceptance rate is < 0.3 (MTP head quality issue, not integration).
