@@ -337,9 +337,21 @@ Evidence (GPU mutex; Qwen3.6-35B-A3B-MTP-UD-Q4_K_S unless noted):
   driver + other processes), not a second pool this runner allocates.
 
 Gaps / residual risk:
-- TG phase_summary `evictions:640` is a stale summary counter (zero actual
-  slot_evict events post-handoff; identical shape in the accepted
-  gplr10-ho-bm and dense-era summaries) — cosmetic, left as-is.
+- FIXED (same-day follow-up): the TG phantom evictions. Root cause was in
+  `load_layer`'s two handoff branches, not the summary: the executor re-arms
+  `consumer_pending` per layer, and the handoff branches ran the streaming
+  slot-reuse protocol (consumer wait + `total_evictions++` + `slot_evict`)
+  although handoff TG copies nothing and overwrites no slot data — one
+  phantom eviction per layer per token (640 = 40x16x1 on MoE; the same
+  inherited defect produced 1024 = 64x16x1 on the dense full handoff,
+  T-Q38HG-02 era). Fix: the consumer-wait/evict blocks are removed from the
+  handoff branches (the streaming branch is untouched). Evidence
+  (gplr10-evictfix-{moe,dense}.{jsonl,log}, GPU mutex, check-telemetry OK
+  both): post-migrate slot_evict 0, TG phase_summary evictions 0, PP
+  evictions unchanged (MoE 39 / dense 127 with identical transfer bytes),
+  TG ids unchanged (dense [286, 220, 197, ...] identical to the pre-fix
+  reference; MoE identical to the QA-512 anchor reference). Host suite
+  22/22.
 - Route hashes are prompt-content-derived: parity claims are same-prompt
   only (the needle-2048 attrib run vs the synthetic-2048 mem-lm run differ
   by design).

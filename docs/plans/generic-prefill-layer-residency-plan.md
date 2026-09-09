@@ -1305,6 +1305,8 @@ Escalate before implementation if
 
 ### T-GPLR-10: MoE handoff — streaming PP + stock llama.cpp TG (hybrid TG)
 
+Commit: vendored 099a27a7e (T-GPLR-08/10/11, includes the evictfix); outer
+docs recorded in the same-day follow-up commit (no push authorized)
 Status: done (2026-09-09). Implemented: begin_handoff moe-expert-bank
 relaxation + attention_only refusal under merge_resident, migrate_layer
 bundle-fix (non-bank members point at the slot bundle, `dst = src`),
@@ -1326,9 +1328,17 @@ control FAILs as designed; shared-memory attribution run: adapter
 Shared Usage stays at the ~0.3-0.37 GB desktop baseline through load,
 PP, and the handoff copy (no 15 GB shared spike attributable to the
 mechanism); run gplr10-attrib peaked dedicated 18.63 GB, TG ids
-identical to gplr10-ho-bm reference. Traces: gplr10-ref-bm/-lm,
-gplr10-ho-bm/-lm, gplr10-refuse-262k, gplr10-dense-ref/-ho,
-gplr10-qa512-ho, gplr10-attrib (+ gpu-mem-poll-attrib.csv).
+identical to gplr10-ho-bm reference. Same-day follow-up: the TG phantom
+evictions (640 MoE / 1024 dense per 16 TG tokens) were traced to
+load_layer's handoff branches running the streaming slot-reuse protocol
+(consumer wait + eviction count + slot_evict event) although handoff TG
+copies nothing and overwrites no slot data; the blocks were removed and
+revalidated (gplr10-evictfix-{moe,dense}: post-migrate slot_evict 0,
+TG summary evictions 0, PP evictions and transfer bytes unchanged, TG
+ids unchanged, checker OK both, host suite 22/22). Traces:
+gplr10-ref-bm/-lm, gplr10-ho-bm/-lm, gplr10-refuse-262k,
+gplr10-dense-ref/-ho, gplr10-qa512-ho, gplr10-attrib (+
+gpu-mem-poll-attrib.csv), gplr10-evictfix-{moe,dense}.
 Depends on: T-GPLR-05 (merge-resident adapter machinery); T-GPLR-07 (answer
 gate for the parity runs). Independent of T-GPLR-08/09 (different flags and
 machinery); serializes in either order with the ready T-GPLR-08
