@@ -6,6 +6,18 @@ This file is the canonical source of environment facts for this workspace. Do
 not invent tool or model facts in source code or plans; record them here first.
 Update this file when the machine, toolchain, or model artifact changes.
 
+## Semantic-QA smoke tier (T-GPLR-07)
+
+The runner-side semantic-QA tooling lives in `tools/semantic-qa/`:
+`gen-needle-prompt.py` (deterministic needle prompts, exact token counts) and
+`check-answer.py` (programmatic grader, self-test included). The 512-token
+anchor needs `QWEN36_MODEL` set to the current Qwen3.6-35B-A3B GGUF path and
+every GPU rung wrapped in `tools/with-gpu-lock.ps1`. Runner invocation details
+and known caveats (TG budget >= ~65 tokens for the 5-item answer, single-ubatch
+PP workaround for the tail-ubatch gap, checker parses mixed runner logs) are
+recorded in `docs/currentstate.md` under T-GPLR-07 and in the T-GPLR-07 task
+contract in `docs/plans/generic-prefill-layer-residency-plan.md`.
+
 ## Host
 
 | Item | Value (observed) |
@@ -14,7 +26,9 @@ Update this file when the machine, toolchain, or model artifact changes.
 | CPU | AMD Ryzen 9 9955HX 16-Core Processor |
 | RAM | 66,234,945,536 bytes (~61.7 GiB) |
 | Shell for tooling | Git Bash (POSIX syntax; never cmd.exe syntax) |
-| Disk | C: has 432 GiB free at inventory time |
+| Disk | C: on an MSI M461 2TB NVMe SSD (BusType NVMe, ~1863 GB); 432 GiB free at inventory time. Drive model observed 2026-09-07 via Get-PhysicalDisk. |
+| Disk sequential read (measured 2026-09-07, 21.39 GB Qwen3.6 GGUF, 64 MiB reads) | 7,745 MB/s buffered (file-cache warm); 2,728 MB/s unbuffered qd1 (FILE_FLAG_NO_BUFFERING, cache bypassed). The ~52 MB/s effective page-in seen in 262K PP runs is mmap fault-path overhead, not a device limit. |
+| Windows token privileges (probed 2026-09-09 via C:\Windows\System32\whoami.exe /priv, <host>\<user>, session 1, non-elevated) | NO SeLockMemoryPrivilege (VirtualLock will fail ERROR_ACCESS_DENIED); SeIncreaseWorkingSetPrivilege present but Disabled; no SeIncreaseQuotaPrivilege. Consequence: T-GPLR-09's working-set-raise + VirtualLock residency path cannot run under the current token without a Local Security Policy change ("Lock pages in memory"). |
 
 ## GPU and CUDA
 

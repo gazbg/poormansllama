@@ -8,6 +8,483 @@ Milestone tag `layer-residency-plan-complete` (2026-09-06): this repo →
 169ab086e857d287daac626dc7eda6a4f9764efe. Both annotated, local only
 (not pushed).
 
+## 2026-09-07: T-GPLR-07 smoke tier wired into tools/run-tests.ps1 (host-validated)
+
+`tools/run-tests.ps1 -Suite qa-smoke` runs the smoke gate as one repeatable
+run under the GPU mutex. DEFAULT rung is 512 tokens on the 512-token anchor;
+the 50-token rung is opt-in via `-SmokeLengths 50` (comma list; the
+quoted-string form silently binds as one int and must not be used).
+2026-09-09 owner decision: the ladder series is 50/512/4k/24k/50k/100k/200k
+-- the 15/30 rungs were removed from the ladder entirely (their live
+evidence below is historical; the 30-token answer-quality failure is no
+longer a ladder blocker). 4k+ lengths are manual owner-invoked commands,
+never part of the suite. The generator refuses targets below 15 tokens (the
+K1-scaffold floor), so no shorter run exists.
+
+Per-rung flow (unchanged leg shape, now looped over the selected rungs,
+default 512):
+1. `gen-needle-prompt.py --target-tokens <len> --calibrate llama-tokenize
+   --model <Qwen3.6 GGUF>` (host-only, exact token count) -> parse
+   achieved=/items= from its summary line.
+2. Runner under `tools/with-gpu-lock.ps1` with the new flags:
+   `--prompt-file <calibrated> --ubatch <achieved> --tg-tokens 96
+   --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank
+   --kv-cache q8 --allow-full-residency --telemetry <dedicated JSONL>
+   --tg-text <detok text>`. Single-ubatch PP is the documented workaround
+   for the tail-ubatch gap.
+3. Strict `--check-telemetry` on the dedicated JSONL (the gate that the
+   ladder's earlier 512/4k rungs lacked — mixed-log claims are not
+   accepted).
+4. `check-answer.py check --tg-text <detok text> --items <items= list>` per-needle
+   grading (50 = N1, 512 = all 5 items) + the same grading with
+   `--negative` must FAIL as designed (exit != 0 with aggregate=FAIL). The
+   checker grades the runner's `--tg-text` file directly -- the runner already
+   detokenized with the model's own vocab via `llama_token_to_piece`, so no
+   trace re-parsing and no GGUF vocab read happen at grading time
+   (`check-answer.py check` also still accepts `--trace --model` for
+   backward-compatible trace grading).
+
+Any step failing exits the suite 1 with the failing rung named; each rung
+gate keeps the dedicated trace `gplr07-qa-<len>.jsonl`, the detokenized text
+`gplr07-qa-<len>.txt`, and the runner log `gplr07-qa-<len>.log` in the build
+dir for inspection.
+
+Host validation (2026-09-07, no GPU): PowerShell parse clean; checker
+self-test 15/15 (added tg-text file mode cases); calibration exact against the real model
+(llama-tokenize, vocab-only) for the smoke tier: 50 -> N1, 512 -> N1,N2,N3,N4,K1
+(needle rows 3/6/9/12 of 12), all achieved == target; 15/30 calibration
+(from the same generator, now removed from the ladder) is historical.
+prompt files regenerated in `build/llama-cuda/gplr07-qa-prompts/`. The 50/512
+legs of this suite previously ran end-to-end on the GPU (2026-09-07 16:08/
+16:12, surviving dedicated JSONL traces + logs in the build dir). A fresh
+512 default-gate pass is the intended next invocation whenever the
+GPU mutex is free; the plan's remaining acceptance items (strict-trace
+re-verification of the 4k rung, dense Qwen3.8 regression re-run) are
+unchanged.
+
+## 2026-09-07/09: qa-smoke gate live runs (50/512 PASS; 15/30 removed from the ladder on 2026-09-09)
+
+Ran the gate legs individually under the GPU mutex (shared-GPU contention
+forced leg-by-leg execution; `tools/run-tests.ps1 -Suite qa-smoke` remains
+the canonical one-shot gate). Command shape per leg, identical to the suite:
+`llama-layer-streaming.exe --model <Qwen3.6-35B GGUF> --prompt-file
+<anchor> --ubatch <achieved> --tg-tokens 96 --pp-no-logits --pp-schedule
+batch-major --residency moe-expert-bank --kv-cache q8 --allow-full-residency
+--telemetry <dedicated JSONL> --tg-text <detok text>`, each runner leg under
+`tools/with-gpu-lock.ps1`, then strict `--check-telemetry` and
+`check-answer.py check --tg-text ...` (+ negative control).
+
+Results (the 15/30 rungs below were removed from the ladder on 2026-09-09;
+their evidence is historical, artifacts retained in the build dir):
+- 15-token rung: PASS. runner exit 0; check-telemetry OK (23326 events, 1
+  slot); K1 'Paris' found; negative control FAILs as designed (exit 1,
+  aggregate=FAIL). Artifacts `gplr07-qa-15.{jsonl,txt,log}` (17:49).
+- 30-token rung: answer gate FAIL. runner exit 0 and check-telemetry OK,
+  but the model does not answer: it pattern-completes the note scaffold
+  ("Note N2: ... is QX-7742", "Note N3: ... QX-7743", ...) instead of
+  stating QX-7741. The checker correctly rejects (aggregate=FAIL) and the
+  negative control correctly PASSes on the wrong answer (exit 0) -- the
+  designed must-fail property worked exactly as specified. This is a
+  model-quality failure on the 30-token N1 scaffold (no pads between
+  statement and question), NOT a runner/telemetry/checker defect: all
+  scheduler invariants held. Greedy decoding makes a re-run near-certain
+  to reproduce. Tuning the scaffold or the acceptance wording is a
+  plan-owned change (generator contract) and was NOT done; superseded by
+  the 2026-09-09 ladder reduction (see resolution below). Artifacts
+  `gplr07-qa-30.{jsonl,txt,log}` (17:58).
+- 50-token rung: PASS (fresh tg-text-graded leg, 2026-09-09). runner exit 0;
+  check-telemetry OK (23326 events, 1 slot, graph_builds 0 both phases); N1
+  'QX-7741' found (aggregate PASS); negative control FAILs as designed
+  (exit 1). Artifacts `gplr07-qa-50.{jsonl,txt,log}` regenerated. (Earlier
+  trace-graded run 16:08 superseded.)
+- 512-token rung: PASS (fresh tg-text-graded leg, 2026-09-09). runner exit
+  0; check-telemetry OK (23326 events, 1 slot, graph_builds 0 both phases);
+  all five items found ('QX-7741 TR-2918 MK-5501 LD-8834 Paris', aggregate
+  PASS); negative control FAILs as designed (exit 1). Artifacts
+  `gplr07-qa-512.{jsonl,txt,log}` regenerated. (Earlier trace-graded run
+  16:12 superseded.)
+
+Blocker resolution (2026-09-09, owner): the 15/30 rungs were removed from
+the ladder series entirely (series = 50/512/4k/24k/50k/100k/200k). The
+30-token answer-quality failure is therefore no longer a ladder blocker;
+its artifacts (`gplr07-qa-30.{jsonl,txt,log}`) remain as evidence, and the
+negative control's must-fail property was still proven live by that run.
+Default-gate invocation: `powershell -NoProfile -ExecutionPolicy Bypass
+-File tools/run-tests.ps1 -Suite qa-smoke` (512 only, ~5 min); the 50-token
+rung is opt-in via `-SmokeLengths 50`; 4k+ ladder lengths stay manual
+owner-invoked commands.
+
+## 2026-09-09: Planner review -- T-GPLR-08 ready, T-GPLR-09 held
+
+Reviewed the two drafted tasks per the planner workflow (read SDD, current
+state, environment facts, controlling code; stated outcomes/gates/unknowns;
+resolved ordinary uncertainty with focused probes; only environment/policy
+decisions deferred to the owner).
+
+T-GPLR-08 (one-layer-ahead PrefetchVirtualMemory probe) moved to READY. The
+contract is falsifiable (262K wall drop >= 20% AND bank transfer drop >= 2x
+vs the 351.9 s T-GPLR-04 baseline; effective per-bank feed >= 2x the 52 MB/s
+cold rate), evidence-backed (the warm-cache leg falsified standby residency;
+layer 0's ~3.5 GB/s working-set path is exactly the mechanism a rolling
+prefetch populates), and narrow (new flag, 1-deep worker queue, two
+telemetry events, one probe). Start remains serialized after T-GPLR-06/07
+close per the plan's ordering rule (one ready task at a time). One draft
+typo fixed: the focused-validation build target said llama-cli; corrected to
+llama-layer-streaming.
+
+T-GPLR-09 (host-RAM bank cache tier) stays DRAFT with a recorded blocker:
+(1) it hard-depends on T-GPLR-08's range walker and telemetry plumbing;
+(2) a 2026-09-09 environment probe (whoami /priv, <host>\<user>,
+non-elevated) shows NO SeLockMemoryPrivilege and SeIncreaseWorkingSet-
+Privilege disabled, so the contract's primary residency path (working-set
+raise + VirtualLock) cannot execute on this machine as configured and the
+acceptance gates (wall <= 110 s) are unreachable without a Local Security
+Policy change. Owner decision required before re-review: (a) enable "Lock
+pages in memory" via elevated policy, (b) redesign without VirtualLock
+(weaker guarantee), or (c) defer until T-GPLR-08 results inform the tier's
+value. Privilege facts recorded in docs/AGENT_ENVIRONMENT.md.
+
+## 2026-09-09: T-GPLR-06/07 CLOSED — T-GPLR-08 and T-GPLR-10 may start
+
+T-GPLR-06 owner review closed (acceptance met; plan status -> done): k=4
+batch verify 2.58x >= the 2x wall gate (d8 2.97x; code-text d16 6.91x vs
+the measured serial 249.69 s); greedy-prefix parity under the recorded
+knife-edge standard (top-2 margins; reruns bit-identical); every failure
+loud (probe trace, en-route defects: n_outputs_max MTP clamp + graph-input
+buffer sizing, both fixed and recorded); traces archived in the build dir.
+
+T-GPLR-07 acceptance closed (plan status -> done):
+- 512/4k strict dedicated-JSONL re-verification COMPLETE. The 512 rung was
+  re-verified earlier today (gplr07-qa-512.jsonl, check-telemetry OK, all
+  5 items PASS, negative control fails as designed). The 4k rung was
+  re-run fresh today under the GPU mutex (GPU idle after a ~7-min wait;
+  anchor regenerated: target=4096 achieved=4096, needle rows 27/55/84/106
+  of 113, matching the ladder record): runner exit 0;
+  `--check-telemetry` OK on the dedicated JSONL (38686 events, 1 slot,
+  graph_builds 0 both phases); PP 4096 tok @ 610.5 tok/s (vs the original
+  606.9); TG 160 tok @ 0.521 tok/s (vs 0.53); aggregate PASS on all five
+  items (QX-7741 TR-2918 MK-5501 LD-8834 Paris); negative control FAILs as
+  designed (exit 1). Peak VRAM 5.37 GiB (this run used --ctx-size 25088;
+  the original 4k run used a smaller ctx). Artifacts
+  gplr07-qa-4k.{jsonl,txt,log}. The 'check-telemetry OK' claims for 512/4k
+  are now backed by surviving dedicated JSONL.
+- Dense Qwen3.8 regression re-run GREEN (GPU mutex, ctest
+  layer-streaming-layer-major-1024 2/2 in 24.6 s, Q38LS_MODEL_PATH =
+  C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf): trace
+  q38ls-lm-1024.jsonl tg_tokens ids=[286] == the recorded reference first
+  greedy ID; run_start arch=qwen35 n_layer=64 slots=4 schedule=layer-major
+  kv f16.
+
+Plan serialization now: T-GPLR-08 (prefetch probe) and T-GPLR-10 (MoE
+handoff) are the next eligible tasks, one at a time, in either order;
+T-GPLR-09 remains held on the SeLockMemoryPrivilege blocker.
+
+## 2026-09-09: T-GPLR-11 DONE — batch-major tail-ubatch gap closed
+
+The recorded tail-boundary defect ("begin_set: activation buffer exhausted"
+e.g. 511 tokens with ubatch 64; workaround --ubatch = pp-tokens) is fixed.
+Pre-coding probes corrected the contract's hypothesis: with PP logits
+enabled the runner marks every position, so the full-width variant B
+already carries the final ubatch's outputs (512/64 logits exited 0 pre-fix,
+PP first greedy ID 48) -- the ONLY missing prebuilt variant is the tail
+WIDTH. Fix: the batch-major prebuild now also builds the tail ubatch
+variant (width t = n % ubatch when 0 < t < ubatch and > 2 ubatches; real
+tail tokens + real logits values, continuing state, consecutive synthetic
+positions like variant B), and buf_act grows one act pair (PP term 4 -> 6
+halves of max_ubatch, <= ~2 MiB at this model). Layer-major was already
+correct (T-Q38CTX-01 prebuilds every chunk width).
+
+Evidence (GPU mutex, Qwen3.6-35B, batch-major, moe-expert-bank, KV q8):
+- 511/64 --pp-no-logits (previously exit 1, activation buffer exhausted):
+  exit 0, PP 22.9 tok/s, evictions 319, graph_builds 0, check-telemetry OK
+  (gplr11-fix-511x64.jsonl).
+- 512/64 WITH logits: exit 0, graph_builds 0, check-telemetry OK, PP first
+  greedy ID 48 -- identical pre-fix (gplr11-probe-512x64logits) and
+  post-fix (gplr11-regress-512x64logits): the working shape is unchanged.
+- Dense Qwen3.8 layer-major-1024 CTest regression 2/2 (ID 286 reference
+  intact); host suite 22/22 green.
+- Semantic-QA gate (runner change touched the experimental path): 512 rung
+  re-run on the fixed binary -- check-telemetry OK, all five items PASS,
+  negative control fails as designed (gplr07-qa-512.{jsonl,txt,log}).
+
+Consequence: --ubatch can now be chosen freely below pp-tokens under
+batch-major; the --ubatch = pp-tokens workaround guidance is retired.
+(Plan header left for the T-GPLR-10 close-out to consolidate, avoiding
+concurrent header edits across sessions.)
+
+## 2026-09-09: T-GPLR-08 implemented and probed — prefetch hypothesis FALSIFIED (instrumentation result, task closed)
+
+Implementation (default-off, byte-identical N=0): `--pp-prefetch-ahead N`
+flag (host-safe parse, off-conflict table entry), per-member range walker
+with an init-time mapping-containment guard (region-level VirtualQuery,
+MEM_MAPPED), a dedicated worker thread + 1-deep queue enqueued from
+`load_layer` after the eviction/consumer-done block, telemetry
+`prefetch_submit`/`prefetch_complete` (+ `prefetch_init` and a run-summary
+line); N=0 emits no new events. Build clean; `tools/run-tests.ps1 -Suite
+host` green; host guards verified (range bound, off-conflict, usage).
+
+Probe (262,144-token PP-only Q8 layer-major, GPU mutex, Qwen3.6-35B, same
+shape as the T-GPLR-04/warm-cache baselines):
+- N=0: wall 350.7 s (747.6 tok/s), transfer 326.4 s, check-telemetry OK
+  (5507 events, 2 slots, graph_builds 0).
+- N=1: wall 352.9 s (742.9 tok/s), transfer 328.3 s, check-telemetry OK
+  (5586 events, 2 slots, graph_builds 0). Prefetch: 39/39 banks submitted
+  and completed, 0 errors, 17.87 GB, API call 19-28 ms/bank (submit-rate
+  line: feed=18,640 MB/s); every next-layer prefetch completed before that
+  layer's copy window opened.
+- Verdict: wall +0.6% (noise). BOTH acceptance gates (wall -20%;
+  transfer/feed >= 2x) are FALSIFIED; recorded per the contract's
+  falsification clause as an instrumentation result, not a performance
+  claim. Parity criterion PASSED: the 512 rung (3783/3783 prefetches,
+  check-telemetry OK, answer PASS, negative control FAILs as designed) and
+  a fresh 50 rung on the prefetch binary (check-telemetry OK, answer PASS,
+  negative control FAILs) via `tools/run-tests.ps1 -Suite qa-smoke
+  -SmokeLengths 50`.
+- Why it looks flat: the fault-driven memcpy feed is unchanged (~2.0 s/bank
+  mean in both runs, lists within noise). The per-bank `transfer` field
+  again absorbs the 10 full-attn layers' ~29.3 s compute windows (slow at
+  copy indices 4,8,...,36 in BOTH runs; slow total 263.6 s / 264.5 s);
+  cross-checked trace-for-trace against the archived 352.5 s warm-cache
+  baseline (gplr-longpp-262144-warmcache.jsonl: same slow indices,
+  264.8 s) — today's runs reproduce the baseline exactly, so there is no
+  regression and no improvement.
+- Attribution (open): PrefetchVirtualMemory returned success on every bank
+  yet the fault rate did not rise. Layer 0's map-time prefetch still shows
+  the fast path is real (~0.13 s / 3.5 GB/s, identical in both runs), so
+  the API CAN populate the working set; the rolling probe shows it does
+  not help steady-state. Remaining hypotheses: prefetched pages are
+  trimmed before use under host memory pressure (7.1 GiB free of 61.7 at
+  analysis time), or the ~2 s/bank stream is not page-fault-bound at all.
+  Distinguishing them needs a fault-count probe (working-set query before/
+  after prefetch) — out of T-GPLR-08 scope.
+- Consequences: T-GPLR-09 (host-RAM tier) loses its main premise (the
+  working-set mechanism it hoped to exploit does not transfer to rolling
+  prefetch); its privilege blocker already holds it as draft. T-GPLR-10
+  (MoE handoff) is unaffected (its 2x floor compares handoff vs streaming
+  serial, not vs prefetch). N=2 was attempted; the run was killed by a
+  terminal timeout mid-flight (5/39 prefetches, no run_end) — no result,
+  not evidence.
+- Artifacts: build/llama-cuda/gplr08-262k-n{0,1}.{jsonl,log}; the n2 file
+  is the killed fragment.
+
+## 2026-09-09: T-GPLR-10 DONE — MoE handoff (streaming PP -> stock llama.cpp TG hybrid)
+
+Implemented, validated, and closed (plan status -> done). Implementation:
+- `begin_handoff` accepts moe-expert-bank (migrate_layer runs verbatim on
+  pkg_cache: the 40 bank packages); `handoff_attention_only` now refuses
+  under merge_resident (exit 2) — partial handoff has no meaning when only
+  banks are pageable.
+- Defect found and fixed during validation: `migrate_layer` built the
+  handoff bundle with only the bank package members, leaving the non-bank
+  members (attention/router/shared-expert/norms) null, so the post-handoff
+  TG graph rebuild dereferenced null and the process died silently right
+  after the migrate event (first gplr10-ho-bm attempt). Fix: non-bank
+  members point at the slot bundle (`dst = src`, the same rule
+  `create_bundle` uses). The loud-failure invariant holds: a broken bundle
+  fails at graph build, never runs another layer's data.
+- Runner gates: `--mtp + --handoff` under moe-expert-bank -> exit 2
+  "...handoff TG is stock llama.cpp decode without a draft loop; MoE MTP
+  verify requires the streaming executor"; layer-major `--tg-tokens > 3`
+  cap lifts when `--handoff` is active (cap remains without); policy-aware
+  handoff progress message. Dense `--mtp + --handoff` verified still legal.
+- VRAM preflight handoff-fit branch (full_model_plus_runtime + act_slab +
+  reserve <= free at run start, structured byte table, refuse before the
+  timed PP). Peak-order rule: slot buffers (522 MB) + act slabs (32 MB)
+  released before the 18.33 GB buf_handoff allocation (recorded in the
+  handoff `release` event).
+- The migrate event now records `free_vram` (true handoff-window peak:
+  free 3.30 GB of 25.65 GB at migrate -> peak ~22.35 GB).
+- Checker: hybrid-TG rules (bank transfer ~0 in the post-handoff
+  phase_summary; handoff event field validation incl. optional free_vram)
+  — backward compatible with the archived dense handoff trace (re-verified
+  against it directly).
+
+Evidence (GPU mutex; Qwen3.6-35B-A3B-MTP-UD-Q4_K_S unless noted):
+- Host suite 22/22 green, including the five new T-GPLR-10 gate fixtures
+  (refuse-mtp-handoff-moe, lm-tg-cap, lm-tg-cap-lift,
+  dense-mtp-handoff-legal, dense-attn-only-legal).
+- Parity (512 layer-major pair): route-hash sequences 40/40 identical
+  streaming vs handoff; TG prefix ids [220, 248046, 198] exact (the
+  streaming reference TG is capped at 3 by the layer-major experiment).
+- Speed: batch-major streaming reference TG 0.495 tok/s -> handoff TG
+  64.63 tok/s (~130x; the contract's >= 2x instrumentation floor is
+  exceeded; recorded as instrumentation, not a general claim).
+  Layer-major handoff: TG 16 tok in 284 ms. Migrate 18,327,011,328 B in
+  ~3.08 s (~5.9 GB/s effective copy rate).
+- Answer gate: QA-512 rung WITH `--handoff` (batch-major, ubatch 512,
+  tg 96): check-telemetry OK, aggregate=PASS 5/5 needles (QX-7741 TR-2918
+  MK-5501 LD-8834 Paris), negative control FAILs as designed
+  (gplr10-qa512-ho.{jsonl,txt,log}).
+- Dense regression (Qwen3.8-27B-Q4_K_M, 1024 PP + 16 TG batch-major,
+  --allow-full-residency — the T-GPLR-04 out-of-core preflight postdates
+  the recorded dense evidence): first ID 286 == the recorded reference;
+  all 16 ids identical streaming vs handoff; check-telemetry OK both
+  (gplr10-dense-ref/-ho.{jsonl,log}).
+- VRAM: 262K Q8 + --handoff refuses exit 1 with the byte table before the
+  timed PP (gplr10-refuse-262k.log); 2048-token run fits with free
+  22.23 GB at start and free_vram 3.14 GB at migrate (no OOM, no silent
+  fallback).
+- Shared-GPU-memory investigation (owner report: "28 GB shared / 48 GB
+  total on PP, none on TG"): adapter `\GPU Adapter Memory\Shared Usage`
+  stayed at the ~0.29-0.37 GB desktop baseline through model load, PP
+  (dedicated 3.87 GB), and the handoff copy window (dedicated 18.63 GB) —
+  run-wide, sampled at 1 s (gplr10-attrib trace +
+  gpu-mem-poll-attrib.csv). The mechanism surfaces NO shared-memory
+  spike: pageable host-mmap banks are read directly by the copy path
+  (copy_source=direct), which Task Manager attributes to dedicated VRAM
+  during the copy window, and TG after handoff transfers 0 bytes. The
+  Task-Manager "Shared GPU memory" figure is machine-wide (desktop +
+  driver + other processes), not a second pool this runner allocates.
+
+Gaps / residual risk:
+- TG phase_summary `evictions:640` is a stale summary counter (zero actual
+  slot_evict events post-handoff; identical shape in the accepted
+  gplr10-ho-bm and dense-era summaries) — cosmetic, left as-is.
+- Route hashes are prompt-content-derived: parity claims are same-prompt
+  only (the needle-2048 attrib run vs the synthetic-2048 mem-lm run differ
+  by design).
+- Measurement tooling: per-process GPU counters stall (25+ s/call) under
+  full GPU load; adapter counters are the reliable path. The surviving
+  poller is build/poll-gpu-memory.ps1 (v10); earlier diagnostics v1-v8 are
+  superseded.
+- No commit (not authorized).
+
+## 2026-09-09: T-GPLR-10 drafted — MoE handoff (streaming PP + stock llama.cpp TG)
+
+(Superseded 2026-09-09 by the T-GPLR-10 DONE section above; the design
+facts below were confirmed during implementation.)
+
+Scoped per owner request (working thread): the hybrid TG path proven on
+dense (T-Q38HG-02/04, 24.75 tok/s) extended to the MoE model. Drafted as
+T-GPLR-10 in docs/plans/generic-prefill-layer-residency-plan.md. Key facts
+established by code inspection (not assumptions):
+- The ONLY hard blocker in the module is begin_handoff's blanket
+  merge_resident refusal (llama-layer-streaming.cpp ~2193-2198). The dense
+  migration machinery (migrate_layer lambda: dev tensors -> one contiguous
+  buf_handoff -> async copy -> sync -> handoff event) runs verbatim on the
+  MoE pkg_cache: the migration list is exactly the 40 bank packages
+  (18,327,011,328 B = 37 x 452,984,832 + 3 x 522,190,848); router,
+  shared-expert, attention, recurrent, norms, static, MTP are already
+  GPU-resident under merge_resident (~3.05 GB non-bank). KV + DeltaNet state
+  stay context-owned (invariant).
+- adapter_qwen35moe.mtp_package == nullptr: MoE MTP is the resident
+  streaming path, so --mtp + --handoff under moe-expert-bank becomes a loud
+  exit-2 gate refusal (stock TG has no draft loop). Dense --mtp + --handoff
+  stays legal.
+- Runner gates to change: the layer-major --tg-tokens > 3 cap (main.cpp
+  ~1679) lifts when --handoff is active (post-handoff TG is stock
+  llama_decode regardless of PP schedule; cap remains without handoff); the
+  handoff progress message "all (64 layers)" becomes policy-aware.
+- VRAM: reuse the T-GPLR-04 preflight (main.cpp ~2077) as the handoff fit
+  gate (full_model_plus_runtime + slabs + reserve <= free at run start,
+  refuse before the timed PP). Long-ctx refuses by design (262K Q8
+  full+runtime 24.30 GB vs observed free 22.92 GB); short-ctx ~21.4-21.5 GB
+  + overhead is marginal and decided by measured free VRAM. Peak-order rule:
+  release slots/slabs before allocating the 18.33 GB handoff buffer.
+- Checker: hybrid-TG phase validates with bank transfer ~0 in the
+  post-handoff phase_summary (handoff-aware rules already accept
+  graph_builds > 0 after handoff); no invented copy pairs.
+- --tg-text works post-handoff (writes from the generated vector, no
+  streaming-only restriction), so the T-GPLR-07 512-rung answer gate is the
+  end-to-end parity vehicle.
+
+## 2026-09-07: T-GPLR-07 runner flags --prompt-file / --tg-text landed (host-validated)
+
+Both flags are additive and default-off in the experimental runner
+(`tools/layer-streaming/main.cpp` in the vendored tree). Contract — the
+plan left the interaction details open, so the decisions are recorded here:
+- `--prompt-file PATH` reads the prompt text as raw bytes from PATH and
+  feeds the exact same `prompt_text` pipeline as `--prompt`/`--prompt-env`
+  (tokenize, pp_tokens override, MTP padding). Combining it with `--prompt`
+  or `--prompt-env` is a loud exit-2 error; with the flag absent, the
+  existing last-wins `--prompt`/`--prompt-env` behavior is byte-identical.
+  Missing file, read failure, and empty file each exit 2 before
+  `llama_backend_init` (host-only). Works in both the streaming and
+  `--residency off` paths (it is prompt-input plumbing; the off path
+  consumes `prompt_tokens` identically).
+- `--tg-text PATH` writes the detokenized generated text
+  (`llama_token_to_piece`, special=false — byte-identical rendering to the
+  "--- generated text ---" section) after successful TG that produced
+  tokens, regardless of the prompt source. Oversized vocab pieces are
+  retried with the required buffer (negative return contract). A failed
+  write is loud and fails the run (`run_end.exit_status 1`). Streaming path
+  only: `--tg-text` + `--residency off` is rejected by the single
+  off-conflict table (one entry added, exit 2).
+
+Host validation (2026-09-07, no GPU, no model load): build exit 0 (only
+main.cpp recompiled); default-off regression — five probe commands
+(`--pp-tokens 0`, bad `--copy-source`, nonexistent-model arch read, forced
+`off` arch read, unset `--prompt-env`) produce byte-identical stderr and
+identical exit codes pre/post change (`build/audit/baseline/` vs
+`build/audit/post/`); new-flag surface — missing value, unreadable file,
+empty file, prompt-source conflict, and off-conflict all exit 2 with the
+recorded messages; a valid file is read and routed
+("prompt-file: read N bytes" then the expected model-arch failure, exit 1);
+host CTest suite 15/15 on the rebuilt binary. The tokenize/TG-write
+end-to-end legs are exercised by the GPU ladder runs per the plan. Still
+remaining for acceptance: smoke wiring in `tools/run-tests.ps1`, the 512/4k
+strict-trace re-verification, and the dense Qwen3.8 regression re-run.
+
+## 2026-09-07: --mtp + --pp-no-logits n_outputs_max clamp fixed
+
+The en-route defect recorded below (GGML_ASSERT(n_outputs_max <=
+cparams.n_outputs_max) in llama-context.cpp:2551 at the first MTP round,
+loud abort exit -1073740791) is fixed in the runner,
+third_party/llama.cpp/tools/layer-streaming/main.cpp (cparams
+n_outputs_max selection, just above the forced-off branch). Root cause:
+with --pp-no-logits the runner clamped n_outputs_max to 1 (kept nonzero
+only for graph reservation), but the MTP batch-verify decode requests
+logits on the frontier plus every draft -- up to 1 + mtp_draft rows in
+ONE ubatch (batch.logits[j] = true for all rmax = 1 + nd rows) -- so
+llama_decode's output_reserve asked the context for more output rows
+than it declared, tripping the assert. The clamp now accounts for the
+MTP draft width: n_outputs_max = pp_no_logits ? (mtp ? 1 + mtp_draft :
+1) : pp_tokens. All other combinations are unchanged (pp logits on:
+pp_tokens; pp_no_logits without mtp: 1), and the draft context's own
+n_outputs_max = 1 is still correct (its decodes never request more than
+one logits row). --pp-no-logits + --mtp is valid again; the d8config no
+longer must keep PP logits on. Compile/link verified (cmake --build
+build/llama-cuda --config Release --target llama-layer-streaming). GPU
+model leg (2026-09-07 15:33, warm cache, GPU mutex, trace
+build/gplr06-batchverify-d8-nologits-fix.jsonl, log
+out/q36-d8-nologits-fix.log, script build/gplr-mtp-nologits-fix-run.ps1):
+the d8 + --pp-no-logits config COMPLETES -- runner exit 0, no assert.
+Fingerprints: the target context now logs n_outputs_max = 9 (the draft
+context stays at 1), and all 40 MTP rounds run. Parity vs the logits-on
+warm baseline is exact: first-16 ids identical (220 248046 198 248045
+248068 271 248069 271 2064 7701 421 279 1414 488 3766 369), 309
+drafted / 87 accepted / acceptance 0.282, 2.17 accepted/round, TG wall
+82.0 s (81,974 ms) vs 81.8 s, check-telemetry OK (10127 events). PP
+phase 5992.5 ms vs warm 5932.9 ms (+1%, noise) -- PP is staging-bound
+(~5.4 s transfer of 40 layer copies, compute only 0.35 s) at this
+shape, so suppressing PP logits does not change the PP wall here; the
+saving would show where logit rows dominate compute/copy. --pp-no-logits
++ --mtp is a valid, parity-identical d8 configuration.
+
+## 2026-09-07: Host I/O Baseline and Tier Direction (owner decision)
+
+Measured (host-only, no GPU): total RAM 61.69 GiB (66,234,945,536 B), free
+50.50 GiB at measurement time. Drive: MSI M461 2TB NVMe on C:. Sequential
+read of the 21.39 GB Qwen3.6 GGUF with 64 MiB reads: 7,745 MB/s buffered,
+2,728 MB/s unbuffered qd1 (FILE_FLAG_NO_BUFFERING). The "HDD-like ~52 MB/s"
+hypothesis for the 262K effective page-in rate is falsified: the device
+delivers ~50x that; 52 MB/s is the mmap page-fault path (small serialized
+I/Os). Warm buffered reads also confirm the whole 21.39 GB file fits
+resident in the 61.7 GiB RAM cache. Warm-cache 262K leg (2026-09-07,
+below) additionally falsifies cache-manager retention as the collapse
+mechanism: with the entire file resident in standby before AND during the
+run, wall/per-layer copy times are identical to the cold baseline.
+
+Owner decision: pursue BOTH tiers per the 15% rule — host-RAM bank residency
+when the pageable set fits in RAM leaving >= 15% of total RAM for the OS, and
+rolling one-layer-ahead prefetch as the streaming tier when it does not.
+Drafted as T-GPLR-08 (prefetch probe) and T-GPLR-09 (host-RAM bank cache
+tier) in docs/plans/generic-prefill-layer-residency-plan.md. T-GPLR-09
+admission math on this machine: reserve = 0.15 x 61.69 GiB = 9.25 GiB; bank
+set 18.33 GB (17.07 GiB); free 50.50 GiB -> 50.50 - 17.07 = 33.43 GiB >= 9.25
+GiB -> admitted today; the rule rejects larger pageable sets automatically.
+
+
 ## T-GPLR-05 Complete: Capability Registry + Regression Closure — Plan Done (2026-09-05)
 
 The generic prefill layer-residency plan is complete: every loaded model now
@@ -71,7 +548,7 @@ tok/s. 38 bank evictions and graph_builds 0 in every run. Decomposition
 (18.33 GB, 40 copies) and pure per-bank H2D copy cost is flat (layer-0
 copies ~0.26 s in every run, ~10.4 s total), but wall is paced by the host
 page-in stream of those same 18.33 GB: effective feed rate 263 MB/s at 50K
-vs 52 MB/s at 262K (uncontrolled file-cache/HDD behavior) -- that, not copy
+vs 52 MB/s at 262K (uncontrolled file-cache behavior; device limit falsified 2026-09-07 - MSI M461 2TB NVMe measured 2,728 MB/s unbuffered / 7,745 MB/s buffered sequential reads of the model file; see AGENT_ENVIRONMENT.md) -- that, not copy
 volume, is why the transfer-time column climbs while bytes stay flat. The
 phase transfer/compute fields measure submit->complete windows that include
 overlapped compute (per-copy transfer_us inflates to ~29.5 s exactly on the
@@ -89,6 +566,34 @@ copy; wait 0.6 s); 4 slots 352.3 s = 744.2 tok/s (36 evictions, slot window
 wide-window copies run concurrently behind compute, leaving wall bound by
 the host read stream). Traces: build/gplr-longpp-*.jsonl, all
 check-telemetry OK.
+
+Warm-cache leg (2026-09-07, same command/shape, GPU mutex, trace
+build/gplr-longpp-262144-warmcache.jsonl, script build/gplr-warmcache-run.ps1,
+log out/q36-longpp-262k-warmcache.log): the whole 21.39 GB GGUF was read
+into the file cache immediately before the run (standby 0.38 -> 20.41 GB;
+second-pass warm read 8,138 MB/s) and STILL sat at 20.57 GB standby after
+run_end -- the file never left memory during the run, with 53 GB free the
+whole time (cleanest environment any long-PP run has had). Result: wall
+352.5 s / 743.7 tok/s, transfer 328.1 s, compute 339.0 s, 38 evictions,
+graph_builds 0, peak VRAM 12,211 MiB -- identical to the 351.9 s baseline
+(delta +0.17%), and per-layer copy windows match trace-for-trace: layer 0
+= 0.13 s, recurrent ~1.7-2.3 s, full-attn ~29.2-29.4 s. Cache-manager
+retention is FALSIFIED as the cause of the 263->52 MB/s collapse:
+standby-resident pages fault through the memcpy path at ~200-215 MB/s, no
+faster than cold. Two refinements:
+- The apparent length-dependent collapse is mostly a phase-field artifact:
+  total_transfer_us absorbs the 10 full-attn layers' ~29.3 s compute
+  windows (~293 s of the 328 s total); the genuine per-bank stream is
+  ~266 MB/s at 50K vs ~215 MB/s at 262K (~20% slower, not 5x), and wall ~
+  30 recurrent x ~2.05 s copy + 10 full-attn x ~29.3 s compute = ~354 s.
+- Layer 0's copy (0.13 s ~ 3.5 GB/s, identical in both traces) rides the
+  loader's one-shot map-time PrefetchVirtualMemory, i.e. WORKING-SET
+  residency -- 16x the standby-fault rate. The fast path exists and is
+  working-set residency, not standby: this directly validates the
+  T-GPLR-08 rolling one-layer-ahead prefetch (PrefetchVirtualMemory
+  populates the working set) and pins its falsifiable gate to the layer-0
+  rate (~3.5 GB/s feed -> wall floor ~66 s, matching the warm-resident
+  boundary traces' 3968 tok/s).
 
 Open performance frontier: TG remains a full 40-bank pass per token
 (0.26-0.52 tok/s measured). Draft task T-GPLR-06 (MTP draft + layer-major
@@ -118,6 +623,147 @@ flat 64 MiB slack, which exhausted at chunk 493/512 on the 262K run (two
 deterministic loud aborts, never silent corruption); sizing now adds 1 MiB
 headroom per chunk (host-side buffer, no VRAM cost). Failed attempt traces
 archived in build/gplr-attempt1/.
+
+T-GPLR-06 step 2 (batch verify) landed and measured (2026-09-06): the MTP
+round now verifies the frontier plus all drafts in one width-(1+d) target
+ubatch - one expert-bank pass per round instead of one per draft - with
+corrected-for-state rollback via exact KV seq_rm plus the recurrent snapshot
+ring, and prebuilt width-k phase-1 graph sets preserving graph_builds == 0.
+128-token draft-4 config: 95.1 s wall vs the 245.4 s serial baseline (2.58x,
+target ~90 s), exit 0, 47 rounds, avg accepted/round 1.70. Parity verdict
+per owner decision (bit-exactness not required across ubatch shapes, but
+divergence must be measured): the one divergence from the serial stream was
+instrumented on both paths with top-2 margins and runner-up tokens - the
+flipped decode is the identical logical decode (same token/position/history),
+serial chose its argmax by 0.0037 logits (smallest margin of the whole run)
+and the width-5 shape flipped it at 0.14 noise scale; all comparable rows
+agree on gold AND runner-up; both streams re-join afterward. Quantized-
+weight shape noise on a knife-edge tie, not a state or wiring defect; reruns
+bit-identical. Host suite green (15/15) on the final binary; traces at
+build/gplr06-{seq128-margins,batchverify-d4-v2}.jsonl. Draft-8 batch verify
+measured 2026-09-07: 82.6 s (1.55 tok/s), 2.97x over serial, avg
+accepted/round 2.17 (40 rounds) - deeper drafts pay off once verify is
+batched; all cross-width divergences are the same measured sub-0.15-margin
+tie flips (traces build/gplr06-batchverify-d8.jsonl). Draft-32 probe:
+96.1 s, peak VRAM 7.42 GB, exit 0, graph_builds 0 - the frontieris d8 (82.6 s); acceptance horizon is 7 (depth >= 8 never accepted in 43
+rounds), memory is NOT the binding constraint (ring planes scale
+linearly, 2.18 GB at d32), and the depth-32 ring rewind is exercised
+(6 zero-accept rounds) with identical first-16 IDs across all configs.
+
+Warm-cache TG staging bound (2026-09-07, same d8 command, GPU mutex,
+trace build/gplr06-batchverify-d8-warmcache.jsonl, script
+build/gplr-tg-warmcache-run.ps1, log out/q36-tg-warmcache.log): the file
+cache was warm before and during the run (standby 21.1 GB, 52.8 GB free,
+GPU idle -- cleanest TG environment recorded). TG wall 81.8 s / 1.564
+tok/s vs the 82.6 s / 1.55 tok/s baseline (delta -1%, noise); 40 rounds,
+accepted/round 2.17, acceptance 0.282 -- behaviorally identical to the
+recorded baseline. The bound: batch-verify wall is staging-volume-bound
+at 40 x 458 MB = 18.33 GB per round, and every TG wall on this machine
+collapses to that volume divided by ~9 GB/s (serial 128t: 250.4 s / 128
+rounds = 1.96 s/round = 9.1 GB/s; d8: 2.01 s/round = 8.9 GB/s; d8 warm:
+2.00 s/round = 9.0 GB/s; compute is only 1.4 s of the 82 s wall).
+Consequences: (1) TG staging is ALREADY at the RAM-speed floor -- the
+host-RAM tier (T-GPLR-09) adds ~0 wall for TG batch verify, exactly like
+standby residency added nothing to PP; (2) batch verify's remaining lever
+is acceptance (tokens per round -- the code-prompt d16 3.54 tok/s optimum
+is the evidence), not staging; (3) batch verify at 1.56 tok/s already
+matches the dense handoff resident-TG rate (1.68 tok/s), so staging is no
+longer the MoE-vs-dense TG differentiator. En-route defect found: --mtp
+with --pp-no-logits trips GGML_ASSERT(n_outputs_max <= cparams.
+n_outputs_max) in llama-context.cpp:2551 at the first MTP round (loud
+abort, exit -1073740791; FIXED same day -- the runner clamp now covers
+1 + mtp_draft, see the '--mtp + --pp-no-logits n_outputs_max clamp
+fixed' entry above). Also
+noted: per-copy window telemetry is scheduler-skew sensitive (median 48
+ms while a foreign process held the GPU busy vs ~0 ms with it idle);
+aggregate staging rate (~9 GB/s) is the robust number, not per-copy
+windows. Coding-prompt depth
+sweep 2026-09-07 (calculator-spec prompt, --prompt-env, 1024 PP,
+ctx 2048, tg 128, batch-major): d8 35.5 s TG (3.60 tok/s, 17 rounds,
+accept 0.815), d16 25.7 s (4.98 tok/s, 12 rounds, 0.650), d32 18.2 s
+(7.02 tok/s, 8 rounds, 0.496) - tok/s still rising at d32; the
+synthetic-prompt depth horizon (7) dissolves on structured code text.
+Caveat: d8/d32 fell into a greedy 2-token repetition loop (no rep
+penalty in harness) while d16 escaped on a round-0 knife-edge flip
+(margin 0.089) and generated real code; a no-loop rerun is required
+before generalizing. Peak VRAM 5.83/6.36/7.42 GB; traces
+build/gplr06-codeprompt-d{8,16,32}.{jsonl,log}.
+
+Coding-prompt depth sweep, repetition penalty (2026-09-07, same prompt,
+--rep-penalty 1.3 last-n 64): loop dead at every depth (max period-2
+run 1/2/1), all legs emit real HTML. d8 76.4 s (1.68 tok/s, 38 rounds,
+accept 0.299), d16 36.1 s (3.54 tok/s, 17 rounds, 0.426) = measured
+optimum, d32 76.1 s (1.68 tok/s, 36 rounds, 0.088 - acceptance
+collapses at depth 32 as the draft ring fills with hypothetical
+penalized tokens). The unpenalized "rising at d32" was loop
+contamination; d16 is the code optimum at 6.8x serial. New runner
+flags --rep-penalty/--rep-last-n replicate penalty_repeat semantics at
+all four greedy pick sites (initial frontier, draft chain, batch-verify
+rows, serial TG) so the draft predicts the penalized target; host suite
+green. Traces: build/gplr06-codeprompt-p13-d{8,16,32}.{jsonl,log}.
+Serial no-MTP leg on the same prompt (2026-09-07, penalty 1.3, natural 885-token PP): 249.69 s TG (0.513 tok/s), real HTML output, loop-free (max period-2 run 1) - the first measured code-text serial baseline; d16 36.12 s => 6.91x true MTP speedup on code (the prior 6.8x inherited the synthetic-prompt baseline). Caveat: batch legs pad PP to 1024 with PAD tokens (mirror requires exact ubatches), serial runs natural 885, so the streams diverge at idx 0 by construction (pad-cell frontier); TG per-token bank geometry is identical, so the timing ratio is clean. Trace: build/gplr06-codeprompt-serial-p13.{jsonl,log}.
+
+T-GPLR-07 semantic-QA ladder first results (2026-09-07): the host-only
+needle-prompt generator and answer checker landed in tools/semantic-qa/
+(stdlib-only, deterministic, exact token-count calibration via
+llama-tokenize --ids; checker self-test 13/13 including the negative-control
+logic). Full ladder tier is green at every rung so far, all on
+Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf, --kv-cache q8, --pp-no-logits,
+--allow-full-residency, batch-major PP, GPU mutex, runner exit 0:
+15 tokens (K1 only) -> "Paris" PASS; 30 tokens (N1) -> "QX-7741" PASS;
+50 tokens (N1) -> "QX-7741" PASS; 512-token anchor (all 5 items) ->
+"QX-7741 TR-2918 MK-5501 LD-8834 Paris" PASS; 4096 tokens (all 5 items,
+needles at rows 27/55/84/106 of 113) -> all five codes PASS with the full
+answer emitted before any drift. The 4k rung: PP 4095 tok in 6.75 s
+(606.9 tok/s), TG 160 tok in 303.9 s (0.53 tok/s), peak VRAM 3.9 GiB,
+check-telemetry OK. Negative control verified live: grading the 512 and 4k
+answers with --negative correctly FAILs (a grader that cannot fail is not
+a grader). Evidence recorded as ANSWER stability, never token-ID stability.
+
+24k ladder rung (2026-09-07, owner-invoked acceptance run): prompt 24,576
+tokens exact (needle rows 169/340/511/647 of 649 = 25/50/75/95% depth),
+delivered via a 113,786-byte env var built directly in Python's
+subprocess env= (CreateProcessW environment block survives the full
+bash->powershell->cmd->exe chain intact; the 32 KB Windows limit applies
+only to SetEnvironmentVariable setters, which are bypassed -- probe
+verified 98,304 chars round-trip, exit 0). Run config identical to the
+4k rung: --ctx-size 25088, --ubatch 24575 single-ubatch PP,
+--tg-tokens 160, --kv-cache q8, --pp-no-logits, --residency
+moe-expert-bank, --pp-schedule batch-major, --allow-full-residency.
+Result: exit 0, PP 24,576 tok in 16.2 s (1516 tok/s), TG 160 tok in
+313.5 s (0.51 tok/s), peak VRAM 10.22 GiB, answer
+"QX-7741 TR-2918 MK-5501 LD-8834 Paris" -> aggregate PASS (all 5 items),
+negative control FAILs as designed. Strict gate satisfied on the
+dedicated JSONL trace build/gplr07-qa-24k.jsonl: --check-telemetry OK
+exit 0 (run_start/run_end, 2 phase_summary, 12,960 copy_submit/complete
+pairs, 6,480 layer_compute, graph_builds 0 both phases). Reproducibility:
+the mixed-log run and the --telemetry re-run produced byte-identical
+first-16 generated IDs and the same PASS answer. This is the first rung
+with a surviving dedicated --telemetry trace; the 512/4k rung traces
+were mixed-log only (their "check-telemetry OK" claims were NOT backed
+by surviving JSONL and should be re-verified before ladder completion).
+
+Runner/tooling findings from the first ladder run (all recorded, none
+silent): (1) the runner has no chat template and keeps generating past EOS
+until its TG budget is spent -- the answer is followed by a turn-echo loop
+("user/assistant" turns and prompt echo); the checker strips everything from
+the first <|endoftext|> on, and the TG budget must cover the answer plus the
+first EOS (~65 tokens for the 5-item answer). (2) The batch-major prebuild
+only builds full-ubatch variants: a PP whose token count is not a multiple
+of the ubatch hits a runtime begin_set for the tail ubatch whose act pair
+exceeds the fixed activation buffer (loud failure "activation buffer
+exhausted" at the tail boundary, e.g. 511 tokens with ubatch 64);workaround used for every run here is --ubatch <pp-tokens> (single-ubatch
+PP, matching the T-GPLR-06 512-token precedent). This tail-ubatch gap was a
+vendored-tree defect candidate; it is now CLOSED by T-GPLR-11 (2026-09-09,
+see the task entry at the top of this file) -- batch-major prebuilds the
+tail variant and the workaround is retired. The failure mode was loud,
+never wrong-data. (3) The runner prints human-readable "first 16 generated ids"
+and a "--- generated text ---" section on combined stdout/stderr instead of
+JSONL run_start/run_end events in that mode; check-answer.py parses both
+(the runner's own detokenized text section is preferred over the 16-ID
+fallback since the full answer exceeds 16 tokens). The strict JSONL
+telemetry gate (check-telemetry OK) remains a separate required check on
+dedicated --telemetry files.
 
 Normal-path parity closed. A forced-off run (GPU mutex, MoE model, 9-token
 prompt) produced PP-logits first greedy ID 13 and first generated ID 5388 —

@@ -11,6 +11,11 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite boundary  # boundary + slot lifecycle (~35s, GPU)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite telemetry # host-only JSONL validation (no GPU, seconds)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite host      # host-only chunk-layout + telemetry fixture tests (no GPU, seconds)
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite qa-smoke # T-GPLR-07 semantic-QA smoke gate: default 512-token run on the 512-token anchor
+#                       (calibrated prompt -> runner + dedicated --telemetry JSONL -> strict
+#                       --check-telemetry -> checker on the runner's --tg-text file + negative
+#                       control; GPU, ~5 min; 50-token rung opt-in via -SmokeLengths 50;
+#                       4k+ ladder lengths are manual owner-invoked commands)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k   # 20K-token PP + 3-token TG experiment (~10-20 min, GPU)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k-layer-major # 20K layer-major PP (T-Q38LM-03, ~10-20 min, GPU)
 #
@@ -24,22 +29,39 @@
 #                       telemetry fixtures (T-Q38CTX-01/02, no GPU, no lock)
 #   pp20k             - one experimental run: PP 20480 tokens (ubatch 512) + TG 3 tokens,
 #                       --pp-no-logits, ~10-20 min, GPU (BLOCKED/superseded by
-#                       layer-major; kept for the owner to remove explicitly)
-#   pp20k-layer-major - T-Q38LM-03: PP 20480 tokens (ubatch 512, 40 chunks) in
-#                       layer-major order, PP-only, --pp-no-logits, ~10-20 min, GPU
+#                       layer-major; kept for the owner to remove explicitly)#   pp20k-layer-major - T-Q38LM-03: PP 20480 tokens (ubatch 512, 40 chunks) in
+#               layer-major order, PP-only, --pp-no-logits, ~10-20 min, GPU
 #               (model path: -ModelPath, else $env:Q38LS_MODEL_PATH, else the
 #               docs/AGENT_ENVIRONMENT.md path)
+#   qa-smoke          - T-GPLR-07 semantic-QA smoke gate. Default run: 512-token
+#               rung on the 512-token anchor (full 5-item document anchor); the
+#               50-token rung is opt-in via -SmokeLengths 50 (comma list; the
+#               quoted-string form silently binds as one int and must not be
+#               used). 4k+ ladder lengths are manual owner-invoked commands, never
+#               part of this suite. The gate a developer runs after
+#               every runner change that touches the experimental path: calibrated
+#               needle prompt (gen-needle-prompt.py, exact token count) -> runner with
+#               --prompt-file + dedicated --telemetry JSONL under the GPU mutex ->
+#               strict --check-telemetry on the JSONL -> check-answer.py grading the
+#               runner's --tg-text generated-text file directly (no trace re-parsing)
+#               + negative control. (model path: -ModelPath, else
+#               $env:QWEN36_MODEL, else the docs/AGENT_ENVIRONMENT.md path)
 #
 # Exits with ctest's exit code (0 = all passed).
 
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'quick', 'boundary', 'telemetry', 'host', 'pp20k', 'pp20k-layer-major')]
+    [ValidateSet('all', 'quick', 'boundary', 'telemetry', 'host', 'qa-smoke', 'pp20k', 'pp20k-layer-major')]
     [string] $Suite = 'all',
 
     [string] $BuildDir = '',
     [string] $Config = 'Release',
-    [string] $ModelPath = ''
+    [string] $ModelPath = '',
+
+    # qa-smoke rung selection: default = 512 only; the 50-token rung is opt-in
+    # via -SmokeLengths 50 (comma list). 4k+ ladder lengths are manual
+    # owner-invoked commands, never part of this suite.
+    [int[]] $SmokeLengths = @(512)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,12 +114,27 @@ $suites = @{
         # T-GPLR-05: host-only capability probe + policy-refusal tests are
         # included here (no GPU, no lock).
         # Host-only: the layout unit test + the fixture JSONL checks (lm40,
-        # tail513, tail1025). Exclude the tail513 GPU run targets AND the
-        # tail513-lm / tail513-bm host checks that FIXTURES-require those GPU
-        # runs (the fixture files under fixtures/ are what the host suite uses).
-        Include = 'layer-streaming-(lm40|tail513|tail1025|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit)-|test-layer-streaming-(layout|model-inspect)'
+        # tail513, tail1025) + the T-GPLR-10 gate fixtures (mtp+handoff+moe
+        # refusal, layer-major tg cap and its handoff lift, dense legal
+        # combos). Exclude the tail513 GPU run targets AND the tail513-lm /
+        # tail513-bm host checks that FIXTURES-require those GPU runs (the
+        # fixture files under fixtures/ are what the host suite uses).
+        Include = 'layer-streaming-(lm40|tail513|tail1025|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal)(-|$)|test-layer-streaming-(layout|model-inspect)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
+    }
+    'qa-smoke' = @{
+        # T-GPLR-07 semantic-QA smoke gate, end-to-end on the real surface under
+        # the GPU mutex. Default rung: 512 tokens on the 512-token anchor (full
+        # 5-item document anchor); the 50-token rung is opt-in via -SmokeLengths
+        # 50. 4k+ ladder lengths are manual owner-invoked commands, never part
+        # of this suite. The dedicated --telemetry JSONL +
+        # strict --check-telemetry pair is the point: it prevents exactly the
+        # mixed-log-only 'check-telemetry OK' claims the ladder recorded for the
+        # 512/4k rungs. Every step must pass or the suite exits 1.
+        Gpu = $true
+        QaSmoke = $true
+        TimeoutSeconds = 1800
     }
     'pp20k' = @{
         # Experimental: large-prompt PP (20480 tokens, ubatch 512 = 40 whole
@@ -198,6 +235,113 @@ elseif ($spec.Direct) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
         -TimeoutSeconds $spec.TimeoutSeconds -Command $DirectCmd
     $exitCode = $LASTEXITCODE
+}
+elseif ($spec.QaSmoke) {
+    # T-GPLR-07: semantic-QA smoke gate. Smoke tier = 50/512-token runs on the
+    # 512-token anchor (default: 512 only). Runs the real surface end-to-end:
+    #   calibrated needle prompt (gen-needle-prompt.py, exact token count;
+    #   50 = N1 scaffold, 512 = full document mode)
+    #   -> runner with --prompt-file + dedicated --telemetry JSONL under the
+    #      GPU mutex (single-ubatch PP: --ubatch = the REAL achieved token
+    #      count, the documented workaround for the tail-ubatch gap)
+    #   -> strict --check-telemetry on the JSONL (the dedicated-JSONL gate)
+    #   -> check-answer.py per-needle grading (--items from the generator's
+    #      per-length items= list) + negative control on the same tg-text
+    #      (must FAIL as designed; a grader that cannot fail is not one)
+    $exe = Join-Path $buildDirResolved "bin\$Config\llama-layer-streaming.exe"
+    $tok = Join-Path $buildDirResolved "bin\$Config\llama-tokenize.exe"
+    if (-not (Test-Path -LiteralPath $tok)) {
+        Write-Host "ERROR: llama-tokenize.exe not found at $tok (needed for prompt calibration)." -ForegroundColor Red
+        exit 1
+    }
+    if (-not $ModelPath) { $ModelPath = $env:QWEN36_MODEL }
+    if (-not $ModelPath) { $ModelPath = 'C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf' }
+    if (-not (Test-Path -LiteralPath $ModelPath)) {
+        Write-Host "ERROR: model not found at $ModelPath. Pass -ModelPath or set QWEN36_MODEL." -ForegroundColor Red
+        exit 1
+    }
+
+    $py = 'python'
+    $gen = Join-Path $PSScriptRoot 'semantic-qa\gen-needle-prompt.py'
+    $chk = Join-Path $PSScriptRoot 'semantic-qa\check-answer.py'
+    $promptDir = Join-Path $buildDirResolved 'gplr07-qa-prompts'
+    New-Item -ItemType Directory -Force -Path $promptDir | Out-Null
+
+    $failed = $false
+    foreach ($len in $SmokeLengths) {
+        if ($len -lt 15) {
+            Write-Host "FAILED: smoke rung length $len is below the generator floor (15 tokens)." -ForegroundColor Red
+            $failed = $true
+            break
+        }
+        $prompt = Join-Path $promptDir "anchor-$len.txt"
+        Write-Host "[qa-smoke] $len tokens: calibrating anchor prompt..."
+        $genOut = & $py $gen --target-tokens $len --calibrate $tok --model $ModelPath --out $prompt 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: prompt calibration exited $LASTEXITCODE" -ForegroundColor Red
+            Write-Host $genOut -ForegroundColor Red
+            $failed = $true
+            break
+        }
+        Write-Host $genOut
+        $achieved = ($genOut | Select-String 'achieved=(\d+)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+        $items = ($genOut | Select-String 'items=(\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+        if (-not $achieved -or -not $items) {
+            Write-Host "FAILED: generator output missing achieved=/items= (got: $genOut)" -ForegroundColor Red
+            $failed = $true
+            break
+        }
+
+        $trace = Join-Path $buildDirResolved "gplr07-qa-$len.jsonl"
+        $tgtext = Join-Path $buildDirResolved "gplr07-qa-$len.txt"
+        $log = Join-Path $buildDirResolved "gplr07-qa-$len.log"
+        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $achieved --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
+        Write-Host "[qa-smoke] $len tokens: runner under GPU mutex (log $log)..."
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
+            -TimeoutSeconds $spec.TimeoutSeconds -Command $runCmd
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            Write-Host "FAILED: $len-token run exited $exitCode" -ForegroundColor Red
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 25 | ForEach-Object { Write-Host $_ -ForegroundColor Red } }
+            $failed = $true
+            continue
+        }
+
+        Write-Host "[qa-smoke] $len tokens: strict --check-telemetry on $trace"
+        & $exe --check-telemetry $trace
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-telemetry rejected $trace" -ForegroundColor Red
+            $failed = $true
+            continue
+        }
+
+        Write-Host "[qa-smoke] $len tokens: grading generated text $tgtext (items=$items)"
+        & $py $chk check --tg-text $tgtext --items $items
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: checker rejected the $len-token answer" -ForegroundColor Red
+            $failed = $true
+            continue
+        }
+
+        Write-Host "[qa-smoke] $len tokens: negative control on the same tg-text (must FAIL as designed)"
+        $negOut = & $py $chk check --tg-text $tgtext --items $items --negative 2>&1
+        $negExit = $LASTEXITCODE
+        $negText = $negOut -join "`n"
+        Write-Host $negOut
+        if ($negExit -eq 0 -or $negText -notmatch 'aggregate=FAIL') {
+            Write-Host "FAILED: negative control did not fail as designed (exit $negExit)" -ForegroundColor Red
+            $failed = $true
+            continue
+        }
+        Write-Host "[qa-smoke] $len-token rung PASSED (check-telemetry OK, answer PASS, negative control FAILs)" -ForegroundColor Green
+    }
+
+    if ($failed) {
+        Write-Host "FAILED: suite 'qa-smoke' failed." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "SUCCESS: suite 'qa-smoke' passed." -ForegroundColor Green
+    exit 0
 }
 elseif ($spec.Gpu) {
     Write-Host "Running under GPU mutex (waits if another process holds it)..."
