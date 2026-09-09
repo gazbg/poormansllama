@@ -1,7 +1,7 @@
 # Current State
 
-Vendored llama.cpp state: `169ab086e` — layer-streaming: generic MoE
-residency, long-PP sizing fix, off first-class, resident MTP (2026-09-06).
+Vendored llama.cpp state: `099a27a7e` — layer-streaming: T-GPLR-08/10/11,
+prefetch probe, MoE handoff, tail-ubatch fix (2026-09-09).
 
 Milestone tag `layer-residency-plan-complete` (2026-09-06): this repo →
 27514d1dabeef7119b53241aad65167ae2a410d8; vendored llama.cpp →
@@ -143,6 +143,8 @@ Policy change. Owner decision required before re-review: (a) enable "Lock
 pages in memory" via elevated policy, (b) redesign without VirtualLock
 (weaker guarantee), or (c) defer until T-GPLR-08 results inform the tier's
 value. Privilege facts recorded in docs/AGENT_ENVIRONMENT.md.
+[Superseded 2026-09-09: T-GPLR-09 is PARKED (owner decision), not merely
+held -- see the PARKED section below.]
 
 ## 2026-09-09: T-GPLR-06/07 CLOSED — T-GPLR-08 and T-GPLR-10 may start
 
@@ -178,6 +180,8 @@ T-GPLR-07 acceptance closed (plan status -> done):
 Plan serialization now: T-GPLR-08 (prefetch probe) and T-GPLR-10 (MoE
 handoff) are the next eligible tasks, one at a time, in either order;
 T-GPLR-09 remains held on the SeLockMemoryPrivilege blocker.
+[Superseded 2026-09-09: T-GPLR-08/10/11 all closed and T-GPLR-09 PARKED
+-- see the DONE and PARKED sections below.]
 
 ## 2026-09-09: T-GPLR-11 DONE — batch-major tail-ubatch gap closed
 
@@ -360,6 +364,45 @@ Gaps / residual risk:
   poller is build/poll-gpu-memory.ps1 (v10); earlier diagnostics v1-v8 are
   superseded.
 - No commit (not authorized).
+
+## 2026-09-09: T-GPLR-09 PARKED — owner decision, plan updated
+
+The held host-RAM bank-cache tier (T-GPLR-09) is now formally PARKED in
+the plan, not merely held as draft. Owner decision 2026-09-09; the plan's
+T-GPLR-09 status block records the rationale, the two-key-door framing,
+and the reopen triggers.
+
+Why parked — a two-key door, and neither key turns today:
+- Key 1 (policy): SeLockMemoryPrivilege is absent and
+  SeIncreaseWorkingSetPrivilege disabled for the token (2026-09-09 probe),
+  so the contract's primary path (working-set raise + VirtualLock) cannot
+  execute without a Local Security Policy change — an owner-level
+  environment change outside the implementer lane.
+- Key 2 (premise): T-GPLR-08's falsified probe (this day) showed the
+  working-set mechanism the tier relies on does not transfer to the
+  rolling stage (hinted pages 39/39 populated, fault-driven feed
+  unchanged), and the Sep 7 warm-cache leg already showed standby
+  residency adds nothing to PP. A locked private copy would additionally
+  be strictly worse under memory pressure (dirty private pages trim to
+  the pagefile — up to ~18 GB pagefile traffic).
+
+Reopen triggers (any ONE, owner-initiated, recorded in the plan's status
+note): (1) privilege granted AND a fault-count attribution probe shows
+staging is fault-bound with trimming — not memcpy-bandwidth-bound; (2)
+the workload moves to host-memory-tight conditions with recorded
+hard-fault/RSS thrash evidence per run; (3) target hardware/OS changes so
+the privilege arrives by default.
+
+Consequences: no code was ever written for the tier, so nothing is
+retired; the 15% admission rule stands as design evidence only. TG
+batch-verify staging already sits at the RAM-speed floor (earlier
+measurement), so a resurrected tier could only ever target PP. The
+remaining program items are unchanged: endurance ladder rungs
+50k/100k/200k (owner-invoked), the T-GPLR-08 attribution question, and
+the second-architecture decision (owner-gated).
+
+Docs-only change (plan status block + header); no commit (not requested
+for this decision).
 
 ## 2026-09-09: T-GPLR-10 drafted — MoE handoff (streaming PP + stock llama.cpp TG)
 

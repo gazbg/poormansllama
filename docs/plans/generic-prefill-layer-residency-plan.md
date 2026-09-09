@@ -4,14 +4,15 @@ Status: T-GPLR-00 through T-GPLR-08 and T-GPLR-10/T-GPLR-11 done
 (2026-09-04/05/09; T-GPLR-08's prefetch gate falsified -- see its status
 note; T-GPLR-10 MoE handoff closed with parity/speed/answer-gate evidence;
 T-GPLR-11 tail-ubatch gap closed); T-GPLR-09
-draft (held: SeLockMemoryPrivilege absent, see its status note).
+PARKED (owner decision 2026-09-09 -- two-key door: privilege blocker plus
+falsified premise; reopen triggers in its status note).
 Remaining program items: endurance ladder rungs 50k/100k/200k
-(owner-invoked), the T-GPLR-08 attribution question, the T-GPLR-09
-decision, and a second architecture passing the acceptance gates
-(owner-gated product decision).
-Commit record (2026-09-09, owner-authorized): vendored-tree changes
-committed on its own repository; parent docs/tools committed following
-this consolidation (both hashes via git log from this commit).
+(owner-invoked), the T-GPLR-08 attribution question, and a second
+architecture passing the acceptance gates (owner-gated product decision).
+Commit record (2026-09-09, owner-authorized): vendored-tree changes in
+third_party/llama.cpp 099a27a7e (T-GPLR-08/10/11); parent docs/tools in
+84be194 (recorded T-GPLR-08/10/11 completion, gitlink bump) and 7bfe83b
+(T-GPLR-10 evictfix follow-up). No push authorized; both repos local.
 
 Design: [Generic Prefill Layer Residency SDD](../layer-residency-sdd.md)
 
@@ -40,8 +41,11 @@ This isolates weight residency from long-prompt activation-slab cost.
 - The selected MoE GGUF path exists, but its header, tensor inventory, vendored
   architecture support, package sizes, and capacity arithmetic are not yet
   verified in this workspace.
-- The root and vendored worktrees contain user changes. Every task preserves
-  them and stages or commits nothing without owner authorization.
+- Worktree state (2026-09-09): all task code is committed (vendored tree
+  clean at 099a27a7e; parent docs/tools committed through 7bfe83b).
+  Generated build/trace/telemetry output stays out of version control;
+  every task still stages or commits nothing beyond its task-owned files
+  without owner authorization.
 
 ## Fixed MoE Acceptance Command Shape
 
@@ -66,20 +70,21 @@ backend     = CUDA
 T-GPLR-00 -> T-GPLR-01 -> T-GPLR-02 -> T-GPLR-03 -> T-GPLR-04 -> T-GPLR-05
 
 Implementation serialization (one ready task at a time): T-GPLR-06/07
-closed 2026-09-09; the next eligible tasks are T-GPLR-08 (streaming-tier
-prefetch probe) and T-GPLR-10 (MoE handoff) in either order, then
-T-GPLR-09 (host-RAM residency tier). T-GPLR-09 reuses T-GPLR-08's range
-walker and telemetry plumbing; when admitted, it makes the rolling prefetch
-unnecessary (all banks resident), and T-GPLR-08 remains the fallback tier and
-the probe for the declined case. T-GPLR-10 is independent of T-GPLR-08/09
-(different flags and machinery). T-GPLR-09 remains held (see its status
-note).
+closed 2026-09-09; T-GPLR-08 (prefetch probe, hypothesis falsified) and
+T-GPLR-10 (MoE handoff) closed 2026-09-09; T-GPLR-11 closed 2026-09-09.
+T-GPLR-09 (host-RAM residency tier) is PARKED (owner decision 2026-09-09:
+a two-key door -- the privilege blocker plus the falsified T-GPLR-08
+premise; reopen triggers in its status note). If reopened, it reuses
+T-GPLR-08's range walker and telemetry plumbing and makes the rolling
+prefetch unnecessary (all banks resident), with T-GPLR-08 remaining the
+fallback tier and the probe for the declined case.
+Remaining program items are listed in the header status above.
 ```
 
 ### T-GPLR-00: Inventory the MoE artifact and capacity
 Status: done (2026-09-04)
 Depends on: none
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Evidence (2026-09-04)
 : - `--inspect-model` host-only mode added to the runner; shared implementation
@@ -190,7 +195,7 @@ Escalate before implementation if
 ### T-GPLR-01: Extract the Qwen package adapter
 Status: done (2026-09-04)
 Depends on: T-GPLR-00
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Evidence (2026-09-04)
 : - Adapter boundary: `llama_ls_member`/`llama_ls_package`/`llama_ls_adapter`
@@ -289,7 +294,7 @@ Escalate before implementation if
 ### T-GPLR-02: Prove the MoE expert-bank package
 Status: done (2026-09-04)
 Depends on: T-GPLR-01
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Evidence (2026-09-04)
 : - MoE adapter registered: `qwen35moe_package` (complete routed-expert bank:
@@ -380,7 +385,7 @@ Escalate before implementation if
 ### T-GPLR-03: Complete a 512-token MoE prefill
 Status: done (2026-09-05)
 Depends on: T-GPLR-02
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Evidence (2026-09-04/05)
 : - 512-token layer-major MoE prefill through all 40 trunk layers, Q8 K/V,
@@ -497,7 +502,7 @@ Escalate before implementation if
 ### T-GPLR-04: Prove the 262K Q8 out-of-core configuration
 Status: done (2026-09-05)
 Depends on: T-GPLR-03
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Goal
 : Complete the 512-token Qwen3.6 prefill with context capacity 262,144 and Q8
@@ -609,7 +614,7 @@ Escalate before implementation if
 ### T-GPLR-05: Publish capability and regression closure
 Status: done (2026-09-05)
 Depends on: T-GPLR-04
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Goal
 : Every loaded model receives a stable layer-residency support result, and the
@@ -738,7 +743,7 @@ ring is written per decode call, so exact length-only rollback requires one
 call per verified token position. This satisfies the plan's layer-major
 verify intent with exact greedy-prefix parity.
 Depends on: T-GPLR-05
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Goal
 : Determine whether MoE token generation can escape the per-token expert-bank
@@ -982,7 +987,7 @@ gplr07-qa-4k.jsonl, both check-telemetry OK; the 4k answer also passes all
 Qwen3.8 regression re-run is green (layer-streaming-layer-major-1024 2/2,
 greedy ID 286).
 Depends on: T-GPLR-05
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Goal
 : Add an answer-correctness observable that survives to 200,000-token prompts,
@@ -1095,7 +1100,7 @@ rise. Recorded as an instrumentation result with full per-bank telemetry
 re-probing under different host memory conditions; parity criterion passed
 (512 + 50 rungs on the prefetch binary).
 Depends on: T-GPLR-05
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Goal
 : While the GPU computes layer L, a dedicated worker thread issues
@@ -1193,21 +1198,46 @@ Escalate before implementation if
 
 ### T-GPLR-09: Host-RAM expert-bank cache tier (15% admission rule)
 
-Status: draft -- HELD (planner review 2026-09-09). Not ready: (1) hard
-dependency on T-GPLR-08's range walker/telemetry plumbing; (2) environment
-blocker probed 2026-09-09: the <host>\<user> token has NO
-SeLockMemoryPrivilege and SeIncreaseWorkingSetPrivilege is disabled, so the
-contract's primary path (SetProcessWorkingSetSize raise + VirtualLock)
-cannot execute on this machine as configured -- the acceptance gates (wall
-<= 110 s) are unreachable without a Local Security Policy change. Owner
-decision required before re-review: (a) enable "Lock pages in memory" for
-the user via elevated policy (environment change, outside the implementer
-lane), (b) redesign the residency mechanism without VirtualLock (weaker
-guarantee), or (c) keep drafted until T-GPLR-08's probe results inform
-whether the tier is worth the policy change.
-Depends on: T-GPLR-08 (reuses its range walker and telemetry plumbing; its
-feed-rate baseline is the comparison point)
-Commit: pending (no commit authorized)
+Status: PARKED (owner decision 2026-09-09, recorded in docs/currentstate.md
+the same day). Do not plan or implement this task without an explicit
+reopen trigger below. History: drafted alongside T-GPLR-08 (planner review
+2026-09-09, initially HELD); T-GPLR-08 then ran and FALSIFIED its gate (see
+its status note), which supplies the second key below.
+
+Rationale -- a two-key door: the tier opens only if BOTH keys turn.
+- Key 1 (policy): the <host>\<user> token has NO SeLockMemoryPrivilege
+  and SeIncreaseWorkingSetPrivilege is disabled (probed 2026-09-09), so the
+  contract's primary path (SetProcessWorkingSetSize raise + VirtualLock)
+  cannot execute on this machine as configured -- the acceptance gates
+  (wall <= 110 s) are unreachable without a Local Security Policy change,
+  an owner-level environment change outside the implementer lane.
+- Key 2 (premise): T-GPLR-08's falsified probe (2026-09-09) showed the
+  working-set mechanism this tier relies on does not transfer to the
+  rolling stage -- hinted prefetch populated pages 39/39 yet the
+  fault-driven feed did not move, and the Sep 7 warm-cache leg already
+  showed standby residency adds nothing to PP. A locked private copy
+  additionally inverts the design's own tradeoff: dirty private pages trim
+  to the pagefile under pressure (up to ~18 GB pagefile traffic), strictly
+  worse than today's file-backed standby behavior.
+
+Reopen triggers (any ONE reopens planning; owner-initiated, recorded here):
+1. SeLockMemoryPrivilege is granted to the token AND a fault-count
+   attribution probe (working-set query before/after prefetch; the open
+   T-GPLR-08 attribution question) shows staging is fault-bound with
+   trimming -- not memcpy-bandwidth-bound.
+2. The primary workload moves to host-memory-tight conditions where the
+   file-backed/standby path demonstrably thrashes (recorded hard-fault/
+   RSS evidence per run, not inference).
+3. Target hardware/OS changes so the privilege arrives by default (fresh
+   provisioned box, admin-by-default account).
+
+While parked: the 15% admission rule below is retained as design evidence,
+not a commitment. TG batch-verify staging already sits at the RAM-speed
+floor (see currentstate), so a resurrected tier could only ever target PP.
+Depends on: T-GPLR-08 plumbing (range walker, telemetry) for any
+resurrection; its falsified gate is also the attribution evidence the
+reopen decision needs.
+Commit: none (docs-only decision; no code was ever written)
 
 Goal
 : When the pageable bank set fits in host RAM under the admission rule, load
@@ -1341,8 +1371,7 @@ gplr10-dense-ref/-ho, gplr10-qa512-ho, gplr10-attrib (+
 gpu-mem-poll-attrib.csv), gplr10-evictfix-{moe,dense}.
 Depends on: T-GPLR-05 (merge-resident adapter machinery); T-GPLR-07 (answer
 gate for the parity runs). Independent of T-GPLR-08/09 (different flags and
-machinery); serializes in either order with the ready T-GPLR-08
-Commit: pending (no commit authorized)
+machinery); serializes in either order with T-GPLR-08 (closed 2026-09-09).
 
 Goal
 : After layer-residency PP (expert banks paged through the slot window),
@@ -1497,7 +1526,7 @@ aggregate PASS with the negative control failing as designed. Plan header
 consolidation deferred to the T-GPLR-10 close-out to avoid concurrent
 header edits across sessions.
 Depends on: none (defect repair on the existing batch-major prebuild)
-Commit: pending (no commit authorized)
+Commit: closed 2026-09-09 -- vendored code through third_party/llama.cpp 099a27a7e; outer docs/tools through 84be194 (follow-up 7bfe83b).
 
 Background / defect record
 : docs/currentstate.md ("Known gaps"): a batch-major PP whose token count is
