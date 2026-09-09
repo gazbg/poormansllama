@@ -111,8 +111,32 @@ For a failure:
 2. Classify it as task-owned, environment, test-expectation, or unrelated.
 3. Trace the owning code path and make the smallest repair.
 4. Rerun the same focused validation first.
+5. If the failure resists steps 2-4, treat it as a problem and follow
+"Problems and Online Help" below before improvising a repair.
 
 Do not broaden a task across an SDD or plan boundary without returning it to the Planner.
+
+## Problems and Online Help
+
+A problem is a failure the loop above cannot resolve -- an error that will
+not classify, an unfamiliar API or toolchain failure, platform behavior that
+contradicts `docs/AGENT_ENVIRONMENT.md`. For such a problem, consult
+authoritative online sources before improvising:
+
+- Prefer primary sources over forum answers: vendor documentation
+	(Microsoft Win32, CUDA, CMake), upstream llama.cpp code, issues, and
+	PRs, and official library references.
+- Verify every online claim against the local tree before acting on it;
+	the vendored sources, recorded environment facts, and the active task
+	contract outrank any web page.
+- Never post private material (model paths, telemetry, host names,
+	internal docs) to public sites; search with generic terms instead.
+- Time-box the lookup. Record what was consulted and what it changed in
+	the task notes or `docs/currentstate.md`.
+- An online answer that requires a new dependency goes through the owner
+	approval gate like any other dependency change.
+- A problem that survives a documented online pass escalates to the owner
+	under the task's escalation condition; it is never resolved by guessing.
 
 ## Layer-Residency Invariants
 
@@ -137,6 +161,31 @@ Run the narrowest meaningful validation first:
 5. Run a larger real-model trace only when the task contract requires it.
 
 For CUDA/runtime work, use the project CMake build and CTest targets defined by the active plan. Do not substitute unrelated `make`, DeepSeek V4, or upstream CI commands. Run the Qwen reference regression before claiming that genericization preserved existing behavior.
+
+### Semantic-QA answer gate (T-GPLR-07)
+
+Runner changes that touch the layer-streaming experimental
+path (or anything that can alter generated output) are validated with the
+semantic-QA ladder in addition to the checks above:
+
+- Smoke tier = 50/512-token runs on the 512-token anchor prompt (the
+	default `qa-smoke` gate runs 512 only; 50 is opt-in via `-SmokeLengths
+	50`; `tools/semantic-qa/gen-needle-prompt.py`, checker
+	`tools/semantic-qa/check-answer.py`). All rungs must report check-telemetry
+	OK and aggregate checker PASS, including the negative control failing as
+	designed. Ladder series: 50/512/4k/24k/50k/100k/200k; 4k+ lengths are
+	owner-invoked manual runs, never part of the suite.
+- The strict acceptance gate is programmatic grading only: normalized
+	substring/regex verdicts plus the must-fail negative control. Never bit,
+	byte, hash, or first-token identity, and never an LLM judge.
+- Ladder lengths (24k, 50k, 100k, 200k) are never run as a batch or on
+	automotion; the owner invokes one length at a time as an explicit
+	GPU-mutex acceptance run.
+- The ladder promises answer stability, never token-ID stability. Do not
+	repair a rung by demanding exact ID agreement.
+- Full commands, flags, and expected results are in the T-GPLR-07 task
+	contract in `docs/plans/generic-prefill-layer-residency-plan.md`; record
+	results in `docs/currentstate.md`.
 
 ## Shared GPU Coordination
 
