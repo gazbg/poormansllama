@@ -29,7 +29,11 @@ T-GPLR-13 close-out; the paired 512 A/B found pinned only RELOCATES the
 staging copy — submit 1,918 -> 927 us, ready-wait 110 -> 1,058 us, per-fetch
 transfer flat and inside the within-arm repeat spread — while costing ~1.8 GiB
 more pinned host memory, so F1 is dead on this hardware; table and verdict in
-currentstate 2026-09-13). T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
+currentstate 2026-09-13). T-GPLR-19 (F2-M1 per-layer row residency at K=1)
+DRAFTED 2026-09-13 from the T-GPLR-13 close-out's F2 item and the T-GPLR-15
+gate reading; it is NOT ready and awaits an owner call, and the T-GPLR-16
+MIN_BATCH=1 revert stays the only already-authorized implementation item.
+T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
 (2026-09-12, owner gate (b) decision): in-progress implementation
 parked; MIN_BATCH=1 disposition = option (a) revert; options (b)/(c)
 unprioritized.
@@ -146,7 +150,10 @@ MIN_BATCH=1 revert (option (a)), which currentstate schedules "alongside or
 after T-GPLR-13" -- and T-GPLR-13 closed 2026-09-13, so that revert is now
 due; it is vendored-tree work carrying the known pre-fix partial-TG step-1
 gold flip, whose QA-gate failure the owner accepted. Anything beyond it needs
-a new drafted task and an owner call. Implementation stays one task at a
+a new drafted task and an owner call. That draft now exists: T-GPLR-19
+(F2-M1 per-layer row residency at K=1) is DRAFTED 2026-09-13 with a
+pre-registered prediction and a four-arm A/B gate, and it neither displaces
+the revert nor changes what is ready. Implementation stays one task at a
 time. [CORRECTED 2026-09-13: this line read "the only READY task is
 T-GPLR-17 (two-process hybrid bridge), which the owner has not selected",
 naming a rejected task as the only ready one -- a claim this thread
@@ -2767,3 +2774,227 @@ Escalate before implementation if
   reactive row-set as-is); or the change cannot avoid touching the shared
   pinned path in a way that risks the dense fixture (then stop rather than
   fork the mechanism).
+
+---
+
+### T-GPLR-19: F2-M1 — per-layer row residency at K=1 (retain the previous window across tokens)
+
+Status: DRAFT (2026-09-13, drafted on owner request from the T-GPLR-13
+close-out's F2 item and the T-GPLR-15 gate reading). NOT READY and not
+selected: nothing is implemented, no GPU run has been made, and the T-GPLR-16
+MIN_BATCH=1 revert remains the only already-authorized implementation item
+(this task does not displace it). Depends on: T-GPLR-13 (DONE — the reactive
+row-set path this task changes); T-GPLR-14 (instrument, closed — it measures
+this task's bytes); the SDD section 4 moe-row-cache treatment (written
+2026-09-13, owner-directed); T-GPLR-15 (DONE-falsified-by-evidence — supplies
+the (b) statistic the prediction rests on, at the retention band the owner
+already approved). Commit: none.
+
+Goal
+: Make a layer's routed expert rows persist ACROSS tokens in per-layer
+  storage, so each token stages only the complement of what is already
+  resident and the TG staging cost falls by the fraction statistic (b) already
+  measures. At K=1 (retain the immediately preceding window) the recorded
+  probe predicts TG 11.578 -> 15.30 tok/s with routing unchanged.
+
+Known evidence
+: - Measured baseline (the one 256-token batch-major probe,
+    `build/llama-cuda/gplr15-phaseA-probe/`): staging is 78.8% of token time
+    (68.03 ms of 86.37 ms/token over 40 layers) at 14,317,978 B per fetch over
+    10,240 fetches (8.00 rows each), 1,700.7 us mean transfer = 8.419 GB/s
+    effective against the 13.7 GB/s link ceiling; wall TG 11.578 tok/s; peak
+    5,723.56 MiB; 0 refusals; `--check-telemetry` OK.
+  - Statistic (b) at K=1 is 0.308848 over the recorded 10,200 pairs, so the
+    complement is 69.12% of the staged bytes (395,835,932 B of 572,719,104 B
+    per token, saving 176,883,172 B). The saving is therefore not a prediction
+    about routing: it is the same statistic the gate was read at, at the
+    retention the owner already approved (SDD section 4 reference band,
+    K=1-2).
+  - The reuse MECHANISM already exists and is deliberately defeated.
+    `load_row_set` computes `fetch` = the union minus whatever
+    `row_set_have[slot]` marks resident, but coverage lives with the SLOT, and
+    a bounded window serves several layers per token (`il % n_slots`), so the
+    code resets coverage whenever another layer takes the slot — otherwise
+    "layer il + n_slots would execute layer il's rows". Recorded runs report
+    `rows_reused = 0` at 4 slots. This task is a PLACEMENT change (residency
+    keyed by logical layer), not new prediction machinery.
+  - The published projection's linearity assumption has free support over a
+    15% range: the 3 q6_K layers stage 16,318,464 B (+15.28%) and measure
+    1,871.5 us against 1,686.8 us (+10.95%), implying a fixed per-call
+    intercept of -73 us on a 1,687 us fetch — no material fixed cost. But the
+    F2 regime is ~3x smaller fetches, i.e. 3x outside the measured range,
+    which is why criterion 3 below is built to fail loudly.
+
+Unknowns
+: - Whether time tracks bytes 3x outside the calibrated range. This is the
+    decisive unknown and the reason the task is worth running even if the
+    speedup disappoints.
+  - Whether a per-layer cache can be keyed correctly without disturbing the
+    shared slot/pinned path that the dense CTest fixture exercises.
+  - Whether the (b) this prediction rests on is itself inflated by the probe's
+    self-echoing anchor. It can only be (repetition raises temporal reuse), so
+    15.30 is an UPPER bound on the measured-rate reading, never a lower one.
+
+Scope
+: - A new residency class per SDD section 4 ("moe-row-cache package (per-layer
+    persistent rows)", amended 2026-09-13): per-layer resident row storage of
+    capacity `min(n_expert, K*W*top_k)` rows, with K=1, W=1 in this task
+    (8 rows per layer).
+  - Residency keyed by LOGICAL LAYER and persisting across tokens; the
+    per-slot coverage reset must not gate the cache path (the default reactive
+    path keeps its existing reset semantics unchanged).
+  - Fetch = the complement of the retained set, where the retained set is the
+    union of the last K windows (K=1: the previous window). Capacity is tight
+    by construction — a one-window union is at most 8 rows.
+  - Atomic per-window ready/retire with the existing generation guard; the
+    layer graph still consumes only after the matching copy event completes.
+  - New counters for cross-token reuse (`rows_resident_cross_token`) and
+    window-age retirement, so the runtime cache can be compared field by field
+    against the analyzer's offline retention simulation, which is the shared
+    semantics both must implement.
+  - New opt-in, default-off flag (working name `--residency-tg-retain N`),
+    rejected with `--residency off` through the existing conflict table.
+  - New driver `tools/run-gplr19-rowcache-ab.ps1`: four arms A/B/A/B inside ONE
+    acquisition of `Global\AI-GPU-EXCLUSIVE-v1`, poller attached, checker per
+    trace.
+
+Non-goals
+: - K > 1 in this task. That is a follow-on rung and it needs the non-echoing
+    re-probe FIRST, because the (b) it would rest on is echo-inflated. W > 1
+    (the telemetry validator enforces `window_tokens == 1` today).
+  - Any prediction, prefetch, or MTP involvement; any eviction policy other
+    than window age.
+  - Changing routing, expert IDs, quantization bytes, or any arithmetic —
+    cache residency must never alter the router's exact output.
+  - Any change to normal llama.cpp execution or to `--residency off`.
+  - Compressing, repacking, or re-quantizing expert bytes to shrink the fetch.
+  - A claim that this closes the fits-regime gap: the oracle ceiling is 0.9385
+    and needs 18.33 GB resident, above the ceiling, so F2 cannot reach the
+    closed handoff's 64.63 tok/s.
+
+Design / failure contract
+: The invariants are inherited rather than invented: a layer graph consumes
+  rows only after the matching copy event completes; a slot is reused only
+  after all CUDA consumers of its generation complete; KV and recurrent state
+  stay owned by logical layer; package members become ready and retire
+  atomically; and quantization bytes and tensor semantics are preserved
+  exactly. Cache residency must be invisible to routing — the ids the FFN
+  consumes are the ids the router produced.
+: Failure is loud and structured, never a silent full refetch. A window whose
+  complement cannot be placed, a retained row whose generation moved, or a
+  layer whose resident map disagrees with its own fetch history is a
+  `rowset_refused` with a new reason code and a non-zero exit — because a
+  silent fallback to the full fetch would keep the measured byte saving intact
+  while the mechanism was broken, which is the one failure this task must not
+  be able to hide. Rows are never read from another layer's storage: a
+  mismatch fails rather than executes.
+
+Implementation steps
+: 1. Read the SDD section 4 moe-row-cache treatment and the T-GPLR-13 close-out;
+     confirm the capacity formula and the retirement rule against the
+     analyzer's offline retention simulation, which both sides must implement
+     identically.
+  2. Allocate per-layer row storage (cap x row_bytes x layers = 566.2 MB on the
+     slot basis, 572.7 MB on the measured per-layer basis at K=1) with the same
+     allocator and lifetime rules the slot row buffers already use.
+  3. Key the residency map by logical layer for the cache path; leave the
+     default reactive path's per-slot invalidation untouched.
+  4. Compute the complement against the per-layer map, fetch it through the
+     existing pack/enqueue path, and mark rows resident only when their copies
+     complete.
+  5. Retire rows that fall out of the K-window BEFORE placing new ones, under
+     the generation guard.
+  6. Emit the new counters and extend `--check-telemetry` to validate them,
+     including conservation (resident + fetched - retired = union size) per
+     window.
+  7. Add the A/B driver; do not touch the default path (default-off must stay
+     byte-identical).
+
+Acceptance criteria (falsifiable)
+: 1. Feasibility (must pass): four arms exit 0 with `--check-telemetry` OK;
+    greedy token IDs identical between arms (greedy determinism) and the
+    ordered `layer|union_ids|hash` route stream identical between arms
+    (retention is not routing); the default-off arm byte-identical to the
+    recorded reactive baseline (572,719,104 B/round, 10,240 fetches,
+    `rows_reused = 0`).
+  2. Mechanism gate — decided on BYTES, not time: the K=1 arm's staged bytes
+    per token fall to the predicted complement, 395,835,932 B = 69.12% of
+    baseline, within 2%, and `rows_resident_cross_token` is non-zero on every
+    layer. FAIL (bytes do not fall) closes the task falsified-by-evidence: the
+    mechanism did not do what it claims, and no timing discussion follows.
+  3. Performance (claim only on passing 2), with the prediction PRE-REGISTERED
+    here before any run: TG 15.30 tok/s if the saving converts at the measured
+    8.419 GB/s effective rate, and 13.61 tok/s if it converts at the 13.7 GB/s
+    link ceiling instead. Both are UPPER bounds on the true gain, because the
+    (b) they rest on comes from a stream that echoes its own anchor. A result
+    at or below the direct arm's within-arm spread FALSIFIES the byte-to-time
+    proportionality that the published artifact's View 2 projects — at 3x
+    extrapolation — and priority returns to the owner (accept the reactive
+    path, or fund the non-echoing re-probe) rather than the cache being scaled
+    up.
+  4. Answer gate: qa-smoke 512 PASS with the negative control failing as
+    designed, plus the T-GPLR-07 smoke tier on the 512 anchor through the
+    row-set path, because this changes the staging path that produces output.
+  5. Default-off immunity: `-Suite host` green; the dense pinned CTest fixture
+    still passes (it shares the slot/pinned path this task touches); no change
+    to `--residency off` behaviour.
+  6. Reported, not claimed: cache allocation bytes (cap x row_bytes x layers)
+    and peak VRAM, read against the published artifact's basis caveat (slot
+    basis and measured per-layer rows differ by 1.1%).
+
+Focused validation
+: 1. `cmake --build build/llama-cuda --config Release --target
+     llama-layer-streaming --parallel 16` -> exit 0.
+  2. `powershell -File tools/run-tests.ps1 -Suite host` -> green (the checker
+     grows the new counters and their conservation rule).
+  3. `powershell -File tools/run-gplr19-rowcache-ab.ps1` (new; GPU mutex via
+     tools/with-gpu-lock.ps1; the 512 anchor prompt
+     `build/llama-cuda/gplr13-ladder/512/anchor-512.txt`; arms differ ONLY by
+     the retention flag; vehicle is the T-GPLR-15 probe's batch-major shape,
+     which is the only row-set vehicle with enough TG tokens to measure a
+     staging change — the layer-major schedule caps handoff-free TG at 3 tokens
+     and `--residency-tg` forces handoff to off: `--model <moe gguf>
+     --prompt-file <anchor> --residency moe-expert-bank --residency-tg
+     --pp-schedule batch-major --pp-tokens 512 --ubatch 512 --tg-tokens 256
+     --layer-slots 4 --kv-cache q8 --greedy --no-mtp --pp-no-logits
+     --allow-full-residency --telemetry <trace>`; order A,B,A,B;
+     `tools/gpu-mem-poll.ps1` attached) -> four runs exit 0, four
+     `--check-telemetry` passes.
+  4. `ctest --test-dir build/llama-cuda -C Release -R
+     "layer-streaming-pinned-1024|qwen38-layer-boundary|layer-slot-lifecycle"
+     --output-on-failure` -> all pass (export Q38LS_MODEL_PATH first —
+     tools/run-tests.ps1 reads but does not propagate it to ctest children).
+  5. qa-smoke 512 default-off rung -> answer PASS, negative control FAILS as
+     designed.
+  6. Run `tools/route_overlap/analyze.py` over the four traces and check the
+     offline (b) at K=1 against the runtime reuse accounting on the SAME
+     stream: the pre-registered prediction and the implementation must agree on
+     the same statistic, or one of them is wrong.
+  7. Record per-arm staged bytes, reuse and retirement counters, per-fetch
+     transfer means, wall TG/token, peak VRAM, and the arm-vs-arm spread in the
+     A/B table.
+
+Required state/document updates
+: `docs/currentstate.md` entry with the A/B table, the byte/conversion verdict
+  and the projection cross-reference; plan status flip (DONE,
+  DONE-falsified-by-evidence, or escalated) plus this task's line in the
+  dependency-order summary; the published artifact's View 2
+  (`docs/plots/gplr15-b-vs-k.html`) and its `docs/currentstate.md` record
+  updated with the measured byte-to-time conversion, since View 2 is where
+  that projection is stated — the bottlenecks file contains no projection;
+  `docs/gplr13-bottlenecks-hypotheses.md` section 8 updated with the F2-M1
+  ranking outcome, since its "Ranking consequence" already names F2 as the TG
+  lever once F1 closed. No SDD amendment: the section 4 moe-row-cache
+  treatment already exists (amended 2026-09-13) — record explicitly that no new
+  package type, policy, or placement mechanism is introduced beyond it.
+
+Escalate before implementation if
+: the owner prefers the T-GPLR-16 MIN_BATCH=1 revert first, which is the only
+  already-authorized implementation item and which this task does not displace;
+  or the per-layer cache cannot be keyed correctly without touching the shared
+  slot/pinned path in a way that risks the dense fixture (then stop rather than
+  fork the mechanism); or the owner wants K=2 or higher inside this task (that
+  needs the non-echoing re-probe first, since an echo-inflated (b) makes every
+  predicted gain optimistic); or the vendored work reaches the commit question
+  (the convention for the vendored fork is the owner's call, and the
+  clean-checkout reproducibility gap has already bitten twice this campaign).
