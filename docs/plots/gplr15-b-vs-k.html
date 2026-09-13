@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>T-GPLR-15 gate 9: statistic (b) versus retention K</title>
+<style>
+ body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 0 auto; max-width: 1040px; padding: 28px 20px 60px; color: #1c1c1c; }
+ h1 { font-size: 20px; margin: 0 0 4px; }
+ h2 { font-size: 15px; margin: 28px 0 8px; }
+ p, li { font-size: 14px; line-height: 1.55; }
+ .sub { color: #555; font-size: 13px; margin: 0 0 18px; }
+ table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+ th, td { border: 1px solid #dcdcdc; padding: 4px 10px; text-align: right; }
+ th { background: #f6f8fa; font-weight: 600; }
+ code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
+ .note { background: #f8f9fb; border-left: 3px solid #1f6feb; padding: 10px 14px;
+          font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>T-GPLR-15 gate 9 &mdash; statistic (b) versus retention K</h1>
+<p class="sub">Measured on a real greedy generation stream: trace
+<code>probe-tg256.jsonl</code>, model Qwen3.6-35B-A3B,
+run_id 11634247, 10,200 consecutive-window pairs,
+W=1, top_k=8, n_expert=256.
+Self-contained: no external assets, no scripts.</p>
+
+<svg viewBox="0 0 980 620" width="100%" role="img" aria-label="Statistic (b) versus retention K for the T-GPLR-15 gate">
+<rect x="82.0" y="96" width="39.9" height="356" fill="#eef4ff"/>
+<text x="88.0" y="526" font-size="12" fill="#3a5fa8">SDD s4 reference band (K=1-2)</text>
+<line x1="96" y1="452.0" x2="900" y2="452.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="456.0" font-size="12" fill="#666" text-anchor="end">0.0</text>
+<line x1="96" y1="380.8" x2="900" y2="380.8" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="384.8" font-size="12" fill="#666" text-anchor="end">0.2</text>
+<line x1="96" y1="309.6" x2="900" y2="309.6" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="313.6" font-size="12" fill="#666" text-anchor="end">0.4</text>
+<line x1="96" y1="238.4" x2="900" y2="238.4" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="242.4" font-size="12" fill="#666" text-anchor="end">0.6</text>
+<line x1="96" y1="167.2" x2="900" y2="167.2" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="171.2" font-size="12" fill="#666" text-anchor="end">0.8</text>
+<line x1="96" y1="96.0" x2="900" y2="96.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="100.0" font-size="12" fill="#666" text-anchor="end">1.0</text>
+<text x="26" y="274" font-size="13" fill="#333" transform="rotate(-90 26 274)" text-anchor="middle">statistic (b) - fraction of the next window already resident</text>
+<line x1="96" y1="238.4" x2="900" y2="238.4" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="7 4"/>
+<text x="896" y="230.4" font-size="12" fill="#c0392b" text-anchor="end">gate 9 threshold 0.6</text>
+<line x1="96" y1="117.9" x2="900" y2="117.9" stroke="#7f8c8d" stroke-width="1.2" stroke-dasharray="2 4"/>
+<text x="102" y="109.9" font-size="12" fill="#5d6d6e" text-anchor="start">T8 oracle ceiling (unbounded retention) 0.9385</text>
+<polyline points="96.0,324.6 121.9,309.6 147.9,309.6 173.8,309.6 199.7,309.6 225.7,309.6 251.6,309.6 277.5,309.6 329.4,309.6 381.3,309.6 485.0,309.6 692.5,309.6 900.0,309.6" fill="none" stroke="#2e7d32" stroke-width="1.6"/>
+<circle cx="96.0" cy="324.6" r="2.6" fill="#2e7d32"/>
+<circle cx="121.9" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="147.9" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="173.8" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="199.7" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="225.7" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="251.6" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="277.5" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="329.4" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="381.3" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="485.0" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="692.5" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="900.0" cy="309.6" r="2.6" fill="#2e7d32"/>
+<circle cx="121.9" cy="309.6" r="6.5" fill="none" stroke="#2e7d32" stroke-width="1.8"/>
+<polyline points="96.0,313.5 121.9,300.1 147.9,300.1 173.8,300.1 199.7,300.1 225.7,300.1 251.6,300.1 277.5,300.1 329.4,300.1 381.3,300.1 485.0,300.1 692.5,300.1 900.0,300.1" fill="none" stroke="#00838f" stroke-width="1.6"/>
+<circle cx="96.0" cy="313.5" r="2.6" fill="#00838f"/>
+<circle cx="121.9" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="147.9" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="173.8" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="199.7" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="225.7" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="251.6" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="277.5" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="329.4" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="381.3" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="485.0" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="692.5" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="900.0" cy="300.1" r="2.6" fill="#00838f"/>
+<circle cx="121.9" cy="300.1" r="6.5" fill="none" stroke="#00838f" stroke-width="1.8"/>
+<polyline points="96.0,317.9 121.9,308.5 147.9,308.5 173.8,308.5 199.7,308.5 225.7,308.5 251.6,308.5 277.5,308.5 329.4,308.5 381.3,308.5 485.0,308.5 692.5,308.5 900.0,308.5" fill="none" stroke="#8d6e63" stroke-width="1.6"/>
+<circle cx="96.0" cy="317.9" r="2.6" fill="#8d6e63"/>
+<circle cx="121.9" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="147.9" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="173.8" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="199.7" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="225.7" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="251.6" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="277.5" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="329.4" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="381.3" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="485.0" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="692.5" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="900.0" cy="308.5" r="2.6" fill="#8d6e63"/>
+<circle cx="121.9" cy="308.5" r="6.5" fill="none" stroke="#8d6e63" stroke-width="1.8"/>
+<polyline points="96.0,320.2 121.9,308.5 147.9,308.5 173.8,308.5 199.7,308.5 225.7,308.5 251.6,308.5 277.5,308.5 329.4,308.5 381.3,308.5 485.0,308.5 692.5,308.5 900.0,308.5" fill="none" stroke="#ad1457" stroke-width="1.6"/>
+<circle cx="96.0" cy="320.2" r="2.6" fill="#ad1457"/>
+<circle cx="121.9" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="147.9" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="173.8" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="199.7" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="225.7" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="251.6" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="277.5" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="329.4" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="381.3" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="485.0" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="692.5" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="900.0" cy="308.5" r="2.6" fill="#ad1457"/>
+<circle cx="121.9" cy="308.5" r="6.5" fill="none" stroke="#ad1457" stroke-width="1.8"/>
+<polyline points="96.0,342.1 121.9,297.4 147.9,262.2 173.8,228.3 199.7,209.8 225.7,196.8 251.6,185.6 277.5,175.2 329.4,151.6 381.3,131.3 485.0,118.2 692.5,117.9 900.0,117.9" fill="none" stroke="#1f6feb" stroke-width="2.4"/>
+<circle cx="96.0" cy="342.1" r="4" fill="#1f6feb"/>
+<circle cx="121.9" cy="297.4" r="4" fill="#1f6feb"/>
+<circle cx="147.9" cy="262.2" r="4" fill="#1f6feb"/>
+<circle cx="173.8" cy="228.3" r="4" fill="#1f6feb"/>
+<circle cx="199.7" cy="209.8" r="4" fill="#1f6feb"/>
+<circle cx="225.7" cy="196.8" r="4" fill="#1f6feb"/>
+<circle cx="251.6" cy="185.6" r="4" fill="#1f6feb"/>
+<circle cx="277.5" cy="175.2" r="4" fill="#1f6feb"/>
+<circle cx="329.4" cy="151.6" r="4" fill="#1f6feb"/>
+<circle cx="381.3" cy="131.3" r="4" fill="#1f6feb"/>
+<circle cx="485.0" cy="118.2" r="4" fill="#1f6feb"/>
+<circle cx="692.5" cy="117.9" r="4" fill="#1f6feb"/>
+<circle cx="900.0" cy="117.9" r="4" fill="#1f6feb"/>
+<text x="96.0" y="360.1" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=1: 0.3088</text>
+<text x="121.9" y="285.4" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=2: 0.4343</text>
+<text x="173.8" y="216.3" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=4: 0.6284</text>
+<text x="277.5" y="163.2" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=8: 0.7775</text>
+<text x="485.0" y="106.2" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=16: 0.9376</text>
+<text x="900.0" y="105.9" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=32: 0.9385</text>
+<circle cx="173.8" cy="228.3" r="7.5" fill="none" stroke="#c0392b" stroke-width="1.8"/>
+<text x="173.8" y="262.3" font-size="12" fill="#c0392b" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">K=4 crosses the gate at 2.26 GB</text>
+<line x1="96" y1="452" x2="900" y2="452" stroke="#999" stroke-width="1.2"/>
+<line x1="96.0" y1="452" x2="96.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="96.0" y="472" font-size="12" fill="#333" text-anchor="middle">1</text>
+<line x1="121.9" y1="452" x2="121.9" y2="457" stroke="#999" stroke-width="1"/>
+<text x="121.9" y="472" font-size="12" fill="#333" text-anchor="middle">2</text>
+<line x1="147.9" y1="452" x2="147.9" y2="457" stroke="#999" stroke-width="1"/>
+<text x="147.9" y="472" font-size="12" fill="#333" text-anchor="middle">3</text>
+<line x1="173.8" y1="452" x2="173.8" y2="457" stroke="#999" stroke-width="1"/>
+<text x="173.8" y="472" font-size="12" fill="#333" text-anchor="middle">4</text>
+<line x1="199.7" y1="452" x2="199.7" y2="457" stroke="#999" stroke-width="1"/>
+<text x="199.7" y="472" font-size="12" fill="#333" text-anchor="middle">5</text>
+<line x1="225.7" y1="452" x2="225.7" y2="457" stroke="#999" stroke-width="1"/>
+<text x="225.7" y="472" font-size="12" fill="#333" text-anchor="middle">6</text>
+<line x1="251.6" y1="452" x2="251.6" y2="457" stroke="#999" stroke-width="1"/>
+<text x="251.6" y="472" font-size="12" fill="#333" text-anchor="middle">7</text>
+<line x1="277.5" y1="452" x2="277.5" y2="457" stroke="#999" stroke-width="1"/>
+<text x="277.5" y="472" font-size="12" fill="#333" text-anchor="middle">8</text>
+<line x1="329.4" y1="452" x2="329.4" y2="457" stroke="#999" stroke-width="1"/>
+<text x="329.4" y="472" font-size="12" fill="#333" text-anchor="middle">10</text>
+<line x1="381.3" y1="452" x2="381.3" y2="457" stroke="#999" stroke-width="1"/>
+<text x="381.3" y="472" font-size="12" fill="#333" text-anchor="middle">12</text>
+<line x1="485.0" y1="452" x2="485.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="485.0" y="472" font-size="12" fill="#333" text-anchor="middle">16</text>
+<line x1="692.5" y1="452" x2="692.5" y2="457" stroke="#999" stroke-width="1"/>
+<text x="692.5" y="472" font-size="12" fill="#333" text-anchor="middle">24</text>
+<line x1="900.0" y1="452" x2="900.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="900.0" y="472" font-size="12" fill="#333" text-anchor="middle">32</text>
+<text x="498" y="494" font-size="13" fill="#333" text-anchor="middle">K = retention depth in token windows (rows per layer = min(256, K*W*8), W=1)</text>
+<line x1="96" y1="96" x2="900" y2="96" stroke="#999" stroke-width="1.2"/>
+<line x1="96.0" y1="96" x2="96.0" y2="91" stroke="#999" stroke-width="1"/>
+<text x="96.0" y="86" font-size="12" fill="#333" text-anchor="middle">0.57 GB</text>
+<line x1="173.8" y1="96" x2="173.8" y2="91" stroke="#999" stroke-width="1"/>
+<text x="173.8" y="86" font-size="12" fill="#333" text-anchor="middle">2.26 GB</text>
+<line x1="277.5" y1="96" x2="277.5" y2="91" stroke="#999" stroke-width="1"/>
+<text x="277.5" y="86" font-size="12" fill="#333" text-anchor="middle">4.53 GB</text>
+<line x1="485.0" y1="96" x2="485.0" y2="91" stroke="#999" stroke-width="1"/>
+<text x="485.0" y="86" font-size="12" fill="#333" text-anchor="middle">9.06 GB</text>
+<line x1="900.0" y1="96" x2="900.0" y2="91" stroke="#999" stroke-width="1"/>
+<text x="900.0" y="86" font-size="12" fill="#333" text-anchor="middle">18.12 GB</text>
+<text x="498" y="64" font-size="13" fill="#333" text-anchor="middle">VRAM this K costs over 40 MoE layers (rows x 1,769,472 B per row, the model slot accounting)</text>
+<line x1="102" y1="380.0500980392157" x2="118" y2="380.0500980392157" stroke="#2e7d32" stroke-width="3"/>
+<line x1="124" y1="380.0500980392157" x2="140" y2="380.0500980392157" stroke="#00838f" stroke-width="3"/>
+<line x1="146" y1="380.0500980392157" x2="162" y2="380.0500980392157" stroke="#8d6e63" stroke-width="3"/>
+<line x1="168" y1="380.0500980392157" x2="184" y2="380.0500980392157" stroke="#ad1457" stroke-width="3"/>
+<text x="196" y="384.0500980392157" font-size="12" fill="#333">the 4 ladder rungs (3-window streams, 80 pairs each), ringed where they saturate</text>
+<text x="102" y="402.1" font-size="12" fill="#333">structural, not routing: 3 windows per layer leaves only 2 predecessor windows, so a K=2 cache (min(256, 2*W*8) = 16 rows)</text>
+<text x="102" y="420.1" font-size="12" fill="#333">already holds every row the oracle could; the probe stream has 256 windows per layer and saturates only at K=24</text>
+</svg>
+
+<h2>How to read K</h2>
+<div class="note">
+K is the per-layer cache's retention <strong>depth in token windows</strong> &mdash; not bytes
+and not a count of experts. A K-window cache holds
+<code>min(n_expert, K*W*top_k)</code> expert rows per layer
+(here W=1, top_k=8, n_expert=256), and one row is
+that expert's gate+up+down slabs (1,769,472 B). The VRAM axis at the top therefore
+<em>follows</em> from K rather than being a separate choice. Statistic (b) is defined
+<strong>at</strong> a K, so a gate reading is complete only when the K it was read at is named:
+reading it at K=1&ndash;2 (the SDD section 4 reference band, shaded) <strong>fails</strong>
+the 0.6 gate, while the curve only crosses 0.6 later, at a VRAM cost the chart prices.
+<br><strong>Basis caveat.</strong> The 1,769,472 B row size is the model's slot accounting (<code>slot_bytes / n_expert</code>) and it is not uniform: 3 of the 40 layers measured stage 2,039,808 B per row against 1,769,472 B for the other 37. So the true footprint at each K is 1.1% above the axis figures — at K=32 the axis reads 18.12 GB against 18.33 GB from the measured per-layer rows (the run's own full-bank figure is 18,327,011,328 B). The axis is left on the slot basis because that is the basis the SDD section 4 band and the T-GPLR-15 retention records are written in.
+</div>
+
+<h2>Reading this curve</h2>
+<ul>
+ <li>The shaded band is the SDD section 4 reference retention: a one-to-two window
+     cache, the only sizing the spec itself declares.</li>
+ <li>The solid blue curve is statistic (b) as measured
+     (10,200 pairs); each marker is a reported K.</li>
+ <li>The thin coloured series are the <strong>4 ladder rungs</strong> overlaid
+     &mdash; 3-window streams, 80 pairs each. Each is
+     ringed at its structural saturation depth K=2 and flat from there on: past that depth
+     the stream has no older window left, so nothing about the gate can be learned there.</li>
+ <li>The red dashed line is the 0.6 gate. The curve crosses it above the reference
+     band, so the verdict depends on which K an adopting task declares &mdash; the
+     reason this was escalated to the owner and closed at the band.</li>
+ <li>The grey dotted line is the T8 oracle ceiling, 0.9385: statistic (b)
+     under <em>unbounded</em> retention, i.e. the whole expert bank resident, which is
+     the outcome the row-set policy exists to avoid. No cache policy of any size can
+     exceed it. The reported K=24 already saturates it.</li>
+</ul>
+
+<h2>Full measured values (view 1)</h2>
+<table><tr><th>K</th><th>rows/layer</th><th>VRAM (GB)</th><th>statistic (b)</th><th>vs gate 0.6</th></tr>
+<tr><td>1</td><td>8</td><td>0.57</td><td>0.3088</td><td>fails</td></tr>
+<tr><td>2</td><td>16</td><td>1.13</td><td>0.4343</td><td>fails</td></tr>
+<tr><td>3</td><td>24</td><td>1.70</td><td>0.5330</td><td>fails</td></tr>
+<tr><td>4</td><td>32</td><td>2.26</td><td>0.6284</td><td>passes</td></tr>
+<tr><td>5</td><td>40</td><td>2.83</td><td>0.6803</td><td>passes</td></tr>
+<tr><td>6</td><td>48</td><td>3.40</td><td>0.7169</td><td>passes</td></tr>
+<tr><td>7</td><td>56</td><td>3.96</td><td>0.7483</td><td>passes</td></tr>
+<tr><td>8</td><td>64</td><td>4.53</td><td>0.7775</td><td>passes</td></tr>
+<tr><td>10</td><td>80</td><td>5.66</td><td>0.8438</td><td>passes</td></tr>
+<tr><td>12</td><td>96</td><td>6.79</td><td>0.9007</td><td>passes</td></tr>
+<tr><td>16</td><td>128</td><td>9.06</td><td>0.9376</td><td>passes</td></tr>
+<tr><td>24</td><td>192</td><td>13.59</td><td>0.9385</td><td>passes</td></tr>
+<tr><td>32</td><td>256</td><td>18.12</td><td>0.9385</td><td>passes</td></tr></table>
+
+<h2>Why the ladder rungs saturate at K=2</h2>
+<p class="sub">A stream of 3 windows per layer has only
+2 predecessor windows, so a cache of depth
+K &ge; 2 already holds that stream's <em>entire</em> history: there is
+nothing older left to retain, and (b) must equal the oracle. Capacity cannot bind first
+either &mdash; a K=2 cache holds
+min(256, 2*W*8) = 16 rows per
+layer, and any union of 2 8-row windows holds at most that many &mdash; so
+the equality is arithmetic, not a property of the routing process.</p>
+<p class="sub">That is why the rung series are flat from K=2 on, and why these samples
+cannot inform the 0.6 threshold: they saturate at a depth set by <em>how much history the
+trace contains</em>, not by how predictable the routing is. The probe stream carries
+256 windows per layer and saturates only at
+K=24 &mdash; the two depths differ by construction, and that difference
+measures stream length, not routing.</p>
+<table><tr><th>rung</th><th>windows/layer</th><th>pairs</th><th>(b) at K=1</th>
+<th>(b) at K=2</th><th>oracle</th><th>structural K</th><th>reported K</th>
+<th>equal?</th></tr>
+<tr><td style="text-align:left"><span style="color:#2e7d32">&#9679;</span> 200k</td><td>3</td><td>80</td><td>0.3578</td><td>0.4000</td><td>0.4000</td><td>2</td><td>2</td><td>yes</td></tr><tr><td style="text-align:left"><span style="color:#00838f">&#9679;</span> 4k</td><td>3</td><td>80</td><td>0.3891</td><td>0.4266</td><td>0.4266</td><td>2</td><td>2</td><td>yes</td></tr><tr><td style="text-align:left"><span style="color:#8d6e63">&#9679;</span> 50</td><td>3</td><td>80</td><td>0.3766</td><td>0.4031</td><td>0.4031</td><td>2</td><td>2</td><td>yes</td></tr><tr><td style="text-align:left"><span style="color:#ad1457">&#9679;</span> 512</td><td>3</td><td>80</td><td>0.3703</td><td>0.4031</td><td>0.4031</td><td>2</td><td>2</td><td>yes</td></tr></table>
+<div class="note"><strong>Checked, not asserted.</strong> On all 4 rungs the reported (b) at every K &ge; 2 equals that rung's oracle exactly, which is what the argument predicts. The overlay is drawn because that check passes.</div>
+
+
+<h2>View 2: what this retention is worth in wall-clock terms</h2>
+<p class="sub">Statistic (b) is the fraction of the next window's rows a cache would
+already hold, so it removes <code>(b) x bytes staged per token</code> from the link. The
+basis is <em>measured from the trace</em>, not assumed: 14,317,978 B per
+fetch over 10,240 fetches (8.00 rows each), mean
+transfer 1,701 us &mdash; 8.42 GB/s
+effective, against the 13.7 GB/s link ceiling. Staging is
+78.8% of token time (68.0 ms of
+86.4 ms/token over 40 layers), leaving a
+18.3 ms/token floor that this lever cannot touch.</p>
+
+<svg viewBox="0 0 980 620" width="100%" role="img" aria-label="Projected TG tokens per second against retention K">
+<rect x="82.0" y="96" width="39.9" height="356" fill="#eef4ff"/>
+<text x="88.0" y="526" font-size="12" fill="#3a5fa8">SDD s4 reference band (K=1-2)</text>
+<line x1="96" y1="452.0" x2="900" y2="452.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="456.0" font-size="12" fill="#666" text-anchor="end">0</text>
+<line x1="96" y1="380.8" x2="900" y2="380.8" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="384.8" font-size="12" fill="#666" text-anchor="end">12</text>
+<line x1="96" y1="309.6" x2="900" y2="309.6" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="313.6" font-size="12" fill="#666" text-anchor="end">25</text>
+<line x1="96" y1="238.4" x2="900" y2="238.4" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="242.4" font-size="12" fill="#666" text-anchor="end">37</text>
+<line x1="96" y1="167.2" x2="900" y2="167.2" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="171.2" font-size="12" fill="#666" text-anchor="end">50</text>
+<line x1="96" y1="96.0" x2="900" y2="96.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="84" y="100.0" font-size="12" fill="#666" text-anchor="end">62</text>
+<text x="26" y="274" font-size="13" fill="#333" transform="rotate(-90 26 274)" text-anchor="middle">projected TG tok/s (projection, not a measured speedup)</text>
+<line x1="96" y1="385.7" x2="900" y2="385.7" stroke="#555" stroke-width="1.6" stroke-dasharray="7 4"/>
+<text x="102" y="401.7" font-size="12" fill="#333">measured reactive row-set TG: 11.578 tok/s</text>
+<line x1="96" y1="139.7" x2="900" y2="139.7" stroke="#8e44ad" stroke-width="1.2" stroke-dasharray="2 4"/>
+<text x="896" y="131.7" font-size="12" fill="#8e44ad" text-anchor="end">all staging removed: 54.5 tok/s (18.3 ms/token floor)</text>
+<polyline points="96.0,374.0 121.9,368.0 147.9,362.6 173.8,356.7 199.7,353.1 225.7,350.4 251.6,348.0 277.5,345.7 329.4,339.9 381.3,334.4 485.0,330.6 692.5,330.5 900.0,330.5" fill="none" stroke="#1f6feb" stroke-width="2.4"/>
+<circle cx="96.0" cy="374.0" r="4" fill="#1f6feb"/>
+<circle cx="121.9" cy="368.0" r="4" fill="#1f6feb"/>
+<circle cx="147.9" cy="362.6" r="4" fill="#1f6feb"/>
+<circle cx="173.8" cy="356.7" r="4" fill="#1f6feb"/>
+<circle cx="199.7" cy="353.1" r="4" fill="#1f6feb"/>
+<circle cx="225.7" cy="350.4" r="4" fill="#1f6feb"/>
+<circle cx="251.6" cy="348.0" r="4" fill="#1f6feb"/>
+<circle cx="277.5" cy="345.7" r="4" fill="#1f6feb"/>
+<circle cx="329.4" cy="339.9" r="4" fill="#1f6feb"/>
+<circle cx="381.3" cy="334.4" r="4" fill="#1f6feb"/>
+<circle cx="485.0" cy="330.6" r="4" fill="#1f6feb"/>
+<circle cx="692.5" cy="330.5" r="4" fill="#1f6feb"/>
+<circle cx="900.0" cy="330.5" r="4" fill="#1f6feb"/>
+<text x="102" y="108" font-size="12" fill="#1f6feb">at the 13.7 GB/s link ceiling</text>
+<polyline points="96.0,364.4 121.9,351.2 147.9,337.7 173.8,320.7 199.7,309.1 225.7,299.7 251.6,290.5 277.5,280.9 329.4,254.3 381.3,223.8 485.0,198.4 692.5,197.7 900.0,197.7" fill="none" stroke="#e07b39" stroke-width="2.4"/>
+<circle cx="96.0" cy="364.4" r="4" fill="#e07b39"/>
+<circle cx="121.9" cy="351.2" r="4" fill="#e07b39"/>
+<circle cx="147.9" cy="337.7" r="4" fill="#e07b39"/>
+<circle cx="173.8" cy="320.7" r="4" fill="#e07b39"/>
+<circle cx="199.7" cy="309.1" r="4" fill="#e07b39"/>
+<circle cx="225.7" cy="299.7" r="4" fill="#e07b39"/>
+<circle cx="251.6" cy="290.5" r="4" fill="#e07b39"/>
+<circle cx="277.5" cy="280.9" r="4" fill="#e07b39"/>
+<circle cx="329.4" cy="254.3" r="4" fill="#e07b39"/>
+<circle cx="381.3" cy="223.8" r="4" fill="#e07b39"/>
+<circle cx="485.0" cy="198.4" r="4" fill="#e07b39"/>
+<circle cx="692.5" cy="197.7" r="4" fill="#e07b39"/>
+<circle cx="900.0" cy="197.7" r="4" fill="#e07b39"/>
+<text x="102" y="122" font-size="12" fill="#e07b39">at the 8.42 GB/s effective per-fetch rate</text>
+<text x="173.8" y="345.7" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">16.6</text>
+<text x="277.5" y="334.7" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">18.6</text>
+<text x="900.0" y="319.5" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">21.2</text>
+<text x="96.0" y="353.4" font-size="12" fill="#e07b39" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">15.3</text>
+<text x="900.0" y="186.7" font-size="12" fill="#e07b39" text-anchor="end" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">44.4</text>
+<line x1="96" y1="452" x2="900" y2="452" stroke="#999" stroke-width="1.2"/>
+<line x1="96.0" y1="452" x2="96.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="96.0" y="472" font-size="12" fill="#333" text-anchor="middle">1</text>
+<line x1="121.9" y1="452" x2="121.9" y2="457" stroke="#999" stroke-width="1"/>
+<text x="121.9" y="472" font-size="12" fill="#333" text-anchor="middle">2</text>
+<line x1="147.9" y1="452" x2="147.9" y2="457" stroke="#999" stroke-width="1"/>
+<text x="147.9" y="472" font-size="12" fill="#333" text-anchor="middle">3</text>
+<line x1="173.8" y1="452" x2="173.8" y2="457" stroke="#999" stroke-width="1"/>
+<text x="173.8" y="472" font-size="12" fill="#333" text-anchor="middle">4</text>
+<line x1="199.7" y1="452" x2="199.7" y2="457" stroke="#999" stroke-width="1"/>
+<text x="199.7" y="472" font-size="12" fill="#333" text-anchor="middle">5</text>
+<line x1="225.7" y1="452" x2="225.7" y2="457" stroke="#999" stroke-width="1"/>
+<text x="225.7" y="472" font-size="12" fill="#333" text-anchor="middle">6</text>
+<line x1="251.6" y1="452" x2="251.6" y2="457" stroke="#999" stroke-width="1"/>
+<text x="251.6" y="472" font-size="12" fill="#333" text-anchor="middle">7</text>
+<line x1="277.5" y1="452" x2="277.5" y2="457" stroke="#999" stroke-width="1"/>
+<text x="277.5" y="472" font-size="12" fill="#333" text-anchor="middle">8</text>
+<line x1="329.4" y1="452" x2="329.4" y2="457" stroke="#999" stroke-width="1"/>
+<text x="329.4" y="472" font-size="12" fill="#333" text-anchor="middle">10</text>
+<line x1="381.3" y1="452" x2="381.3" y2="457" stroke="#999" stroke-width="1"/>
+<text x="381.3" y="472" font-size="12" fill="#333" text-anchor="middle">12</text>
+<line x1="485.0" y1="452" x2="485.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="485.0" y="472" font-size="12" fill="#333" text-anchor="middle">16</text>
+<line x1="692.5" y1="452" x2="692.5" y2="457" stroke="#999" stroke-width="1"/>
+<text x="692.5" y="472" font-size="12" fill="#333" text-anchor="middle">24</text>
+<line x1="900.0" y1="452" x2="900.0" y2="457" stroke="#999" stroke-width="1"/>
+<text x="900.0" y="472" font-size="12" fill="#333" text-anchor="middle">32</text>
+<text x="498" y="494" font-size="13" fill="#333" text-anchor="middle">K = retention depth in token windows</text>
+</svg>
+
+<h2>Projected values</h2>
+<table><tr><th>K</th><th>rows/layer</th><th>VRAM (GB)</th><th>statistic (b)</th><th>bytes saved/token (MB)</th><th>ms saved @ 13.7 GB/s</th><th>tok/s @ 13.7 GB/s</th><th>ms saved @ 8.42 GB/s</th><th>tok/s @ 8.42 GB/s</th></tr>
+<tr><td>1</td><td>8</td><td>0.57</td><td>0.3088</td><td>176.9</td><td>12.91</td><td>13.61</td><td>21.01</td><td>15.30</td></tr>
+<tr><td>2</td><td>16</td><td>1.13</td><td>0.4343</td><td>248.7</td><td>18.15</td><td>14.66</td><td>29.54</td><td>17.60</td></tr>
+<tr><td>3</td><td>24</td><td>1.70</td><td>0.5330</td><td>305.3</td><td>22.28</td><td>15.60</td><td>36.26</td><td>19.96</td></tr>
+<tr><td>4</td><td>32</td><td>2.26</td><td>0.6284</td><td>359.9</td><td>26.27</td><td>16.64</td><td>42.75</td><td>22.92</td></tr>
+<tr><td>5</td><td>40</td><td>2.83</td><td>0.6803</td><td>389.6</td><td>28.44</td><td>17.26</td><td>46.28</td><td>24.94</td></tr>
+<tr><td>6</td><td>48</td><td>3.40</td><td>0.7169</td><td>410.6</td><td>29.97</td><td>17.73</td><td>48.77</td><td>26.59</td></tr>
+<tr><td>7</td><td>56</td><td>3.96</td><td>0.7483</td><td>428.6</td><td>31.28</td><td>18.15</td><td>50.91</td><td>28.20</td></tr>
+<tr><td>8</td><td>64</td><td>4.53</td><td>0.7775</td><td>445.3</td><td>32.50</td><td>18.56</td><td>52.89</td><td>29.87</td></tr>
+<tr><td>10</td><td>80</td><td>5.66</td><td>0.8438</td><td>483.3</td><td>35.27</td><td>19.57</td><td>57.40</td><td>34.52</td></tr>
+<tr><td>12</td><td>96</td><td>6.79</td><td>0.9007</td><td>515.9</td><td>37.65</td><td>20.53</td><td>61.27</td><td>39.84</td></tr>
+<tr><td>16</td><td>128</td><td>9.06</td><td>0.9376</td><td>537.0</td><td>39.20</td><td>21.20</td><td>63.78</td><td>44.27</td></tr>
+<tr><td>24</td><td>192</td><td>13.59</td><td>0.9385</td><td>537.5</td><td>39.23</td><td>21.21</td><td>63.84</td><td>44.38</td></tr>
+<tr><td>32</td><td>256</td><td>18.12</td><td>0.9385</td><td>537.5</td><td>39.23</td><td>21.21</td><td>63.84</td><td>44.38</td></tr></table>
+
+<div class="note"><strong>Projection, not a claim.</strong> It assumes the staged bytes stay
+on the critical path &mdash; they do: staging is 78.8% of token
+time and the layer graph waits on the copy event &mdash; and that removing a share of them
+removes the same share of the measured per-fetch transfer. The two series differ only in the
+rate they price that saving at: the <strong>blue</strong> series uses the
+13.7 GB/s link ceiling, the smallest reading of the two, and the one that would also
+require the transfer path itself to reach the ceiling; the <strong>orange</strong> series uses
+the 8.42 GB/s this path is actually measured at, which is what
+today's mechanism supports. The dotted line is the lever's own asymptote: with
+<em>every</em> staged byte removed, 18.3 ms/token remains, so no retention
+choice &mdash; and no predictor at all, however accurate &mdash; takes TG past
+54.5 tok/s on this run. It is one 256-token run on a stream that
+echoes its own anchor, and no paired measured run exists for any point here; the task
+contracts forbid a speedup claim without one. This is the decision arithmetic for F2, not a
+result.</div>
+
+<h2>Provenance</h2>
+<p class="sub">
+Input report: <code>build/llama-cuda/gplr15-phaseA-probe/analysis-wide.json</code>.<br>
+Ladder rungs: <code>build/gplr15-ladder-wide.json</code> (4 reports over the ladder traces).<br>
+Re-create it with:<br>
+<code>python tools/route_overlap/analyze.py "build/llama-cuda/gplr13-ladder/*/rowset-*.jsonl" --retention-k 1,2,3,4,5,6,7,8,10,12,16,24,32 --json build/gplr15-ladder-wide.json</code><br>
+Generated by <code>tools/route_overlap/plot-b-vs-k.py</code> (stdlib only).<br>
+Re-render with:<br>
+<code>python tools/route_overlap/plot-b-vs-k.py --input &lt;analysis.json&gt; --trace &lt;trace.jsonl&gt; --tg-tok-s &lt;measured baseline&gt; --out docs/plots/gplr15-b-vs-k.html --ladder build/gplr15-ladder-wide.json</code>
+</p>
+<p class="sub">Scope: view 1 measures routing predictability only, and the stream it was
+measured on echoes its own anchor prompt &mdash; repetition can only increase temporal
+reuse, so the in-band failure is conservative while the crossing and the ceiling are likely
+optimistic. View 2 is a projection built on view 1's statistic plus a measured staging
+share; neither view is a throughput, quality, or equivalence claim.</p>
+</body>
+</html>

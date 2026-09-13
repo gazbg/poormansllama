@@ -842,6 +842,7 @@ def render_txt(report, json_basename=None):
         for rep in report
         if rep.get("rowset")
     ]
+    rs_first = next((rep["rowset"] for rep in report if rep.get("rowset")), None)
     if readings:
         lines.append(
             f"T-GPLR-15 gate 9 reading (threshold {GATE9_THRESHOLD}; SDD section "
@@ -867,14 +868,45 @@ def render_txt(report, json_basename=None):
                     else f"; at or above the {GATE9_THRESHOLD} threshold"
                 )
             )
-        lines.append(
-            "   The oracle is MONOTONE in stream length (more history can only add "
-            "coverage), so a below-threshold ceiling on these short samples "
-            "falsifies the gate for THESE STREAMS only, never for the program. "
-            "The verdict requires T-GPLR-15 Phase A's long single-prompt "
-            "generation probe (~10,200 pairs), where the same T8 line separates "
-            "'no policy can pass' from 'retention is the limit'."
-        )
+        if all(orc["below_gate9_threshold"] for _, _, orc, _ in readings):
+            lines.append(
+                "   The oracle is MONOTONE in stream length (more history can only "
+                "add coverage), so a below-threshold ceiling on these short samples "
+                "falsifies the gate for THESE STREAMS only, never for the program. "
+                "What separates 'no policy can pass' from 'retention is the limit' "
+                "is a stream long enough for the T8 line to mean something, such as "
+                "T-GPLR-15 Phase A's long single-prompt generation probe."
+            )
+        else:
+            lines.append(
+                "   The T8 oracle is an UPPER BOUND, not a verdict: it is statistic "
+                "(b) under UNBOUNDED retention, i.e. the whole expert bank resident, "
+                "which is the outcome the row-set policy exists to avoid. The gate "
+                "is read against statistic (b) at the retention the adopting task "
+                "DECLARES (SDD section 4 reference band: K=1-2, next window in the "
+                "denominator), so a ceiling at or above the threshold does not pass "
+                "the gate by itself -- it bounds what a larger declared retention "
+                "could buy, at the VRAM cost printed at each K."
+            )
+        if rs_first is not None:
+            lines.append(
+                "   How to read K: K is the per-layer cache's retention DEPTH in "
+                "token windows, not bytes and not a count of experts. A K-window "
+                "cache holds min(n_expert, K*W*top_k) expert rows per layer (here "
+                f"W={rs_first['window_tokens']}, top_k={rs_first['top_k']}, "
+                f"n_expert={rs_first['n_expert']}), and one row is that expert's "
+                f"gate+up+down slabs ({rs_first['row_bytes']:,} B here). The byte "
+                "totals printed at each K therefore FOLLOW from K rather than "
+                "being chosen: K=1 keeps only the previous window. Statistic (b) "
+                "is defined AT a K, so a gate reading is complete only when the K "
+                "it was read at is named -- the SDD section 4 reference band is "
+                "K=1-2."
+            )
+            lines.append(
+                "   Plot this curve as a standalone artifact (stdlib only, no "
+                "network): python tools/route_overlap/plot-b-vs-k.py "
+                "--input <json> --out <html>"
+            )
     else:
         lines.append(
             "T-GPLR-15 go/no-go: UNDECIDABLE from these traces (no row-set "
