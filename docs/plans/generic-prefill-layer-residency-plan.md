@@ -1835,7 +1835,9 @@ the rowset_fetch telemetry that unblocks T-GPLR-15; the T-GPLR-16
 escalation goes option (a) (revert MIN_BATCH=1), preserving the
 measured 64.63 tok/s full-handoff result as the fits-regime answer.
 Depends on: the SDD amendment above (done); the vendored CUDA tree
-(present). Commit: none.
+(present). Commit: 46644f1 (documentation close-out 2026-09-13: plan,
+currentstate, SDD, bottlenecks doc — the vendored T-GPLR-13 implementation
+itself remains uncommitted in third_party/llama.cpp).
 Update 2026-09-12: gate (a) is RESOLVED — the owner directed the SDD
 amendment and it is written: sections 1, 4 (moe-row-set package,
 including the hard execution-shape constraint: CUDA-resident pre-execution
@@ -2110,23 +2112,23 @@ path can never lift that cap today)
     supply the 10,200-pair gate stream.
 
 Gate metric and decision rule (Phase A acceptance, falsifiable)
-: - Primary: token-level temporal hit rate = fraction of
-    consecutive-window pairs (per layer, windows sorted by `chunk`, W=1
-    only) with EQUAL FNV-1a-64 `hash` — the same statistic T5 already
-    defines, re-sourced to `rowset_fetch`. Exact, not sampled.
-  - Secondary (context, never a substitute): mean containment
-    `|A n B| / |A|` of consecutive windows, and containment of the next
-    window in the CUMULATIVE resident set (the realistic predictor ceiling,
-    since a prefetch cache persists across windows — this distinguishes
-    "prediction fails" from "rotation discards", which the 2-step pilot
-    could not).
-  - PASS = primary >= 0.6 on the 256-token trace (SDD gate 9). Record
+: - OWNED BY THE SDD: `docs/layer-residency-sdd.md` section 10 ("Gate 9
+    decision rule", clarified 2026-09-13) defines the verdict statistic —
+    the realized predictor ceiling over a persisting per-layer cache,
+    computed offline from the recorded union streams — and the 0.6
+    threshold. This block cites that rule and does not vary it.
+  - Reported with the verdict, as CONTEXT and never as the verdict: exact
+    consecutive-window containment, and the exact consecutive-window
+    hash-equality rate (which is structurally near zero at top_k=8 over
+    n_expert=256 and measured 0/80 at every recorded ladder rung — the
+    pilot signal behind the 2026-09-13 clarification).
+  - PASS = the SDD statistic >= 0.6 on the 256-token trace. Record
     per-layer breakdown; if the aggregate passes ONLY because a few layers
     sit near 1.0 while late layers collapse, report the volatility and let
     the owner decide whether a per-layer policy is product intent before
     Phase B (escalation condition, below).
-  - FAIL = primary < 0.6: append the result to the bottlenecks doc,
-    update currentstate, mark the task DONE-falsified-by-evidence. No
+  - FAIL = the SDD statistic < 0.6: append the result to the bottlenecks
+    doc, update currentstate, mark the task DONE-falsified-by-evidence. No
     library change, no Phase B, T-GPLR-15 closed per SDD gate 9; the
     reactive row-set path stands as the program's TG answer alongside the
     closed handoff.
@@ -2157,7 +2159,14 @@ Focused validation (Phase A)
      first: T5 verdict must become MEASURED (re-sourced) with values equal
      to the bottlenecks doc's hand-computed pilot (0/80 hash-equal,
      containment 0.358-0.389) — cross-validates the re-sourcing before any
-     new run. 2. Analyze the new 256-token trace: T5 MEASURED with
+     new run. PROVENANCE CAVEAT (2026-09-13): those pilot numbers were
+     hand-computed from `build/llama-cuda/gplr13-ladder/analysis-stats.json`,
+     an UNTRACKED build artifact (`.gitignore:/build/`) whose producing
+     script is not in the repository, so they are not reproducible from
+     tracked tooling; the analyzer's re-derivation replaces them as
+     evidence, and any disagreement is investigated and recorded before
+     the gate run rather than silently resolved in either direction.
+   2. Analyze the new 256-token trace: T5 MEASURED with
      n_pairs = 10,200; hash recompute passes on every rowset_fetch.
    3. No GPU work outside `tools/with-gpu-lock.ps1`; the probe run's
      recorded evidence per the model-run testing standard.

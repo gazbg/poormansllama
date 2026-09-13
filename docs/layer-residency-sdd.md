@@ -396,11 +396,30 @@ measurable and never double-booked. Row identity fields (`route_union`,
 `union_ids`, `hash`) keep their exact semantics: union IDs remain the router's
 EXECUTED IDs — never predicted IDs and never the cache's contents — so the
 reactive superset gate stays checkable. The T-GPLR-15 gate inputs are two
-distinct statistics and a verdict must state which it used: (a)
-consecutive-window exact containment from the union streams, which is a
-property of the routing stream and therefore measurable with the cache
-disabled; and (b) cumulative-resident-set containment, the realized predictor
-ceiling, which is only well-defined once per-layer persistence exists.
+distinct statistics: (a) consecutive-window exact containment from the union
+streams, which is a property of the routing stream and therefore measurable
+with the cache disabled; and (b) cumulative-resident-set containment, the
+realized predictor ceiling — computable offline by simulating a bounded
+retention over the recorded union streams, and additionally well-defined at
+runtime once per-layer persistence exists (the cache-served-row telemetry
+above is that runtime form, and is the positive-reuse check of gate 10).
+
+Gate 9 decision rule (sole owner; clarified 2026-09-13): the T-GPLR-15
+verdict statistic is (b), the realized predictor ceiling — the fraction of
+the NEXT window's routed expert rows that a persisting per-layer cache
+(retention K windows, W=1) would already hold, with the next window in the
+denominator (`|A n B| / |B|`, A = resident set, B = the next window's
+required set). The 0.6 threshold in gate 9 is read against that statistic.
+Context statistics may be reported in either direction (`/ |A|` or `/ |B|`),
+but the direction must be stated wherever they appear; the verdict statistic
+is always next-window-in-denominator. Exact window-hash equality and exact
+consecutive-window containment are reported as CONTEXT and are never the
+verdict: at top_k=8 over n_expert=256,
+exact window identity is structurally near zero — measured 0/80 pairs at
+every recorded ladder rung — so gating on it would falsify a live direction
+on a sparsity artifact rather than on routing predictability. The T-GPLR-15
+task block and `docs/currentstate.md` cite this rule; neither restates a
+different one.
 
 Host submission, ready latency, availability wait, compute, graph patch/setup,
 and wall time remain distinct. Windows file-cache state remains best-effort and

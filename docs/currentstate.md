@@ -1,5 +1,41 @@
 # Current State
 
+## 2026-09-13: Gate 9 decision rule now single-owned by the SDD (T-GPLR-15 metric corrected); cited pilot numbers carry a provenance caveat; T-GPLR-13's commit recorded
+
+Audit follow-up. Three surgical documentation corrections. No code changed,
+no GPU runs, no new task scope.
+
+- **One owner for the T-GPLR-15 gate.** `docs/layer-residency-sdd.md`
+  section 10 now carries the sole "Gate 9 decision rule": the verdict
+  statistic is (b), the realized predictor ceiling — the fraction of the NEXT
+  window's routed expert rows that a persisting per-layer cache (retention K
+  windows, W=1) would already hold, next window in the denominator
+  (`|A n B| / |B|`) — and the 0.6 threshold is read against it. Exact
+  window-hash equality and exact consecutive-window containment are CONTEXT
+  only, never the verdict: at top_k=8 over n_expert=256, exact window identity
+  is structurally near zero (measured 0/80 at every ladder rung), so gating on
+  it would have closed T-GPLR-15 on a sparsity artifact instead of on routing
+  predictability. The T-GPLR-15 task block now cites the SDD rule rather than
+  defining its own.
+  **Supersedes** the gate-rule line in the 2026-09-13 T-GPLR-15 contract entry
+  below (`primary = hash-equal consecutive-window rate`); that entry is left
+  unedited as the record of what was written at the time. The SDD is the
+  governing spec and the later-dated amendment, so this adopts its rule rather
+  than overriding it — no owner decision was needed and none was inferred.
+- **Provenance caveat on every cited pilot number** (0/80 hash-equal,
+  containment 0.358-0.389): they were hand-computed from
+  `build/llama-cuda/gplr13-ladder/analysis-stats.json`, an untracked build
+  artifact (`.gitignore:/build/`) whose producing script is not present in the
+  repository, so they are NOT reproducible from tracked tooling. Recorded in
+  the bottlenecks doc section 2 (canonical statement; caveat attached under
+  the table) and in the plan's T-GPLR-15 cross-validation step. The Phase A
+  re-derivation in `tools/route_overlap/analyze.py` replaces them as evidence;
+  a disagreement there is investigated and recorded, not silently resolved.
+- **T-GPLR-13's DONE block records its commit** (`46644f1`) per AGENTS.md,
+  with the faithful qualification that the commit carries the documentation
+  close-out only — the vendored T-GPLR-13 implementation remains uncommitted
+  in `third_party/llama.cpp`.
+
 ## 2026-09-13: SDD amended with the F2 per-layer row cache (`moe-row-cache`) residency class — realized reuse and the T-GPLR-15 gate's cumulative-resident-set ceiling are now defined and measurable
 
 Owner-requested SDD treatment written into docs/layer-residency-sdd.md
@@ -105,6 +141,8 @@ real traces:
   poller attached) yielding 10,200 consecutive-window pairs at ~2.4 MB
   trace.
 - Gate rule: primary = hash-equal consecutive-window rate (exact, W=1).
+  [SUPERSEDED 2026-09-13 by the gate-rule entry at the top of this file — the
+  SDD section 10 rule governs; this line is retained as written.]
   PASS >= 0.6 per SDD gate 9 advances to Phase B (implementation, own
   dated contract update at entry; F2 per-layer row caches are a prerequisite
   design and a NEW residency class under SDD section 4). FAIL < 0.6 closes
