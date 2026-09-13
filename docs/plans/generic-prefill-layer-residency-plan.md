@@ -2854,9 +2854,10 @@ Scope
     semantics both must implement.
   - New opt-in, default-off flag (working name `--residency-tg-retain N`),
     rejected with `--residency off` through the existing conflict table.
-  - New driver `tools/run-gplr19-rowcache-ab.ps1`: four arms A/B/A/B inside ONE
-    acquisition of `Global\AI-GPU-EXCLUSIVE-v1`, poller attached, checker per
-    trace.
+  - New driver `tools/run-gplr19-rowcache-ab.ps1`, TRACKED under `tools/`
+    (RESOLVED 2026-09-13 below; not a gitignored `build/` one-off): four arms
+    A/B/A/B inside ONE acquisition of `Global\AI-GPU-EXCLUSIVE-v1`, poller
+    attached, checker per trace.
 
 Non-goals
 : - K > 1 in this task. That is a follow-on rung and it needs the non-echoing
@@ -2998,3 +2999,23 @@ Escalate before implementation if
   predicted gain optimistic); or the vendored work reaches the commit question
   (the convention for the vendored fork is the owner's call, and the
   clean-checkout reproducibility gap has already bitten twice this campaign).
+
+RESOLVED 2026-09-13 (decided on owner instruction): the T-GPLR-19 A/B driver
+lives in TRACKED `tools/` at `tools/run-gplr19-rowcache-ab.ps1`, not as a
+gitignored `build/` one-off. It is the producer of this task's gate — criterion
+1's four-arm feasibility and criterion 2's byte verdict are both read from its
+traces — and a gate a clean checkout cannot run is unverifiable, which is the
+citation defect this campaign has already fixed twice. The nearest precedent
+agrees: T-GPLR-18, same A/B/A/B shape, same GPU-mutex pattern, same poller
+attachment and per-trace checker, has its driver tracked
+(`tools/run-gplr18-pinned-ab.ps1`, `ba1f31e`). The alternative — the gitignored
+`tools/run-gplr13-*.ps1` ladder/probe convention — is rejected because those
+runners produced EXPLORATORY telemetry, whereas this driver produces a
+CONTRACT acceptance verdict recorded in a tracked task, which is the same
+reason the Phase A spec was tracked rather than inlined (RESOLVED 2026-09-13,
+T-GPLR-15). Tracking the driver narrows the clean-checkout gap to its VENDORED
+half only: the K=1 mechanism is itself a new change in `third_party/llama.cpp`,
+and it will sit in the dirty vendored tree exactly as T-GPLR-18's
+`load_row_set` change does until the owner decides the vendored-fork
+convention — so the K=1 arm is still not reproducible from the tracked tree
+alone, and that question stays open in the Escalate list above.
