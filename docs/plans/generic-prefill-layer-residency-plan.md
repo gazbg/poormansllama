@@ -34,10 +34,15 @@ currentstate 2026-09-13). T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to D
 parked; MIN_BATCH=1 disposition = option (a) revert; options (b)/(c)
 unprioritized.
 T-GPLR-17 (two-process hybrid bridge: streaming PP -> slot state file
--> CPU-expert llama-server stock TG) is READY (2026-09-10, owner
-request): orchestration + one runner flag over the in-tree
+-> CPU-expert llama-server stock TG) was drafted READY 2026-09-10 on owner
+request (orchestration + one runner flag over the in-tree
 llama_state_seq_save/load_file seam and the server's existing /slots
-save-restore endpoints; no SDD amendment needed.
+save-restore endpoints; no SDD amendment needed) and was REJECTED by the
+owner the same day, with the whole implementation reverted -- see its block
+and currentstate 2026-09-10; it must not be re-implemented without a new
+owner decision. [CORRECTED 2026-09-13: this line read "is READY (2026-09-10,
+owner request)", which contradicted the task block below and the rejection
+entry. The drafting claim is retained as history.]
 Commit record (2026-09-09, owner-authorized): vendored-tree changes in
 third_party/llama.cpp 099a27a7e (T-GPLR-08/10/11); parent docs/tools in
 84be194 (recorded T-GPLR-08/10/11 completion, gitlink bump) and 7bfe83b
@@ -134,9 +139,18 @@ lever reverts to F2 (bytes) or T-GPLR-15 hiding;
 T-GPLR-16 (mixed-placement TG mode)
 DEPRIORITIZED to DRAFT (2026-09-12, owner gate (b) decision) --
 in-progress implementation parked, MIN_BATCH=1 disposition = option (a)
-revert, (b)/(c) unprioritized. With T-GPLR-15 and T-GPLR-18 both closed, the
-only READY task is T-GPLR-17 (two-process hybrid bridge), which the owner has
-not selected; implementation stays one task at a time.
+revert, (b)/(c) unprioritized. With T-GPLR-15 and T-GPLR-18 both closed and
+T-GPLR-17 REJECTED (2026-09-10; see its block), NO task is currently READY.
+The one already-authorized implementation item outstanding is the T-GPLR-16
+MIN_BATCH=1 revert (option (a)), which currentstate schedules "alongside or
+after T-GPLR-13" -- and T-GPLR-13 closed 2026-09-13, so that revert is now
+due; it is vendored-tree work carrying the known pre-fix partial-TG step-1
+gold flip, whose QA-gate failure the owner accepted. Anything beyond it needs
+a new drafted task and an owner call. Implementation stays one task at a
+time. [CORRECTED 2026-09-13: this line read "the only READY task is
+T-GPLR-17 (two-process hybrid bridge), which the owner has not selected",
+naming a rejected task as the only ready one -- a claim this thread
+introduced when correcting an earlier stale sentence.]
 ```
 
 ### T-GPLR-00: Inventory the MoE artifact and capacity
