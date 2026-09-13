@@ -2195,11 +2195,11 @@ Focused validation (Phase A)
      0.3578 against 0.377 / 0.370 / 0.389 / 0.358) with 0/80 hash-equal.
      PROVENANCE NOTE (2026-09-13): the pilot numbers were originally
      MACHINE-computed by `build/analyze_gplr13_ladder.py`, an untracked
-     one-off inside the gitignored `/build/` tree. They no longer depend on
-     that file for their meaning, but `tools/route_overlap/analyze.py` is
-     ALSO still untracked (the whole T-GPLR-14 harness is), so "reproducible
-     from tracked tooling" holds only once that directory is committed —
-     flagged, not silently assumed. Any disagreement between the two
+     one-off inside the gitignored `/build/` tree. The producer of record is
+     now the TRACKED `tools/route_overlap/analyze.py` (tracked 2026-09-13),
+     which reproduces every pilot value exactly; a clean checkout still lacks
+     the untracked `build/` traces it reads, so re-deriving the numbers needs
+     those traces or a fresh ladder run. Any disagreement between the two
      producers is investigated and recorded before the gate run rather than
      silently resolved in either direction.
    2. Analyze the new 256-token trace against the SDD statistic: the (b)

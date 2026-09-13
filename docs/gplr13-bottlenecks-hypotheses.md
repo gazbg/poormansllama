@@ -75,10 +75,10 @@ the T-GPLR-15 Phase A analyzer `tools/route_overlap/analyze.py` REPRODUCES the
 table above exactly — 0/80 hash-equal at every size and containment 0.377 /
 0.370 / 0.389 / 0.358 at 50/512/4k/200k — and adds the gate-9 statistic (b) at
 K=2 (0.4031 / 0.4031 / 0.4266 / 0.4000, first measured values; capacity 16
-rows/layer = 1,132.5 MB over 40 layers vs 566.2 MB at K=1). NOTE: that analyzer
-is itself still UNTRACKED (the whole T-GPLR-14 harness is), so "reproducible
-from tracked tooling" holds only once `tools/route_overlap/` is committed.
-Reproduce with:
+rows/layer = 1,132.5 MB over 40 layers vs 566.2 MB at K=1). That analyzer is
+now TRACKED (2026-09-13), so the producer of these numbers is in a clean
+checkout; the untracked `build/` traces it reads are not, so re-deriving them
+needs those traces or a fresh ladder run. Reproduce with:
 `python tools/route_overlap/analyze.py "build/llama-cuda/gplr13-ladder/*/rowset-*.jsonl"`
 (artifact `build/gplr15-phaseA.{txt,json}`). The containment direction is owned
 by the SDD section 10 gate 9 decision rule (`|A n B| / |B|`, next window in the

@@ -36,18 +36,20 @@ of this commit.
   are the word serial (vs parallel). Both are project design docs.
 - **Retires the earlier flag** rather than rewriting it: the previous entry's
   "same defect class, still open" bullet is annotated RESOLVED in place.
-- **Same class, still open (not addressed here):** `tools/route_overlap/` — the
-  analyzer extended today, and the rest of the T-GPLR-14/MEMPROBE harness —
-  remains untracked, with the T-GPLR-14 `.ps1` runners,
-  `tools/gpu-mem-poll.ps1`, `tools/gplr16-dump.cpp` and
-  `tools/run-memprobe-dense.ps1`. Out of this task's scope; flagged for the
-  owner.
+- **Partly closed 2026-09-13:** `tools/route_overlap/analyze.py` — the tool
+  that produces the statistic (b) numbers — is now TRACKED. Still untracked and
+  left to the owner: the T-GPLR-14 `.ps1` runners (`run-gplr13-ladder.ps1`,
+  `run-gplr13-negfix.ps1`, `run-gplr13-rowset-probe.ps1`), `tools/gpu-mem-poll.ps1`,
+  `tools/gplr16-dump.cpp` and `tools/run-memprobe-dense.ps1` — pre-existing work
+  not authored in this thread. `.lean-ctx*.toml*` are agent tooling artifacts
+  that belong in `.gitignore`, not history.
 
 ## 2026-09-13: T-GPLR-15 Phase A analyzer implemented — first real values of the SDD gate-9 statistic (b), and K=1 reproduces the recorded pilot exactly
 
 Implementer work on T-GPLR-15's controlling phase: host-only, no library
-changes, no GPU runs, no GPU mutex needed. Nothing is committed — the changes
-are in the working tree.
+changes, no GPU runs, no GPU mutex needed. The analyzer is TRACKED as of
+2026-09-13 (this entry first recorded it as a working-tree change; the commit
+that added it also updated this line).
 
 - **The analyzer now works on real row-set traces.** `tools/route_overlap/analyze.py`
   accepts `rowset_init` / `rowset_fetch` / `rowset_round` / `rowset_refused`
@@ -100,16 +102,15 @@ are in the working tree.
   fixture (K=1 = 0.0 vs K=2 = 0.5 on the same windows), the hash-mismatch and
   non-canonical-ids negative controls, and the `--retention-k` guard; reruns
   byte-identical for both txt and json.
-- **Provenance improved, but NOT yet "reproducible from tracked tooling".**
-  The recorded pilot values no longer depend on the untracked one-off for
-their meaning — the analyzer reproduces them exactly — but
-  `tools/route_overlap/analyze.py` is itself still UNTRACKED, as is the whole
-  T-GPLR-14 harness (`git ls-files tools/route_overlap/` is empty; the path is
-  not gitignored, it was simply never committed). The "reproducible from
-  tracked tooling" claim becomes literally true only when that directory is
-  committed. This is the same clean-checkout defect class as the schema-doc gap
-  fixed earlier today, now on the harness; it is left to the owner because
-  committing the harness is a scope decision, not a measurement one.
+- **Provenance is now genuine for these numbers.** The recorded pilot values
+  were originally MACHINE-computed by the untracked one-off; they are now
+  reproduced exactly by `tools/route_overlap/analyze.py`, which is TRACKED as of
+  2026-09-13, so the producer of the gate-9 statistic is present in a clean
+  checkout. What a clean checkout still does NOT contain: the untracked
+  `build/` traces it reads (`.gitignore:/build/`), so re-deriving the numbers
+  still needs either those traces or a fresh ladder run — and the T-GPLR-14
+  `.ps1` runners and MEMPROBE tools remain untracked (owner's call; only the
+  analyzer was in this thread's scope).
 - **Remaining Phase A step (not done here):** the one 256-token batch-major
   generation probe under `tools/with-gpu-lock.ps1`, which is what turns this
   cross-validation into the gate verdict (~10,200 pairs). Nothing in this entry
