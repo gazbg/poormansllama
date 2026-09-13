@@ -608,3 +608,17 @@ ranking already said once F1's upside collapsed - the difference is that the
 collapse is now measured rather than predicted. No throughput claim is made:
 wall time across the four arms (10.4-16.5 s) is dominated by shared-GPU noise
 and the two `direct` arms are both the fastest and the slowest.
+
+**F2-M1 ranking outcome (2026-09-13, T-GPLR-19).** F2 was ranked as the
+remaining lever here, and it has now been RUN as a mechanism rather than
+predicted. The four-arm A/B (A,B,A,B in one GPU session; reactive vs K=1
+per-layer row retention) measured TG **11.953 -> 14.021 tok/s**, gain **+2.068**
+against a **0.011** within-pair spread, with staged bytes falling to
+**396,398,208 B/round** against the predicted 395,835,932 (**+0.142%**, i.e. the
+byte prediction was met, not merely bounded). So this section's ranking is
+CONFIRMED: with F1 dead, F2 is the lever that moves TG, and it moves it by
+~17% at K=1. Two things this does NOT upgrade: the same-run projection envelope
+(13.61-15.30 tok/s) still rests on a self-echoing anchor at 3x extrapolation,
+so scaling K is not licensed by this result; and the 0.6 gate is read against
+statistic (b), which at K=1 is 0.3088 - well below it - so F2-M1 is a real but
+partial answer, not a pass on the gate the earlier Phase A reading failed.

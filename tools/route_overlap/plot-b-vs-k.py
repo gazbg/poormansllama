@@ -59,6 +59,7 @@ RUNG_COLOURS = ["#2e7d32", "#00838f", "#8d6e63", "#ad1457"]
 HALO = (' paint-order="stroke" stroke="#ffffff" stroke-width="3.2" '
         'stroke-linejoin="round"')
 LINK_GBS_DEFAULT = 13.7   # measured Gen4 x8 H2D ceiling (T-Q38TG-00)
+MEASURED_AB_DEFAULT = "build/llama-cuda/gplr19-rowcache-ab/summary.json"
 
 W, H = 980, 620
 X0, X1 = 96, 900        # plot box, left/right
@@ -248,7 +249,7 @@ def project_times(d, basis, baseline_tok_s, link_gbs):
     }
 
 
-def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs):
+def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs, measured=None):
     """View 2: projected TG tok/s against retention K, at both measured rates."""
     rows = proj["rows"]
     ks = [r["k"] for r in rows]
@@ -312,6 +313,21 @@ def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs):
         add(f'<text x="{X0 + 6}" y="{Y0 + (12 if tag == "link" else 26)}" font-size="12" '
             f'fill="{colour}">{label}</text>')
 
+    # The paired measurement (T-GPLR-19's four-arm A/B) is drawn ON this view
+    # rather than only described, because the K=1 point is exactly what the
+    # projection is asked to predict: the run measured a value between the two
+    # projected series, so a reader can see which series the hardware landed
+    # near instead of taking the caption's word for it. The label goes in the
+    # legend row, not beside the marker -- the geometry here is tight at K=1
+    # (7 px between the series) and a label on the marker would sit on them.
+    if measured:
+        mx, my = x(1), y(measured["k1_tok_s"])
+        add(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="7.5" fill="none" '
+            f'stroke="#111" stroke-width="2"/>')
+        add(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="2.8" fill="#111"/>')
+        add(f'<text x="{X0 + 6}" y="{Y0 + 40}" font-size="12" fill="#111">'
+            f'\u25cf measured paired K=1 (ABAB): {measured["k1_tok_s"]:.3f} tok/s</text>')
+
     # Value labels, with two guards because this geometry is genuinely tight: the link
     # projection is nearly flat early (13.6 at K=1 vs 14.7 at K=2, 7 px apart) and the
     # orange series sits only {9,17} px above it at those K, so a label above a blue
@@ -345,6 +361,49 @@ def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs):
         f'text-anchor="middle">K = retention depth in token windows</text>')
     add('</svg>')
     return "\n".join(out)
+
+
+def load_measured_ab(path, basis, d):
+    """The T-GPLR-19 paired K=1 result, read from its own A/B summary.
+
+    Returns None when the file is absent, so the artifact degrades to the
+    projection only rather than inventing a measurement. The byte-to-time
+    conversion is derived here from the arm means (removed bytes over the time
+    actually saved), never quoted from a note.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8-sig") as fh:
+        arms = json.load(fh)
+    # the driver records tok/s as text (it scrapes the run log), so coerce
+    off = [a for a in arms if int(a.get("retain")) == 0]
+    on = [a for a in arms if int(a.get("retain")) == 1]
+    if not off or not on:
+        return None
+    tg = lambda a: float(a["tg_tok_s"])
+    base_tg = sum(tg(a) for a in off) / len(off)
+    k1_tg = sum(tg(a) for a in on) / len(on)
+    base_b = sum(float(a["staged_per_round"]) for a in off) / len(off)
+    k1_b = sum(float(a["staged_per_round"]) for a in on) / len(on)
+    saved_b = base_b - k1_b
+    saved_s = (1.0 / base_tg) - (1.0 / k1_tg)
+    conv = saved_b / saved_s / 1e9 if saved_s > 0 else 0.0
+    spread = max(
+        abs(tg(on[0]) - tg(on[-1])),
+        abs(tg(off[0]) - tg(off[-1])),
+    )
+    # the projected byte reduction at K=1, from the same curve view 1 shows
+    k1 = next((v for k, v in d["curve"] if k == 1), None)
+    predicted_pct = k1["value"] * 100.0 if k1 else 0.0
+    return {
+        "baseline_tok_s": base_tg,
+        "k1_tok_s": k1_tg,
+        "gain": k1_tg - base_tg,
+        "spread": spread,
+        "byte_pct": saved_b / base_b * 100.0,
+        "predicted_pct": predicted_pct,
+        "conversion_gbs": conv,
+    }
 
 
 def build_time_table(proj, link_gbs, basis):
@@ -540,7 +599,8 @@ def build_table(d):
 
 
 def build_html(d, input_name, generated_from, basis=None, baseline_tok_s=None,
-               link_gbs=LINK_GBS_DEFAULT, rungs=None, ladder_name=None):
+               link_gbs=LINK_GBS_DEFAULT, rungs=None, ladder_name=None,
+               measured=None, measured_path=None):
     sat = d["saturated_by"]
     sat_note = (
         f"The reported K={sat} already saturates it." if sat is not None
@@ -572,6 +632,37 @@ def build_html(d, input_name, generated_from, basis=None, baseline_tok_s=None,
             f'is the basis the SDD section 4 band and the T-GPLR-15 retention records are '
             f'written in.'
         )
+    # The K=1 point of this projection has been measured: T-GPLR-19's four-arm
+    # paired A/B (tools/run-gplr19-rowcache-ab.ps1) ran A,B,A,B in one GPU
+    # session. Where that measurement is supplied, view 2 states it next to the
+    # projection instead of claiming no paired run exists.
+    measured_note = ""
+    # The A/B summary is gitignored build output, so the ringed marker disappears
+    # from a clean checkout while the caption's numbers do not. Say which is which
+    # rather than letting a regenerate silently drop the measurement.
+    measured_src = (
+        f"Paired K=1 measurement: <code>{html.escape(str(measured_path))}</code> "
+        f"(gitignored build output; the marker is drawn only while it exists, but "
+        f"the values are recorded in the view 2 caption regardless).<br>\n"
+        if measured else ""
+    )
+    if measured:
+        measured_note = (
+            f" A PAIRED MEASUREMENT NOW EXISTS at K=1: four arms "
+            f"A,B,A,B in one GPU session gave a reactive mean of "
+            f"{measured['baseline_tok_s']:.3f} tok/s and a K=1 mean of "
+            f"{measured['k1_tok_s']:.3f} tok/s (gain {measured['gain']:+.3f}, "
+            f"within-pair spread {measured['spread']:.3f}). The realized byte "
+            f"reduction was {measured['byte_pct']:.2f}% against the "
+            f"{measured['predicted_pct']:.2f}% projected here, and the removed "
+            f"bytes converted at {measured['conversion_gbs']:.2f} GB/s &mdash; "
+            f"faster than the {link_gbs:g} GB/s this view's blue series assumes, "
+            f"which is why the measurement lands near that series rather than the "
+            f"orange one. Marginal removed bytes are cheaper than average bytes "
+            f"because the per-call cost does not shrink with them; that is the "
+            f"proportionality assumption this view rests on, and at 3x "
+            f"extrapolation into F2's regime it is UNTESTED."
+        )
     view2 = ""
     rerun = ("python tools/route_overlap/plot-b-vs-k.py --input <analysis.json> "
              "--out docs/plots/gplr15-b-vs-k.html")
@@ -589,7 +680,7 @@ effective, against the {link_gbs:g} GB/s link ceiling. Staging is
 {proj['base_ms']:.1f} ms/token over {d['layers']} layers), leaving a
 {proj['floor_ms']:.1f} ms/token floor that this lever cannot touch.</p>
 
-{build_time_svg(d, basis, proj, baseline_tok_s, link_gbs)}
+{build_time_svg(d, basis, proj, baseline_tok_s, link_gbs, measured)}
 
 <h2>Projected values</h2>
 <table>{build_time_table(proj, link_gbs, basis)}</table>
@@ -606,9 +697,9 @@ today's mechanism supports. The dotted line is the lever's own asymptote: with
 <em>every</em> staged byte removed, {proj['floor_ms']:.1f} ms/token remains, so no retention
 choice &mdash; and no predictor at all, however accurate &mdash; takes TG past
 {1000 / proj['floor_ms']:.1f} tok/s on this run. It is one 256-token run on a stream that
-echoes its own anchor, and no paired measured run exists for any point here; the task
-contracts forbid a speedup claim without one. This is the decision arithmetic for F2, not a
-result.</div>
+echoes its own anchor.{measured_note} This view is the decision arithmetic for F2; the
+K=1 point has since been settled by measurement rather than by projection &mdash; it is
+the ringed marker in view 2, between the two projected series.</div>
 """
         rerun = ("python tools/route_overlap/plot-b-vs-k.py --input <analysis.json> "
                  "--trace <trace.jsonl> --tg-tok-s <measured baseline> "
@@ -750,7 +841,7 @@ the 0.6 gate, while the curve only crosses 0.6 later, at a VRAM cost the chart p
 <h2>Provenance</h2>
 <p class="sub">
 Input report: <code>{html.escape(input_name)}</code>.<br>
-{ladder_note}Generated by <code>{html.escape(generated_from)}</code> (stdlib only).<br>
+{measured_src}{ladder_note}Generated by <code>{html.escape(generated_from)}</code> (stdlib only).<br>
 Re-render with:<br>
 <code>{html.escape(rerun)}</code>
 </p>
@@ -772,6 +863,12 @@ def main():
                     help="row-set trace (jsonl); adds the wall-clock view")
     ap.add_argument("--tg-tok-s", type=float, default=None,
                     help="measured baseline TG tok/s for the same run (required with --trace)")
+    ap.add_argument(
+        "--measured-ab", default=MEASURED_AB_DEFAULT,
+        help="T-GPLR-19 four-arm A/B summary.json (the paired K=1 measurement). "
+        "When the file exists, view 2 states the measured K=1 point instead of "
+        "claiming that no paired run exists.",
+    )
     ap.add_argument("--link-gbs", type=float, default=LINK_GBS_DEFAULT,
                     help=f"H2D link capacity in GB/s for the projection (default {LINK_GBS_DEFAULT})")
     ap.add_argument("--ladder", default=None,
@@ -786,8 +883,10 @@ def main():
                          "baseline it projects from, and glossing over that would make the "
                          "projection look like a result")
     rungs = load_rungs(args.ladder) if args.ladder else None
+    measured = load_measured_ab(args.measured_ab, basis, d) if basis is not None else None
     doc = build_html(d, args.input, "tools/route_overlap/plot-b-vs-k.py",
-                     basis, args.tg_tok_s, args.link_gbs, rungs, args.ladder)
+                     basis, args.tg_tok_s, args.link_gbs, rungs, args.ladder, measured,
+                     args.measured_ab)
     with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(doc)
     print(f"wrote {args.out}")

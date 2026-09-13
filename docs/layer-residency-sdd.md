@@ -45,6 +45,23 @@ predictive variant a substrate to pre-stage into. It is an opt-in sub-mode of
 `moe-row-set`, applies only to the TG phase, changes nothing in prefill, and
 changes no default.
 
+Scope amendment 2026-09-13 (owner-directed): the `moe-row-cache` RETENTION
+POLICY is resolved to a ROW-CAPACITY LRU. `K` names a row BUDGET of
+`min(n_expert, K*W*top_k)` rows per layer, and the cache keeps that budget's
+most recently ROUTED rows; it does not hold exactly the rows routed in the
+last K windows. Section 4's capacity language and gate 9's statistic (b) had
+been read those two ways, and the two readings are not the same rule: they
+agree exactly at K=1 and diverge at K>=2, where the row-capacity reading can
+only retain more. The footprint is `K*W*top_k` rows per layer under EITHER
+reading, so the resolved policy costs nothing and the window-count reading is
+retired as strictly weaker. This makes gate 9's (b) — already computed under
+the row-capacity reading — the mechanism's measured behaviour instead of an
+overstatement of it; measured on the preserved 10,200-pair probe stream, (b)
+at K=2/K=4 is 0.4343/0.6284 under the resolved policy against
+0.4015/0.5194 under the retired one. The implementation, the C++ checker and
+the offline analyzer are pinned together by
+`tools/route_overlap/crosscheck-retention.py`, which fails on any divergence.
+
 ## 2. Fixed Acceptance Targets
 
 ### Dense reference
@@ -189,13 +206,19 @@ arrives.
   window/generation) — proves the bytes belong to that layer and have not been
   invalidated. Provenance is structural, stored with the bytes; it is never
   inferred from slot ownership or from a bare coverage bitmap.
-- **Bounded retention.** Capacity is declared per layer and in total, sized
-  for the worst case: `min(n_expert, K*W*top_k)` rows x that layer's member
-  slab bytes, for a retention of K windows of width W (W=1, top_k=8 on the
-  Qwen3.6 target: ~14.2 MB per 8-row set; a one-to-two window retention is
-  ~0.57-1.13 GB across 40 MoE layers). A write that would exceed the declared
-  capacity is a loud refusal — never silent growth, and never eviction of an
-  entry a running consumer may still read.
+- **Bounded retention (policy resolved 2026-09-13, owner-directed).** Capacity
+  is declared per layer and in total, sized for the worst case:
+  `min(n_expert, K*W*top_k)` rows x that layer's member slab bytes, for a
+  budget of K windows' worth of rows at width W (W=1, top_k=8 on the Qwen3.6
+  target: ~14.2 MB per 8-row set; a one-to-two window budget is ~0.57-1.13 GB
+  across 40 MoE layers). K is a ROW BUDGET, not a window count: under that
+  budget the cache keeps the K*W*top_k most recently ROUTED rows per layer,
+  evicting a row only when a row this window needs must be placed. Retention
+  DEPTH is therefore data-dependent and unbounded in time; only the row count
+  is bounded, which is what the VRAM bound requires. A row needed by the
+  current window is never an eviction victim, so a write that would exceed the
+  declared capacity is a loud refusal — never silent growth, and never
+  eviction of an entry a running consumer may still read.
 - **Atomicity per window.** A window's rows become ready together and retire
   together; a row-consuming graph observes only ready entries, and a cached
   row consumed by a layer's row-consuming phase is ordered after the matching
@@ -410,9 +433,13 @@ above is that runtime form, and is the positive-reuse check of gate 10).
 Gate 9 decision rule (sole owner; owner-directed 2026-09-13): the T-GPLR-15
 verdict statistic is (b), the realized predictor ceiling — the fraction of
 the NEXT window's routed expert rows that a persisting per-layer cache
-(retention K windows, W=1) would already hold, with the next window in the
-denominator (`|A n B| / |B|`, A = resident set, B = the next window's
-required set). The 0.6 threshold in gate 9 is read against that statistic.
+(retention budget K windows' worth of rows, W=1) would already hold, with the
+next window in the denominator (`|A n B| / |B|`, A = resident set, B = the
+next window's required set). The cache the statistic assumes is the section 4
+`moe-row-cache` policy resolved 2026-09-13: a ROW-CAPACITY LRU keeping the
+`min(n_expert, K*W*top_k)` most recently routed rows per layer, which is
+exactly what the runtime implements — so (b) predicts the mechanism's measured
+staging reduction rather than bounding it from above. The 0.6 threshold in gate 9 is read against that statistic.
 Context statistics may be reported in either direction (`/ |A|` or `/ |B|`),
 but the direction must be stated wherever they appear; the verdict statistic
 is always next-window-in-denominator. Exact window-hash equality and exact

@@ -31,8 +31,14 @@ transfer flat and inside the within-arm repeat spread — while costing ~1.8 GiB
 more pinned host memory, so F1 is dead on this hardware; table and verdict in
 currentstate 2026-09-13). T-GPLR-19 (F2-M1 per-layer row residency at K=1)
 DRAFTED 2026-09-13 from the T-GPLR-13 close-out's F2 item and the T-GPLR-15
-gate reading; it is NOT ready and awaits an owner call, and the T-GPLR-16
-MIN_BATCH=1 revert stays the only already-authorized implementation item.
+gate reading, and DONE the same day: its four-arm A/B gate ran and all six
+acceptance criteria passed (K=1 stages 396,398,208 B/round vs the predicted
+395,835,932, +0.142%; TG 11.953 -> 14.021 tok/s against a 0.011 within-pair
+spread; table and verdicts in currentstate 2026-09-13). Its Commit field now
+records both hashes: the vendored-fork commit convention was decided
+2026-09-13 (see the section of that name above) and applied the same day, so
+its mechanism is reproducible from a clean checkout. The T-GPLR-16 MIN_BATCH=1
+revert remains outstanding and is not displaced.
 T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
 (2026-09-12, owner gate (b) decision): in-progress implementation
 parked; MIN_BATCH=1 disposition = option (a) revert; options (b)/(c)
@@ -102,6 +108,58 @@ MTP         = disabled
 backend     = CUDA
 ```
 
+## Vendored-Tree Commit Convention (RATIFIED 2026-09-13, owner-directed:
+"decide the vendored-fork commit convention")
+
+This was repeatedly recorded as an "open owner call" and blocked T-GPLR-19's
+Commit field. It is not open: the mechanism is forced by how the root repo
+stores the vendored tree, and the practice is already evidenced four times in
+root history. What follows ratifies it as a rule instead of leaving it implicit
+in task Commit fields.
+
+**The mechanism, which is not a choice.** `third_party/llama.cpp` is recorded by
+the root repo as a gitlink (index mode `160000`); there is no `.gitmodules`, so
+the root stores only a commit SHA for that directory, never the file contents.
+A vendored file change is therefore reproducible from a clean checkout **only**
+if (1) it is committed inside the nested repo, and (2) the root repo commits the
+bumped gitlink. No third mechanism exists: the root cannot hold those bytes
+while the gitlink is present.
+
+**The rule.**
+
+- Nested commits go on the fork's local `master` with the subject
+  `layer-streaming: T-GPLR-<ids> - <summary>`.
+- The fork's `origin` is upstream `ggml-org/llama.cpp`. The nested repo must
+  **never be pushed**, and no upstream-facing material is ever written. Every
+  campaign commit there exists only to make the tree state reproducible and to
+  keep the root gitlink meaningful; the nested repo is a local fork by
+  construction and is already ahead of `origin/master`.
+- The root commit's subject is `Record ...` and its payload is the task's state
+  docs, its tracked `tools/` surface, and `third_party/llama.cpp` (the 2-line
+  gitlink bump). Precedents, all in root history: `2308dca`, `64b5aeb`,
+  `1148136` ("Bump vendored llama.cpp to 169ab086e"), `84be194`.
+- The task's `Commit:` field names **both** hashes, because the root hash alone
+  does not identify the vendored code. That is already the convention's field
+  format in this plan ("vendored code through third_party/llama.cpp <sha>;
+  outer docs/tools through <sha>").
+- Root and nested halves of one task must land together. A root commit that
+  bumps the gitlink while leaving the task's tracked harness uncommitted (or the
+  reverse) reproduces the half-committed defect this convention exists to stop;
+  `tools/run-tests.ps1` currently pins a ctest target defined only inside the
+  nested repo's uncommitted diff, so those two are one unit.
+
+**Attribution limit, stated rather than hidden.** The first application of this
+rule carries the *accumulated* uncommitted mechanism (T-GPLR-12/13/16/18/19),
+because the nested tree has been dirty since `099a27a7e` (T-GPLR-08/10/11).
+Per-hunk splitting was rejected: the T-GPLR-19 hunks live in files that also
+carry earlier tasks' hunks, so no partition into per-task nested commits yields
+an intermediate tree that compiles -- which would defeat the only purpose the
+commit has, reproducibility. That backlog commit cannot tell you which hunks
+came from which task. Going forward, one nested commit per task fixes this; the
+lumped commit is a one-time artifact of the campaign having accumulated
+uncommitted, and it is recorded as such rather than presented as per-task
+history.
+
 ## Dependency Order
 
 ```text
@@ -150,10 +208,17 @@ MIN_BATCH=1 revert (option (a)), which currentstate schedules "alongside or
 after T-GPLR-13" -- and T-GPLR-13 closed 2026-09-13, so that revert is now
 due; it is vendored-tree work carrying the known pre-fix partial-TG step-1
 gold flip, whose QA-gate failure the owner accepted. Anything beyond it needs
-a new drafted task and an owner call. That draft now exists: T-GPLR-19
-(F2-M1 per-layer row residency at K=1) is DRAFTED 2026-09-13 with a
-pre-registered prediction and a four-arm A/B gate, and it neither displaces
-the revert nor changes what is ready. Implementation stays one task at a
+a new drafted task and an owner call. That task now exists and is CLOSED:
+T-GPLR-19 (F2-M1 per-layer row residency at K=1) was DRAFTED 2026-09-13 with a
+pre-registered prediction and a four-arm A/B gate, and RAN THE GATE the same
+day — criteria 1-6 all passed, so F2-M1 is no longer a proposal but a measured
+mechanism (TG 11.953 -> 14.021 tok/s at a 0.011 within-pair spread, staged
+bytes at +0.142% of the prediction). It did not displace the revert, which is
+still outstanding, and it no longer carries an owner call of its own: the
+vendored-fork commit convention was DECIDED 2026-09-13 (ratified in the section
+of that name above, from the four precedents already in root history), so its
+Commit field records both hashes. Implementation
+stays one task at a
 time. [CORRECTED 2026-09-13: this line read "the only READY task is
 T-GPLR-17 (two-process hybrid bridge), which the owner has not selected",
 naming a rejected task as the only ready one -- a claim this thread
@@ -1875,7 +1940,12 @@ measured 64.63 tok/s full-handoff result as the fits-regime answer.
 Depends on: the SDD amendment above (done); the vendored CUDA tree
 (present). Commit: 46644f1 (documentation close-out 2026-09-13: plan,
 currentstate, SDD, bottlenecks doc — the vendored T-GPLR-13 implementation
-itself remains uncommitted in third_party/llama.cpp).
+itself remains uncommitted in third_party/llama.cpp). [CORRECTED 2026-09-13: the
+parenthetical's LAST clause is superseded — the vendored implementation is now
+committed in `third_party/llama.cpp` **a61528b47**, the accumulated-backlog
+commit decided under "Vendored-Tree Commit Convention" above. The 46644f1
+close-out itself is unchanged; only the "remains uncommitted" claim was true
+when written and is not true now.]
 Update 2026-09-12: gate (a) is RESOLVED — the owner directed the SDD
 amendment and it is written: sections 1, 4 (moe-row-set package,
 including the hard execution-shape constraint: CUDA-resident pre-execution
@@ -2629,7 +2699,13 @@ fixture present; still passing 4/4 with the row-set change in place). Commit: ba
 (documentation close-out 2026-09-13: the A/B record in `docs/currentstate.md`,
 bottlenecks section 8, this status flip, and the driver +
 `tools/gpu-mem-poll.ps1`; the `load_row_set` change itself stays uncommitted in
-the vendored tree, see the note below).
+the vendored tree, see the note below). [CORRECTED 2026-09-13: the
+`load_row_set` change is now committed in `third_party/llama.cpp`
+**a61528b47** (the accumulated-backlog commit); see "Vendored-Tree Commit
+Convention" above.]
+[CORRECTED 2026-09-13: this note is superseded — the `load_row_set` change is
+committed in `third_party/llama.cpp` a61528b47, so the pinned arm IS now
+reproducible from a clean checkout. Retained as written:]
 Note: the `load_row_set` change itself is UNCOMMITTED in the dirty
 `third_party/llama.cpp` working tree (owner convention for the vendored fork),
 so the pinned arm is not reproducible from a clean checkout.
@@ -2779,16 +2855,124 @@ Escalate before implementation if
 
 ### T-GPLR-19: F2-M1 — per-layer row residency at K=1 (retain the previous window across tokens)
 
-Status: DRAFT (2026-09-13, drafted on owner request from the T-GPLR-13
-close-out's F2 item and the T-GPLR-15 gate reading). NOT READY and not
-selected: nothing is implemented, no GPU run has been made, and the T-GPLR-16
+Status: DONE 2026-09-13 — all six acceptance criteria demonstrated (A/B table
+and per-criterion verdicts in the RESULT block below). Commit: vendored code
+through `third_party/llama.cpp` **a61528b47** (the accumulated-backlog commit —
+see the attribution limit in the convention section above: it carries
+T-GPLR-12/13/16/18/19's vendored halves as one unit, so this hash makes the
+mechanism reproducible, not genuinely per-task history); outer docs/tools in the
+`Record ...` commit that bumps the gitlink (hash recorded in the follow-up, per
+the plan's existing field format). Previously recorded as: none — the
+vendored-fork convention is an open owner call (this task's Escalate clause),
+and the mechanism lives in `third_party/llama.cpp`, so no hash can be recorded
+until that is settled. The T-GPLR-16 MIN_BATCH=1 revert is NOT displaced and
+remains outstanding.
+
+Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
+the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
+run has been made". The mechanism HAS since been implemented behind the
+new default-off `--residency-tg-retain N` flag (shape (i): per-layer cache plus
+a device-side refresh of the slot bundle), the C++ checker and the offline
+analyzer have been brought under one rule and pinned by
+`tools/route_overlap/crosscheck-retention.py`, and ONE K=1 runtime arm has been
+run: exit 0, `--check-telemetry` OK, 0 refusals, 25,202 rows retained and
+101,477,941,248 bytes staged -- both exactly the offline figures -- with
+byte-identical greedy output to the recorded baseline and TG 13.926 tok/s
+against the baseline's 11.578, at unchanged peak VRAM. What remains, and what
+keeps this NOT READY, is the four-arm A/B gate below and the K > 1 rungs. The
+vendored-fork commit convention is still the gating owner call. [CORRECTED
+2026-09-13: this note is superseded on its first clause -- the four-arm gate
+has since RUN and passed all six criteria (RESULT block below, Status DONE);
+the K > 1 rungs stay deliberately DEFERRED, not outstanding. The vendored-fork
+commit convention is still the gating owner call.]] The T-GPLR-16
 MIN_BATCH=1 revert remains the only already-authorized implementation item
 (this task does not displace it). Depends on: T-GPLR-13 (DONE — the reactive
 row-set path this task changes); T-GPLR-14 (instrument, closed — it measures
 this task's bytes); the SDD section 4 moe-row-cache treatment (written
 2026-09-13, owner-directed); T-GPLR-15 (DONE-falsified-by-evidence — supplies
 the (b) statistic the prediction rests on, at the retention band the owner
-already approved). Commit: none.
+already approved). Commit: vendored half in `third_party/llama.cpp` a61528b47;
+outer half in the gitlink-bump commit recorded in the follow-up.
+
+RESULT 2026-09-13 — the four-arm gate RAN and PASSED (`tools/run-gplr19-rowcache-ab.ps1`,
+arms A,B,A,B inside ONE GPU-mutex session, poller attached, checker per trace;
+full table and verdicts in `docs/currentstate.md`). In one sentence: the byte
+mechanism works exactly as the statistic predicted, and the time gain is real,
+positive and smaller than the byte reduction.
+
+  arm  retain  exit  checker  tg tok/s  staged/round    transfer_us  rows_fet  rows_ret  refused
+  A1   0       0     0        11.951    572,719,104     1653.0       81920     0         0
+  B1   1       0     0        14.015    396,398,208     1362.3       56718     25202     0
+  A2   0       0     0        11.955    572,719,104     1648.9       81920     0         0
+  B2   1       0     0        14.026    396,398,208     1356.2       56718     25202     0
+
+- Criterion 1 PASS: four arms exit 0 with `--check-telemetry` OK; the ordered
+  `layer|union_ids|hash` route stream is identical across all four arms; greedy
+  token IDs are identical across all four arms; the reactive arms reproduce the
+  recorded baseline exactly (10,240 fetches, 572,719,104 B/round, `rows_reused`
+  = 0).
+- Criterion 2 PASS (the mechanism gate, decided on BYTES): K=1 stages
+  396,398,208 B/round against the predicted 395,835,932 — **+0.142%**, inside
+  the 2% band — and cross-token retention is non-zero on all 40 layers. The
+  task is therefore NOT falsified-by-evidence.
+- Criterion 3 PASS, inside the pre-registered envelope: reactive mean 11.953,
+  K=1 mean 14.021 tok/s, gain **+2.068** against a within-pair spread of
+  **0.011** (the gain is ~188x the spread, so the proportionality clause does
+  NOT fire). 14.021 sits between the two pre-registered bounds — above the
+  13.61 conservative bound, below the 15.30 optimistic one. The removed bytes
+  converted at **14.29 GB/s**, i.e. faster than the 13.7 GB/s link ceiling,
+  because the marginal removed bytes are cheaper than average ones (the per-call
+  cost does not shrink with them). That is the proportionality assumption the
+  artifact's View 2 rests on, and at 3x extrapolation it remains untested — so
+  no speedup claim beyond "this paired run measured +2.068 tok/s at K=1".
+- Criterion 4 PASS: `-Suite qa-smoke` 512 — `--check-telemetry` OK (23,326
+  events), answer aggregate PASS on all five items, negative control FAILS as
+  designed.
+- Criterion 5 PASS: `-Suite host` 23/23; `layer-streaming-pinned-1024` 2/2
+  (27.4 s), `qwen38-layer-boundary` 1/1, `layer-slot-lifecycle` 1/1, all under
+  the mutex with `Q38LS_MODEL_PATH` set.
+- Criterion 6 reported: the runtime logs the cache at 40 layers x 8 rows/layer
+  = **546.8 MiB** private VRAM. `peak_vram_bytes` was **identical** across all
+  four arms (5,723.56 MiB), and it is computed from free-memory deltas around
+  the run (`main.cpp:4169`), so it evidently does not resolve a persistent
+  private allocation — the cache's cost must be read from its own allocation
+  log, not from that field. The attached poller CSVs cannot price it either:
+  their adapter-level `dedicated_bytes` peak (~394-428 MiB) is inconsistent with
+  a run that demonstrably uses ~5.7 GiB. Recorded as an instrumentation
+  limitation, not glossed.
+- Naming, reconciled rather than silently changed: criterion 2 and step 6 name a
+  counter `rows_resident_cross_token`; the shipped field is `n_rows_retained`
+  (with `n_rows_retired`). The driver evaluates the shipped field and says so.
+- No new package type, policy, or placement mechanism beyond SDD section 4: the
+  shape-(i) cache is the section 4 `moe-row-cache` class, and its retention
+  policy is the one the 2026-09-13 owner-directed section 4 amendment already
+  records. No further SDD amendment is introduced by this task.
+
+POLICY RESOLVED 2026-09-13 (decided on owner instruction): the retention
+policy is a ROW-CAPACITY LRU, not a window-count membership set. `K` is a ROW
+BUDGET of `min(n_expert, K*W*top_k)` rows per layer — unchanged arithmetic,
+unchanged VRAM (`row_set_cap` is the same expression under either reading) —
+and the cache keeps that budget's most recently ROUTED rows, evicting a row
+only when a row the current window needs must be placed. The window-count
+reading ("hold exactly the rows routed in the last K windows") was retired
+rather than the statistic, because it is strictly weaker at EQUAL cost: a row
+routed in the last K windows has at most cap-1 rows routed after it, so it is
+always among the cap most recently routed and can never be evicted where the
+window-count rule would keep it. Consequences for this contract:
+  - statistic (b) does NOT move. It was already computed under the row-capacity
+    reading, so the published curve becomes a PREDICTION of this mechanism
+    instead of an overstatement of it, and the K=1 prediction below stands
+    verbatim (the two readings are identical at K=1).
+  - the DEFERRED K>=2 rungs are the affected ones: (b) at K=2/K=4 is
+    0.4343/0.6284 under the resolved policy against 0.4015/0.5194 under the
+    retired one, so the gate crossing moves from ~K=5.9 to ~K=3.6. That is a
+    further reason those rungs come after the non-echoing re-probe.
+  - implementation, C++ checker and offline analyzer are pinned together by
+    `tools/route_overlap/crosscheck-retention.py`, verified EQUAL at K=1,2,4,8
+    on the preserved 10,200-pair probe stream (2026-09-13).
+
+[CORRECTED 2026-09-13: the three statements below assumed the retired
+window-count reading. Each now describes the resolved policy.]
 
 Goal
 : Make a layer's routed expert rows persist ACROSS tokens in per-layer
@@ -2810,6 +2994,17 @@ Known evidence
     about routing: it is the same statistic the gate was read at, at the
     retention the owner already approved (SDD section 4 reference band,
     K=1-2).
+  - MEASURED 2026-09-13 on the K=1 runtime arm, and this is what settles the
+    byte half of the prediction: the arm retained 25,202 rows and staged
+    101,477,941,248 bytes over 10,240 fetches, EXACTLY the offline figures, so
+    (b) predicts realized staged bytes to the row rather than bounding them.
+    The byte saving was met (30.77% removed); the pre-registered 15.30 tok/s
+    was NOT (measured 13.926 against the recorded baseline's 11.578, ~12.2 GB/s
+    effective on the removed bytes). The shortfall is therefore the OTHER
+    declared unknown -- whether time tracks bytes 3x outside the calibrated
+    range -- not the echo-inflation caveat. Greedy output was byte-identical to
+    the baseline's, so the retained rows were the right rows. One arm against a
+    recorded baseline; not a gate verdict.
   - The reuse MECHANISM already exists and is deliberately defeated.
     `load_row_set` computes `fetch` = the union minus whatever
     `row_set_have[slot]` marks resident, but coverage lives with the SLOT, and
@@ -2844,8 +3039,10 @@ Scope
     per-slot coverage reset must not gate the cache path (the default reactive
     path keeps its existing reset semantics unchanged).
   - Fetch = the complement of the retained set, where the retained set is the
-    union of the last K windows (K=1: the previous window). Capacity is tight
-    by construction — a one-window union is at most 8 rows.
+    cache's CURRENT contents under the resolved row-capacity policy (K=1: the
+    cap is 8 rows and the two readings coincide, so this is the previous
+    window's rows). Capacity is tight by construction: a window needs at most
+    `W*top_k` = 8 rows and the cap is `min(n_expert, K*top_k)` >= that.
   - Atomic per-window ready/retire with the existing generation guard; the
     layer graph still consumes only after the matching copy event completes.
   - New counters for cross-token reuse (`rows_resident_cross_token`) and
@@ -2864,7 +3061,9 @@ Non-goals
     re-probe FIRST, because the (b) it would rest on is echo-inflated. W > 1
     (the telemetry validator enforces `window_tokens == 1` today).
   - Any prediction, prefetch, or MTP involvement; any eviction policy other
-    than window age.
+    than recency (the resolved policy is a row-capacity LRU; the retired
+    window-count rule remains measurable only as the analyzer's
+    `--retention-policy kwindow-union`).
   - Changing routing, expert IDs, quantization bytes, or any arithmetic —
     cache residency must never alter the router's exact output.
   - Any change to normal llama.cpp execution or to `--residency off`.
@@ -2903,8 +3102,10 @@ Implementation steps
   4. Compute the complement against the per-layer map, fetch it through the
      existing pack/enqueue path, and mark rows resident only when their copies
      complete.
-  5. Retire rows that fall out of the K-window BEFORE placing new ones, under
-     the generation guard.
+  5. Evict least-recently-routed rows BEFORE placing new ones, never evicting a
+     row the current window needs, under the generation guard; stamp recency
+     across the whole union in ascending expert-id order so the in-window
+     tie-break is deterministic and matches the analyzer's.
   6. Emit the new counters and extend `--check-telemetry` to validate them,
      including conservation (resident + fetched - retired = union size) per
      window.

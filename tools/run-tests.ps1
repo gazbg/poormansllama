@@ -119,7 +119,7 @@ $suites = @{
         # combos). Exclude the tail513 GPU run targets AND the tail513-lm /
         # tail513-bm host checks that FIXTURES-require those GPU runs (the
         # fixture files under fixtures/ are what the host suite uses).
-        Include = 'layer-streaming-(lm40|tail513|tail1025|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal)(-|$)|test-layer-streaming-(layout|model-inspect)'
+        Include = 'layer-streaming-(lm40|tail513|tail1025|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal)(-|$)|test-layer-streaming-(layout|model-inspect)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -295,7 +295,9 @@ elseif ($spec.QaSmoke) {
         $trace = Join-Path $buildDirResolved "gplr07-qa-$len.jsonl"
         $tgtext = Join-Path $buildDirResolved "gplr07-qa-$len.txt"
         $log = Join-Path $buildDirResolved "gplr07-qa-$len.log"
-        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $achieved --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
+        # T-GPLR-12: --no-handoff pins this gate to the recorded streaming-TG
+        # shape (the default-profile QA rungs run separately with auto).
+        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $achieved --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --no-handoff --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
         Write-Host "[qa-smoke] $len tokens: runner under GPU mutex (log $log)..."
         & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
             -TimeoutSeconds $spec.TimeoutSeconds -Command $runCmd

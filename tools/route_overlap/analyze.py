@@ -81,6 +81,33 @@ TOKEN_VERDICT_NO_TG_PHASE = "NO_TG_PHASE"
 GATE9_THRESHOLD = 0.6
 DEFAULT_RETENTION_KS = (1, 2)
 
+# Retention policies the verdict statistic can be computed under. The SDD's
+# section 4 (moe-row-cache) says capacity is a ROW count of K*W*top_k and that
+# an overlapping stream lets a cache hold more than K windows' worth of rows;
+# section 10 describes the statistic as "K-window cumulative-resident-set
+# containment". Those two readings are NOT the same policy, so both are named
+# explicitly. POLICY RESOLVED 2026-09-13 (owner-directed): the implementation
+# and the gate statistic both use row-capacity-lru, so the published (b) curve
+# is now a PREDICTION of the mechanism rather than an overstatement of it.
+#
+#   row-capacity-lru  the resident set is the cap = min(n_expert, K*W*top_k)
+#                     most-recently-ROUTED rows. DEFAULT, and the policy the
+#                     runtime (llama-layer-streaming.cpp load_row_set), the
+#                     C++ checker (tools/layer-streaming/main.cpp
+#                     ls_retention_errors) and the C++ acceptance gate
+#                     (--residency-tg-retain K) all implement. Verified equal to
+#                     the runtime by tools/route_overlap/crosscheck-retention.py
+#                     at K=1,2,4,8 on the preserved probe stream.
+#   kwindow-union     SUPERSEDED. the resident set is union(windows e-K+1..e)
+#                     with an in-window row promoted. Same footprint, weakly
+#                     weaker (see the cross-check), kept only so the superseded
+#                     rule stays measurable and the 2026-09-13 decision
+#                     remains falsifiable.
+# The two coincide exactly at K=1 (cap == one window) and diverge at K>=2.
+RETENTION_POLICY_LRU = "row-capacity-lru"
+RETENTION_POLICY_UNION = "kwindow-union"
+RETENTION_POLICIES = (RETENTION_POLICY_LRU, RETENTION_POLICY_UNION)
+
 # Vendor hash parameters. NOTE: llama-layer-streaming.cpp's tel_rowset_fetch
 # seeds with the literal 1469598103934665603, which is NOT the standard FNV-1a
 # offset basis 0xCBF29CE484222325 (14695981039346656037) -- its comment claims
@@ -120,6 +147,15 @@ def parse_args(argv):
         default=",".join(str(k) for k in DEFAULT_RETENTION_KS),
         help="comma-separated retention window counts (K) for the gate 9 "
         "statistic (b) curve; default is the SDD's reference band",
+    )
+    ap.add_argument(
+        "--retention-policy",
+        default=RETENTION_POLICY_LRU,
+        choices=list(RETENTION_POLICIES),
+        help="bounding rule for the statistic (b) curve: 'row-capacity-lru' "
+        "(default; both the implemented and the published policy) keeps the "
+        "cap most-recently-requested rows, 'kwindow-union' (superseded) keeps "
+        "union(windows e-K+1..e) with promotion. They agree exactly at K=1.",
     )
     ap.add_argument(
         "--self-test",
@@ -484,20 +520,63 @@ def exact_consecutive_containment(series):
     }
 
 
-def simulate_retention(wins, capacity):
+def simulate_retention(wins, capacity, policy=RETENTION_POLICY_LRU, retain_k=None):
     """Retention per-window (required, hits) for one layer.
 
     capacity=None means UNBOUNDED retention (the T8 oracle); otherwise the
-    resident set is bounded to that many rows.
+    resident set is bounded. `policy` selects the bounding rule (see the
+    RETENTION_POLICY_* constants); `retain_k` is the K the union policy needs.
 
-    The resident set is a row-count-bounded LRU over the most recent requests:
-    capacity rows, window-granular recency (all rows of one window share a
-    recency), ascending-id tie-break. Capacity is a ROW count per SDD section
-    4, so when windows overlap a cache can hold more than K windows' worth of
-    rows -- that is the realized ceiling, not a window-count abstraction.
+    row-capacity-lru (DEFAULT): the resident set is a row-count-bounded LRU
+    over the most recent requests -- capacity rows, window-granular recency
+    (all rows of one window share a recency), ascending-id tie-break. Capacity
+    is a ROW count per SDD section 4, so when windows overlap a cache can hold
+    more than K windows' worth of rows -- that is the realized ceiling, not a
+    window-count abstraction.
+
+    kwindow-union: the resident set is union(windows e-K+1..e). A row routed
+    in the current window is PROMOTED to it, so a hot row stays part of the
+    sliding union instead of ageing out while still in use; a row absent from
+    the current window and older than K-1 windows is evicted. This mirrors the
+    runtime's load_row_set retirement order exactly (age > K first, then
+    promote an in-union row, then evict an out-of-union row of age > K-1), and
+    it is what makes the cache bounded by K*W*top_k by construction rather
+    than by capacity pressure.
+
     Windows with a predecessor only: a cold cache holds nothing at the first
     window, and counting it would add structural zeros the pilot never had.
     """
+    if policy not in RETENTION_POLICIES:
+        raise ValueError(f"unknown retention policy {policy!r}")
+    if policy == RETENTION_POLICY_UNION:
+        if retain_k is None:
+            raise ValueError("kwindow-union needs retain_k")
+        resident = {}          # row -> epoch it was last routed in
+        out = []
+        for idx, (_chunk, ids, _h) in enumerate(wins):
+            s = set(ids)
+            # Retirement runs BEFORE scoring, exactly as load_row_set step 1
+            # runs before its step 2: a row routed in this window but older
+            # than K is retired first and is therefore NOT a hit. Scoring
+            # first would count a stale in-union row the runtime refuses.
+            for x in list(resident):
+                age = idx - resident[x]
+                if age > retain_k:
+                    del resident[x]
+                elif x in s:
+                    resident[x] = idx
+                elif age > retain_k - 1:
+                    del resident[x]
+            if idx:
+                out.append((len(s), len(s & set(resident))))
+            for x in s:
+                resident[x] = idx
+            if capacity is not None and len(resident) > capacity:
+                raise AssertionError(
+                    f"kwindow-union exceeded its declared capacity at window "
+                    f"{idx}: {len(resident)} > {capacity}"
+                )
+        return out
     resident = []
     out = []
     for idx, (_chunk, ids, _h) in enumerate(wins):
@@ -513,13 +592,15 @@ def simulate_retention(wins, capacity):
     return out
 
 
-def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0):
+def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0,
+                         policy=RETENTION_POLICY_LRU):
     """T6: SDD gate 9 statistic (b) -- the realized predictor ceiling, per K.
 
     value = mean over per-layer windows-with-a-predecessor of
     |resident n required| / |required| -- next window in the denominator.
     K=1 reduces exactly to consecutive-window containment, which is this
     tool's cross-validation anchor against the recorded pilot (0.358-0.389).
+    Both K=1 anchors hold under either policy; they diverge at K>=2.
     """
     out = {}
     for k in ks:
@@ -532,7 +613,7 @@ def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0
         hits_total = 0
         required_total = 0
         for _layer, wins in sorted(series.items()):
-            rows = simulate_retention(wins, cap)
+            rows = simulate_retention(wins, cap, policy, retain_k=k)
             ratios = [h / req for req, h in rows if req]
             pooled.extend(ratios)
             hits_total += sum(h for _req, h in rows)
@@ -541,6 +622,7 @@ def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0
             if layer_mean is not None:
                 per_layer.append(layer_mean)
         out[k] = {
+            "policy": policy,
             "capacity_rows_per_layer": cap,
             "capacity_bytes_total": (
                 cap * row_bytes * len(series) if row_bytes else None
@@ -649,7 +731,8 @@ def fmt_or_na(x, nd=4):
     return fmt_float(x, nd) if x is not None else "n/a"
 
 
-def build_report(traces, retention_ks=DEFAULT_RETENTION_KS):
+def build_report(traces, retention_ks=DEFAULT_RETENTION_KS,
+                 retention_policy=RETENTION_POLICY_LRU):
     report = []
     for path, (run_id, model, n_tg, routes, rowset) in traces:
         series = rowset_series(rowset["fetch"])
@@ -670,7 +753,8 @@ def build_report(traces, retention_ks=DEFAULT_RETENTION_KS):
                 int(slot_bytes // n_expert) if (n_expert and slot_bytes) else 0
             )
             b_curve = resident_containment(
-                series, retention_ks, n_expert, top_k, window_tokens, row_bytes
+                series, retention_ks, n_expert, top_k, window_tokens, row_bytes,
+                retention_policy,
             )
             oracle = oracle_containment(series)
             # Exact saturation: a reported K whose pooled hits and required equal
@@ -694,6 +778,7 @@ def build_report(traces, retention_ks=DEFAULT_RETENTION_KS):
                 "window_tokens": window_tokens,
                 "top_k": top_k,
                 "n_expert": n_expert,
+                "retention_policy": retention_policy,
                 "slot_bytes": slot_bytes,
                 "row_bytes": row_bytes,
                 "hash_recompute_ok": len(rowset["fetch"]),
@@ -1153,6 +1238,33 @@ def self_test() -> int:
         "rowset: (b) at K=1 equals consecutive-window containment",
     )
 
+    # Policy divergence fixture. A={1..8}, B={9..16}, windows [A, B, A, A, B].
+    # At K=2 both rules see the same stream but bound it differently: the
+    # row-capacity LRU still holds B at window 5 (its 16 slots filled at
+    # window 2), while the K-window union evicted B at window 4 (age 2 > K-1),
+    # so window 5 is 8 hits for the LRU and 0 for the union -- 0.75 against
+    # 0.50 pooled. That spread IS the two readings of SDD gate 9 at K=2; the
+    # self-test pins it so neither can be changed silently.
+    _a = list(range(1, 9))
+    _b = list(range(9, 17))
+    _pser = {0: [(i, ids, 0) for i, ids in enumerate([_a, _b, _a, _a, _b])]}
+    _bl = resident_containment(_pser, (1, 2), 256, 8, 1)
+    _bu = resident_containment(
+        _pser, (1, 2), 256, 8, 1, policy=RETENTION_POLICY_UNION
+    )
+    check(abs(_bl[2]["value"] - 0.75) < 1e-9, "rowset: policy LRU K=2 == 0.75")
+    check(abs(_bu[2]["value"] - 0.5) < 1e-9, "rowset: policy UNION K=2 == 0.5")
+    check(
+        abs(_bl[1]["value"] - _bu[1]["value"]) < 1e-9
+        and abs(_bl[1]["value"] - 0.25) < 1e-9,
+        "rowset: the two policies agree exactly at K=1",
+    )
+    check(
+        _bu[1]["policy"] == RETENTION_POLICY_UNION
+        and _bl[1]["policy"] == RETENTION_POLICY_LRU,
+        "rowset: policy recorded in the curve",
+    )
+
     rap = reappearance_histogram(series)
     check(rap["gaps"] == {"2": 16}, "rowset: reappearance gaps {2: 16}")
     check(
@@ -1303,7 +1415,7 @@ def main(argv):
     for p in trace_paths:
         parsed.append((os.path.basename(p), load_trace(p)))
 
-    report = build_report(parsed, retention_ks)
+    report = build_report(parsed, retention_ks, args.retention_policy)
     txt = render_txt(
         report,
         json_basename=os.path.basename(args.json_out) if args.json_out else None,

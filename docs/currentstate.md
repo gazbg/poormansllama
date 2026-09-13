@@ -1,5 +1,292 @@
 # Current State
 
+## 2026-09-13: Vendored-fork commit convention DECIDED and applied — the vendored backlog is committed, so the T-GPLR-12/13/16/18/19 mechanisms are reproducible from a clean checkout
+
+Owner-directed ("decide the vendored-fork commit convention"). Documentation and
+commits only; no code changed by this pass, no GPU runs. The rule is written
+normatively in
+`docs/plans/generic-prefill-layer-residency-plan.md` under "Vendored-Tree Commit
+Convention".
+
+**The convention was not a choice, which is why leaving it "open" was costing
+more than deciding it.** `third_party/llama.cpp` is recorded by the root repo as
+a gitlink (index mode `160000`) and there is no `.gitmodules`, so the root stores
+only a commit SHA for that directory — never its file contents. A vendored
+change is therefore reproducible from a clean checkout **only** if (1) it is
+committed inside the nested repo and (2) the root repo commits the bumped
+gitlink. There is no third mechanism. The practice was already evidenced four
+times in root history (`2308dca`, `64b5aeb`, `1148136` — "Bump vendored
+llama.cpp to 169ab086e" — and `84be194`), and the plan's own `Commit:` fields
+already used the two-hash form ("vendored code through third_party/llama.cpp
+<sha>; outer docs/tools through <sha>"). What was missing was a normative
+statement, not a decision.
+
+**Rules.** Nested commits go on the fork's local `master` with the subject
+`layer-streaming: T-GPLR-<ids> - <summary>`. The fork is **never pushed**: its
+`origin` is upstream `ggml-org/llama.cpp`, and AGENTS.md forbids upstream-facing
+material, so a stray `git push` inside that directory is the one live hazard in
+this arrangement (it is now ahead 4 of `origin/master`). The root commit's
+subject is `Record ...` and it carries the task's docs, its tracked `tools/`
+surface, and the 2-line gitlink bump. The task's `Commit:` field names **both**
+hashes, because the root hash alone does not identify the vendored code.
+
+**Applied.** `third_party/llama.cpp` **a61528b47** — 9 files, +2,694/-149 — the
+accumulated mechanism that had been dirty since `099a27a7e` (T-GPLR-08/10/11).
+It carries `src/llama-layer-streaming.{h,cpp}`, `src/llama-context.cpp`,
+`src/models/{models.h,qwen35moe.cpp}`, `ggml/src/ggml-backend.cpp`,
+`ggml/src/ggml-cuda/ggml-cuda.cu`, and `tools/layer-streaming/{main.cpp,
+CMakeLists.txt}`. Checked before staging: no absolute or host paths anywhere in
+the added lines, no new `TODO`/`FIXME`, and every diagnostic print is env-gated
+(`LLAMA_LAYER_STREAMING_DEBUG`, `GGML_LS_GRAPH_EXEC_MARKERS`,
+`LLAMA_LS_TG_ROUTER_PROBE`), so default behaviour and the CPU path are untouched.
+`git diff --cached --check` clean; nested worktree clean after the commit.
+
+**Attribution limit, stated rather than hidden.** The commit spans five tasks
+(T-GPLR-12/13/16/18/19) as one unit and therefore cannot tell you which hunk
+came from which task. Per-hunk splitting was rejected on a mechanical ground,
+not convenience: the T-GPLR-19 hunks live in files that also carry T-GPLR-00..18
+hunks, so no partition into per-task nested commits yields an intermediate tree
+that compiles — which would defeat the only purpose the commit has,
+reproducibility. The commit pins the tree state that all the campaign's evidence
+was actually measured on; going forward, one nested commit per task restores
+per-task attribution.
+
+**What was included besides the vendored tree, and the coupling argument.**
+`tools/run-tests.ps1` is in the root commit even though its diff is T-GPLR-12/16
+work, because it pins the host-suite pattern for
+`layer-streaming-dense-mtp-auto-refusal` — a ctest target that exists **only**
+inside the nested repo's now-committed CMakeLists (confirmed: 0 occurrences in
+`099a27a7e`, present at `CMakeLists.txt:536` in the backlog). Committing the
+gitlink while leaving that harness uncommitted would create a tree whose tracked
+test list references a target the tracked CMakeLists does not define — the same
+half-committed defect this pass exists to stop.
+
+**Excluded, deliberately.** `AGENTS.md` (an agent-tooling `## Tools` section,
+not campaign work), the `.lean-ctx*` artifacts, and five campaign runners that
+tracked docs cite but that remain untracked and gitignored:
+`tools/run-gplr13-ladder.ps1` and `tools/run-gplr13-negfix.ps1` (both cited in the
+plan and currentstate), `tools/run-gplr13-rowset-probe.ps1` (cited in
+`docs/gplr13-bottlenecks-hypotheses.md`), `tools/run-memprobe-dense.ps1` and
+`tools/gplr16-dump.cpp` (cited in currentstate). This is a **live instance of the
+campaign's own defect class** — tracked text citing a file a clean checkout lacks
+— left unfixed on purpose: three of the four runners default to a host model path
+via a parameter (acceptable), but `tools/run-memprobe-dense.ps1` hardcodes
+`C:/Models/...` with no override, and AGENTS.md requires model paths to be
+treated as environment facts rather than source constants. Tracking them is
+therefore a hardening task, not a bookkeeping one, and folding it into this pass
+would have silently committed host-specific constants. Reported here so it can
+be authorized as its own task.
+
+**Corrections made in the same pass**, since the commit falsifies them: the plan's
+T-GPLR-13 and T-GPLR-18 blocks both said their vendored implementation "remains
+uncommitted" / "stays uncommitted in the vendored tree", T-GPLR-18's follow-up
+note said the pinned arm was therefore not reproducible from a clean checkout,
+the plan's T-GPLR-19 `Commit:` fields read `none`, and two bullets in the
+T-GPLR-19 entry above named the convention as an open owner call. All five now
+record `a61528b47`, in the established in-place bracketed style rather than by
+rewriting dated records.
+
+**Evidence.** Nested build clean (CUDA Release, `llama-layer-streaming` exit 0),
+outer host suite **23/23**, T-GPLR-19's four-arm A/B gate passing all six
+criteria, and the runtime-vs-analyzer retention cross-check EQUAL at K=1,2,4,8 —
+all on exactly the tree now pinned by `a61528b47`.
+
+## 2026-09-13: T-GPLR-19 DONE — the four-arm K=1 A/B gate RAN and all six acceptance criteria passed; F2-M1 is now a measured mechanism
+
+GPU work under the mutex, plus documentation. Driver:
+`tools/run-gplr19-rowcache-ab.ps1` (TRACKED, per the task's RESOLVED
+harness-home decision). Arms A,B,A,B in ONE acquisition of
+`Global\AI-GPU-EXCLUSIVE-v1`; `tools/gpu-mem-poll.ps1` attached per arm;
+`--check-telemetry` per trace. The arms differ ONLY by
+`--residency-tg-retain 1`; the vehicle is the T-GPLR-15 probe's batch-major
+shape (the only row-set vehicle with enough TG tokens to measure a staging
+change). Re-runnable without the GPU via `-AnalyzeOnly`.
+
+| arm | retain | exit | checker | pp tok/s | TG tok/s | staged/round (B) | transfer_us | rows_fet | rows_ret | rows_rtd | refused |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A1 | 0 | 0 | 0 | 92.060 | **11.951** | 572,719,104 | 1653.0 | 81,920 | 0 | 0 | 0 |
+| B1 | 1 | 0 | 0 | 92.036 | **14.015** | 396,398,208 | 1362.3 | 56,718 | 25,202 | 56,398 | 0 |
+| A2 | 0 | 0 | 0 | 92.396 | **11.955** | 572,719,104 | 1648.9 | 81,920 | 0 | 0 | 0 |
+| B2 | 1 | 0 | 0 | 92.588 | **14.026** | 396,398,208 | 1356.2 | 56,718 | 25,202 | 56,398 | 0 |
+
+- **Criterion 1 (feasibility + parity) PASS.** Four arms exit 0 with
+  `--check-telemetry` OK; the ordered `layer|union_ids|hash` route stream is
+  identical across all four arms; greedy token IDs are identical across all four
+  arms; the reactive arms reproduce the recorded baseline EXACTLY — 10,240
+  fetches, 572,719,104 B/round, `rows_reused` = 0.
+- **Criterion 2 (mechanism gate, decided on BYTES) PASS — not
+  falsified-by-evidence.** K=1 stages **396,398,208 B/round** against the
+  predicted 395,835,932: **+0.142%**, inside the 2% band. Cross-token retention
+  is non-zero on all 40 layers. So the statistic (b) the gate was read at
+  predicts realized staged BYTES to the fraction of a percent, not merely an
+  upper bound.
+- **Criterion 3 (performance) PASS, inside the pre-registered envelope.**
+  Reactive mean 11.953 -> K=1 mean **14.021 tok/s**, gain **+2.068** against a
+  within-pair spread of **0.011** — the gain is ~188x the spread, so the
+  proportionality clause did NOT fire. 14.021 lies between the two
+  pre-registered bounds (above the 13.61 conservative bound, below the 15.30
+  optimistic one). The removed bytes converted at **14.29 GB/s** — faster than
+  the 13.7 GB/s link ceiling, because the marginal removed bytes are cheaper
+  than average ones (the per-call cost does not shrink with them). No speedup
+  claim beyond "this paired run measured +2.068 tok/s at K=1": the two bounds
+  were declared UPPER bounds precisely because (b) comes from
+  self-echoing-anchor stream, and the 3x extrapolation the artifact's View 2
+  rests on remains untested.
+- **Criterion 4 PASS:** `-Suite qa-smoke` 512 — `--check-telemetry` OK (23,326
+  events), answer aggregate **PASS** on all five items (N1-N4 + K1), negative
+  control **FAILS as designed**.
+- **Criterion 5 PASS:** `-Suite host` **23/23**; `layer-streaming-pinned-1024`
+  **2/2** (27.4 s), `qwen38-layer-boundary` **1/1**, `layer-slot-lifecycle`
+  **1/1** — the dense pinned fixture shares the slot/pinned path this task
+  touches, so this is the no-regression evidence for the eviction rewrite.
+- **Criterion 6 (reported, not claimed):** the runtime logs the cache at 40
+  layers x 8 rows/layer = **546.8 MiB** private VRAM, K=1. `peak_vram_bytes`
+  was **identical across all four arms** (5,723.56 MiB) — and it is computed
+  from free-memory deltas around the run (`main.cpp:4169`), so it evidently does
+  not resolve a persistent private allocation. The cache's cost must be read
+  from its own allocation log, not from that field. The attached poller CSVs
+  cannot price it either: their adapter-level `dedicated_bytes` peak
+  (~394-428 MiB) is inconsistent with a run that demonstrably uses ~5.7 GiB.
+  Recorded as an instrumentation limitation rather than glossed.
+- **Offline (b) vs runtime, on the SAME stream:** offline (b) at K=1 = 25,202
+  hits / 81,600 required = 0.308848; the runtime retained rows on both B arms =
+  **25,202** — exact agreement, not approximate. The A arms are reported N/A
+  with the reason (retention off, so there is no runtime cache to compare), not
+  as mismatches.
+- **Reproducibility:** the whole driver was re-run after three driver defects
+  were fixed (a regex for the allocation line, the offline-vs-runtime check
+  applied to cache-less arms, and `-AnalyzeOnly` deleting its own evidence), and
+  the gate verdicts were unchanged — the gain was +2.037 then and +2.068 now
+  across a ~1.2% session-to-session drift, so the verdict is robust to it.
+- **Naming reconciled, not silently changed:** criterion 2 and step 6 name a
+  counter `rows_resident_cross_token`; the shipped telemetry field is
+  `n_rows_retained` (with `n_rows_retired`). The driver evaluates the shipped
+  field and says so. The task is otherwise unchanged: no new package type,
+  policy, or placement mechanism beyond SDD section 4 — the shape-(i) cache is
+  the section 4 `moe-row-cache` class, and its retention policy is the one the
+  2026-09-13 owner-directed section 4 amendment already records.
+- **Artifact update (required by the task):** `docs/plots/gplr15-b-vs-k.html`
+  View 2 now states AND DRAWS the measured K=1 point — a ringed marker between
+  the two projected series, at y=371.7 against y=374.0 (link ceiling, 13.61
+  tok/s) and y=364.4 (effective rate, 15.30), so the reader can see which series
+  the hardware landed near instead of taking the caption's word for it — with
+  reactive 11.953, K=1 14.021, gain +2.068, spread 0.011, realized byte
+  reduction 30.79% against the 30.88% projected, conversion 14.29 GB/s, all
+  read from the A/B `summary.json` by a new `--measured-ab` option in
+  `tools/route_overlap/plot-b-vs-k.py`, so the chart cannot drift from the
+  measurement. Its previous claim that "no paired measured run exists for any
+  point here" was **falsified by this run** and is replaced. Disclosed in the
+  artifact's provenance: the summary is gitignored build output, so the marker
+  is drawn only while it exists — the caption carries the values regardless.
+  Verified by reading the rendered page: the label and the ring are present in
+  the live DOM and the marker sits between the two series at K=1 by coordinate;
+  pixel-level visual capture was unavailable in this build, so the placement is
+  asserted from the SVG coordinates rather than from a screenshot.
+- **Open owner call: NONE remaining for this task.** [CORRECTED 2026-09-13:
+  this bullet named the vendored-fork commit convention as open and said
+  T-GPLR-19's Commit field stays `none`. The convention was DECIDED the same day
+  (see the entry at the top of this file) and applied, so the field records both
+  hashes and the K=1 arm's vendored half is now reproducible from a clean
+  checkout. Retained as written: the mechanism is a change in
+  `third_party/llama.cpp`, so T-GPLR-19's Commit field stays `none` until that
+  is settled; the clean-checkout caveat from the harness-home decision therefore
+  still stands for the K=1 arm's vendored half.]
+
+## 2026-09-13: Retention policy RESOLVED — the implementation moved to the row-capacity LRU the gate already measured, so the published (b) curve is now a prediction of the mechanism instead of an overstatement
+
+Host-only implementation + documentation change (no GPU run, no library run).
+Two independent implementations of the `moe-row-cache` retention rule had
+diverged, because SDD section 4 ("capacity is a ROW count of `K*W*top_k`") and
+the phrase "K-window" in gate 9 admit two readings. They are now one rule.
+
+- **The decision.** `K` is a ROW BUDGET of `min(n_expert, K*W*top_k)` rows per
+  layer, and the cache keeps that budget's most recently ROUTED rows. The
+  competing reading ("hold exactly the rows routed in the last K windows") was
+  retired rather than the statistic. It was decided on DOMINANCE, not taste:
+  both readings charge the identical `row_set_cap = min(n_exp, K*top_k)`, so
+  there is no VRAM tradeoff to weigh, and the row-capacity rule weakly wins —
+  a row routed in the last K windows has at most cap-1 rows routed after it,
+  so it is always among the cap most recently routed and can never be evicted
+  where the window-count rule would keep it. The weaker rule was the one the
+  runtime happened to implement; the stronger one was already what the gate and
+  the published curve measured.
+- **What moved, and what did not.** The IMPLEMENTATION moved
+  (`llama-layer-streaming.cpp` `load_row_set` + its C++ checker). The statistic
+  did NOT: (b) was already computed under the row-capacity reading, so
+  `docs/plots/gplr15-b-vs-k.html` regenerates **byte-identical** (`diff -q`
+  clean) and the curve's numbers now describe the mechanism. K=1 is provably
+  unchanged — the two readings are identical there (cap = 8 = exactly one
+  window), which is why the K=1 pre-registered prediction in T-GPLR-19 stands
+  verbatim and the outstanding K=1 gate is unaffected.
+- **Measured effect, on the preserved 10,200-pair probe stream.**
+  Statistic (b) per K, implementation vs the retired rule: K=1 0.308848 both;
+  K=2 0.434265 vs 0.401544; K=4 **0.628419** vs 0.519436; K=8 0.777488 vs
+  0.659252. The gate crossing moves from ~K=5.9 to ~**K=3.6**, so at K=4 the
+  gate now PASSES as published instead of failing by 0.081 — at the same
+  1.13 GB. The oracle ceiling is unchanged at 0.938456, so the stream was
+  never the limit; the policy was.
+- **Anti-drift, verified rather than asserted.** New tracked harness
+  `tools/route_overlap/crosscheck-retention.py` replays one shared recorded
+  stream through the runtime rule and the offline analyzer and fails on any
+  disagreement. Result: window-sequence identity OK (analyzer `chunk` order ==
+  runtime `epoch = ubatch - 1`, chunks consecutive), the C++ checker ACCEPTS
+  the emitted fixture at K=1,2,4,8, and the runtime rule equals the analyzer's
+  `row-capacity-lru` policy **exactly, row for row**, at every K. Negative
+  control: asserting the superseded `kwindow-union` policy instead reports
+  DRIFT at K>=2 and exits 1, so the check cannot pass vacuously. It caught a
+  real bug during development — an emitter cache keyed by expert alone instead
+  of `(layer, expert)`, which let layer 1's first window claim residency from
+  layer 0; the C++ checker rejected the fixture and the emitter was fixed.
+- **Analyzer gained an explicit policy.** `analyze.py` now names both rules
+  (`--retention-policy {row-capacity-lru,kwindow-union}`, default the former)
+  and records the policy in its report, so the two can be compared by name
+  rather than by convention. Default behaviour is unchanged (K=1/K=2 values
+  bit-identical; oracle and exact-consecutive identical), self-test grew 51 ->
+  **55 checks** and pins both policies' K=2 divergence (0.75 vs 0.50 on a
+  purpose-built fixture) so neither can move silently.
+- **Not done, deliberately.** No K>=2 GPU arm: the mechanism's recency eviction
+  is validated host-side (checker + crosscheck + build) and by the K=1
+  invariance proof, but a K=2 arm (16 rows/layer, 1.13 GB) remains to be run,
+  and T-GPLR-19's deferred `K > 1` rungs still want the non-echoing re-probe
+  first. Nothing is committed; the vendored-fork convention is still open.
+- **Runtime arm run at K=1** (one arm, GPU mutex held; driver
+  `build/llama-cuda/gplr19-k1/run-k1.ps1`, same vehicle as the recorded probe
+  plus `--residency-tg-retain 1`, so the only difference is the flag under
+  test). Runner exit 0; `--check-telemetry: OK (21,020 events, 4 slots)`; peak
+  VRAM **5,723.56 MiB — unchanged from baseline**, so the 566 MB cache did not
+  raise peak; 0 refusals; 0 accounting errors; TG **13.926 tok/s** (wall
+  18,382.7 ms) against the recorded reactive baseline's 11.578 tok/s (wall
+  22,110.8 ms).
+- **The runtime reproduces the offline statistic exactly, not approximately.**
+  The arm retained **25,202** rows over 10,240 fetches and staged
+  **101,477,941,248** bytes — both figures identical to what the analyzer and
+  the cross-check harness computed offline for this stream at K=1 (25,202 hits;
+  staged 101,477,941,248). Reuse over the whole stream is 0.307642 (0.308848
+  once the 1,809 cold windows are excluded, which is the analyzer's
+  convention). This is a three-way agreement — implementation, C++ checker,
+  offline analyzer — on real hardware, not only in simulation.
+- **Arithmetic preserved, decisively.** The K=1 arm's greedy decode output
+  (`k1-retain.txt`) is **byte-identical** to the recorded baseline's
+  (`probe-tg256.txt`): 463 bytes each, `diff` clean. Wrong retained rows or a
+  bad D2D refresh would have changed the logits, so this is stronger evidence
+  than any telemetry counter that the rewritten eviction path serves the right
+  bytes.
+- **The pre-registered 15.30 tok/s was NOT reached, and the reason is
+  specific.** The BYTE half of the prediction was met exactly (30.77% staged
+  bytes removed, matching (b) = 0.308848 to the row), so the shortfall is the
+  byte→time conversion — i.e. T-GPLR-19's OTHER declared unknown ("whether time
+  tracks bytes 3x outside the calibrated range"), not the echo-inflation caveat
+  that was expected to bite. Implied effective bandwidth of the removed bytes:
+  ~12.2 GB/s. This is one arm against a RECORDED baseline, not a same-session
+  paired A/B, so it is not a gate verdict; T-GPLR-19's four-arm gate remains
+  unrun.
+- **Validation:** build clean; host suite **23/23**; reactive probe trace
+  `--check-telemetry` exit 0 (no retention → no regression); the K=1 union-rule
+  fixture still exit 0 (proving K=1 invariance) while the K=2 union-rule
+  fixture now exit 1 (proving the checker changed); all three tampered variants
+  still rejected; `py_compile` clean on both tools; published artifact
+  regenerates byte-identical.
+
 ## 2026-09-13: T-GPLR-19 drafted (F2-M1 per-layer row residency at K=1) and its A/B driver's home DECIDED — tracked `tools/`, not a gitignored `build/` one-off
 
 Documentation only: no code, no build, no GPU run. This change records the
@@ -610,7 +897,10 @@ no GPU runs, no new task scope.
 - **T-GPLR-13's DONE block records its commit** (`46644f1`) per AGENTS.md,
   with the faithful qualification that the commit carries the documentation
   close-out only — the vendored T-GPLR-13 implementation remains uncommitted
-  in `third_party/llama.cpp`.
+  in `third_party/llama.cpp`. [CORRECTED 2026-09-13: the qualification's second
+  half is superseded — the vendored implementation is now committed as
+  `third_party/llama.cpp` **a61528b47**. The `46644f1` record itself was accurate
+  and is unchanged.]
 
 ## 2026-09-13: SDD amended with the F2 per-layer row cache (`moe-row-cache`) residency class — realized reuse and the T-GPLR-15 gate's cumulative-resident-set ceiling are now defined and measurable
 
