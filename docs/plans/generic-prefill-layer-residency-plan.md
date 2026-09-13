@@ -2154,9 +2154,10 @@ permitted execution shapes, loud cache failures, cache-vs-link telemetry
 classes, gate 10, and the cache risk list. A Phase B / F2 contract is no
 longer blocked on design.
 Depends on: T-GPLR-13 (DONE); T-GPLR-14 (instrument, closed).
-Commit: the closing commit is the one carrying the 2026-09-13 RETENTION
-DECISION above; its hash is recorded by the short bookkeeping commit that
-follows it (the same two-step pattern used for T-GPLR-18's ba1f31e).
+Commit: 8510ac7 (2026-09-13: the RETENTION DECISION above, the status flip,
+the currentstate decision entry and the bottlenecks section 7 decision note).
+This line is recorded by the bookkeeping commit that follows it — the same
+two-step pattern used for T-GPLR-18's ba1f31e.
 
 Goal
 : Raise MoE TG tok/s by staging the NEXT token window's row set while
