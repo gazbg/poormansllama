@@ -59,7 +59,15 @@ RUNG_COLOURS = ["#2e7d32", "#00838f", "#8d6e63", "#ad1457"]
 HALO = (' paint-order="stroke" stroke="#ffffff" stroke-width="3.2" '
         'stroke-linejoin="round"')
 LINK_GBS_DEFAULT = 13.7   # measured Gen4 x8 H2D ceiling (T-Q38TG-00)
-MEASURED_AB_DEFAULT = "build/llama-cuda/gplr19-rowcache-ab/summary.json"
+# One A/B summary per retention depth. The K=1 gate plus whichever deferred
+# rungs have been run; a path that does not exist is skipped, not faked.
+MEASURED_AB_DEFAULTS = [
+    "build/llama-cuda/gplr19-rowcache-ab/summary.json",   # K=1, the gate
+    "build/llama-cuda/gplr19-k2-ab/summary.json",
+    "build/llama-cuda/gplr19-k4-ab/summary.json",
+    "build/llama-cuda/gplr19-k6-ab/summary.json",
+    "build/llama-cuda/gplr19-k8-ab/summary.json",
+]
 
 W, H = 980, 620
 X0, X1 = 96, 900        # plot box, left/right
@@ -260,6 +268,8 @@ def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs, measured=None):
     # retention (or any perfect predictor) can buy back.
     asymptote = 1000.0 / proj["floor_ms"]
     top = max(max(r["link_toks"], r["eff_toks"]) for r in rows)
+    if measured:
+        top = max(top, max(m["tok_s"] for m in measured))
     ymax = max(top, asymptote) * 1.14
 
     def x(k):
@@ -313,20 +323,27 @@ def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs, measured=None):
         add(f'<text x="{X0 + 6}" y="{Y0 + (12 if tag == "link" else 26)}" font-size="12" '
             f'fill="{colour}">{label}</text>')
 
-    # The paired measurement (T-GPLR-19's four-arm A/B) is drawn ON this view
-    # rather than only described, because the K=1 point is exactly what the
-    # projection is asked to predict: the run measured a value between the two
-    # projected series, so a reader can see which series the hardware landed
-    # near instead of taking the caption's word for it. The label goes in the
-    # legend row, not beside the marker -- the geometry here is tight at K=1
-    # (7 px between the series) and a label on the marker would sit on them.
+    # The paired measurements (T-GPLR-19's four-arm A/B, one run per retention
+    # depth) are drawn ON this view rather than only described, because they are
+    # exactly what the projection is asked to predict. Drawing the series instead
+    # of a single marker is what makes the shape checkable: the measured line
+    # tracks inside the projected band, so a reader can see whether the bracket
+    # held as well as whether one point landed in it. Markers are hollow rings so
+    # the projected series stay visible underneath. Labels go in the legend row,
+    # not beside the markers: the geometry here is tight (7 px between the
+    # projected series at K=1) and a label would sit on them.
     if measured:
-        mx, my = x(1), y(measured["k1_tok_s"])
-        add(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="7.5" fill="none" '
-            f'stroke="#111" stroke-width="2"/>')
-        add(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="2.8" fill="#111"/>')
+        pts = " ".join(f"{x(m['k']):.1f},{y(m['tok_s']):.1f}" for m in measured)
+        if len(measured) > 1:
+            add(f'<polyline points="{pts}" fill="none" stroke="#111" '
+                f'stroke-width="1.6" stroke-dasharray="3 3"/>')
+        for m in measured:
+            add(f'<circle cx="{x(m["k"]):.1f}" cy="{y(m["tok_s"]):.1f}" r="7" '
+                f'fill="none" stroke="#111" stroke-width="2"/>')
+            add(f'<circle cx="{x(m["k"]):.1f}" cy="{y(m["tok_s"]):.1f}" r="2.6" fill="#111"/>')
+        ks = ", ".join(str(m["k"]) for m in measured)
         add(f'<text x="{X0 + 6}" y="{Y0 + 40}" font-size="12" fill="#111">'
-            f'\u25cf measured paired K=1 (ABAB): {measured["k1_tok_s"]:.3f} tok/s</text>')
+            f'\u25cf measured, one ABAB run per K: K={ks}</text>')
 
     # Value labels, with two guards because this geometry is genuinely tight: the link
     # projection is nearly flat early (13.6 at K=1 vs 14.7 at K=2, 7 px apart) and the
@@ -363,47 +380,55 @@ def build_time_svg(d, basis, proj, baseline_tok_s, link_gbs, measured=None):
     return "\n".join(out)
 
 
-def load_measured_ab(path, basis, d):
-    """The T-GPLR-19 paired K=1 result, read from its own A/B summary.
+def load_measured_abs(paths, basis, d):
+    """The paired T-GPLR-19 A/B results, one entry per retention depth K.
 
-    Returns None when the file is absent, so the artifact degrades to the
-    projection only rather than inventing a measurement. The byte-to-time
-    conversion is derived here from the arm means (removed bytes over the time
-    actually saved), never quoted from a note.
+    Reads one summary.json per K (the K=1 gate plus whichever deferred rungs
+    have been run). Files that are absent are skipped, so the artifact degrades
+    to fewer measured points rather than inventing one. Every number here is
+    derived from the arm means -- removed bytes over the time actually saved --
+    never quoted from a note, and the byte fraction is checked against the
+    curve view 1 already shows so a rung cannot silently disagree with it.
     """
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8-sig") as fh:
-        arms = json.load(fh)
-    # the driver records tok/s as text (it scrapes the run log), so coerce
-    off = [a for a in arms if int(a.get("retain")) == 0]
-    on = [a for a in arms if int(a.get("retain")) == 1]
-    if not off or not on:
-        return None
-    tg = lambda a: float(a["tg_tok_s"])
-    base_tg = sum(tg(a) for a in off) / len(off)
-    k1_tg = sum(tg(a) for a in on) / len(on)
-    base_b = sum(float(a["staged_per_round"]) for a in off) / len(off)
-    k1_b = sum(float(a["staged_per_round"]) for a in on) / len(on)
-    saved_b = base_b - k1_b
-    saved_s = (1.0 / base_tg) - (1.0 / k1_tg)
-    conv = saved_b / saved_s / 1e9 if saved_s > 0 else 0.0
-    spread = max(
-        abs(tg(on[0]) - tg(on[-1])),
-        abs(tg(off[0]) - tg(off[-1])),
-    )
-    # the projected byte reduction at K=1, from the same curve view 1 shows
-    k1 = next((v for k, v in d["curve"] if k == 1), None)
-    predicted_pct = k1["value"] * 100.0 if k1 else 0.0
-    return {
-        "baseline_tok_s": base_tg,
-        "k1_tok_s": k1_tg,
-        "gain": k1_tg - base_tg,
-        "spread": spread,
-        "byte_pct": saved_b / base_b * 100.0,
-        "predicted_pct": predicted_pct,
-        "conversion_gbs": conv,
-    }
+    out = []
+    for path in (paths or []):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8-sig") as fh:
+            arms = json.load(fh)
+        # the driver records tok/s as text (it scrapes the run log), so coerce
+        off = [a for a in arms if int(a.get("retain")) == 0]
+        ks = sorted({int(a["retain"]) for a in arms if int(a.get("retain")) > 0})
+        if not off or not ks:
+            continue
+        k = ks[0]
+        on = [a for a in arms if int(a.get("retain")) == k]
+        tg = lambda a: float(a["tg_tok_s"])
+        base_tg = sum(tg(a) for a in off) / len(off)
+        ret_tg = sum(tg(a) for a in on) / len(on)
+        base_b = sum(float(a["staged_per_round"]) for a in off) / len(off)
+        ret_b = sum(float(a["staged_per_round"]) for a in on) / len(on)
+        saved_b = base_b - ret_b
+        saved_s = (1.0 / base_tg) - (1.0 / ret_tg)
+        conv = saved_b / saved_s / 1e9 if saved_s > 0 else 0.0
+        spread = max(
+            abs(tg(on[0]) - tg(on[-1])),
+            abs(tg(off[0]) - tg(off[-1])),
+        )
+        point = next((v for kk, v in d["curve"] if kk == k), None)
+        out.append({
+            "k": k,
+            "path": path,
+            "reactive_tok_s": base_tg,
+            "tok_s": ret_tg,
+            "gain": ret_tg - base_tg,
+            "saved_ms_per_token": (1.0 / base_tg - 1.0 / ret_tg) * 1000.0,
+            "spread": spread,
+            "byte_pct": saved_b / base_b * 100.0,
+            "predicted_pct": point["value"] * 100.0 if point else 0.0,
+            "conversion_gbs": conv,
+        })
+    return sorted(out, key=lambda p: p["k"]) if out else None
 
 
 def build_time_table(proj, link_gbs, basis):
@@ -600,7 +625,7 @@ def build_table(d):
 
 def build_html(d, input_name, generated_from, basis=None, baseline_tok_s=None,
                link_gbs=LINK_GBS_DEFAULT, rungs=None, ladder_name=None,
-               measured=None, measured_path=None):
+               measured=None):
     sat = d["saturated_by"]
     sat_note = (
         f"The reported K={sat} already saturates it." if sat is not None
@@ -632,36 +657,49 @@ def build_html(d, input_name, generated_from, basis=None, baseline_tok_s=None,
             f'is the basis the SDD section 4 band and the T-GPLR-15 retention records are '
             f'written in.'
         )
-    # The K=1 point of this projection has been measured: T-GPLR-19's four-arm
-    # paired A/B (tools/run-gplr19-rowcache-ab.ps1) ran A,B,A,B in one GPU
-    # session. Where that measurement is supplied, view 2 states it next to the
+    # The projection has been measured at several retention depths: T-GPLR-19's
+    # four-arm paired A/B (tools/run-gplr19-rowcache-ab.ps1) ran A,B,A,B per K.
+    # Where those measurements are supplied, view 2 draws them against the
     # projection instead of claiming no paired run exists.
     measured_note = ""
-    # The A/B summary is gitignored build output, so the ringed marker disappears
-    # from a clean checkout while the caption's numbers do not. Say which is which
-    # rather than letting a regenerate silently drop the measurement.
+    # The A/B summaries are gitignored build output, so the measured series
+    # disappears from a clean checkout while the caption's numbers do not. Say
+    # which is which rather than letting a regenerate silently drop it.
     measured_src = (
-        f"Paired K=1 measurement: <code>{html.escape(str(measured_path))}</code> "
-        f"(gitignored build output; the marker is drawn only while it exists, but "
-        f"the values are recorded in the view 2 caption regardless).<br>\n"
-        if measured else ""
-    )
+        "Paired measurements: <code>"
+        + "</code>, <code>".join(html.escape(str(m["path"])) for m in measured)
+        + "</code> (gitignored build output; the measured series is drawn only "
+          "while these exist, but the values are stated in the view 2 caption "
+          "regardless).<br>\n"
+    ) if measured else ""
     if measured:
+        k1 = next((m for m in measured if m["k"] == 1), None)
+        first, last = measured[0], measured[-1]
+        r_lo = min(m["reactive_tok_s"] for m in measured)
+        r_hi = max(m["reactive_tok_s"] for m in measured)
+        # the byte side is compared in PERCENTAGE POINTS of (b), not relative
+        # bytes, because that is the quantity the gate is written in
+        pp = max(abs(m["byte_pct"] - m["predicted_pct"]) for m in measured)
+        convs = ", ".join(f"K={m['k']} {m['conversion_gbs']:.2f}" for m in measured)
         measured_note = (
-            f" A PAIRED MEASUREMENT NOW EXISTS at K=1: four arms "
-            f"A,B,A,B in one GPU session gave a reactive mean of "
-            f"{measured['baseline_tok_s']:.3f} tok/s and a K=1 mean of "
-            f"{measured['k1_tok_s']:.3f} tok/s (gain {measured['gain']:+.3f}, "
-            f"within-pair spread {measured['spread']:.3f}). The realized byte "
-            f"reduction was {measured['byte_pct']:.2f}% against the "
-            f"{measured['predicted_pct']:.2f}% projected here, and the removed "
-            f"bytes converted at {measured['conversion_gbs']:.2f} GB/s &mdash; "
-            f"faster than the {link_gbs:g} GB/s this view's blue series assumes, "
-            f"which is why the measurement lands near that series rather than the "
-            f"orange one. Marginal removed bytes are cheaper than average bytes "
-            f"because the per-call cost does not shrink with them; that is the "
-            f"proportionality assumption this view rests on, and at 3x "
-            f"extrapolation into F2's regime it is UNTESTED."
+            f" A PAIRED MEASUREMENT NOW EXISTS at K="
+            f"{', '.join(str(m['k']) for m in measured)}: four arms A,B,A,B in "
+            f"one GPU session per depth. The reactive arms held at "
+            f"{r_lo:.3f}&ndash;{r_hi:.3f} tok/s across all of them, and the "
+            f"retention arms reached {first['tok_s']:.3f} tok/s at K={first['k']} "
+            f"rising to {last['tok_s']:.3f} tok/s at K={last['k']} (gain "
+            f"{last['gain']:+.3f}, within-pair spread {last['spread']:.3f} there). "
+            f"Every rung's realized byte reduction landed within {pp:.2f} "
+            f"percentage points of the value projected here, so the byte side of "
+            f"this view holds at depth. "
+            + (f"The K=1 point converted at {k1['conversion_gbs']:.2f} GB/s &mdash; "
+               f"faster than the {link_gbs:g} GB/s this view's blue series assumes. "
+               if k1 else "")
+            + f"The conversion rate does NOT hold flat, though: {convs} GB/s, so "
+              f"the deeper bytes are worth materially less than the first "
+              f"window's and the series' late points sit below the blue line. "
+              f"The proportionality assumption this view rests on is therefore "
+              f"measured and DEGRADING, not untested."
         )
     view2 = ""
     rerun = ("python tools/route_overlap/plot-b-vs-k.py --input <analysis.json> "
@@ -864,10 +902,10 @@ def main():
     ap.add_argument("--tg-tok-s", type=float, default=None,
                     help="measured baseline TG tok/s for the same run (required with --trace)")
     ap.add_argument(
-        "--measured-ab", default=MEASURED_AB_DEFAULT,
-        help="T-GPLR-19 four-arm A/B summary.json (the paired K=1 measurement). "
-        "When the file exists, view 2 states the measured K=1 point instead of "
-        "claiming that no paired run exists.",
+        "--measured-ab", nargs='+', default=MEASURED_AB_DEFAULTS,
+        help="one T-GPLR-19 four-arm A/B summary.json per retention depth (the "
+        "paired measurement). Each file that exists adds a measured point to "
+        "view 2 instead of the artifact claiming that no paired run exists.",
     )
     ap.add_argument("--link-gbs", type=float, default=LINK_GBS_DEFAULT,
                     help=f"H2D link capacity in GB/s for the projection (default {LINK_GBS_DEFAULT})")
@@ -883,10 +921,9 @@ def main():
                          "baseline it projects from, and glossing over that would make the "
                          "projection look like a result")
     rungs = load_rungs(args.ladder) if args.ladder else None
-    measured = load_measured_ab(args.measured_ab, basis, d) if basis is not None else None
+    measured = load_measured_abs(args.measured_ab, basis, d) if basis is not None else None
     doc = build_html(d, args.input, "tools/route_overlap/plot-b-vs-k.py",
-                     basis, args.tg_tok_s, args.link_gbs, rungs, args.ladder, measured,
-                     args.measured_ab)
+                     basis, args.tg_tok_s, args.link_gbs, rungs, args.ladder, measured)
     with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(doc)
     print(f"wrote {args.out}")

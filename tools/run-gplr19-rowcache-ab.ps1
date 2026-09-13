@@ -36,7 +36,17 @@ param(
     # disk, without touching the GPU. The A/B table must be re-derivable from
     # its own artifacts; this also keeps the recorded table honest if the
     # criteria wording changes.
-    [switch] $AnalyzeOnly
+    [switch] $AnalyzeOnly,
+
+    # Retention depth for the B (treatment) arms. K=1 is the task's
+    # pre-registered case; K=2/4/6/8 are the rungs the contract DEFERRED, run
+    # through this same arm loop so the design, flags and criteria stay one
+    # implementation. Each K writes to its own output root so no rung can
+    # overwrite another's evidence.
+    [int] $RetainK = 1,
+
+    # Override the output root. Empty = derive it from $RetainK.
+    [string] $OutRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 $root   = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
@@ -54,7 +64,9 @@ foreach ($f in @($exe, $poller, $an, $prompt)) {
 }
 if (-not (Test-Path -LiteralPath $moe)) { throw "missing model: $moe" }
 
-$outRoot = Join-Path $root 'build\llama-cuda\gplr19-rowcache-ab'
+if ($RetainK -lt 1 -or $RetainK -gt 64) { throw "--residency-tg-retain accepts 1..64; got $RetainK" }
+$kTag = if ($RetainK -eq 1) { 'gplr19-rowcache-ab' } else { "gplr19-k$RetainK-ab" }
+$outRoot = if ($OutRoot) { $OutRoot } else { Join-Path $root "build\llama-cuda\$kTag" }
 New-Item -ItemType Directory -Force -Path $outRoot | Out-Null
 $drvLog = Join-Path $outRoot 'driver.log'
 if (Test-Path $drvLog) { Remove-Item $drvLog -Force }
@@ -88,16 +100,30 @@ $basePerRound = [math]::Round($baseStaged / $baseRounds, 0)
 Log ("baseline (recorded probe): fetches={0} rounds={1} staged={2} per-round={3}" -f `
      $baseFetches, $baseRounds, $baseStaged, $basePerRound)
 
-$predByteTarget = 395835932.0   # contract criterion 2
-$predTokS_842   = 15.30         # contract criterion 3, 8.419 GB/s conversion
-$predTokS_137   = 13.61         # contract criterion 3, 13.7 GB/s ceiling
+# --- criterion 2's target, derived from the offline (b) AT THIS K -------------
+# At K=1 the contract froze the target at 395,835,932 B. That number is just
+# baseline x (1 - (b)_1), so the same rule generalises instead of being
+# re-typed per K -- and it keeps the prediction tied to the trace it came from
+# rather than to a literal someone could fat-finger.
+$widePath = Join-Path $root 'build\llama-cuda\gplr15-phaseA-probe\analysis-wide.json'
+if (-not (Test-Path -LiteralPath $widePath)) { throw "missing offline report: $widePath" }
+$wide = Get-Content -LiteralPath $widePath -Raw | ConvertFrom-Json
+$wrs  = $wide[0].rowset
+$predB = [double]$wrs.verdict_statistic_b."$RetainK".value
+$predOfflineHits = [uint64]$wrs.verdict_statistic_b."$RetainK".hits_total
+$predOfflineReq  = [uint64]$wrs.verdict_statistic_b."$RetainK".required_total
+$predByteTarget  = [math]::Round($basePerRound * (1.0 - $predB), 0)
+$predTokS_842   = 15.30         # contract criterion 3, 8.419 GB/s conversion (K=1 only)
+$predTokS_137   = 13.61         # contract criterion 3, 13.7 GB/s ceiling (K=1 only)
+Log ("offline statistic (b) at K={0}: {1:N6} ({2}/{3} rows) -> predicted staged/round {4}" -f `
+     $RetainK, $predB, $predOfflineHits, $predOfflineReq, $predByteTarget)
 
 # --- four arms, one mutex session -------------------------------------------
 $arms = @(
     [ordered]@{ name = 'A1'; retain = 0 },
-    [ordered]@{ name = 'B1'; retain = 1 },
+    [ordered]@{ name = 'B1'; retain = $RetainK },
     [ordered]@{ name = 'A2'; retain = 0 },
-    [ordered]@{ name = 'B2'; retain = 1 }
+    [ordered]@{ name = 'B2'; retain = $RetainK }
 )
 foreach ($a in $arms) {
     $a.trace = Join-Path $outRoot ('arm-{0}.jsonl' -f $a.name)
@@ -293,7 +319,7 @@ foreach ($r in $rows) {
 }
 
 $A  = @($rows | Where-Object { $_.retain -eq 0 })
-$B  = @($rows | Where-Object { $_.retain -eq 1 })
+$B  = @($rows | Where-Object { $_.retain -eq $RetainK })
 $same_route = (($rows | Select-Object -ExpandProperty route_digest | Select-Object -Unique).Count -eq 1)
 $same_ids   = (($rows | Select-Object -ExpandProperty tg_ids | Select-Object -Unique).Count -eq 1)
 $all_ok     = (@($rows | Where-Object { $_.exit -ne 0 -or $_.checker -ne 0 }).Count -eq 0)
@@ -314,8 +340,8 @@ $byteDelta = ($bMean - $predByteTarget) / $predByteTarget
 $byteOk = [math]::Abs($byteDelta) -le 0.02
 $reuseOk = (@($B | Where-Object { $_.rows_retained -le 0 -or $_.layers_with_reuse -lt 40 }).Count -eq 0)
 $crit2 = $byteOk -and $reuseOk
-Log ("criterion 2 (bytes): K=1 staged/round mean {0} vs predicted {1} -> {2:P3} (target within 2%) | cross-token reuse non-zero on all 40 layers: {3} -> {4}" -f `
-     [math]::Round($bMean, 0), $predByteTarget, $byteDelta, $reuseOk, $(if ($crit2) { 'PASS' } else { 'FAIL' }))
+Log ("criterion 2 (bytes): K={5} staged/round mean {0} vs predicted {1} -> {2:P3} (target within 2%) | cross-token reuse non-zero on all 40 layers: {3} -> {4}" -f `
+     [math]::Round($bMean, 0), $predByteTarget, $byteDelta, $reuseOk, $(if ($crit2) { 'PASS' } else { 'FAIL' }), $RetainK)
 Log '  note: contract criterion 2 names this counter `rows_resident_cross_token`; the shipped field is `n_rows_retained` (the driver evaluates the shipped one).'
 
 # criterion 3: performance, only if 2 passed
@@ -328,12 +354,36 @@ if ($crit2) {
     $bSpread = [math]::Abs($bTg[0] - $bTg[1])
     $within  = [math]::Max($aSpread, $bSpread)
     $gain    = $bMeanTg - $aMean
-    Log ("criterion 3 (performance): reactive mean {0:N3} tok/s | K=1 mean {1:N3} tok/s | gain {2:N3} | within-arm spread {3:N3}" -f `
-         $aMean, $bMeanTg, $gain, $within)
-    Log ("  pre-registered upper bounds: {0} tok/s (8.419 GB/s conversion) and {1} tok/s (13.7 GB/s ceiling)" -f $predTokS_842, $predTokS_137)
+    Log ("criterion 3 (performance): reactive mean {0:N3} tok/s | K={4} mean {1:N3} tok/s | gain {2:N3} | within-arm spread {3:N3}" -f `
+         $aMean, $bMeanTg, $gain, $within, $RetainK)
+    if ($RetainK -eq 1) {
+        Log ("  pre-registered upper bounds: {0} tok/s (8.419 GB/s conversion) and {1} tok/s (13.7 GB/s ceiling)" -f $predTokS_842, $predTokS_137)
+    } else {
+        Log "  no pre-registered bound exists for K>1: the contract deferred these rungs, so the bounds below are POST-HOC and reported as context, never as a verdict."
+    }
     Log ("  gain exceeds the within-arm spread: {0}" -f $(if ($gain -gt $within) { 'YES' } else { 'NO -- falsifies byte-to-time proportionality' }))
-    Log ("  above the 8.419 GB/s bound: {0}; above the link-ceiling bound: {1}" -f `
-         $(if ($bMeanTg -gt $predTokS_842) { 'YES' } else { 'NO' }), $(if ($bMeanTg -gt $predTokS_137) { 'YES' } else { 'NO' }))
+    # The conversion is what these rungs are actually for: view 2's projection
+    # rests on removed bytes converting at a rate that does NOT degrade with
+    # depth, and that assumption was measured at exactly one point (K=1,
+    # 14.29 GB/s). Every rung re-measures it, so drift is visible as a number.
+    $bBytes  = ($B | Measure-Object staged_per_round -Average).Average
+    $aBytes  = ($A | Measure-Object staged_per_round -Average).Average
+    $savedB  = $aBytes - $bBytes
+    $savedMs = (1000.0 / $aMean) - (1000.0 / $bMeanTg)
+    $convGbs = if ($savedMs -gt 0) { ($savedB / ($savedMs / 1000.0)) / 1e9 } else { 0.0 }
+    Log ("  byte-to-time conversion at K={0}: {1:N0} B saved per token over {2:N2} ms saved = {3:N2} GB/s" -f `
+         $RetainK, $savedB, $savedMs, $convGbs)
+    if ($RetainK -eq 1) {
+        Log ("  above the 8.419 GB/s bound: {0}; above the link-ceiling bound: {1}" -f `
+             $(if ($bMeanTg -gt $predTokS_842) { 'YES' } else { 'NO' }), $(if ($bMeanTg -gt $predTokS_137) { 'YES' } else { 'NO' }))
+    }
+    # the artifact's View-2 projections at this K, for context only
+    $projNote = if ($null -ne $wrs.verdict_statistic_b."$RetainK") {
+        $offB = [double]$wrs.verdict_statistic_b."$RetainK".value
+        $frac = 1.0 - $offB
+        ('  offline (b) at K={0} is {1:N6}, so the staged-byte fraction should be {2:N6} of the reactive arms.' -f $RetainK, $offB, $frac)
+    } else { '' }
+    if ($projNote) { Log $projNote }
 } else {
     Log 'criterion 3 (performance): NOT EVALUATED -- criterion 2 failed, so no timing discussion follows (contract).'
 }
@@ -345,15 +395,15 @@ foreach ($r in $B) {
 
 # --- offline (b) vs runtime reuse on the SAME stream -------------------------
 Log ''
-Log '=== offline (b) at K=1 vs runtime reuse accounting, same stream ==='
+Log ("=== offline (b) at K={0} vs runtime reuse accounting, same stream ===" -f $RetainK)
 foreach ($a in $arms) {
     $rep = Join-Path $outRoot ('analysis-{0}.json' -f $a.name)
-    $g = Invoke-Capture @($py, $an, $a.trace, '--retention-k', '1', '--json', $rep)
+    $g = Invoke-Capture @($py, $an, $a.trace, '--retention-k', "$RetainK", '--json', $rep)
     if ($g.code -ne 0) { Log ("analyze {0} FAILED: {1}" -f $a.name, ($g.out -join ' ')); continue }
     $j = Get-Content -LiteralPath $rep -Raw | ConvertFrom-Json
     $rs = $j[0].rowset
-    $offlineHits = $rs.verdict_statistic_b.'1'.hits_total
-    $offlineReq  = $rs.verdict_statistic_b.'1'.required_total
+    $offlineHits = $rs.verdict_statistic_b."$RetainK".hits_total
+    $offlineReq  = $rs.verdict_statistic_b."$RetainK".required_total
     $rtRows = $a.stats.rows_retained
     if ($a.retain -eq 0) {
         # Offline (b) answers "what would a cache hold on this stream", so the
@@ -361,14 +411,18 @@ foreach ($a in $arms) {
         # The comparison is meaningful only on the retention arms, where the
         # runtime and the analyzer are describing the same objects.
         Log ("arm {0}: offline (b) hits {1}/{2} = {3:N6} | retention OFF, so there is no runtime cache to compare -- N/A (not a mismatch)" -f `
-             $a.name, $offlineHits, $offlineReq, $rs.verdict_statistic_b.'1'.value)
+             $a.name, $offlineHits, $offlineReq, $rs.verdict_statistic_b."$RetainK".value)
         continue
     }
+    # The COUNT is the assertion; the two fractions use different denominators on
+    # purpose -- the runtime divides by every fetch x top_k, the offline statistic
+    # divides by its 10,200 consecutive-window pairs (it has no predecessor for
+    # the first window). Comparing the raw counts avoids that convention clash.
     $match = ($rtRows -eq [uint64]$offlineHits)
-    Log ("arm {0}: offline (b) hits {1}/{2} = {3:N6} | runtime retained rows {4} | runtime reuse fraction {5:N6} | agree exactly: {6}" -f `
-         $a.name, $offlineHits, $offlineReq, $rs.verdict_statistic_b.'1'.value, $rtRows,
-         ($rtRows / [double]([math]::Max(1, $a.stats.n_fetch * 8))), $match)
+    Log ("arm {0}: offline (b) hits {1}/{2} = {3:N6} | runtime retained rows {4} (over {5} row requests) = {6:N6} | agree exactly: {7}" -f `
+         $a.name, $offlineHits, $offlineReq, $rs.verdict_statistic_b."$RetainK".value, $rtRows,
+         ($a.stats.n_fetch * 8), ($rtRows / [double]([math]::Max(1, $a.stats.n_fetch * 8))), $match)
 }
 
 Log ''
-Log ("GPLR19 AB DONE overall={0}" -f $(if ($crit1 -and $crit2) { 'CRITERIA-1-2-PASS' } else { 'NOT-PASSED' }))
+Log ("GPLR19 AB DONE K={1} overall={0}" -f $(if ($crit1 -and $crit2) { 'CRITERIA-1-2-PASS' } else { 'NOT-PASSED' }), $RetainK)

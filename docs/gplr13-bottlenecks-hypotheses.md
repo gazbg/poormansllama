@@ -622,3 +622,19 @@ CONFIRMED: with F1 dead, F2 is the lever that moves TG, and it moves it by
 so scaling K is not licensed by this result; and the 0.6 gate is read against
 statistic (b), which at K=1 is 0.3088 - well below it - so F2-M1 is a real but
 partial answer, not a pass on the gate the earlier Phase A reading failed.
+
+[UPDATED 2026-09-13, later the same day: the first clause is superseded -- the
+`K > 1` rungs WERE run (K=2/4/6/8, all PASS) and the scaling is now measured,
+not extrapolated. Measured TG: 14.021 / 15.820 / 19.727 / 22.074 / 24.481 tok/s
+at K=1/2/4/6/8 against reactive arms at 11.863-11.967, and the runtime's
+retained-row count equals the offline statistic exactly at every depth. Two
+qualifications survive and one is added. (a) The self-echoing anchor caveat
+STANDS: these rungs measure internal consistency, and the non-echoing re-probe
+is still the gate-bearing run, so the gate standing at K>=4 (measured fraction
+0.6263 against 0.6284 projected) is NOT yet a non-echoing verdict. (b) The
+byte-to-time conversion DEGRADES with depth -- 14.29, 12.18, 10.67, 10.52,
+10.23 GB/s -- so scaling K buys steadily less time per byte, and the marginal
+rate past the first window is ~8-9.5 GB/s, near this path's effective per-fetch
+rate rather than the link ceiling. (c) New: the second clause above is now a
+measured statement at K=4 rather than an inference, but only on the echoing
+stream.]

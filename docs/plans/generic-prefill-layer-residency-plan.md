@@ -34,7 +34,13 @@ DRAFTED 2026-09-13 from the T-GPLR-13 close-out's F2 item and the T-GPLR-15
 gate reading, and DONE the same day: its four-arm A/B gate ran and all six
 acceptance criteria passed (K=1 stages 396,398,208 B/round vs the predicted
 395,835,932, +0.142%; TG 11.953 -> 14.021 tok/s against a 0.011 within-pair
-spread; table and verdicts in currentstate 2026-09-13). Its Commit field now
+spread; table and verdicts in currentstate 2026-09-13). Its deferred `K > 1`
+rungs were then RUN the same day at K=2/4/6/8 and all PASS, with the runtime's
+retained-row count equal to the offline statistic EXACTLY at every depth — a
+result recorded as internal consistency only, because that stream echoes its
+own anchor and the non-echoing re-probe remains the gate. The measured
+byte-to-time conversion DEGRADES with depth (14.29 -> 10.23 GB/s, K=1 -> 8),
+which corrects view 2 of the published artifact. Its Commit field now
 records both hashes: the vendored-fork commit convention was decided
 2026-09-13 (see the section of that name above) and applied the same day, so
 its mechanism is reproducible from a clean checkout. The T-GPLR-16 MIN_BATCH=1
@@ -2869,6 +2875,14 @@ and the mechanism lives in `third_party/llama.cpp`, so no hash can be recorded
 until that is settled. The T-GPLR-16 MIN_BATCH=1 revert is NOT displaced and
 remains outstanding.
 
+[UPDATED 2026-09-13, later the same day: the deferred `K > 1` rungs were RUN
+(owner-directed) at K=2, K=4, K=6 and K=8 — all PASS, runtime retention
+accounting equal to the offline statistic at every depth. See the RUNGS block
+below. The one item still outstanding for this task is the NON-ECHOING RE-PROBE
+that the contract set as the precondition for trusting a `K > 1` gate standing;
+the rungs were run on the echoing stream, so their absolute (b) values are
+optimistic and they are recorded as an internal-consistency result only.]
+
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
 run has been made". The mechanism HAS since been implemented behind the
@@ -2882,10 +2896,13 @@ byte-identical greedy output to the recorded baseline and TG 13.926 tok/s
 against the baseline's 11.578, at unchanged peak VRAM. What remains, and what
 keeps this NOT READY, is the four-arm A/B gate below and the K > 1 rungs. The
 vendored-fork commit convention is still the gating owner call. [CORRECTED
-2026-09-13: this note is superseded on its first clause -- the four-arm gate
-has since RUN and passed all six criteria (RESULT block below, Status DONE);
-the K > 1 rungs stay deliberately DEFERRED, not outstanding. The vendored-fork
-commit convention is still the gating owner call.]] The T-GPLR-16
+2026-09-13: this note is superseded on BOTH remaining clauses -- the four-arm
+gate has since RUN and passed all six criteria (RESULT block below, Status
+DONE), the K > 1 rungs have since RUN at K=2/4/6/8 and all passed (RUNGS block
+below), and the vendored-fork commit convention was DECIDED and applied the same
+day (a61528b47 / 54c6df4). What is still outstanding is the NON-ECHOING
+RE-PROBE, which is the gate-bearing measurement and is named in the Status
+field.]] The T-GPLR-16
 MIN_BATCH=1 revert remains the only already-authorized implementation item
 (this task does not displace it). Depends on: T-GPLR-13 (DONE — the reactive
 row-set path this task changes); T-GPLR-14 (instrument, closed — it measures
@@ -2900,6 +2917,22 @@ arms A,B,A,B inside ONE GPU-mutex session, poller attached, checker per trace;
 full table and verdicts in `docs/currentstate.md`). In one sentence: the byte
 mechanism works exactly as the statistic predicted, and the time gain is real,
 positive and smaller than the byte reduction.
+
+RUNGS 2026-09-13 — the DEFERRED `K > 1` rungs were subsequently RUN at K=2, K=4,
+K=6 and K=8 (owner-directed), one mutex session per rung, same A,B,A,B design
+via the new `-RetainK`: all four PASS criteria 1 and 2, and the runtime's
+retained-row count equals the offline `hits_total` EXACTLY at every depth
+(25,202 / 35,436 / 51,279 / 58,498 / 63,443). Two consequences for this
+contract. (1) The K>1 half of the outstanding item below is CLOSED as measured
+work; the NON-ECHOING RE-PROBE is still outstanding and still the gate-bearing
+measurement, because this stream echoes its own anchor and so inflates the
+absolute (b) — the rungs establish internal consistency, not gate standing.
+(2) The byte-to-time conversion is now measured as DEGRADING with depth (14.29,
+12.18, 10.67, 10.52, 10.23 GB/s at K=1/2/4/6/8; marginal 8.93/8.35/9.55/7.69
+GB/s), so the `K ~= 3.6` crossing computed below is a crossing of the BYTE
+statistic and does not by itself predict the TG gain at that K. Table and
+verdicts in `docs/currentstate.md`; the measured series is drawn in
+`docs/plots/gplr15-b-vs-k.html`.
 
   arm  retain  exit  checker  tg tok/s  staged/round    transfer_us  rows_fet  rows_ret  refused
   A1   0       0     0        11.951    572,719,104     1653.0       81920     0         0
@@ -2964,7 +2997,8 @@ window-count rule would keep it. Consequences for this contract:
     reading, so the published curve becomes a PREDICTION of this mechanism
     instead of an overstatement of it, and the K=1 prediction below stands
     verbatim (the two readings are identical at K=1).
-  - the DEFERRED K>=2 rungs are the affected ones: (b) at K=2/K=4 is
+  - the K>=2 rungs (since RUN — see the RUNGS block above) are the affected
+    ones: (b) at K=2/K=4 is
     0.4343/0.6284 under the resolved policy against 0.4015/0.5194 under the
     retired one, so the gate crossing moves from ~K=5.9 to ~K=3.6. That is a
     further reason those rungs come after the non-echoing re-probe.

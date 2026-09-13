@@ -1,5 +1,101 @@
 # Current State
 
+## 2026-09-13: T-GPLR-19 deferred rungs RUN at K=2, K=4, K=6, K=8 — every rung passes, the runtime reproduces the offline statistic exactly, and the byte-to-time conversion is now measured as DEGRADING with depth
+
+Owner-directed ("run the deferred K=2 and K=4 and K=6 and K=8"). GPU work
+under the mutex, one acquisition per rung (four arms A,B,A,B inside each, as the
+contract requires), plus the measured series added to the published artifact.
+Driver: `tools/run-gplr19-rowcache-ab.ps1 -RetainK <K>`, extended in this pass
+(see "Driver change" below). Each rung writes to its own output root
+(`build/llama-cuda/gplr19-k<K>-ab/`) so no rung can overwrite another's evidence.
+
+```text
+ K  cacheMiB  (b)off  pred B/token  meas B/token  delta   rows_ret==hits  TG off   TG on    gain   sprd   GB/s  ms save
+ 1     546.8  0.3088   395,835,932   396,398,208  0.142%      True        11.953  14.021  +2.068  0.011  14.29   12.34
+ 2    1093.0  0.4343   324,007,411   324,793,824  0.243%      True        11.967  15.820  +3.853  0.045  12.18   20.35
+ 4    2185.4  0.6284   212,811,470   214,053,600  0.584%      True        11.863  19.727  +7.865  0.163  10.67   33.61
+ 6    3277.8  0.7169   162,144,078   163,659,552  0.935%      True        11.878  22.074 +10.196  0.058  10.52   38.88
+ 8    4370.1  0.7775   127,437,019   129,075,264  1.286%      True        11.873  24.481 +12.609  0.288  10.23   43.38
+```
+
+**All four rungs PASS criteria 1 and 2.** Every arm exited 0 with
+`--check-telemetry` OK; the ordered `layer|union_ids|hash` route stream and the
+greedy token IDs are identical across all four arms of every rung; the reactive
+arms reproduce the recorded baseline exactly (10,240 fetches, 572,719,104
+B/round, `rows_reused` 0); zero refusals anywhere. The reactive TG arms held at
+**11.863–11.967 tok/s** across five separate GPU sessions, which is what makes
+the rung-to-rung comparison readable.
+
+**The strongest result is the row-set agreement, not the throughput.** The
+runtime's retained-row count equals the offline statistic's `hits_total`
+EXACTLY at every rung — 25,202 / 35,436 / 51,279 / 58,498 / 63,443. The C++
+cache and the independent Python simulation are selecting the same rows, not
+merely agreeing on a fraction. The measured gate fraction `1 - staged/reactive`
+tracks the offline (b) to within **0.29 percentage points** at every rung
+(0.3079/0.4329/0.6263/0.7142/0.7746 against 0.3088/0.4343/0.6284/0.7169/0.7775),
+and the staged-bytes prediction is inside the 2% band at every depth, drifting
+monotonically from +0.142% to +1.286%.
+
+**The finding that changes the F2 arithmetic: the conversion rate is not flat.**
+Saved bytes per token convert to saved time at **14.29 GB/s at K=1, then 12.18,
+10.67, 10.52 and 10.23 GB/s** at K=2/4/6/8. The marginal rate between rungs is
+8.93 (K1→2), 8.35 (K2→4), 9.55 (K4→6) and 7.69 (K6→8) GB/s — i.e. only the
+FIRST retained window converts at above-link-ceiling rates; every deeper window
+converts at roughly the path's measured effective per-fetch rate (8.42 GB/s).
+So `docs/plots/gplr15-b-vs-k.html` view 2's blue series (flat 13.7 GB/s) is
+optimistic at depth and its orange series (8.42 GB/s) is the better model for
+K>1. Diminishing returns are stark in cache terms: 8x the cache (0.57 -> 4.53 GB
+slot basis) buys 2.51x the saved bytes and 1.75x the TG gain.
+
+**Measured vs projected, and the artifact now shows it.** All five measured
+points sit INSIDE view 2's projected band at their own K — verified from the
+rendered DOM, not by eye (K=1 371.7 px inside 364.4–374.0; K=2 361.4 inside
+351.2–368.0; K=4 339.0 inside 320.7–356.7; K=6 325.6 inside 299.7–350.4; K=8
+311.8 inside 280.9–345.7). Measured tok/s: 14.021 / 15.820 / 19.727 / 22.074 /
+24.481 against projected bounds of 13.61–15.30 / 14.66–17.60 / 16.64–22.92 /
+17.73–26.59 / 18.56–29.87. So view 2's BRACKET was right at every depth while
+its slope assumption was wrong — and the artifact's previous claim that the
+proportionality "at 3x extrapolation into F2's regime is UNTESTED" is now
+falsified and has been replaced.
+
+**The echoed-stream caveat applies, and these are NOT gate verdicts.** The probe
+stream echoes its own anchor prompt, which inflates temporal reuse; that is why
+the plan deferred these rungs behind a non-echoing re-probe. The absolute (b)
+values — and therefore the gate standing at K>=4 — are optimistic, and the
+oracle ceiling (0.9385 here against 0.4000–0.4266 on the 3-window ladder rungs)
+is the signature. What these rungs establish is INTERNAL consistency: the
+runtime reproduces the offline statistic it was predicted from, exactly, on the
+same stream. What they do not establish is that K=4 clears 0.6 on a
+non-echoing prompt. That re-probe remains outstanding and is still the
+gate-bearing measurement.
+
+One data-quality note, stated rather than smoothed: the reactive arms' PP read
+79.0–92.6 tok/s across sessions while their TG stayed at 11.86–11.98, so PP from
+these arms is not comparable across rungs and should not be read as a PP result.
+
+**Driver change (tracked, `tools/run-gplr19-rowcache-ab.ps1`).** Added
+`-RetainK` (default 1) and `-OutRoot`. Criterion 2's byte target is now DERIVED
+from the offline (b) at that K as `baseline x (1 - (b)_K)` instead of re-typed
+per rung — at K=1 that formula reproduces the contract's literal 395,835,932 B
+exactly, which is the check that the generalisation is honest. Criteria 3's
+pre-registered bounds are asserted only at K=1; for K>1 the driver says plainly
+that no pre-registered bound exists and reports the measured conversion as
+context rather than as a verdict. Regression evidence: with the change in place,
+`-AnalyzeOnly` at K=1 regenerates `summary.json` **byte-identical** and the same
+criteria verdicts.
+
+**Artifact change.** `tools/route_overlap/plot-b-vs-k.py` now takes
+`--measured-ab` as a list (one A/B summary per depth; absent paths are skipped
+and the series degrades to however many points exist — verified by passing a
+nonexistent path and getting K=1 alone). View 2 draws the measured series as
+hollow rings joined by a dashed line plus a legend row, and the caption now
+states is degrading instead of untested. Byte-side deltas are compared in
+PERCENTAGE POINTS of (b) because that is the quantity the gate is written in.
+Determinism: the artifact regenerates byte-identical.
+
+Validation: build clean, outer host suite PASS, analyzer self-test PASS (55
+checks), artifact deterministic, all 20 arms exit 0 with checker 0.
+
 ## 2026-09-13: Vendored-fork commit convention DECIDED and applied — the vendored backlog is committed, so the T-GPLR-12/13/16/18/19 mechanisms are reproducible from a clean checkout
 
 Owner-directed ("decide the vendored-fork commit convention"). Documentation and
@@ -253,6 +349,12 @@ the phrase "K-window" in gate 9 admit two readings. They are now one rule.
   invariance proof, but a K=2 arm (16 rows/layer, 1.13 GB) remains to be run,
   and T-GPLR-19's deferred `K > 1` rungs still want the non-echoing re-probe
   first. Nothing is committed; the vendored-fork convention is still open.
+  [SUPERSEDED 2026-09-13, later the same day: the K=2/4/6/8 arms HAVE been run
+  and all passed (see the entry at the top of this file); the non-echoing
+  re-probe is still outstanding and is still the gate-bearing measurement; and
+  the vendored-fork convention was decided and applied (`a61528b47` /
+  `54c6df4`). Retained as written because this entry records what was true when
+  the policy was resolved.]
 - **Runtime arm run at K=1** (one arm, GPU mutex held; driver
   `build/llama-cuda/gplr19-k1/run-k1.ps1`, same vehicle as the recorded probe
   plus `--residency-tg-retain 1`, so the only difference is the flag under

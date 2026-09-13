@@ -309,9 +309,18 @@ effective, against the 13.7 GB/s link ceiling. Staging is
 <circle cx="692.5" cy="197.7" r="4" fill="#e07b39"/>
 <circle cx="900.0" cy="197.7" r="4" fill="#e07b39"/>
 <text x="102" y="122" font-size="12" fill="#e07b39">at the 8.42 GB/s effective per-fetch rate</text>
-<circle cx="96.0" cy="371.7" r="7.5" fill="none" stroke="#111" stroke-width="2"/>
-<circle cx="96.0" cy="371.7" r="2.8" fill="#111"/>
-<text x="102" y="136" font-size="12" fill="#111">● measured paired K=1 (ABAB): 14.021 tok/s</text>
+<polyline points="96.0,371.7 121.9,361.4 173.8,339.0 225.7,325.6 277.5,311.8" fill="none" stroke="#111" stroke-width="1.6" stroke-dasharray="3 3"/>
+<circle cx="96.0" cy="371.7" r="7" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="96.0" cy="371.7" r="2.6" fill="#111"/>
+<circle cx="121.9" cy="361.4" r="7" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="121.9" cy="361.4" r="2.6" fill="#111"/>
+<circle cx="173.8" cy="339.0" r="7" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="173.8" cy="339.0" r="2.6" fill="#111"/>
+<circle cx="225.7" cy="325.6" r="7" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="225.7" cy="325.6" r="2.6" fill="#111"/>
+<circle cx="277.5" cy="311.8" r="7" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="277.5" cy="311.8" r="2.6" fill="#111"/>
+<text x="102" y="136" font-size="12" fill="#111">● measured, one ABAB run per K: K=1, 2, 4, 6, 8</text>
 <text x="173.8" y="345.7" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">16.6</text>
 <text x="277.5" y="334.7" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">18.6</text>
 <text x="900.0" y="319.5" font-size="12" fill="#0b3d91" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round">21.2</text>
@@ -375,14 +384,14 @@ today's mechanism supports. The dotted line is the lever's own asymptote: with
 <em>every</em> staged byte removed, 18.3 ms/token remains, so no retention
 choice &mdash; and no predictor at all, however accurate &mdash; takes TG past
 54.5 tok/s on this run. It is one 256-token run on a stream that
-echoes its own anchor. A PAIRED MEASUREMENT NOW EXISTS at K=1: four arms A,B,A,B in one GPU session gave a reactive mean of 11.953 tok/s and a K=1 mean of 14.021 tok/s (gain +2.068, within-pair spread 0.011). The realized byte reduction was 30.79% against the 30.88% projected here, and the removed bytes converted at 14.29 GB/s &mdash; faster than the 13.7 GB/s this view's blue series assumes, which is why the measurement lands near that series rather than the orange one. Marginal removed bytes are cheaper than average bytes because the per-call cost does not shrink with them; that is the proportionality assumption this view rests on, and at 3x extrapolation into F2's regime it is UNTESTED. This view is the decision arithmetic for F2; the
+echoes its own anchor. A PAIRED MEASUREMENT NOW EXISTS at K=1, 2, 4, 6, 8: four arms A,B,A,B in one GPU session per depth. The reactive arms held at 11.863&ndash;11.967 tok/s across all of them, and the retention arms reached 14.021 tok/s at K=1 rising to 24.481 tok/s at K=8 (gain +12.609, within-pair spread 0.288 there). Every rung's realized byte reduction landed within 0.29 percentage points of the value projected here, so the byte side of this view holds at depth. The K=1 point converted at 14.29 GB/s &mdash; faster than the 13.7 GB/s this view's blue series assumes. The conversion rate does NOT hold flat, though: K=1 14.29, K=2 12.18, K=4 10.67, K=6 10.52, K=8 10.23 GB/s, so the deeper bytes are worth materially less than the first window's and the series' late points sit below the blue line. The proportionality assumption this view rests on is therefore measured and DEGRADING, not untested. This view is the decision arithmetic for F2; the
 K=1 point has since been settled by measurement rather than by projection &mdash; it is
 the ringed marker in view 2, between the two projected series.</div>
 
 <h2>Provenance</h2>
 <p class="sub">
 Input report: <code>build/llama-cuda/gplr15-phaseA-probe/analysis-wide.json</code>.<br>
-Paired K=1 measurement: <code>build/llama-cuda/gplr19-rowcache-ab/summary.json</code> (gitignored build output; the marker is drawn only while it exists, but the values are recorded in the view 2 caption regardless).<br>
+Paired measurements: <code>build/llama-cuda/gplr19-rowcache-ab/summary.json</code>, <code>build/llama-cuda/gplr19-k2-ab/summary.json</code>, <code>build/llama-cuda/gplr19-k4-ab/summary.json</code>, <code>build/llama-cuda/gplr19-k6-ab/summary.json</code>, <code>build/llama-cuda/gplr19-k8-ab/summary.json</code> (gitignored build output; the measured series is drawn only while these exist, but the values are stated in the view 2 caption regardless).<br>
 Ladder rungs: <code>build/gplr15-ladder-wide.json</code> (4 reports over the ladder traces).<br>
 Re-create it with:<br>
 <code>python tools/route_overlap/analyze.py "build/llama-cuda/gplr13-ladder/*/rowset-*.jsonl" --retention-k 1,2,3,4,5,6,7,8,10,12,16,24,32 --json build/gplr15-ladder-wide.json</code><br>
