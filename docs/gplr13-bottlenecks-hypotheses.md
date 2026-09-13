@@ -65,17 +65,24 @@ the exact lower bound, containment `|A n B| / |B|` is exact (full lists).
 | containment mean (consecutive windows) | 0.377 | 0.370 | 0.389 | 0.358 |
 | rows_reused reported by runner | 0 | 0 | 0 | 0 |
 
-Provenance caveat (2026-09-13; corrected the same day after verification):
-the two statistics above are MACHINE-computed by
-`build/analyze_gplr13_ladder.py`, the untracked one-off already named in
-section 1. That script lives INSIDE the gitignored `/build/` tree
-(`.gitignore:/build/`), so it does not survive a clean checkout and the
-numbers are not reproducible from tracked tooling alone — the regeneration
-command in section 5 works only while that untracked file is present. The
-tracked replacement is the T-GPLR-15 Phase A re-derivation in
-`tools/route_overlap/analyze.py`, which becomes the producer of record. The
-containment direction is owned by the SDD section 10 gate 9 decision rule
-(`|A n B| / |B|`, next window in the denominator).
+Provenance caveat (2026-09-13; corrected the same day after verification, then
+superseded the same day by the T-GPLR-15 Phase A re-derivation): the two
+statistics above were MACHINE-computed by `build/analyze_gplr13_ladder.py`,
+the untracked one-off already named in section 1. That script lives INSIDE the
+gitignored `/build/` tree (`.gitignore:/build/`), so it does not survive a clean
+checkout, and at the time of writing it was the only source. It no longer is:
+the T-GPLR-15 Phase A analyzer `tools/route_overlap/analyze.py` REPRODUCES the
+table above exactly — 0/80 hash-equal at every size and containment 0.377 /
+0.370 / 0.389 / 0.358 at 50/512/4k/200k — and adds the gate-9 statistic (b) at
+K=2 (0.4031 / 0.4031 / 0.4266 / 0.4000, first measured values; capacity 16
+rows/layer = 1,132.5 MB over 40 layers vs 566.2 MB at K=1). NOTE: that analyzer
+is itself still UNTRACKED (the whole T-GPLR-14 harness is), so "reproducible
+from tracked tooling" holds only once `tools/route_overlap/` is committed.
+Reproduce with:
+`python tools/route_overlap/analyze.py "build/llama-cuda/gplr13-ladder/*/rowset-*.jsonl"`
+(artifact `build/gplr15-phaseA.{txt,json}`). The containment direction is owned
+by the SDD section 10 gate 9 decision rule (`|A n B| / |B|`, next window in the
+denominator).
 
 Honest thinness: 80 pairs per size, 3 rounds, one prompt family, W=1 only.
 This is the first measurement of T-GPLR-15's 0.6 temporal hit-rate gate and

@@ -1,5 +1,120 @@
 # Current State
 
+## 2026-09-13: Both remaining untracked docs brought under version control — the model-run testing standard and the 2026-09-11 inference performance review
+
+Owner decision on the open question left by the schema-doc pass. Documentation
+only: no code changed, no GPU runs, no new task scope. Both docs are tracked as
+of this commit.
+
+- **Decision: track BOTH; inline neither.** `docs/model-run-testing-standard.md`
+  (173 lines) and `docs/inference-performance-review-2026-09-11.md` (585 lines)
+  are now tracked in `docs/`. `git ls-files` was empty for both and neither had
+  any commit history, so a clean checkout did not contain them.
+- **Why the standard:** the T-GPLR-15 block defers to it for what counts as
+  recorded evidence ("attached per the testing standard"; "recorded evidence
+  per the model-run testing standard") and
+  `docs/gplr13-bottlenecks-hypotheses.md:176` cites it by path. The standard
+  that defines the probe run's evidence shape is not optional context for that
+  run. It stays marked a DRAFT — tracked is not approved; owner review is still
+  desired before it becomes a runner or CI contract.
+- **Why the review:** it is uncited anywhere in the repo, which is why it was
+  easy to leave behind, but it is the origin analysis for the whole MoE row-set
+  program: its P1 transfer-granularity finding IS the row-set hypothesis, and
+  its focused experiment 7 anticipated the T-GPLR-15 reuse gate by warning that
+  the 60% TG cache hit rate was unevidenced and that per-layer TG IDs had to be
+  collected before any prediction work. Phase A has since measured that gate:
+  0.37-0.43 against the 0.6 threshold. Losing the document that predicted the
+  result on the way to measuring it would be a real loss.
+- **Both headers carry a dated status note** in the established in-place style:
+  tracked status and role stated, the original status text retained as-written
+  inside a `[SUPERSEDED ...]` block. The review's note also records that its
+  per-task status observations are as of 2026-09-11 and are superseded by this
+  file and the active plan, so a reader cannot mistake its dated READY/DRAFT/
+  rejected table for current state.
+- **Content sweep before tracking:** no absolute local paths, usernames, host
+  names, IP addresses, or credentials in either file; the only "serial" matches
+  are the word serial (vs parallel). Both are project design docs.
+- **Retires the earlier flag** rather than rewriting it: the previous entry's
+  "same defect class, still open" bullet is annotated RESOLVED in place.
+- **Same class, still open (not addressed here):** `tools/route_overlap/` — the
+  analyzer extended today, and the rest of the T-GPLR-14/MEMPROBE harness —
+  remains untracked, with the T-GPLR-14 `.ps1` runners,
+  `tools/gpu-mem-poll.ps1`, `tools/gplr16-dump.cpp` and
+  `tools/run-memprobe-dense.ps1`. Out of this task's scope; flagged for the
+  owner.
+
+## 2026-09-13: T-GPLR-15 Phase A analyzer implemented — first real values of the SDD gate-9 statistic (b), and K=1 reproduces the recorded pilot exactly
+
+Implementer work on T-GPLR-15's controlling phase: host-only, no library
+changes, no GPU runs, no GPU mutex needed. Nothing is committed — the changes
+are in the working tree.
+
+- **The analyzer now works on real row-set traces.** `tools/route_overlap/analyze.py`
+  accepts `rowset_init` / `rowset_fetch` / `rowset_round` / `rowset_refused`
+  (it previously exited 2 on the first of them, so no ladder rung could be
+  analyzed at all) and VALIDATES each `rowset_fetch`: canonical ascending
+  unique comma-joined `union_ids`, count equal to `route_union`, and a
+  recomputed hash equal to the emitted one (exit 2 with file:line otherwise).
+- **New statistic (b), the SDD gate-9 verdict statistic**
+  (`simulate_retention` + `resident_containment`): per-layer bounded-retention
+  simulation over the recorded union streams, capacity `min(n_expert, K*W*top_k)`
+  rows, window-granular LRU, next window in the denominator (`|A n B| / |B|`),
+  reported as a per-K curve. Windows with a predecessor only (a cold cache
+  holds nothing at the first window). Also added: exact consecutive-window
+  containment from full `union_ids` in both directions (T4, direction always
+  stated), and the per-layer reappearance-distance histogram (T7) with
+  cumulative coverage at 1/2/4/8 windows.
+- **T5 is re-sourced from `rowset_fetch`** and now prints its `n_pairs`; it is
+  reported as CONTEXT, never the gate. Two pre-existing defects fixed while in
+  the file: the measured T5 rate was computed and then DROPPED (never stored,
+  so the report's T5 line never showed it), and a nested glob pattern
+  (`.../*/rowset-*.jsonl`) crashed with a traceback instead of failing loudly —
+  the pattern expansion now uses `glob` and honors the tool's failure contract.
+- **Cross-validation on the preserved ladder traces PASSED, exactly.**
+  `python tools/route_overlap/analyze.py "build/llama-cuda/gplr13-ladder/*/rowset-*.jsonl"`
+  (artifact: `build/gplr15-phaseA.{txt,json}`) reproduces every recorded pilot
+  number: T5 MEASURED 0/80 window-equality at every rung, and statistic (b) at
+  K=1 = 0.3766 (50) / 0.3703 (512) / 0.3891 (4k) / 0.3578 (200k) against the
+  recorded containment means 0.377 / 0.370 / 0.389 / 0.358. The hash recompute
+  passed on all 120 `rowset_fetch` events per rung.
+- **First real K=2 values (new information):** (b) = 0.4031 / 0.4031 / 0.4266 /
+  0.4000 in the same order, at capacity 16 rows/layer = 1,132.5 MB over 40
+  layers (K=1: 8 rows, 566.2 MB). Both K values in the SDD's reference band sit
+  far below the 0.6 threshold on this stream.
+- **The aggregate hides real per-layer spread** — at 512 the per-layer (b) at
+  K=1 is min 0.0625 / mean 0.3703 / max 0.7500 over 2 pairs per layer. This is
+  the aggregate-vs-per-layer tension the task's escalation clause names, now
+  with numbers; it is reported, not resolved (a per-layer policy is product
+  intent, not an implementer call).
+- **Internal consistency check:** at K=1 the total hits equal the gap-1
+  reappearance count by construction (237 on the 512 rung, 229 / 249 / 241 on
+  the others), which the T7 histogram independently reproduces.
+- **Finding — the vendor's "FNV-1a-64" is not standard FNV-1a.**
+  `tel_rowset_fetch` seeds with the literal `1469598103934665603`; the standard
+  offset basis is `0xCBF29CE484222325` = `14695981039346656037` (one digit
+  longer), and the vendor comment claims equality with this tool's helper. The
+  helper now uses the vendor literal, verified by reproducing emitted hashes;
+  with the standard basis the recompute cross-check would fail on every real
+  event. No library change was made.
+- **Validation:** self-test PASS (43 checks, was 19) including the K-curve
+  fixture (K=1 = 0.0 vs K=2 = 0.5 on the same windows), the hash-mismatch and
+  non-canonical-ids negative controls, and the `--retention-k` guard; reruns
+  byte-identical for both txt and json.
+- **Provenance improved, but NOT yet "reproducible from tracked tooling".**
+  The recorded pilot values no longer depend on the untracked one-off for
+their meaning — the analyzer reproduces them exactly — but
+  `tools/route_overlap/analyze.py` is itself still UNTRACKED, as is the whole
+  T-GPLR-14 harness (`git ls-files tools/route_overlap/` is empty; the path is
+  not gitignored, it was simply never committed). The "reproducible from
+  tracked tooling" claim becomes literally true only when that directory is
+  committed. This is the same clean-checkout defect class as the schema-doc gap
+  fixed earlier today, now on the harness; it is left to the owner because
+  committing the harness is a scope decision, not a measurement one.
+- **Remaining Phase A step (not done here):** the one 256-token batch-major
+  generation probe under `tools/with-gpu-lock.ps1`, which is what turns this
+  cross-validation into the gate verdict (~10,200 pairs). Nothing in this entry
+  claims a gate verdict, a performance result, or an F2 implementation.
+
 ## 2026-09-13: Rowset telemetry schema draft brought into version control (tracked, not inlined) — the T-GPLR-15 contract no longer cites a spec a clean checkout would not contain
 
 Owner decision on the open question flagged in the T-GPLR-15 contract's
@@ -31,7 +146,8 @@ task scope. The schema's content is unchanged apart from its status header.
   model-run testing standard" and "per the testing standard", both in the
   T-GPLR-15 block), while `docs/gplr13-bottlenecks-hypotheses.md:169` cites it
   by path. The file remains untracked, so the same clean-checkout gap applies.
-  Out of scope here and not addressed.
+  [RESOLVED 2026-09-13: the owner decided to TRACK it — see the newest entry at
+  the top of this file. The wording above is retained as written.]
 
 ## 2026-09-13: Gate 9 decision rule now single-owned by the SDD (T-GPLR-15 metric corrected); cited pilot numbers carry a provenance caveat; T-GPLR-13's commit recorded
 

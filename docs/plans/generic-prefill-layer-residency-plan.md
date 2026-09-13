@@ -16,10 +16,14 @@ chosen over the T-GPLR-16 escalation options; implementation COMPLETE
 2026-09-13 incl. 512-token row-set run, qa-smoke regression, and the
 50/512/4k/200k ladder — all PASS; residual follow-ups in its status note);
 T-GPLR-15
-predictive per-token prefetch READY 2026-09-13 as a gate-measurement-first
-task (Phase A: measure the 0.6 temporal hit-rate gate from rowset_fetch
-telemetry with no library changes — analyze.py re-source + one 256-token
-generation probe; below 0.6 the task closes falsified-by-evidence per SDD
+predictive per-token prefetch IN PROGRESS 2026-09-13 as a
+gate-measurement-first task (Phase A analyzer half DONE: the
+`tools/route_overlap/analyze.py` extension and the statistic (b) simulation
+are implemented and the ladder cross-validation PASSED exactly — K=1
+reproduces the recorded pilot 0.377/0.370/0.389/0.358 with 0/80 hash-equal,
+first K=2 values 0.403/0.403/0.427/0.400, both below 0.6 on this stream;
+remaining Phase A step is the one 256-token batch-major generation probe;
+below 0.6 the task closes falsified-by-evidence per SDD
 gate 9; Phase B implementation only on PASS + owner review); T-GPLR-18
 pinned row-set staging READY 2026-09-13 (F1 from the T-GPLR-13 close-out;
 tests the existing `--copy-source pinned` path against the measured
@@ -109,9 +113,10 @@ MoE TG row-set program (2026-09-09): T-GPLR-14 (route-overlap instrument)
 done; T-GPLR-13 (reactive row-set) DONE 2026-09-13 (owner review) -- gate (a)
 resolved (moe-row-set SDD amendment) and gate (b) decided 2026-09-12 (owner):
 chosen over the T-GPLR-16 escalation options; T-GPLR-15 (predictive per-token
-prefetch) READY 2026-09-13, gate-measurement-first (Phase A measures the
-0.6 hit-rate gate from T-GPLR-13's rowset_fetch telemetry with no library
-changes; below 0.6 the task closes falsified-by-evidence per SDD gate 9);
+prefetch) IN PROGRESS 2026-09-13, gate-measurement-first (Phase A: the
+analyzer extension and the statistic (b) simulation are DONE and
+cross-validated against the recorded ladder pilot; the 256-token probe run
+remains; below 0.6 the task closes falsified-by-evidence per SDD gate 9);
 T-GPLR-18 (pinned row-set staging, F1) READY 2026-09-13 with a 512 A/B gate
 -- two ready tasks now exist (T-GPLR-15 Phase A and T-GPLR-18); they are
 independent (host-only analyzer + probe vs one small library change + GPU
@@ -2034,12 +2039,29 @@ Escalate before reuse if
 
 ### T-GPLR-15: Predictive per-token expert prefetch (one-window-ahead)
 
-Status: READY (2026-09-13, contract rewritten on owner request now that
-T-GPLR-13 is DONE and `rowset_fetch` telemetry exists in real traces).
-GATE-MEASUREMENT-FIRST contract: Phase A measures the 0.6 temporal hit-rate
-gate with NO library changes and NO implementation of prediction; the task
-closes as falsified-by-evidence if the gate measures below 0.6 (SDD gate 9).
-Only a PASS advances to Phase B (implementation, separately owner-reviewed).
+Status: in-progress (2026-09-13). Contract rewritten on owner request
+2026-09-13 now that T-GPLR-13 is DONE and `rowset_fetch` telemetry exists in
+real traces. GATE-MEASUREMENT-FIRST contract: Phase A measures the 0.6
+temporal hit-rate gate with NO library changes and NO implementation of
+prediction; the task closes as falsified-by-evidence if the gate measures
+below 0.6 (SDD gate 9). Only a PASS advances to Phase B (implementation,
+separately owner-reviewed).
+Phase A status (2026-09-13): the analyzer half is DONE and its cross-validation
+step PASSED. `tools/route_overlap/analyze.py` now accepts the `rowset_*`
+events, validates every `rowset_fetch` (canonical `union_ids`, count,
+hash recompute), computes statistic (b) offline as a per-K curve with capacity
+`min(n_expert, K*W*top_k)` rows, and reports exact consecutive-window
+containment plus the reappearance-distance histogram. On the preserved ladder
+traces (artifact `build/gplr15-phaseA.{txt,json}`): T5 MEASURED 0/80
+window-equal at every rung; (b) at K=1 = 0.3766 / 0.3703 / 0.3891 / 0.3578
+(50/512/4k/200k), matching the recorded pilot exactly; (b) at K=2 = 0.4031 /
+0.4031 / 0.4266 / 0.4000 (first measured values, 1,132.5 MB over 40 layers
+vs 566.2 MB at K=1); per-layer spread at 512 is min 0.0625 / mean 0.3703 /
+max 0.7500 — the escalation clause's aggregate-vs-per-layer tension, with
+numbers attached. REMAINING Phase A step: the one 256-token batch-major
+generation probe under the GPU mutex (~10,200 pairs), which is what produces
+the gate verdict; the ladder rungs carry only 2 windows with a predecessor per
+layer and are cross-validation, never the verdict.
 Prior history: drafted 2026-09-09 gated on T-GPLR-13's rowset_fetch
 telemetry; negative pilot recorded by the ladder analysis (bottlenecks doc
 section 2): 2-step containment mean 0.358-0.389 over W=1 at every ladder
@@ -2168,15 +2190,18 @@ Focused validation (Phase A)
      first: T5 verdict must become MEASURED (re-sourced) with values equal
      to the bottlenecks doc's recorded pilot (0/80 hash-equal,
      containment 0.358-0.389) — cross-validates the re-sourcing before any
-     new run. PROVENANCE CAVEAT (2026-09-13; corrected the same day after
-     verification): those pilot numbers are MACHINE-computed by
-     `build/analyze_gplr13_ladder.py` — an untracked one-off that lives
-     INSIDE the gitignored `/build/` tree, so it does not survive a clean
-     checkout and the numbers are not reproducible from tracked tooling
-     alone (its regeneration command is documented in the bottlenecks doc
-     section 5). The analyzer's re-derivation replaces them as evidence,
-     and any disagreement is investigated and recorded before the gate run
-     rather than silently resolved in either direction.
+     new run. STATUS 2026-09-13: PERFORMED AND PASSED — the analyzer
+     reproduces all four pilot values exactly (0.3766 / 0.3703 / 0.3891 /
+     0.3578 against 0.377 / 0.370 / 0.389 / 0.358) with 0/80 hash-equal.
+     PROVENANCE NOTE (2026-09-13): the pilot numbers were originally
+     MACHINE-computed by `build/analyze_gplr13_ladder.py`, an untracked
+     one-off inside the gitignored `/build/` tree. They no longer depend on
+     that file for their meaning, but `tools/route_overlap/analyze.py` is
+     ALSO still untracked (the whole T-GPLR-14 harness is), so "reproducible
+     from tracked tooling" holds only once that directory is committed —
+     flagged, not silently assumed. Any disagreement between the two
+     producers is investigated and recorded before the gate run rather than
+     silently resolved in either direction.
    2. Analyze the new 256-token trace against the SDD statistic: the (b)
      value at the declared retention (per-K curve reported) is the gate
      input and the PASS/FAIL verdict. T5's re-sourced verdict is reported as
@@ -2184,7 +2209,8 @@ Focused validation (Phase A)
      recompute must pass on every rowset_fetch (that check is the shared
      union-parsing/integrity check, not the gate).
    3. No GPU work outside `tools/with-gpu-lock.ps1`; the probe run's
-     recorded evidence per the model-run testing standard.
+     recorded evidence per `docs/model-run-testing-standard.md` (tracked
+     2026-09-13; still a draft, not an approved CI contract).
 
 Escalate before implementation if
 : the hit-rate gate cannot be evaluated from rowset_fetch telemetry; the

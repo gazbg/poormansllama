@@ -183,6 +183,17 @@ Per event, all checkable offline from the JSONL + inventory:
 The gate verdict is SDD statistic (b) per the SDD section 10 gate 9 decision
 rule; the remaining items are context or telemetry-integrity work.
 
+IMPLEMENTED 2026-09-13 (T-GPLR-15 Phase A): every item below is in
+`tools/route_overlap/analyze.py` (that file is in the working tree but is still
+UNTRACKED, like the rest of the T-GPLR-14 harness), verified by reproducing the
+recorded ladder
+pilot exactly (0/80 hash-equal; statistic (b) at K=1 = 0.3766 / 0.3703 /
+0.3891 / 0.3578 at 50/512/4k/200k; first K=2 values 0.4031 / 0.4031 / 0.4266 /
+0.4000). Note for the recompute cross-check: `tel_rowset_fetch` seeds its hash
+with the literal `1469598103934665603`, which is NOT the standard FNV-1a offset
+basis — the analyzer must use the vendor literal or every real event would
+mismatch.
+
 - Add the OFFLINE simulation that produces statistic (b): containment of the
   NEXT window's routed rows in the CUMULATIVE per-layer resident set, by
   simulating a declared bounded retention over the recorded per-layer
