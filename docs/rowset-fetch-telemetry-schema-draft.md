@@ -205,6 +205,13 @@ mismatch.
   the denominator (`|A n B| / |B|`).
 - Add the per-layer reappearance-distance histogram, computed offline from
   the `union_ids` streams — the slot-count decision input, not a gate value.
+- Add the ORACLE ceiling (T8; owner request 2026-09-13): statistic (b) under
+  UNBOUNDED retention — the fraction of each window covered by the union of all
+  prior windows for that layer. No cache policy of any size can exceed it, so it
+  answers whether any policy could reach the 0.6 gate on the same stream. It is
+  monotone in stream length, so the report must carry that caveat wherever the
+  ceiling is compared against the threshold, and it is reported with pooled
+  hits/required totals so exact saturation by a reported K is detectable.
 - Accept `rowset_init`, `rowset_fetch`, `rowset_round`, `rowset_refused` as
   known events (today unknown types exit 2 with file:line — the list must
   grow, loudly validated as before).

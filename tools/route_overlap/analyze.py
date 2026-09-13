@@ -30,6 +30,13 @@ Parses layer-streaming telemetry JSONL traces and computes, per trace:
       first window; including it would add structural zeros).
   T7  per-layer reappearance-distance histogram (offline from the union
       streams) -- the slot-count decision input, never a gate value.
+  T8  ORACLE retention ceiling: statistic (b) under UNBOUNDED retention --
+      the fraction of each window covered by the union of ALL prior windows
+      for that layer. No bounded (or unbounded) cache policy can exceed it on
+      the same stream, so it answers "could any policy reach the 0.6 gate
+      here?". Caveat carried in the report: the oracle is MONOTONE in stream
+      length, so a low oracle on a short stream bounds that stream only -- it
+      is not a program-level falsification.
 
 Gate threshold and retention band are constants here, read from the SDD
 gate 9 decision rule; `--retention-k` overrides the band for a wider curve.
@@ -478,7 +485,10 @@ def exact_consecutive_containment(series):
 
 
 def simulate_retention(wins, capacity):
-    """Bounded-retention per-window (required, hits) for one layer.
+    """Retention per-window (required, hits) for one layer.
+
+    capacity=None means UNBOUNDED retention (the T8 oracle); otherwise the
+    resident set is bounded to that many rows.
 
     The resident set is a row-count-bounded LRU over the most recent requests:
     capacity rows, window-granular recency (all rows of one window share a
@@ -498,7 +508,8 @@ def simulate_retention(wins, capacity):
             if i in resident:
                 resident.remove(i)
             resident.insert(0, i)
-        del resident[capacity:]
+        if capacity is not None:
+            del resident[capacity:]
     return out
 
 
@@ -518,9 +529,14 @@ def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0
         cap = max(1, cap)
         pooled = []
         per_layer = []
+        hits_total = 0
+        required_total = 0
         for _layer, wins in sorted(series.items()):
-            ratios = [h / req for req, h in simulate_retention(wins, cap) if req]
+            rows = simulate_retention(wins, cap)
+            ratios = [h / req for req, h in rows if req]
             pooled.extend(ratios)
+            hits_total += sum(h for _req, h in rows)
+            required_total += sum(req for req, _h in rows)
             layer_mean = _mean(ratios)
             if layer_mean is not None:
                 per_layer.append(layer_mean)
@@ -535,8 +551,52 @@ def resident_containment(series, ks, n_expert, top_k, window_tokens, row_bytes=0
             "per_layer_max": max(per_layer) if per_layer else None,
             "layers": len(per_layer),
             "windows_with_predecessor": len(pooled),
+            "hits_total": hits_total,
+            "required_total": required_total,
         }
     return out
+
+
+def oracle_containment(series):
+    """T8: the unbounded-retention ceiling -- an upper bound on statistic (b).
+
+    Every window with a predecessor is scored as |union(all prior windows) n
+    window| / |window|, per layer. No cache policy can beat this on the same
+    stream, so comparing it against the 0.6 threshold answers whether ANY
+    policy could pass here -- and comparing it against the per-K curve shows
+    how much of that headroom a small retention actually reaches.
+
+    Reported with explicit totals so callers can detect EXACT saturation (a
+    K whose pooled hits and required equal the oracle's) rather than inferring
+    it from two rounded means.
+    """
+    pooled = []
+    per_layer = []
+    hits_total = 0
+    required_total = 0
+    for _layer, wins in sorted(series.items()):
+        rows = simulate_retention(wins, None)
+        ratios = [h / req for req, h in rows if req]
+        pooled.extend(ratios)
+        hits_total += sum(h for _req, h in rows)
+        required_total += sum(req for req, _h in rows)
+        layer_mean = _mean(ratios)
+        if layer_mean is not None:
+            per_layer.append(layer_mean)
+    value = _mean(pooled)
+    return {
+        "value": value,
+        "per_layer_min": min(per_layer) if per_layer else None,
+        "per_layer_mean": _mean(per_layer),
+        "per_layer_max": max(per_layer) if per_layer else None,
+        "layers": len(per_layer),
+        "windows_with_predecessor": len(pooled),
+        "hits_total": hits_total,
+        "required_total": required_total,
+        "below_gate9_threshold": (
+            None if value is None else value < GATE9_THRESHOLD
+        ),
+    }
 
 
 def reappearance_histogram(series):
@@ -609,6 +669,22 @@ def build_report(traces, retention_ks=DEFAULT_RETENTION_KS):
             row_bytes = (
                 int(slot_bytes // n_expert) if (n_expert and slot_bytes) else 0
             )
+            b_curve = resident_containment(
+                series, retention_ks, n_expert, top_k, window_tokens, row_bytes
+            )
+            oracle = oracle_containment(series)
+            # Exact saturation: a reported K whose pooled hits and required equal
+            # the oracle's, i.e. bounded retention already holds everything the
+            # unbounded cache could -- so more VRAM buys nothing on this stream.
+            saturated_by = next(
+                (
+                    k
+                    for k, v in sorted(b_curve.items())
+                    if v["hits_total"] == oracle["hits_total"]
+                    and v["required_total"] == oracle["required_total"]
+                ),
+                None,
+            )
             rowset_block = {
                 "n_fetch": len(rowset["fetch"]),
                 "n_round": rowset["round"],
@@ -622,9 +698,9 @@ def build_report(traces, retention_ks=DEFAULT_RETENTION_KS):
                 "row_bytes": row_bytes,
                 "hash_recompute_ok": len(rowset["fetch"]),
                 "t5_window_pairs": sum(len(w) - 1 for w in series.values()),
-                "verdict_statistic_b": resident_containment(
-                    series, retention_ks, n_expert, top_k, window_tokens, row_bytes
-                ),
+                "verdict_statistic_b": b_curve,
+                "oracle_containment": oracle,
+                "ceiling_saturated_by_k": saturated_by,
                 "exact_consecutive": exact_consecutive_containment(series),
                 "reappearance": reappearance_histogram(series),
             }
@@ -728,6 +804,19 @@ def render_txt(report, json_basename=None):
                     f"{fmt_or_na(v['per_layer_mean'])}/"
                     f"{fmt_or_na(v['per_layer_max'])}) -- W={rb['window_tokens']}"
                 )
+            orc = rb["oracle_containment"]
+            sat = rb["ceiling_saturated_by_k"]
+            lines.append(
+                "   T8 oracle ceiling (unbounded retention; no policy can exceed "
+                f"it on this stream): {fmt_or_na(orc['value'])}"
+                + (
+                    f" -- reported K={sat} ALREADY SATURATES it (more VRAM buys "
+                    "nothing here)"
+                    if sat is not None
+                    else " -- NOT saturated by the reported K values (retention "
+                    "is the limit, not the stream)"
+                )
+            )
             rap = rb["reappearance"]
             cov = rap["coverage_by_retention_windows"]
             lines.append(
@@ -744,7 +833,12 @@ def render_txt(report, json_basename=None):
             )
     lines.append("")
     readings = [
-        (rep["path"], rep["rowset"]["verdict_statistic_b"])
+        (
+            rep["path"],
+            rep["rowset"]["verdict_statistic_b"],
+            rep["rowset"]["oracle_containment"],
+            rep["rowset"]["ceiling_saturated_by_k"],
+        )
         for rep in report
         if rep.get("rowset")
     ]
@@ -753,16 +847,33 @@ def render_txt(report, json_basename=None):
             f"T-GPLR-15 gate 9 reading (threshold {GATE9_THRESHOLD}; SDD section "
             "10 owns the rule) -- statistic (b), the realized predictor ceiling:"
         )
-        for path, b in readings:
+        for path, b, orc, sat in readings:
             cells = ", ".join(
                 f"K={k}: {fmt_or_na(v['value'])}" for k, v in sorted(b.items())
             )
             lines.append(f"   {path}: {cells}")
+            lines.append(
+                "     ceiling (T8 oracle, unbounded retention): "
+                + fmt_or_na(orc["value"])
+                + (
+                    f" -- reported K={sat} already saturates it"
+                    if sat is not None
+                    else " -- NOT saturated by the reported K values"
+                )
+                + (
+                    f"; BELOW the {GATE9_THRESHOLD} threshold, so NO cache policy "
+                    "of any size reaches the gate on this stream"
+                    if orc["below_gate9_threshold"]
+                    else f"; at or above the {GATE9_THRESHOLD} threshold"
+                )
+            )
         lines.append(
-            "   These traces carry 3 TG windows per layer (2 windows with a "
-            "predecessor), so this reading CROSS-VALIDATES the recorded pilot at "
-            "K=1 rather than deciding the gate. The verdict requires T-GPLR-15 "
-            "Phase A's long single-prompt generation probe (~10,200 pairs)."
+            "   The oracle is MONOTONE in stream length (more history can only add "
+            "coverage), so a below-threshold ceiling on these short samples "
+            "falsifies the gate for THESE STREAMS only, never for the program. "
+            "The verdict requires T-GPLR-15 Phase A's long single-prompt "
+            "generation probe (~10,200 pairs), where the same T8 line separates "
+            "'no policy can pass' from 'retention is the limit'."
         )
     else:
         lines.append(
@@ -831,16 +942,30 @@ _ROWSET_WINDOWS = (
 )
 
 
+# Reuse distance LONGER than any 2-window capacity: window 4 re-requests
+# window 1's rows after two intervening disjoint windows. K=2 (16 rows) has
+# evicted them; the unbounded oracle still holds them. This is the fixture that
+# separates "bounded retention is the limit" from "the stream is the limit".
+_ORACLE_WINDOWS = (
+    (0, 1, "1,2,3,4,5,6,7,8", 9797314157462417237),
+    (0, 2, "10,11,12,13,14,15,16,17", 7622554333669719173),
+    (0, 3, "18,19,20,21,22,23,24,25", 1405361139609267651),
+    (0, 4, "1,2,3,4,5,6,7,8", 9797314157462417237),
+)
+
+
 # Each layer requires the OTHER window's rows one step later, so K=1 holds
 # nothing (0.0) while K=2 holds everything (0.5 pooled) -- the fixture that
-# proves the K curve is real and not a constant.
-def rowset_jsonl(mutation=None):
+# proves the K curve is real and not a constant. Because its union never exceeds
+# 16 rows, K=2 also exactly saturates the T8 oracle, which tests that path too.
+def rowset_jsonl(mutation=None, windows=None):
+    windows = _ROWSET_WINDOWS if windows is None else windows
     out = [
         '{"event": "rowset_init", "run_id": 9, "policy": "moe-row-set", '
         '"n_slots": 4, "slot_bytes": 452984832, "window_tokens": 1, '
         '"n_expert": 256, "top_k": 8, "t_us": 1}'
     ]
-    for idx, (layer, chunk, ids, h) in enumerate(_ROWSET_WINDOWS):
+    for idx, (layer, chunk, ids, h) in enumerate(windows):
         if mutation == "hash" and idx == 0:
             h += 1
         if mutation == "order" and idx == 0:
@@ -874,6 +999,7 @@ def self_test() -> int:
         ("bad.jsonl", BAD_JSONL),
         ("bad2.jsonl", BAD2_JSONL),
         ("rowset.jsonl", rowset_jsonl()),
+        ("rowset_oracle.jsonl", rowset_jsonl(windows=_ORACLE_WINDOWS)),
         ("rowset_bad_hash.jsonl", rowset_jsonl("hash")),
         ("rowset_bad_order.jsonl", rowset_jsonl("order")),
     ):
@@ -1027,6 +1153,46 @@ def self_test() -> int:
     check(
         rep_rowset[0]["temporal_token_verdict"] == TOKEN_VERDICT_MEASURED,
         "rowset: report T5 MEASURED",
+    )
+
+    # -- T8 oracle ceiling: bounded retention vs unbounded -------------------
+    _r3, _m3, _n3, _rt3, _ro3 = load_trace(paths["rowset_oracle.jsonl"])
+    ser3 = rowset_series(_ro3["fetch"])
+    b3 = resident_containment(ser3, (1, 2), 256, 8, 1)
+    check(b3[1]["value"] == 0.0, "oracle fixture: K=1 holds nothing (0.0)")
+    check(b3[2]["value"] == 0.0, "oracle fixture: K=2 evicts before the reuse")
+    orc3 = oracle_containment(ser3)
+    check(
+        abs(orc3["value"] - 1.0 / 3.0) < 1e-9,
+        "oracle fixture: unbounded ceiling is 1/3",
+    )
+    check(
+        orc3["hits_total"] == 8 and orc3["required_total"] == 24,
+        "oracle fixture: pooled hits/required 8/24",
+    )
+    check(
+        orc3["below_gate9_threshold"] is True,
+        "oracle fixture: ceiling below the gate threshold",
+    )
+    rep3 = build_report(
+        [("rowset_oracle.jsonl", load_trace(paths["rowset_oracle.jsonl"]))]
+    )
+    check(
+        rep3[0]["rowset"]["ceiling_saturated_by_k"] is None,
+        "oracle fixture: reported K band does NOT saturate the ceiling",
+    )
+    # The 3-window fixture is the mirror image: its union never exceeds the
+    # K=2 capacity, so the oracle is EXACTLY the K=2 value and must be detected
+    # as saturated -- by totals, not by comparing rounded means.
+    blk2 = rep_rowset[0]["rowset"]
+    check(
+        blk2["ceiling_saturated_by_k"] == 2,
+        "3-window fixture: K=2 exactly saturates the oracle",
+    )
+    check(
+        blk2["oracle_containment"]["value"]
+        == blk2["verdict_statistic_b"][2]["value"],
+        "3-window fixture: oracle equals K=2 (capacity 16 cannot evict)",
     )
 
     expect_loud(

@@ -1,5 +1,39 @@
 # Current State
 
+## 2026-09-13: T8 oracle retention ceiling added to the analyzer — on the ladder samples NO policy can reach the 0.6 gate, but those samples structurally cannot settle it
+
+Owner-requested follow-up on the Phase A analyzer; the analyzer change and this
+record land in the same commit. Host-only: no library changes, no GPU runs, no
+GPU mutex needed.
+
+- **New T8 oracle** = statistic (b) under UNBOUNDED retention: the fraction of
+each window covered by the union of ALL prior windows for that layer. No cache
+policy of any size can exceed it on the same stream, so it answers "could any
+policy reach the 0.6 gate here?". Implemented as `simulate_retention(wins,
+None)` (same simulator, eviction disabled) plus `oracle_containment`, reported
+with pooled hits/required totals so EXACT saturation by a reported K is
+detectable rather than inferred from two rounded means.
+- **Result on the recorded ladder streams: no policy reaches the gate.**
+Oracle = 0.4000 (200k) / 0.4266 (4k) / 0.4031 (50) / 0.4031 (512), all below
+0.6, and every rung reports `ceiling_saturated_by_k = 2`.
+- **That saturation is STRUCTURAL, not evidence about long-stream
+predictability.** With W=1 and top_k=8, K=2's capacity is exactly 16 rows, and
+the union of two 8-row windows can never exceed 16 — so on any 3-window stream
+unbounded retention is provably IDENTICAL to K=2. The oracle therefore confirms
+only that retention sizing is not the limiting factor on these samples; the
+limit is the routing stream's own sparsity (T7 at the 512 rung: 486 of 702
+layer-rows requested exactly once within 3 windows). Since the oracle is MONOTONE in stream length (more history
+can only add coverage), a 3-window ceiling bounds the sample and never the
+program. The 256-token probe is where this test becomes decisive.
+- **Machine-checked, including the negative direction:** the report prints the
+below-threshold conclusion per trace and carries the monotonicity caveat
+inline; the self-test grew to 51 checks (was 43) with a 4-window fixture whose
+reuse distance exceeds the 2-window capacity — K=1 = K=2 = 0.0 while the oracle
+is 1/3 and `ceiling_saturated_by_k` is None — plus the mirror case requiring the
+3-window fixture to report exact saturation at K=2. Both paths of the new logic
+are therefore covered, not just the one the real traces happen to exercise.
+- Artifact regenerated: `build/gplr15-phaseA.{txt,json}`.
+
 ## 2026-09-13: Both remaining untracked docs brought under version control — the model-run testing standard and the 2026-09-11 inference performance review
 
 Owner decision on the open question left by the schema-doc pass. Documentation

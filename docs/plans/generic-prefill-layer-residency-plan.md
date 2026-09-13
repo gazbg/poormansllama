@@ -2062,6 +2062,19 @@ numbers attached. REMAINING Phase A step: the one 256-token batch-major
 generation probe under the GPU mutex (~10,200 pairs), which is what produces
 the gate verdict; the ladder rungs carry only 2 windows with a predecessor per
 layer and are cross-validation, never the verdict.
+The analyzer also reports a T8 ORACLE ceiling (added on owner request
+2026-09-13): statistic (b) under UNBOUNDED retention, i.e. the fraction of each
+window covered by the union of all prior windows, which no cache policy of any
+size can exceed. On all four rungs the oracle EQUALS the K=2 value
+(0.4000 / 0.4266 / 0.4031 / 0.4031) and the report marks K=2 as exactly
+saturating it — and that equality is STRUCTURAL, not a finding about long-stream
+predictability: with W=1 and top_k=8 the K=2 capacity is 16 rows, which the
+union of two 8-row windows can never exceed, so on a 3-window stream unbounded
+retention and K=2 are provably identical. Consequence for reading the gate: the
+ladder samples show that retention sizing is not the limiting factor (none of
+them reaches 0.6 at any capacity), but they cannot falsify the gate, because
+the oracle is monotone in stream length. The probe's T8 line is what
+separates "no policy can pass" from "retention is the limit".
 Prior history: drafted 2026-09-09 gated on T-GPLR-13's rowset_fetch
 telemetry; negative pilot recorded by the ladder analysis (bottlenecks doc
 section 2): 2-step containment mean 0.358-0.389 over W=1 at every ladder
