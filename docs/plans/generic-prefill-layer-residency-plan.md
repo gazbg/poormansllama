@@ -7,8 +7,32 @@ T-GPLR-11 tail-ubatch gap closed); T-GPLR-09
 PARKED (owner decision 2026-09-09 -- two-key door: privilege blocker plus
 falsified premise; reopen triggers in its status note).
 Remaining program items: endurance ladder rungs 50k/100k/200k
-(owner-invoked), the T-GPLR-08 attribution question, and a second
-architecture passing the acceptance gates (owner-gated product decision).
+(owner-invoked), the T-GPLR-08 attribution question, a second
+architecture passing the acceptance gates (owner-gated product decision),
+and the MoE TG row-set program (T-GPLR-14 instrument done 2026-09-09;
+T-GPLR-13 reactive row-set DONE 2026-09-13 (owner review; moe-row-set SDD
+amendment WRITTEN 2026-09-12 (owner-directed); gate (b) DECIDED 2026-09-12 —
+chosen over the T-GPLR-16 escalation options; implementation COMPLETE
+2026-09-13 incl. 512-token row-set run, qa-smoke regression, and the
+50/512/4k/200k ladder — all PASS; residual follow-ups in its status note);
+T-GPLR-15
+predictive per-token prefetch READY 2026-09-13 as a gate-measurement-first
+task (Phase A: measure the 0.6 temporal hit-rate gate from rowset_fetch
+telemetry with no library changes — analyze.py re-source + one 256-token
+generation probe; below 0.6 the task closes falsified-by-evidence per SDD
+gate 9; Phase B implementation only on PASS + owner review); T-GPLR-18
+pinned row-set staging READY 2026-09-13 (F1 from the T-GPLR-13 close-out;
+tests the existing `--copy-source pinned` path against the measured
+13.7 GB/s link ceiling and the T-Q38PERF-03 counter-evidence; 512 A/B gate,
+negative result is a legitimate close). T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
+(2026-09-12, owner gate (b) decision): in-progress implementation
+parked; MIN_BATCH=1 disposition = option (a) revert; options (b)/(c)
+unprioritized.
+T-GPLR-17 (two-process hybrid bridge: streaming PP -> slot state file
+-> CPU-expert llama-server stock TG) is READY (2026-09-10, owner
+request): orchestration + one runner flag over the in-tree
+llama_state_seq_save/load_file seam and the server's existing /slots
+save-restore endpoints; no SDD amendment needed.
 Commit record (2026-09-09, owner-authorized): vendored-tree changes in
 third_party/llama.cpp 099a27a7e (T-GPLR-08/10/11); parent docs/tools in
 84be194 (recorded T-GPLR-08/10/11 completion, gitlink bump) and 7bfe83b
@@ -71,7 +95,9 @@ T-GPLR-00 -> T-GPLR-01 -> T-GPLR-02 -> T-GPLR-03 -> T-GPLR-04 -> T-GPLR-05
 
 Implementation serialization (one ready task at a time): T-GPLR-06/07
 closed 2026-09-09; T-GPLR-08 (prefetch probe, hypothesis falsified) and
-T-GPLR-10 (MoE handoff) closed 2026-09-09; T-GPLR-11 closed 2026-09-09.
+T-GPLR-10 (MoE handoff) closed 2026-09-09; T-GPLR-11 closed 2026-09-09;
+T-GPLR-13 (reactive row-set) closed 2026-09-13 (owner review; residual
+follow-ups F1-F3 recorded in its status note).
 T-GPLR-09 (host-RAM residency tier) is PARKED (owner decision 2026-09-09:
 a two-key door -- the privilege blocker plus the falsified T-GPLR-08
 premise; reopen triggers in its status note). If reopened, it reuses
@@ -79,6 +105,21 @@ T-GPLR-08's range walker and telemetry plumbing and makes the rolling
 prefetch unnecessary (all banks resident), with T-GPLR-08 remaining the
 fallback tier and the probe for the declined case.
 Remaining program items are listed in the header status above.
+MoE TG row-set program (2026-09-09): T-GPLR-14 (route-overlap instrument)
+done; T-GPLR-13 (reactive row-set) DONE 2026-09-13 (owner review) -- gate (a)
+resolved (moe-row-set SDD amendment) and gate (b) decided 2026-09-12 (owner):
+chosen over the T-GPLR-16 escalation options; T-GPLR-15 (predictive per-token
+prefetch) READY 2026-09-13, gate-measurement-first (Phase A measures the
+0.6 hit-rate gate from T-GPLR-13's rowset_fetch telemetry with no library
+changes; below 0.6 the task closes falsified-by-evidence per SDD gate 9);
+T-GPLR-18 (pinned row-set staging, F1) READY 2026-09-13 with a 512 A/B gate
+-- two ready tasks now exist (T-GPLR-15 Phase A and T-GPLR-18); they are
+independent (host-only analyzer + probe vs one small library change + GPU
+A/B), and the owner selects order while implementation stays one at a time;
+T-GPLR-16 (mixed-placement TG mode)
+DEPRIORITIZED to DRAFT (2026-09-12, owner gate (b) decision) --
+in-progress implementation parked, MIN_BATCH=1 disposition = option (a)
+revert, (b)/(c) unprioritized. One ready task at a time.
 ```
 
 ### T-GPLR-00: Inventory the MoE artifact and capacity
@@ -1630,3 +1671,912 @@ Escalate before implementation if
   buf_act growth exceeds one act pair; the logits final-ubatch variant turns
   out to already be reachable (verify first with a 512/64 logits probe
   before coding -- a cheap disprovable check).
+
+### T-GPLR-12: Default profile v2 (handoff auto, q8 KV, layer-major+pw-probe, bf16 slabs)
+
+Status: done (2026-09-09; owner decision after the defaults
+inventory: adopt points 1/2/3/5 of the proven-good list as defaults;
+MTP stays opt-in because with handoff auto the fits-regime TG is stock
+decode and MTP batch verify only matters in the streaming regime).
+All acceptance criteria demonstrated; the bf16 MoE escalation clause
+FIRED and the owner re-decided: bf16 slab default kept everywhere
+(dense bit-identical ID 286; MoE answers 5/5 at every rung with one
+cosmetic template-boundary re-tokenization vs f32; token-ID
+reproducibility on MoE consciously ceded — MoE cross-dtype comparisons
+use the answer gate, never TG-ID equality).
+Depends on: T-GPLR-10 (handoff machinery + preflight fit branch);
+T-GPLR-07 (answer gate vehicle). Commit: pending (T-GPLR-12 changes
+uncommitted in the vendored tree; no commit authorized yet)
+
+Goal
+: Make the measured-good configuration the runner default while keeping
+  every mode overridable and normal llama.cpp behavior intact when the
+  streaming path is refused.
+
+Scope (four default flips)
+: 1. `--kv-cache q8` default (f16/q4 stay explicit).
+   2. `--pp-schedule layer-major` + `--pw-probe` default (batch-major stays
+      explicit; the QA gate scripts already pass the schedule explicitly).
+   3. `--act-slab-dtype bf16` default (f32 stays explicit).
+   4. Handoff default = AUTO: new `--handoff auto|on|off` tri-state with
+      `--no-handoff` alias for off (default auto). auto enables --handoff
+      only when (a) the resolved policy is streamable (not forced off), and
+      (b) the T-GPLR-10 handoff-fit preflight branch passes at run start;
+      otherwise the run proceeds as streaming TG with a one-line stderr
+      notice (recorded in telemetry) -- never a silent behavior change for
+      fits-regime runs that explicitly pass --no-handoff, and never a
+      fallback AFTER work has begun. Explicit --handoff keeps today's
+      hard-refuse semantics.
+
+Non-goals
+: MTP default-on (owner declined: subsumed by auto-handoff in the fits
+  regime; stays opt-in for streaming-regime TG bursts); changing dense
+  reference fixture shapes; changing the answer-gate grader; multi-GPU.
+
+Design / failure contract
+: The fit decision reuses the existing T-GPLR-10 preflight arithmetic
+  (full_model_plus_runtime + act_slab_bytes + reserve <= observed free
+  VRAM) evaluated BEFORE the timed PP; no second arithmetic path. The
+  auto-off case is loud (stderr notice + telemetry run_start field
+  `handoff_mode`: "auto-on" | "auto-off" | "on" | "off") and checkable by
+  the checker. Existing refusals keep their semantics: --mtp + --handoff
+  under moe-expert-bank refuses only when handoff is actually on (mtp
+  without handoff under moe-expert-bank stays legal, the streaming MTP
+  path); the layer-major TG cap lifts only when handoff is actually on.
+
+Acceptance criteria (falsifiable)
+: - Host: new fixtures -- (a) handoff auto + fits-regime shape reaches the
+    post-parse gates with handoff on; (b) --no-handoff disables; (c) auto
+    does not change the refusal messages of the T-GPLR-10 gate set;
+    (d) existing 50 fixtures stay green unchanged (the QA gate scripts
+    pass explicit schedules so they are default-immune).
+   - Parity: bf16-vs-f32 slab route-hash + greedy-ID parity on the Qwen3.6
+     100K synthetic layer-major rung (the owner's pre-approval condition)
+     AND on the dense 1024 anchor (Q38LS_MODEL_PATH) -- bf16 activations
+     may flip knife-edge IDs, so equality of the TG id is the gate.
+   - Answer gate (semantic QA, owner-required for the bf16 default):
+     rungs 50 AND 512 on layer-major with bf16 slabs under the NEW
+     defaults: check-telemetry OK, aggregate PASS, negative control FAILs
+     as designed. Plus the standard `tools/run-tests.ps1 -Suite qa-smoke`.
+   - Behavior: MoE 512 run under pure new defaults auto-enables handoff
+     (run_start handoff_mode=auto-on), TG ids unchanged vs the
+     gplr10-qa512-ho reference, migrate event 18,327,011,328 B; dense
+     ctest layer-major-1024 2/2 (ID 286) unchanged.
+   - Auto-off: a shape that cannot fit (262K Q8) runs streaming TG with
+     handoff_mode=auto-off + stderr notice, exit 0, checker OK -- or
+     refuses loudly if resources are insufficient (never silently degrades
+     mid-run).
+
+Focused validation
+: `cmake --build build/llama-cuda --config Release --target
+  llama-layer-streaming`; `tools/run-tests.ps1 -Suite host`; GPU mutex:
+  the parity/auto-off/QA list above with --check-telemetry on every trace.
+
+State update
+: Record the new default profile, handoff_mode field, bf16 parity verdicts
+  (100K + dense anchor + QA rungs), and the auto-on/auto-off behavior in
+  docs/currentstate.md.
+
+Escalate before implementation if
+: bf16 flips the dense anchor ID 286 or a QA rung (then bf16 stays opt-in
+  and the owner re-decides); auto-handoff cannot be decided host-safely
+  before the timed PP without a second arithmetic path.
+
+Result (2026-09-09, all under the GPU mutex)
+: Host suite 23/23 (new fixtures: tri-state parsing, auto-refusal mtp
+  shape, lm-tg-cap auto-lift). GPU ladder traces
+  `build/llama-cuda/gplr12-*.jsonl`:
+  - Dense anchor pair 1024+1 greedy, f32 vs bf16: `tg_tokens ids=[286]`
+    identical both; ctest `layer-streaming-layer-major-1024` 2/2 in
+    19.8 s under pure new defaults (run_start slab=bf16, kv=q8,
+    handoff_mode=auto-off, ID 286 unchanged).
+  - Auto-on: QA-50 and QA-512 rungs under pure defaults (no
+    schedule/dtype/kv/handoff flags) auto-enabled handoff
+    (`handoff_mode=auto-on`, fit gate passed, out-of-core refusal
+    waived by design), migrate 18,327,011,328 B exact on both;
+    check-telemetry OK; answers PASS (50: N1; 512: 5/5); negative
+    controls FAIL as designed.
+  - Auto-off: 262K rung `handoff_mode=auto-off` with loud stderr
+    notice (24.3 GB need > 22.2 GB free), streaming PP 262144 tokens
+    at 1160.9 tok/s, exit 0, checker OK.
+  - bf16-vs-f32 route parity, MoE 100K pair: 0/840 route hashes equal
+    (bf16 slab rounding perturbs router near-ties; compounding from
+    layer 0). Dense has no router: bit-identical.
+  - Decisive QA-512 three-way (identical shape/prompt/handoff;
+    bf16-vs-f32 is one variable): IDs differ by exactly ONE inserted
+    token at the chat-template boundary ("assistant\n" re-tokenized);
+    entire needle tail byte-identical; answers 5/5 both. The f32
+    control ALSO differs from the old batch-major reference
+    `gplr10-qa512-ho` (position 43) — the old reference was never
+    schedule-stable, so the contract's TG-ID-vs-reference criterion
+    was unattainable for MoE regardless of dtype.
+  - Escalation clause FIRED (bf16 flips a QA rung); owner re-decided
+    2026-09-09: bf16 default KEPT everywhere; MoE comparisons are
+    answer-gated, never token-ID-gated.
+  - Two defects found & fixed en route: (1) MoE streaming builder
+    (`qwen35moe.cpp`) lacked the three `slab_bf16` cast points the
+    dense builder has — MoE + bf16 slabs crashed in norm.cu; ported
+    the dense pattern (cast on read, writes via ggml_cpy). (2) The
+    new checker rule used `handoff_seen` (reset per phase_summary),
+    so on/auto-on traces could never pass; now `handoff_ever`.
+  - Cost/benefit recorded: bf16 slabs halve the slab allocation
+    (100K MoE: 1.53 GiB -> 768 MiB; 262K: 4 GiB -> 2 GiB), lower peak
+    VRAM by the same bytes, and are a direct input to the auto-handoff
+    fit arithmetic (marginal shapes flip auto-off -> auto-on) — the
+    reason the owner kept it despite the routing perturbation.
+
+---
+
+### T-GPLR-13: Reactive expert row-set residency (bounded row windows for MoE TG)
+
+Status: DONE (2026-09-13; marked done on owner review. Status history:
+in-progress 2026-09-12; implementation started after gate (b) was decided by
+the owner — decision
+recorded below and in currentstate.md). Implementation COMPLETE 2026-09-13
+(update below); the remaining Focused-validation items are DONE 2026-09-13:
+the 512-token row-set run (checker OK) and the qa-smoke 512 regression
+(answer PASS, negative control FAILS, no rowset events on the default-off
+path), plus the owner-directed test ladder 50/512/4k/200k — all sizes PASS
+with memory evidence (table in currentstate.md) — and the dense cold-path
+validation (qwen38-layer-boundary + layer-slot-lifecycle 2/2 under the GPU
+mutex, post-change; audit close-out below). Audit close-out 2026-09-13:
+validator parity (rowset_init window_tokens rule ported to
+validate_telemetry; both validators verified identical on row-set rules)
+and dual-path negative controls 18/18. Gate (a) was the `moe-row-set` SDD
+amendment (this task adds a second MoE residency
+package granularity — routed-expert row windows — which the active SDD
+does not define), RESOLVED 2026-09-12. Gate (b) was product priority
+vs the handoff path; DECIDED 2026-09-12: T-GPLR-13 is the next
+implementation task, chosen over the T-GPLR-16 escalation options
+(a/b/c) — reactive row-set is single-process (the T-GPLR-17 rejection
+makes that property program-defining), bounded-VRAM by construction,
+works in the not-fitting regime where handoff cannot, and produces
+the rowset_fetch telemetry that unblocks T-GPLR-15; the T-GPLR-16
+escalation goes option (a) (revert MIN_BATCH=1), preserving the
+measured 64.63 tok/s full-handoff result as the fits-regime answer.
+Depends on: the SDD amendment above (done); the vendored CUDA tree
+(present). Commit: none.
+Update 2026-09-12: gate (a) is RESOLVED — the owner directed the SDD
+amendment and it is written: sections 1, 4 (moe-row-set package,
+including the hard execution-shape constraint: CUDA-resident pre-execution
+slot packages only, scheduler cross-backend staging prohibited on this
+path per the T-GPLR-16 deadlock evidence), 6, 8, 9, 10, 11, 12 of
+docs/layer-residency-sdd.md. Gate (b) remains open. Per the amended SDD,
+row-set graphs must consume CUDA-resident slot weights under the standard
+copy-event/generation lifecycle; any design that stages rows via the
+backend scheduler during graph execution is out of contract.
+
+The owner marked T-GPLR-13 done 2026-09-13 after the staging analysis in
+docs/gplr13-bottlenecks-hypotheses.md section 6 (ready-latency ~5% of TG
+fetch; submit-side pageable-H2D staging mechanism; H1(b) corrected to F2
+per-layer row caches). Residual risks and open follow-ups at close:
+(1) F1 pinned row staging (new follow-up contract candidate) — the
+submit-side staging loop is the dominant TG cost; expected but UNMEASURED
+1.2-1.4x TG tok/s; needs its own task contract with a 512 A/B probe as
+falsifier. (2) F2 per-layer row caches — reuse realization and the
+T-GPLR-15 0.6 gate measurement; SDD residency treatment WRITTEN 2026-09-13
+(SDD section 4 "moe-row-cache package", sections 6-12 amended), so a Phase B
+or F2 task contract can now be drafted against a defined class. (3) F3/H8 zero TG per-part compute timings remain a telemetry
+debt. (4) H2 (200k staging-bandwidth decline) and H7 (~5 GB commit residual)
+remain explained-to-first-order only. (5) T-GPLR-15's 0.6 hit-rate gate is
+still unverified over a real stream (pilot containment 0.358-0.389 is a
+negative pilot signal, not a verdict). (6) Performance claims remain
+instrumentation-only per the task contract: the row-set win is byte/wall
+evidence on 3-token windows, never a headline tok/s claim.
+Update 2026-09-13: implementation complete. Runner wiring (`--residency-tg`
+flag + usage, loud gates: requires `--residency moe-expert-bank` and
+`--tg-tokens > 0`, incompatible with `--residency off` / `--handoff` /
+`--handoff-partial` / `--mtp`; explicit request suppresses the T-GPLR-12
+auto-handoff fit heuristic; `ls.row_set_requested` set before init;
+`begin_row_set()` after PP — activation failure aborts TG before any
+decode — and `end_row_set()` after TG), library pieces (`run_start`
+"rowset":"on" marker, width-1 prebuild guard failing loudly on
+`n_rs_seq > 0`, `rowset_init`/`rowset_fetch`/`rowset_round`/`rowset_refused`
+telemetry per the schema draft), and checker validation in both check- and
+validate-telemetry (W=1 identity, accounting identity, generation lifecycle
+per (slot, owner, generation), FNV-1a-64 hash recompute via `strtoull` —
+`atoll` saturated above LLONG_MAX — run_start-marker gating, default-off
+absence). Built clean; host suites green (default-off path untouched).
+Evidence: `build/llama-cuda/gplr13/rowset-pp64-tg3.jsonl` (Qwen3.6-35B MoE,
+PP 64 + TG 3, 4 slots, exit 0, check-telemetry OK, 569 events, 120
+rowset_fetch; each `rowset_round` staged 572,719,104 of 18,327,011,328
+bytes = 3.12% — exactly the 8/256 reactive union at W=1, route parity
+held). Negative controls (`tools/run-gplr13-negfix.ps1`, host-only:
+tampered fixtures each trip their rule loudly) were 8/8 at implementation
+time; after the 2026-09-13 audit close-out they are DUAL-PATH — every
+fixture asserted against BOTH --check-telemetry and --validate-telemetry
+with identical expected failures, 18/18 verdicts correct, including a
+window_tokens fixture for the rule ported to validate_telemetry that day.
+Dense cold-path validation (audit close-out): qwen38-layer-boundary +
+layer-slot-lifecycle 2/2 under the GPU mutex with Q38LS_MODEL_PATH set
+explicitly — harness note: tools/run-tests.ps1 reads but does not
+propagate the model path to ctest children; the caller must export it.
+This proves the shared telemetry paths (tel_run_start format string,
+executor) on dense shapes post-change. The never-fired reuse branch
+(rows_reused=0 at 4 slots, structural per the ladder analysis) is ruled
+NOT a T-GPLR-13 defect; its first positive demonstration is owned by the
+H1 follow-up contract (docs/gplr13-bottlenecks-hypotheses.md).
+Ladder 2026-09-13 (owner-directed): 50/512/4k/200k row-set + qa-smoke-512
+regression, every run under the GPU mutex with the memory poller attached —
+ALL PASS, no retries, zero refusals, staged bytes 3.12-3.13% at every size
+(context-length invariant), TG tok/s 10.1 -> 7.7 (instrumentation only),
+shared segment 66 -> 268 MiB while dedicated grew ~4.1 GB (no duplication;
+T-MEMPROBE-01 conclusion extends to 200k). Per-size metrics and artifacts:
+`build/llama-cuda/gplr13-ladder/` (`summary.json`, per-size traces+CSVs),
+table in currentstate.md; driver `tools/run-gplr13-ladder.ps1`.
+
+Goal
+: Cut MoE TG staging volume below the full 40-bank pass (the measured
+  TG floor: 18.33 GB/round at ~9 GB/s) by staging only the union of
+  expert rows actually routed in a bounded token window, reacting to
+  route telemetry instead of predicting it.
+
+Scope
+: `moe-row-set` package = per layer, the deduplicated set of routed
+  expert rows for the window (window = one token or a small token
+  group, decided at implementation review); per-layer `rowset_fetch`
+  telemetry emitting the FULL per-token union ID list (this is also
+  T-GPLR-15's gate telemetry — no separate instrument appears).
+  Layer-major PP and every other policy are untouched; CUDA-only,
+  opt-in, fails loudly.
+
+Non-goals
+: expert prediction/rotation experiments; dense models; the CPU path;
+  quality claims (routing must stay bit-exact — row residency may not
+  alter router arithmetic, expert IDs, or quantization bytes).
+
+Design / failure contract
+: Logical layer identity and slot identity remain separate; a row-set
+  package is immutable for its generation and retires atomically;
+  consumers wait on the copy event; missing rows, stale generation, or
+  insufficient VRAM refuse loudly (exit 2 / structured telemetry),
+  never silently running another layer's rows.
+
+Acceptance criteria (falsifiable; owner-reviewed after the SDD amendment)
+: - Route-event parity: for every layer and token, the executed row
+    set covers the router's exact expert IDs (no missing-row path).
+  - check-telemetry validates rowset_fetch completeness (union ID
+    lists sum to per-token route counts).
+  - Staging bytes per TG round < full-bank bytes by the measured union
+    width ratio; wall time recorded as an instrumentation result,
+    distinct from any performance claim.
+  - Dense Qwen3.8 ctest regression and the QA smoke gate stay green
+    (default-off path untouched).
+
+Focused validation
+: Build llama-layer-streaming; host suite; GPU mutex: one 512-token MoE
+  run with row-set TG, checker OK; dense ctest 2/2; qa-smoke 512.
+
+Escalate before implementation if
+: row-copy granularity proves finer than the copy engine can express
+  without per-row sync that erases the saving (the recorded task risk).
+  (The former first clause — "the SDD amendment is declined" — was
+  removed when gate (a) resolved 2026-09-12.)
+
+---
+
+### T-GPLR-14: Route-overlap instrument (offline evidence for the row-set/prefetch gates)
+
+Status: done (2026-09-09). Validated on real traces; the tool was
+reconstructed the same day after its isolated workspace was lost (see
+Provenance) and re-proven against the recorded artifacts
+byte-for-byte. Depends on: none (host-only, stdlib-only, read-only).
+Commit: none.
+
+Goal
+: Quantify, from existing telemetry traces only, the expert-union
+  overlap statistics that gate T-GPLR-13/15: per-layer union widths,
+  exact hash-equality overlap bounds, an advisory sampled-ID overlap,
+  and the token-level temporal hit rate — computing what the evidence
+  supports exactly and reporting the rest as UNDECIDABLE, never
+  guessed.
+
+Scope
+: `tools/route_overlap/analyze.py` (stdlib-only; deterministic output;
+  no timestamps). Inputs: one or more telemetry JSONL traces. Outputs:
+  txt report + json payload. Statistics: T1 per-layer route-union
+  width (min/mean/max); T2 consecutive-chunk hash-equality rate per
+  layer (exact lower bound on union overlap; unequal hashes never
+  imply inequality); T3 adjacent-layer hash-equality; T4 sampled-ID
+  overlap between consecutive chunks — containment |A n B| / |A|,
+  advisory only, biased low (top_k samples, not full unions); T5
+  token-level temporal verdict: MEASURED only from per-token route
+  events (n_tokens == 1), else INSUFFICIENT_INPUT / NO_TG_PHASE /
+  NO_ROUTE_EVENTS with the reason.
+
+Failure contract
+: Unsupported event types, missing route fields, malformed lines, and
+  missing files exit 2 naming file:line or the path. No silent skips;
+  advisory numbers are labeled and are never a go/no-go input.
+
+Acceptance criteria (falsifiable)
+: - Self-test PASS on hand-computed fixtures (chunked, per-token
+    MEASURED, and loud-failure negatives; exit 2 with file:line).
+  - Fidelity: rerun over the 5 recorded gplr12-* traces reproduces
+    build/llama-cuda/gplr14-route-overlap.{txt,json} byte-identically
+    (txt including the trailer; json equal per record).
+  - Determinism: two runs with identical arguments/paths are
+    byte-identical.
+
+Result (2026-09-09; artifacts gplr14-route-overlap.{txt,json})
+: 5 traces (gplr12-qa-512, qa-50, 100k-bf16, 100k-f32, 262k-auto):
+  union widths 245-256 on the 512-token anchor; 19-174 on the
+  50-token anchor (late layers collapse hardest); 100k/262k PP unions
+  near-saturated; T2/T3 = 0.0 everywhere (no chunk ever repeats a
+  full union); T4 advisory 0.2892/0.2952/0.3096 (PP chunks). T5:
+  INSUFFICIENT_INPUT on the QA traces (96 TG tokens, no per-token
+  route events), NO_TG_PHASE on the PP-only traces. PRIMARY FINDING
+  (instrumentation result): the runner emits route events only at
+  PP-chunk granularity; no surviving trace carries per-token TG
+  routes, so the T-GPLR-15 token-level temporal hit rate is
+  UNDECIDABLE from existing traces and the proposed 0.6 threshold
+  stays PROPOSED/UNMEASURED. Consequence: T-GPLR-15's gate telemetry
+  falls to T-GPLR-13's rowset_fetch events (full per-token union ID
+  lists), so no extra telemetry work appears.
+
+Provenance note (2026-09-09)
+: The original implementation ran in an isolated (ephemeral) workspace
+  lost on tab close; its plan/currentstate rows were lost with it.
+  The tool was reconstructed in the main worktree and re-proven by
+  byte-identical reproduction of the surviving artifacts plus the
+  surviving self-test fixtures (%TEMP% route-overlap-selftest-*);
+  the T4 containment metric is pinned by the recorded 0.28921875 on
+  100k-bf16 (Jaccard and pooled alternatives do not reproduce it).
+
+Escalate before reuse if
+: a future trace class adds an event type outside the known list (the
+  tool fails loudly by design; extend the known-event table with a
+  fixture, never weaken the contract).
+
+---
+
+### T-GPLR-15: Predictive per-token expert prefetch (one-window-ahead)
+
+Status: READY (2026-09-13, contract rewritten on owner request now that
+T-GPLR-13 is DONE and `rowset_fetch` telemetry exists in real traces).
+GATE-MEASUREMENT-FIRST contract: Phase A measures the 0.6 temporal hit-rate
+gate with NO library changes and NO implementation of prediction; the task
+closes as falsified-by-evidence if the gate measures below 0.6 (SDD gate 9).
+Only a PASS advances to Phase B (implementation, separately owner-reviewed).
+Prior history: drafted 2026-09-09 gated on T-GPLR-13's rowset_fetch
+telemetry; negative pilot recorded by the ladder analysis (bottlenecks doc
+section 2): 2-step containment mean 0.358-0.389 over W=1 at every ladder
+size — a negative pilot over 2 consecutive steps only (80 pairs per size,
+one prompt family), never a gate verdict; the gate is defined over a real
+generation stream. Implementation-shape note carried from the T-GPLR-13
+close-out: realizing predicted reuse requires the F2 per-layer row-cache
+design (H1(b) correction, bottlenecks doc section 6.4) — per-layer coverage
+over the aliased slot buffers is unsound; any Phase B design must treat
+per-layer row caches as a NEW residency class under SDD section 4 (atomic
+ready/retire, generation lifecycle). That treatment now EXISTS: SDD section 4
+"moe-row-cache package (per-layer persistent rows; amended 2026-09-13)", with
+sections 1, 6, 7, 8, 9, 10, 11, 12 amended to match — per-layer keying with
+structural provenance, bounded retention, per-window atomicity, the two
+permitted execution shapes, loud cache failures, cache-vs-link telemetry
+classes, gate 10, and the cache risk list. A Phase B / F2 contract is no
+longer blocked on design.
+Depends on: T-GPLR-13 (DONE); T-GPLR-14 (instrument, closed).
+Commit: none.
+
+Goal
+: Raise MoE TG tok/s by staging the NEXT token window's row set while
+  the current window computes, when the measured temporal hit rate
+  says the prediction is usually right — falsifiable against the
+  reactive row-set baseline.
+
+Scope (Phase A — gate measurement, this task's controlling phase)
+: Host-only + one GPU probe run. NO library changes. Extend
+  `tools/route_overlap/analyze.py` so T5's per-token verdict sources
+  `rowset_fetch` events per schema draft section 6 (known-event list grows
+  to include rowset_*; hash recompute cross-check on every event; unknown
+  events still exit 2 with file:line; determinism rules unchanged). Add an
+  exact-containment statistic (consecutive-window `|A n B| / |A|` from full
+  `union_ids` lists — upgrades T4 from advisory where row-set traces exist)
+  and a per-layer reappearance-distance histogram (offline from the
+  union streams; the slot-count decision input). Then acquire ONE
+  sufficiently long real-generation trace on the BATCH-MAJOR vehicle (see
+  the corrected probe protocol below), on the ladder model
+  (Qwen3.6-35B-A3B-MTP-UD-Q4_K_S), anchor-prompt warm state, memory poller
+  attached per the testing standard. 256 tokens yields 255
+  consecutive-window pairs per layer x 40 layers = 10,200 pairs (vs 80 in
+  the pilot) at ~9.2 KB/token JSONL (~2.4 MB trace) and ~25-33 s TG wall at
+  the measured 7.7-10.1 tok/s — a bounded, single-mutex probe.
+
+Corrected probe protocol 2026-09-13 (contract correction; the original
+`--tg-tokens 256` on the default layer-major schedule is REFUSED by the
+runner: main.cpp:2190 and :2878 cap handoff-free layer-major TG at 3 tokens,
+and `--residency-tg` forces handoff auto -> off at main.cpp:2465, so the row
+path can never lift that cap today)
+: - Vehicle: `--pp-schedule batch-major`, which has no TG-token cap and is
+    the SDD's normative default; `--tg-tokens 256 --greedy --no-mtp` is legal
+    there. The measured quantity is a property of the generation stream
+    (prompt + KV + model), and batch-major and layer-major PP produce the
+    same KV per the validated PP equivalence gates, so sourcing the hit-rate
+    stream from a batch-major run is legitimate — but row-set TG after a
+    batch-major PP is UNVERIFIED, so Phase A starts with a one-run
+    feasibility check (row-set activates, `run_start` carries "rowset",
+    `rowset_fetch` events appear, checker OK). If that check fails, the
+    fallback is a repeated-3-token layer-major stream assembled with
+    DIFFERENT prompts, or an owner decision to lift the cap for row-set mode
+    — which is its own task, not part of this contract.
+  - Sampling limit to record: greedy decoding at a fixed prompt is
+    DETERMINISTIC, so repeated identical runs reproduce the SAME pair
+    population and add no independent samples. Only stream length (or a
+    prompt family) grows n — exactly why the long-run vehicle is required
+    rather than more short runs.
+  - The original layer-major 3-token shape remains valid for the
+    re-sourcing cross-check (it must reproduce the recorded 0/80 hash-equal
+    and 0.358-0.389 containment from the ladder traces), but it cannot
+    supply the 10,200-pair gate stream.
+
+Gate metric and decision rule (Phase A acceptance, falsifiable)
+: - Primary: token-level temporal hit rate = fraction of
+    consecutive-window pairs (per layer, windows sorted by `chunk`, W=1
+    only) with EQUAL FNV-1a-64 `hash` — the same statistic T5 already
+    defines, re-sourced to `rowset_fetch`. Exact, not sampled.
+  - Secondary (context, never a substitute): mean containment
+    `|A n B| / |A|` of consecutive windows, and containment of the next
+    window in the CUMULATIVE resident set (the realistic predictor ceiling,
+    since a prefetch cache persists across windows — this distinguishes
+    "prediction fails" from "rotation discards", which the 2-step pilot
+    could not).
+  - PASS = primary >= 0.6 on the 256-token trace (SDD gate 9). Record
+    per-layer breakdown; if the aggregate passes ONLY because a few layers
+    sit near 1.0 while late layers collapse, report the volatility and let
+    the owner decide whether a per-layer policy is product intent before
+    Phase B (escalation condition, below).
+  - FAIL = primary < 0.6: append the result to the bottlenecks doc,
+    update currentstate, mark the task DONE-falsified-by-evidence. No
+    library change, no Phase B, T-GPLR-15 closed per SDD gate 9; the
+    reactive row-set path stands as the program's TG answer alongside the
+    closed handoff.
+  - Either verdict is an instrumentation result, not a performance
+    claim.
+
+Non-goals (Phase A)
+: No predictor code, no prefetch staging, no W>1 execution, no F2 row
+  caches, no new events beyond what T-GPLR-13 already emits. The trace is
+  a reactive-baseline trace; prediction appears in Phase B only.
+
+Scope (Phase B — implementation, entered ONLY on gate PASS + owner review)
+: One-window-ahead prefetch of row-set packages only; no multi-window
+  speculation; identical loud-failure and bit-exact-routing contracts as
+  T-GPLR-13; rowset_fetch's `union_ids` remain the router's EXECUTED ids
+  (schema draft section 3: predicted IDs appear as timing/byte effects,
+  never as altered union lists, keeping the reactive superset gate
+  checkable); staging before graph execution per SDD section 4; prefetch
+  must not increase availability-wait time vs the reactive baseline;
+  before/after pair (reactive vs prefetch) under the GPU mutex with
+  --check-telemetry; performance claimed only if wall tok/s improves at
+  equal shape and the semantic-QA answer gate passes. Phase B gets its own
+  dated contract update at entry (it is written now only as a boundary,
+  not as a ready contract).
+
+Focused validation (Phase A)
+: 1. `python tools/route_overlap/analyze.py` on the EXISTING ladder traces
+     first: T5 verdict must become MEASURED (re-sourced) with values equal
+     to the bottlenecks doc's hand-computed pilot (0/80 hash-equal,
+     containment 0.358-0.389) — cross-validates the re-sourcing before any
+     new run. 2. Analyze the new 256-token trace: T5 MEASURED with
+     n_pairs = 10,200; hash recompute passes on every rowset_fetch.
+   3. No GPU work outside `tools/with-gpu-lock.ps1`; the probe run's
+     recorded evidence per the model-run testing standard.
+
+Escalate before implementation if
+: the hit-rate gate cannot be evaluated from rowset_fetch telemetry; the
+  aggregate-vs-per-layer tension above makes the 0.6 threshold ambiguous
+  as product intent; or owner priority favors handoff (which already
+  reaches 64.63 tok/s TG on fits-regime shapes).
+
+---
+
+### T-GPLR-16: Mixed-placement TG mode (single-process streaming PP + partial-placement TG)
+
+Status: in-progress (2026-09-10; owner authorized implementation after the
+T-GPLR-17 two-process bridge was rejected — this task is the single-process
+replacement it gated). DEPRIORITIZED to DRAFT 2026-09-12 (owner gate (b)
+decision: T-GPLR-13 reactive row-set is the priority TG path; the
+MIN_BATCH=1 wedge disposition below applies; do not resume without a new
+owner call). Drafted 2026-09-10; renumbered from a stale "T-GPLR-14" forward reference in currentstate.md's NCMOE-262K section — that
+ID belongs to the closed route-overlap instrument. Depends on: the vendored
+CUDA tree. Commit: none.
+Update 2026-09-12: the MIN_BATCH=1 TG wedge is fully characterized as a
+device-side stream deadlock (3rd TG token, MUL_MAT_ID CUDA fast path on
+host-resident banks under partial handoff; graphs- and rowcopy-independent;
+StackWalk64 + TDR evidence in currentstate.md 2026-09-12). A capture-time
+staged-weights containment was attempted and reverted (ineffective: the
+compat check runs before the scheduler rewire; capture is not the mechanism).
+Escalated to the owner under this task's escalation condition: (a) revert
+MIN_BATCH=1 and accept the failing QA gate, (b) invest in upstream deadlock
+chasing, or (c) the consistent-arithmetic CPU-PP alternative.
+DISPOSITION 2026-09-12 (owner decision, gate (b) context): option (a) is
+chosen — revert MIN_BATCH=1 to pre-fix partial TG with the known step-1
+gold flip; partial TG is not the priority path and the QA-gate failure is
+accepted until a consistent-arithmetic route (option c) is explicitly
+prioritized. Options (b)/(c) stay open but unprioritized; the fits regime
+is served by the closed T-GPLR-10 handoff (64.63 tok/s) and the
+not-fitting regime by T-GPLR-13 (now DONE 2026-09-13). No upstream deadlock
+investigation is authorized (option b declined for now).
+
+Design decisions resolved by code inspection (implementer, 2026-09-10):
+- Mechanism rides the existing handoff machinery, NOT a new placement path:
+  `begin_handoff` grows a partial mode that migrates only the routed-expert
+  banks with `il >= handoff_partial_from` (the NCMOE-equivalent suffix rule:
+  upstream llama.cpp keeps the FIRST N blocks' expert banks on CPU, so the
+  bank split point maps to `partial_from = n_layer - N`). Non-migrated layers
+  keep their host-mmap CPU tensors (model-load override already stages every
+  bank on CPU) — the same mixed CPU/GPU execution the attention-only handoff
+  proved (T-Q38HG-04), now inside a layer instead of whole-layer.
+- TG-only routing: `slot_layer()` routes `il < partial_from` banks to the
+  host-mmap tensors only when phase == 1 (TG); PP keeps banking all 40 banks
+  through the 4-slot window unchanged. Mixed-placement TG is the goal; PP
+  throughput must not regress by serializing on CPU FFN.
+- Fit gate: partial_need = (sum of bank bytes il >= partial_from) + KV/state
+  + slabs + reserve <= observed free VRAM, computed from the inventory's
+  per-layer `packages.moe_expert_bank[]` bytes at the preflight, before the
+  timed PP. No fit = loud exit-1 refusal (no silent fallback).
+- Telemetry: migrate event carries `"partial":true,"partial_from":N`; the
+  checker extends the migrate-layer-count rule (N-bank migration is legal
+  when partial is set) and requires handoff_mode "on" + bank transfer 0 in
+  the TG phase summary (unchanged).
+- MTP stays refused with partial handoff (same gate as full handoff under
+  moe-expert-bank).
+
+Goal
+: Make the measured two-process 16 GB pipeline (our streaming PP at
+  1160.9 tok/s -> 262K prefill in ~226 s, then stock `-ncmoe 20` TG at
+  64.9 tok/s) a single-process run: stage the first N routed-expert
+  banks on CPU (NCMOE-style partial placement), run streaming-PP
+  prefill, then continue token generation in the same process with KV
+  and session state intact.
+
+Scope
+: Runner option for partial routed-expert-bank placement (N banks
+  host-resident) on the MoE path; in-process PP-to-TG continuation that
+  preserves session state and live weight-slot assignments (no reset);
+  structured telemetry separating PP and TG phases; CUDA-only, opt-in,
+  fails loudly.
+
+Non-goals
+: Dense models; the CPU path; changing stock llama.cpp default
+  placement or `-ncmoe` behavior; quality claims (routing, expert IDs,
+  and quantization bytes stay bit-exact — placement only relocates
+  immutable weight bytes).
+
+Design / failure contract
+: Logical layer identity and slot identity stay separate; host-resident
+  banks are immutable for their generation and re-stage atomically on
+  demand; KV and recurrent state remain owned by logical layers, never
+  by weight slots; PP-to-TG retains session state and live slot
+  assignments (the invariant above) — the mixed-placement path must not
+  reset the context at the phase boundary; insufficient VRAM, missing
+  banks, stale generations, or failed copy events refuse loudly (exit 2
+  / structured telemetry), never silently running other placement.
+
+Acceptance criteria (falsifiable)
+: - Single-process run at the NCMOE-262K shape (262144 ctx, q8_0 KV,
+    `-ncmoe`-equivalent N=20) completes PP + TG in one process with
+    check-telemetry OK and TG tok/s reported as an instrumentation
+    result; VRAM flat across the PP->TG boundary (no transient above
+    steady state, sampler-cadence evidence).
+  - TG tok/s parity band vs the two-process measurement recorded;
+    deviation beyond the recorded band is explained or escalated.
+  - Session-state continuity: KV contents across the PP->TG boundary
+    proven by the QA answer gate (smoke tier) on the same run, not by
+    state-dump inspection alone.
+  - Default-off: without the option, runner placement and CPU fallback
+    behavior are byte-for-byte unchanged (dense Qwen3.8 ctest 2/2;
+    qa-smoke 512 green).
+
+Focused validation
+: Build llama-layer-streaming; host suite; GPU mutex: one single-process
+  mixed-placement run at the NCMOE-262K shape with --check-telemetry,
+  plus the qa-smoke 512 default-off regression.
+
+Escalate before implementation if
+: owner priority favors the handoff path (T-GPLR-10 already reaches
+  64.63 tok/s TG on fits-regime shapes), or the in-process PP->TG
+  handoff proves to require context reset (which the invariant above
+  forbids). [Note 2026-09-12: owner priority was called in gate (b) —
+  T-GPLR-13 first; this task is deprioritized to DRAFT, options (a)
+  chosen per the disposition above, (b)/(c) unprioritized.]
+
+---
+
+### T-GPLR-17: Two-process hybrid bridge (streaming PP -> slot state file -> CPU-expert llama-server stock TG)
+
+Status: rejected (2026-09-10 owner decision, after the implementer's bridge
+probe proved the mechanism end-to-end: runner PP -> slot state file ->
+llama-server restore -> stock TG with prompt_n=1 continuity). The owner
+rejected the two-process engine-switching hybrid as unusable for production
+or local inference ("cannot have inference that constantly switches
+engines") and requested a full revert; the entire implementation
+(runner --state-out flag, state_save telemetry, conflict gates, host
+fixtures, tools/run-hybrid.ps1, hybrid suites) was removed. The recorded
+state-save/restore seam facts (library API + server endpoints) remain valid
+historical evidence; the single-process mixed-placement TG mode
+(T-GPLR-16) is the aligned direction for TG-at-context. Do not re-implement
+this task without a new owner decision. Depends on: the vendored CUDA
+tree (present); the existing server slot endpoints and library state-file
+seam (both present — no SDD amendment: this task adds no new residency
+package type, policy, or placement mechanism, it only orchestrates two
+existing processes and adds one runner flag). Commit: none.
+
+Goal
+: Make the measured two-process pipeline runnable end-to-end under an 8
+  GB VRAM ceiling today: the layer-streaming runner performs streaming
+  layer-major PP (its own fit gate, e.g. the recorded 50K shape at
+  1392.57 tok/s), writes its KV + recurrent state to a slot state file,
+  and a CPU-expert llama-server (fit-target ~7000 MiB or -ncmoe 40,
+  recorded TG shape: 32.44 tok/s with MTP at 262K) restores that state
+  and continues stock TG — without ever holding the full model in VRAM
+  in either process.
+
+Known evidence
+: - `llama_state_seq_save_file` / `llama_state_seq_load_file` exist in
+    src/llama-context.cpp (state_seq_load_file at 3534; state_seq_save_file
+    follows it) and are used by the server's
+    POST /slots/{id}?action=save|restore endpoints
+    (server-context.cpp 2480, 4553; routes registered server.cpp:273);
+    the payload is the prompt token list plus the full memory module
+    write (KV AND recurrent DeltaNet state — `memory->state_write(io)`,
+    llama-context.cpp ~3577-3583), so both state classes cross the boundary.
+  - Server restore semantics (server-context.cpp:4553+): the task
+    erases the slot, then `llama_state_seq_load_file`, then updates the
+    slot's cached prompt tokens — restore replaces slot contents.
+  - Recorded shapes to reuse: runner 50K layer-major (1392.57 tok/s PP,
+    peak 6.54 GB, gplr-moe-8gb-50k), server auto-fit 16000 (TG 32.44
+    tok/s, MTP acceptance 0.546, graphs reused 456, owner baseline log
+    2026-09-10), bench `-ncmoe 20` row-read semantics at ~35-40 GB/s
+    effective DDR feed.
+  - Falsified alternative recorded: the single-process --handoff combo
+    needs the whole model in VRAM post-migrate (refused at 50K on
+    2026-09-10 with a 699 MiB shortfall; impossible at 262K on 24 GB).
+
+Scope
+: - Runner: `--state-out PATH` flag (after successful PP, before any TG
+    work): emit a `state_save` telemetry event, call
+    `llama_state_seq_save_file(seq 0, PATH, prompt_tokens, n)`
+    (synchronize happens inside the API), verify the returned byte size
+    and that PATH exists non-empty; skip flag when PP did not complete.
+  - Server side: ZERO vendored code changes — drive the existing
+    POST /slots/{id}?action=save|restore over HTTP from a new
+    PowerShell driver `tools/run-hybrid.ps1`: start llama-server with
+    CPU-expert placement (either explicit `-ncmoe 40 -ngl 999` or
+    `-fit on -fit-target <MiB>`), wait for /health, POST restore with
+    the state file, then submit a generation request whose prompt is
+    the final token of the restored prompt (or rely on the server's
+    slot-prompt continuation), stream TG, and tear down. The script
+    records both processes' logs, the state-file byte size, and exit
+    statuses.
+  - Interop gate inside the driver: assert the state file was written
+    by the same model artifact (runner writes a sidecar JSON recording
+    model path + byte size + n_tokens; driver refuses a mismatch —
+    loud, before any GPU work).
+  - Telemetry/evidence: JSON Lines from the runner phase; server
+    timings from the generation response (timings block) for TG tok/s;
+    per-phase wall/transfer/compute kept distinct; peak VRAM via the
+    existing NVML poller (build/poll-gpu-memory.ps1).
+
+Non-goals
+: No change to stock llama.cpp placement, -ncmoe, or --fit behavior; no
+  change to the streaming executor, slot protocol, or handoff path; no
+  single-process mode (that is T-GPLR-16); no MTP in phase 1 evidence
+  (the server may run MTP, but acceptance is measured without it first);
+  no quality claims beyond the answer gate; dense models out of scope
+  (the mechanism is architecture-agnostic but the acceptance shape is
+  the MoE model).
+
+Design / failure contract
+: The runner flag is default-off and host-safe (parse-time conflict
+  entry: --state-out with --residency off exits 2; --state-out with
+  --handoff exits 2 — the two bridges are alternatives); a failed save
+  (API false, zero-byte file, missing file) is loud: exit 1 with the
+  path in the message and a failed state_save event, never a silent
+  empty handoff. KV and recurrent state remain owned by the logical
+  sequence across the process boundary (the slot file IS the transfer);
+  the driver refuses to restore into a server whose /props model
+  identity differs from the sidecar record (before any generation).
+  Insufficient VRAM in the server process fails through the server's
+  own loud load path — the driver reports and stops, no fallback.
+
+Acceptance criteria (falsifiable)
+: - End-to-end 50K run under the GPU mutex: runner PP (layer-major,
+    ubatch 512, slots 4, KV q8, ~6.5 GB) exits 0 with a state_save
+    event and a state file of the expected magnitude (KV 534 MB +
+    recurrent 66 MB + overhead, tens-of-MB tolerance), then the server
+    (CPU-expert placement, VRAM ceiling respected) restores it and
+    generates >= 16 tokens with its timings block intact.
+  - State continuity proven by the semantic-QA answer gate at the 512
+    rung driven through the hybrid (needle answers recovered by
+    check-answer.py on the TG text; negative control fails as
+    designed) — the accepted proxy for KV correctness across the
+    process boundary.
+  - TG tok/s and peak VRAM recorded as an instrumentation result for
+    both processes (target shape: runner <= ~7 GB; server <= 8 GB
+    ceiling chosen by the driver; combined serial phases never
+    overlap); no performance claim beyond the recorded numbers.
+  - Default-off: without --state-out the runner is byte-identical
+    (existing suites stay green; no new telemetry events).
+
+Focused validation
+: 1. Build llama-layer-streaming (runner flag) — exit 0.
+  2. Host suite `tools/run-tests.ps1 -Suite host` — green, including
+     the new tri-state flag fixtures (conflict table entries).
+  3. Small bridge probe (GPU mutex): runner PP 512 tokens --state-out
+     -> server -ncmoe 40 restore + 8 TG tokens; both exit 0; state file
+     non-empty; server timings block present.
+  4. The 50K acceptance run above under the GPU mutex with NVML
+     polling; artifacts: runner trace, state file + sidecar, server
+     log, driver log, poller CSV.
+  5. QA 512 rung through the hybrid with --tg-text + check-answer.py
+     (positive PASS, negative FAIL-as-designed).
+  6. Dense regression ctest layer-streaming-layer-major-1024 2/2
+     (default-off untouched).
+
+Required state/document updates
+: docs/currentstate.md entry with both commands, VRAM peaks, state-file
+  size, TG tok/s, and the QA verdict; plan status flip to done only
+  after items 1-6; no SDD change (record explicitly that no SDD
+  amendment was needed because no mechanism or package type changed).
+
+Escalate before implementation if
+: the owner prefers the driver as a C tool or in-process (T-GPLR-16
+  takes priority), or the server restore path proves unable to accept a
+  state whose n_ctx differs from the server's configured context (then
+  the driver pins the server ctx to the runner's ctx — if that still
+  fails, the task escalates rather than patching the server's restore
+  semantics, which are upstream-shared behavior).
+
+---
+
+### T-GPLR-18: Pinned staging for row-set fetches (F1 — pageable per-call H2D vs the existing pinned path)
+
+Status: READY (2026-09-13; drafted from the T-GPLR-13 close-out, bottlenecks
+doc section 6.3 "F1", and immediately constrained by the counter-evidence
+recorded in section 6.7 of that file). This task TESTS a hypothesis; a
+negative result is a legitimate close. Depends on: T-GPLR-13 (DONE — the
+row-set path and its telemetry); the existing pinned staging machinery and
+`--copy-source pinned` (T-Q38PERF-03, done 2026-08-20; dense pinned CTest
+fixture present). Commit: none.
+
+Known evidence (counter-evidence first — this task exists to test, not assume)
+: - Row-set staging today: `load_row_set` issues 24
+    `ggml_backend_tensor_set_async` calls per fetch (8 expert slabs x 3
+    members x ~589,824 B = ~14.16 MB) straight from mmap-backed pageable
+    sources; it never consults `slot.buf_staging`. Measured at the 512 rung
+    (T-GPLR-13 ladder): `host_submit_us` mean 1,826 us, `ready_latency_us`
+    mean 106 us, `transfer_us` mean 1,932 us, 120 fetches per run, staged
+    572,719,104 B/round = 3.125% of the bank.
+  - The pinned hypothesis was ALREADY measured on the dense path and FAILED:
+    T-Q38PERF-03's paired 1,024-token run found pinned PP 8,366.4 ms vs
+    direct 8,195.3 ms and pinned TG 2,757.5 ms vs direct 2,515.0 ms — pinned
+    cut host submission (PP 7,505.1 -> 6,062.4 ms) but raised availability
+    wait (TG 5.3 -> 1,510.4 ms). T-Q38TG-00 measured the same on large
+    packages: 245.9 MB direct 17.94 ms (13.71 GB/s) vs pinned 18.0 ms DMA +
+    11.7 ms explicit staging = 29.8 ms.
+  - The H2D link is saturated: 13.7 GB/s steady-state on a negotiated
+    Gen4 x8 (87% of the 15.75 GB/s physical ceiling), and pageable sources
+    are internally staged at that same rate — pinned adds no throughput, it
+    only relocates the staging copy into an explicit host memcpy.
+  - Surviving narrow hypothesis: the row-set regime differs from dense
+    whole-package copies in one measurable way — 24 small copies (~0.59 MB)
+    per 14.16 MB, where per-call driver overhead could dominate. The
+    measured submit (1,826 us) exceeds the ~1,033 us a 14.16 MB DMA at the
+    13.7 GB/s ceiling would take, leaving ~0.8 ms/fetch unexplained by raw
+    DMA. Whether pinned recovers any of that, or merely relocates the copy
+    (as the dense pair did), is exactly what the 512 A/B decides.
+
+Goal
+: Decide, with a paired 512 A/B, whether staging row-set fetches through
+  the existing pinned host buffers (when `--copy-source pinned` is
+  requested) reduces the per-fetch staging cost at IDENTICAL staged bytes
+  and IDENTICAL routing — and, if it does, whether the reduction reaches
+  wall time.
+
+Scope
+: - `load_row_set` honors `slot.buf_staging` when present (i.e. when
+    `--copy-source pinned`): pack each fetched slab into the pinned buffer
+    and enqueue its async copy from there, interleaved per slab (mirroring
+    `load_layer`'s member-at-a-time pack-and-enqueue), with natural
+    destination offsets (`e * slab_bytes`) and byte-exact quantization
+    carried by the memcpy.
+  - Bounds: a packed window that would not fit the pinned buffer is a loud
+    structured error (never a partial row set). Retain the event lifecycle
+    (`ev_copy_start`/`ev_copy_end`/`ev_copy_ready` plus the host-blocking
+    wait before part B): the staging scratch is reused by the next fetch
+    only after the prior copies complete.
+  - Telemetry/accounting unchanged: `bytes_staged`, `n_rows_fetched`,
+    `route_union`, `union_ids`, `hash`, `rowset_round`, and every checker
+    rule stay identical; `run_start.copy_source` (already emitted) labels
+    the arm. No new flag, no checker change, no schema change.
+  - New driver `tools/run-gplr18-pinned-ab.ps1`: the 512 rung A/B/A/B
+    interleaved within one GPU-mutex session, poller attached, checker per
+    trace.
+
+Non-goals
+: No new runner flag; no change to the default (`direct`) path or to
+  normal llama.cpp; no attempt to exceed the 13.7 GB/s link; no replacement
+  of the host-blocking wait with an async/streamed wait (a different task
+  with its own hazard analysis); no repacking or row-packaged FFN bundles;
+  no F2 per-layer row caches; no T-GPLR-15 prediction; no throughput claim
+  unless the gates below pass.
+
+Design / failure contract
+: Pinned mode's existing failure contract is inherited unchanged:
+  allocation failure or allocator fallback to ordinary host memory is a
+  loud structured initialization error, never a silent switch to pageable
+  storage — `GGML_CUDA_NO_PINNED` therefore makes a pinned arm fail loudly
+  rather than quietly run direct. Staging still happens before graph
+  execution on the copy backend (SDD section 4); routing is untouched; the
+  FFN still consumes only after the copy event completes.
+
+Acceptance criteria (falsifiable)
+: 1. Feasibility (must pass): both arms exit 0; `--check-telemetry` OK on
+    every trace; staged bytes identical (572,719,104 B/round = 3.125%);
+    generated token IDs identical between arms (greedy determinism) and the
+    `rowset_fetch` route-union streams/hashes identical between arms
+    (staging is not routing).
+  2. Instrumentation gate (the decision): the pinned arm's per-fetch
+    `transfer_us` mean is lower than the direct arm's by MORE than the
+    largest within-arm spread across repeats, with `host_submit_us` and
+    `ready_latency_us` reported separately (their split is expected to move
+    — submission down, ready-wait up, T-Q38PERF-03's signature) and the wall
+    TG phase not slower. FAIL (flat or worse) closes the task as
+    falsified-by-evidence: the per-call pageable-staging theory is then dead
+    on this hardware too, and the TG lever reverts to F2 (bytes).
+  3. Performance (claim only on passing 2): the paired pinned/direct wall
+    comparison at equal shape must improve beyond the observed spread and
+    keep the qa-smoke 512 answer gate PASS; otherwise instrument only, no
+    claim. Pre-registered bound: per-fetch staging cannot beat ~1.03 ms
+    (14.16 MB at the measured 13.7 GB/s ceiling), so any claimed gain must
+    be consistent with 1.93 -> >=1.03 ms; a claim implying more is an
+    arithmetic error, not evidence.
+  4. Default-off immunity: the direct arm's `rowset` event stream is
+    unchanged from the recorded ladder baseline (same staged bytes, fetched
+    count, reuse count, timing-field semantics); host suites green; the
+    dense pinned CTest fixture still passes (it shares the pinned path this
+    task touches).
+
+Focused validation
+: 1. `cmake --build build/llama-cuda --config Release --target
+     llama-layer-streaming --parallel 16` -> exit 0.
+  2. `powershell -File tools/run-tests.ps1 -Suite host` -> green (no
+     telemetry/checker changes expected).
+  3. `powershell -File tools/run-gplr18-pinned-ab.ps1` (new; GPU mutex via
+     tools/with-gpu-lock.ps1; 512 anchor prompt; arms differ ONLY by
+     `--copy-source direct|pinned`; everything else the T-GPLR-13 ladder
+     shape: `--residency moe-expert-bank --residency-tg --pp-tokens 512
+     --ubatch 512 --tg-tokens 3 --layer-slots 4 --kv-cache q8 --greedy
+     --no-mtp --pp-no-logits --allow-full-residency --telemetry <trace>`;
+     order A,B,A,B; `tools/gpu-mem-poll.ps1` attached) -> four runs exit 0,
+     four `--check-telemetry` passes.
+  4. `ctest --test-dir build/llama-cuda -C Release -R
+     "layer-streaming-pinned-1024|qwen38-layer-boundary|layer-slot-lifecycle"
+     --output-on-failure` -> all pass (export Q38LS_MODEL_PATH first —
+     tools/run-tests.ps1 reads but does not propagate it to ctest children).
+  5. qa-smoke 512 default-off rung -> answer PASS, negative control FAILS as
+     designed (no rowset events).
+  6. Record per-arm per-fetch means (submit/ready/transfer), staged bytes,
+     route parity, wall, peak VRAM, and the arm-vs-arm spread in the A/B
+     table.
+
+Required state/document updates
+: `docs/currentstate.md` entry with the A/B table, the verdict, and the
+  counter-evidence reference; plan status flip (DONE or
+  DONE-falsified-by-evidence); `docs/gplr13-bottlenecks-hypotheses.md`
+  appended verdict referencing the pinned/13.7 GB/s ceiling correction
+  (section 6.7). No SDD amendment: this is the existing pinned staging
+  applied to the existing row-set path — no new package type, policy, or
+  placement mechanism.
+
+Escalate before implementation if
+: the owner wants a tok/s claim rather than an instrumentation result (the
+  layer-major row-set shape is capped at `--tg-tokens 3`, so a longer-TG
+  vehicle needs its own decision — see the T-GPLR-15 note on the batch-major
+  vehicle and the greedy-determinism sampling limit); or the A/B shows a
+  real per-fetch saving that does not reach wall time (prioritization
+  returns to the owner: F2 bytes vs T-GPLR-15 hiding vs accepting the
+  reactive row-set as-is); or the change cannot avoid touching the shared
+  pinned path in a way that risks the dense fixture (then stop rather than
+  fork the mechanism).

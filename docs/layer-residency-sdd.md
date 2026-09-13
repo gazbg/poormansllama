@@ -1,6 +1,12 @@
 # Generic Prefill Layer Residency SDD
 
 Status: Draft - scope approved 2026-09-04; implementation pending
+Amended 2026-09-12: `moe-row-set` TG package granularity approved by the
+owner (T-GPLR-13 gate (a)); see sections 1, 4, 8, 9, 10, 11, 12.
+Amended 2026-09-13: per-layer row cache (`moe-row-cache`, the F2 class) defined
+as a TG-phase residency class under `moe-row-set`, so that measured row reuse
+is realizable and T-GPLR-15's cumulative-resident-set ceiling is measurable;
+see sections 1, 4, 6, 7, 8, 9, 10, 11, 12.
 
 Reference implementation: `third_party/llama.cpp/src/llama-layer-streaming.*`
 
@@ -23,6 +29,18 @@ layout, mutable-state contract, or graph topology.
 capability result. A supported adapter supplies a package catalog and one-layer
 graph contract. An unsupported model is refused with a structured reason and
 can still use normal llama.cpp when the experiment is disabled.
+
+Scope amendment 2026-09-12: the primary workload remains layer-major prefill.
+The `moe-row-set` package (section 4) extends the package contract to the
+token-generation phase of MoE models as an owner-approved, separately gated
+policy. It changes nothing in the prefill policies, package classes, or
+acceptance targets above.
+
+Scope amendment 2026-09-13: the per-layer row cache (section 4) is the
+storage class that makes measured row reuse realizable and gives T-GPLR-15's
+predictive variant a substrate to pre-stage into. It is an opt-in sub-mode of
+`moe-row-set`, applies only to the TG phase, changes nothing in prefill, and
+changes no default.
 
 ## 2. Fixed Acceptance Targets
 
@@ -97,6 +115,105 @@ transfer may be cheaper than sparse reads and uploads. This policy does not
 predict routing: the package is ready before the router runs, and the existing
 graph evaluates exactly the router-selected IDs.
 
+### moe-row-set package (TG row windows; amended 2026-09-12)
+
+For one logical MoE layer and one token-generation window W (default: one
+token; small token groups are an implementation-review decision for T-GPLR-13),
+the package contains the deduplicated union of routed-expert rows — across
+`ffn_gate_exps`, `ffn_up_exps`, and `ffn_down_exps` — that the router selects
+for the tokens in W, at top-k cardinality. Router, attention, normalization,
+shared experts, embeddings, output head, KV cache, and mutable state remain
+outside it.
+
+- **Reactive membership.** The union is computed from the router's exact
+  executed IDs for W. The policy never predicts routing and never alters
+  router arithmetic, expert IDs, or quantization bytes; rows are copied
+  byte-exact at their natural offsets. Because the IDs for W exist only
+  after the router runs, the layer executes in two phases at TG — the
+  attention-plus-router phase first, then row staging by the residency
+  machinery, then the row-consuming FFN phase — and the execution-shape
+  constraint below binds the row-consuming phase: both phases consume only
+  CUDA-resident weights, and staging between them belongs to the residency
+  mechanism (copy event, generation, atomic readiness), never to the
+  backend scheduler. The exact graph split point is a T-GPLR-13
+  implementation-review decision; a predictive variant (T-GPLR-15) may
+  pre-stage the next window during the current one but still waits for the
+  reactive superset before its FFN phase runs.
+- **Immutable generation.** A row-set package is immutable for its
+  generation; its members (the three row sets plus row-identity metadata)
+  become ready and retire atomically. A graph cannot observe a partial copy.
+- **Execution-shape constraint (hard requirement).** Row-set packages are
+  CUDA-resident slot buffers staged by the residency mechanism BEFORE the
+  layer graph executes, under the same copy-event, generation, and
+  consumer-done lifecycle as every other package. `MUL_MAT_ID` in a row-set
+  graph must always consume CUDA-resident weights owned by the matching slot
+  generation. Cross-backend staging INSIDE graph execution is prohibited on
+  this path: the backend scheduler's expert row-copy (`ggml-backend.cpp`
+  compute_splits) and any op-offload path that rewires a weight source to a
+  compute-usage staging buffer must be disabled for row-set graphs. Evidence:
+  the T-GPLR-16 MIN_BATCH=1 route deadlocked the device on the 3rd TG token
+  whenever CUDA `MUL_MAT_ID` at token batch consumed scheduler-staged
+  host-bank weights — regardless of CUDA graphs or rowcopy
+  (docs/currentstate.md, 2026-09-12). This constraint keeps the row-set path
+  in the proven full-handoff execution shape.
+- **Loud under-coverage.** The staged row set must be a superset of the
+  router's exact selected IDs for W. A missing row refuses loudly (exit 2,
+  structured telemetry, stable reason) and never substitutes or drops an
+  expert.
+- **Capacity.** Row-set window bytes are a preflight input like any slot
+  occupancy. Union width is volatile (near-saturated for wide windows per
+  T-GPLR-14); preflight must account for the worst case, not the mean.
+
+### moe-row-cache package (per-layer persistent rows; amended 2026-09-13)
+
+The F2 storage class (label from docs/gplr13-bottlenecks-hypotheses.md section
+6; no task ID assigned yet). It exists so that measured row reuse can be
+REALIZED: the `moe-row-set` slot buffers are keyed by slot, and the bundles of
+the layers that share a slot alias one device buffer at offset 0, so between
+two visits of a logical layer an intervening owner overwrites the same byte
+ranges — a resident claim made without per-layer storage is therefore unsound
+(analysis: section 6.4 of that file). The same storage is what T-GPLR-15's
+predictive variant needs in order to hold pre-staged rows until their window
+arrives.
+
+- **Membership.** Per logical MoE layer, the routed-expert rows that layer has
+  staged for recent windows, at member granularity (`ffn_gate_exps`,
+  `ffn_up_exps`, `ffn_down_exps`), as byte-exact contiguous slabs at their
+  natural offsets — row identity is exactly the `moe-row-set` identity.
+- **Per-layer keying and provenance (defining property).** Storage and every
+  resident claim are keyed by LOGICAL LAYER, never by slot. A row is claimable
+  as resident only when stored provenance — (layer, member, expert, written
+  window/generation) — proves the bytes belong to that layer and have not been
+  invalidated. Provenance is structural, stored with the bytes; it is never
+  inferred from slot ownership or from a bare coverage bitmap.
+- **Bounded retention.** Capacity is declared per layer and in total, sized
+  for the worst case: `min(n_expert, K*W*top_k)` rows x that layer's member
+  slab bytes, for a retention of K windows of width W (W=1, top_k=8 on the
+  Qwen3.6 target: ~14.2 MB per 8-row set; a one-to-two window retention is
+  ~0.57-1.13 GB across 40 MoE layers). A write that would exceed the declared
+  capacity is a loud refusal — never silent growth, and never eviction of an
+  entry a running consumer may still read.
+- **Atomicity per window.** A window's rows become ready together and retire
+  together; a row-consuming graph observes only ready entries, and a cached
+  row consumed by a layer's row-consuming phase is ordered after the matching
+  copy event, exactly like a link-staged row.
+- **Execution shape.** Cache entries are CUDA-resident, staged by the
+  residency mechanism BEFORE the graph executes, under the same
+  copy-event/generation/consumer-done lifecycle; the section-4 execution-shape
+  constraint applies unchanged. Two shapes are permitted, and the adopting
+  task must declare which it uses: (i) cache to slot-bundle device-side
+  refresh before the row-consuming phase, or (ii) graph tensors bound
+  directly to the cache buffer, with provenance covering every bound range.
+  Either way the FFN consumes only weights owned by the matching generation.
+- **Reuse optimizes copies only.** The router's exact IDs still define the
+  required coverage; a cache entry removes a row from the copy list and never
+  substitutes for the superset check.
+- **Not prediction.** Filling the cache reactively is this class; filling it
+  ahead of the reactive need is T-GPLR-15's variant, whose fills are still
+  residency copies and whose consumption still waits for reactive coverage.
+  The class never alters routing, expert IDs, quantization bytes, or
+  checkpoint metadata, and never owns KV, recurrent state, or session state.
+
 ## 5. Layer-Major Prefill
 
 ```text
@@ -134,6 +251,18 @@ Each architecture adapter owns only:
 5. causal and state preparation per chunk; and
 6. required graph variants and a focused parity output.
 
+For `moe-row-set` the adapter additionally owns (7) per-window reactive
+row-membership enumeration — computing each window's deduplicated expert-row
+union from the router's exact executed IDs and emitting the `rowset_fetch`
+telemetry — and (8) declaring which scheduler staging paths its row-set graphs
+forbid, so the section-4 execution-shape constraint is enforced at the
+adapter boundary rather than trusted to global defaults.
+
+For a per-layer row cache the adapter additionally owns (9) declaring the
+cache's worst-case row count per layer and the member/expert ranges its
+provenance may hold, so cache capacity and soundness are adapter facts rather
+than global defaults.
+
 Adapters must reuse existing model tensors and graph helpers. They must not
 copy the slot scheduler, telemetry writer, or capacity planner. The existing
 Qwen code becomes the first adapter by extraction, not rewrite.
@@ -148,6 +277,12 @@ Qwen code becomes the first adapter by extraction, not rewrite.
 - A slot is reused only after the prior generation's consumers complete.
 - Coalescing adjacent source ranges is allowed only when byte identity and
   destination offsets remain exact.
+- A per-layer row cache (section 4) is a further residency class: its declared
+  capacity is a preflight input like slot occupancy, its fills and refreshes
+  are ordinary residency copies under the same event/generation/
+  consumer-done discipline, and it never changes a slot window's contents or
+  lifecycle. Headroom accounting must carry the cache, the slots, KV, state,
+  activations, and workspaces together.
 
 Preflight accounts for static CUDA weights, slot buffers, Q8 KV at 262,144
 tokens, recurrent state, activation slabs, graph/input contexts, workspaces,
@@ -163,8 +298,25 @@ Initial private modes are:
 
 - `off`: normal llama.cpp behavior;
 - `dense-layer`: complete dense decoder packages;
-- `moe-expert-bank`: complete routed-expert packages; and
+- `moe-expert-bank`: complete routed-expert packages;
+- `moe-row-set`: TG-phase reactive routed-expert row windows (amended
+  2026-09-12; owner-gated, implemented by T-GPLR-13, falsifiable per the
+  T-GPLR-15 gate); and
 - `auto`: only a later policy task may select among adapter-supported modes.
+
+`moe-row-set` is opt-in and CUDA-only like every other experimental mode. It
+applies only to the token-generation phase; PP keeps its declared policy
+(`moe-expert-bank` unless a later task says otherwise). Enabling it changes no
+default: without the explicit flag, runner placement, `-ncmoe` behavior, and
+the CPU path are byte-for-byte unchanged.
+
+The per-layer row cache is an opt-in sub-mode of `moe-row-set`
+(`moe-row-cache`, amended 2026-09-13), CUDA-only and TG-only like its parent.
+Where the parent declares a per-slot row window, the sub-mode adds per-layer
+persistent storage for rows that the logical layer has already staged. It
+changes no default: without the explicit flag the row-set parent behavior,
+runner placement, `-ncmoe` behavior, and the CPU path stay byte-for-byte
+unchanged.
 
 Forced modes exist for lifecycle testing. Until a cost model is validated,
 `auto` may use an explicit prompt-width threshold but must report all inputs
@@ -204,8 +356,19 @@ invalid package membership, insufficient capacity, stale generation, source
 read or copy failure, failed CUDA event, missing graph variant, or graph launch
 failure.
 
-It never substitutes a layer, drops an expert, changes routing, continues with
-partial weights, or silently falls back. Normal llama.cpp remains available by
+For `moe-row-set` it additionally fails loudly for a staged row set that does
+not cover the router's exact selected IDs for the window (under-coverage), a
+row-set generation consumed before its copy event completes, or any attempt to
+route `MUL_MAT_ID` on this path through a scheduler cross-backend staging
+buffer (the execution-shape constraint of section 4). It never substitutes a
+layer, drops an expert, changes routing, continues with partial weights, or
+silently falls back.
+
+For the per-layer row cache it fails loudly for allocation beyond the declared
+capacity, retention overflow, a missing or invalidated provenance record, a
+resident claim made without provenance, or an entry consumed before its copy
+event completes. It never silently disables the cache mid-run: a cache-off run
+is an explicit, separately recorded run with its own trace. Normal llama.cpp remains available by
 running with the experiment disabled.
 
 ## 10. Telemetry
@@ -217,6 +380,27 @@ types, static/slot/KV/activation/workspace byte classes, and support decision.
 The MoE path also reports expert count, top-k, route union width per layer and
 chunk, expert-bank copies per layer pass, and sampled exact router IDs for the
 parity check. Routing telemetry is observational and never influences routing.
+
+For `moe-row-set`, the path additionally emits per-layer `rowset_fetch`
+events carrying the FULL per-token union ID list for each window (also the
+gate telemetry for T-GPLR-15's temporal hit rate — no separate instrument
+appears), staged row-set bytes per window and per TG round, and the standard
+distinct timings (host submit, ready latency, availability wait, compute,
+graph setup, wall time) per window. Staging bytes must be reported against the
+full-bank baseline so the union-width saving is measurable, never assumed.
+
+For a per-layer row cache the path separately reports cache-served rows,
+device-side refresh bytes, link-staged bytes, cache high-water bytes, and
+invalidation counts, so the link saving and the added copy class are both
+measurable and never double-booked. Row identity fields (`route_union`,
+`union_ids`, `hash`) keep their exact semantics: union IDs remain the router's
+EXECUTED IDs — never predicted IDs and never the cache's contents — so the
+reactive superset gate stays checkable. The T-GPLR-15 gate inputs are two
+distinct statistics and a verdict must state which it used: (a)
+consecutive-window exact containment from the union streams, which is a
+property of the routing stream and therefore measurable with the cache
+disabled; and (b) cumulative-resident-set containment, the realized predictor
+ceiling, which is only well-defined once per-layer persistence exists.
 
 Host submission, ready latency, availability wait, compute, graph patch/setup,
 and wall time remain distinct. Windows file-cache state remains best-effort and
@@ -236,6 +420,27 @@ must not be described as controlled cold-cache evidence.
 6. Default-off llama.cpp builds and behavior remain unchanged.
 7. Any speed claim requires a paired normal-versus-residency run on the same
    model, prompt, build, and observed GPU state.
+8. `moe-row-set` (amended 2026-09-12): for every layer and window, the
+   executed row set covers the router's exact expert IDs (route-event parity;
+   no missing-row path); the checker validates `rowset_fetch` completeness
+   (union ID lists sum to per-token route counts); staging bytes per TG round
+   are recorded against the full-bank baseline as an instrumentation result;
+   the semantic-QA answer gate passes on the same run; and the dense ctest
+   plus qa-smoke 512 default-off regressions stay green.
+9. `moe-row-set` performance is claimed only if wall TG tok/s improves over
+   the reactive row-set baseline at equal shape (T-GPLR-15's gate), and the
+   measured token-level temporal hit rate reaches 0.6 before any predictive
+   variant is implemented; below 0.6 the predictive task closes as
+   falsified-by-evidence.
+10. `moe-row-cache` (amended 2026-09-13): with the cache enabled, executed
+    coverage still equals the router's exact IDs for every layer and window
+    (no missing-row path; checker-validated), and reuse is demonstrated
+    POSITIVELY — cache-served rows non-zero in a real trace, with bytes
+    reported against both the full-bank baseline and the reactive cache-off
+    baseline. Any performance claim requires a cache-on/cache-off pair at
+    equal shape, because the cache changes the byte denominator and a lone
+    fast run is not evidence. Cache-off and default-off paths remain
+    byte-for-byte unchanged.
 
 ## 12. Known Risks
 
@@ -249,3 +454,26 @@ must not be described as controlled cold-cache evidence.
   strongly skewed or expert count is very large.
 - Dense token generation remains PCIe-bound and is not the target of this
   prefill design.
+- `moe-row-set` risks (amended 2026-09-12): the token-level temporal hit rate
+  that motivates row windows is UNMEASURED (T-GPLR-14 found no trace with
+  per-token TG routes); if it measures below 0.6, the predictive variant is
+  falsified and even the reactive policy may not beat full-bank at TG.
+  Union width is volatile — near-saturated for wide windows, collapsing in
+  late layers on short prompts — so capacity preflight must size for the
+  worst case. The execution-shape constraint (section 4) is a measured
+  landmine, not a style preference: scheduler cross-backend staging of
+  host-resident banks deadlocked the device under T-GPLR-16, and any future
+  "optimization" that moves row-set staging inside graph execution walks
+  back into that failure mode.
+- `moe-row-cache` risks (amended 2026-09-13): the class adds a VRAM footprint
+  (~0.57-1.13 GB at the measured Qwen3.6 shape for one-to-two window retention
+  across 40 MoE layers) against the bounded-residency intent, so preflight
+  must carry it explicitly. Provenance mistakes could execute another layer's
+  weights — the exact hazard that falsified the bookkeeping-only variant
+  (bottlenecks doc section 6.4) — so provenance must be structural, never
+  inferred. The device-side refresh is a second copy class that can be
+  mistaken for a link saving, and a cache can mask a link regression, so
+  cache-on/cache-off pairs are required. A passing 0.6 stream gate does not by
+  itself imply a wall-time win: the measured 13.7 GB/s H2D link (T-Q38TG-00)
+  bounds per-byte gains, and per-call overhead (plan task T-GPLR-18) bounds
+  the rest.
