@@ -23,14 +23,17 @@ no GPU runs, no new task scope.
   governing spec and the later-dated amendment, so this adopts its rule rather
   than overriding it — no owner decision was needed and none was inferred.
 - **Provenance caveat on every cited pilot number** (0/80 hash-equal,
-  containment 0.358-0.389): they were hand-computed from
-  `build/llama-cuda/gplr13-ladder/analysis-stats.json`, an untracked build
-  artifact (`.gitignore:/build/`) whose producing script is not present in the
-  repository, so they are NOT reproducible from tracked tooling. Recorded in
-  the bottlenecks doc section 2 (canonical statement; caveat attached under
-  the table) and in the plan's T-GPLR-15 cross-validation step. The Phase A
+  containment 0.358-0.389): they are MACHINE-computed by
+  `build/analyze_gplr13_ladder.py`, an untracked one-off that lives inside the
+  gitignored `/build/` tree, so it does not survive a clean checkout and the
+  numbers are NOT reproducible from tracked tooling alone. Recorded in the
+  bottlenecks doc section 2 (canonical statement; caveat attached under the
+  table) and in the plan's T-GPLR-15 cross-validation step. The Phase A
   re-derivation in `tools/route_overlap/analyze.py` replaces them as evidence;
   a disagreement there is investigated and recorded, not silently resolved.
+  (Corrected 2026-09-13 after post-commit verification: the first version of
+  this caveat claimed no producing script existed in the repository, which
+  contradicted the bottlenecks doc section 1 and was false.)
 - **T-GPLR-13's DONE block records its commit** (`46644f1`) per AGENTS.md,
   with the faithful qualification that the commit carries the documentation
   close-out only — the vendored T-GPLR-13 implementation remains uncommitted

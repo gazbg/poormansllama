@@ -2071,11 +2071,20 @@ Scope (Phase A — gate measurement, this task's controlling phase)
   `tools/route_overlap/analyze.py` so T5's per-token verdict sources
   `rowset_fetch` events per schema draft section 6 (known-event list grows
   to include rowset_*; hash recompute cross-check on every event; unknown
-  events still exit 2 with file:line; determinism rules unchanged). Add an
-  exact-containment statistic (consecutive-window `|A n B| / |A|` from full
-  `union_ids` lists — upgrades T4 from advisory where row-set traces exist)
-  and a per-layer reappearance-distance histogram (offline from the
-  union streams; the slot-count decision input). Then acquire ONE
+  events still exit 2 with file:line; determinism rules unchanged). Add the
+  SDD's verdict statistic (b): containment of the NEXT window's routed rows
+  in the CUMULATIVE resident set, computed OFFLINE by simulating bounded
+  retention over the recorded union streams — retention K windows of width
+  W=1, capacity sized per SDD section 4 (`min(n_expert, K*W*top_k)` rows x
+  member slab bytes; ~14.2 MB per 8-row set, ~0.57-1.13 GB across 40 MoE
+  layers for K=1-2) — reported as a per-K curve across the SDD's reference
+  retention band. The gate verdict is read at the retention the adopting F2
+  task declares; a verdict that flips inside that band is escalated as
+  product intent (VRAM), never picked here. Also add an exact-containment
+  statistic (consecutive-window `|A n B| / |A|` from full `union_ids` lists —
+  upgrades T4 from advisory where row-set traces exist) and a per-layer
+  reappearance-distance histogram (offline from the union streams; the
+  slot-count decision input). Then acquire ONE
   sufficiently long real-generation trace on the BATCH-MAJOR vehicle (see
   the corrected probe protocol below), on the ladder model
   (Qwen3.6-35B-A3B-MTP-UD-Q4_K_S), anchor-prompt warm state, memory poller
@@ -2157,25 +2166,35 @@ Scope (Phase B — implementation, entered ONLY on gate PASS + owner review)
 Focused validation (Phase A)
 : 1. `python tools/route_overlap/analyze.py` on the EXISTING ladder traces
      first: T5 verdict must become MEASURED (re-sourced) with values equal
-     to the bottlenecks doc's hand-computed pilot (0/80 hash-equal,
+     to the bottlenecks doc's recorded pilot (0/80 hash-equal,
      containment 0.358-0.389) — cross-validates the re-sourcing before any
-     new run. PROVENANCE CAVEAT (2026-09-13): those pilot numbers were
-     hand-computed from `build/llama-cuda/gplr13-ladder/analysis-stats.json`,
-     an UNTRACKED build artifact (`.gitignore:/build/`) whose producing
-     script is not in the repository, so they are not reproducible from
-     tracked tooling; the analyzer's re-derivation replaces them as
-     evidence, and any disagreement is investigated and recorded before
-     the gate run rather than silently resolved in either direction.
-   2. Analyze the new 256-token trace: T5 MEASURED with
-     n_pairs = 10,200; hash recompute passes on every rowset_fetch.
+     new run. PROVENANCE CAVEAT (2026-09-13; corrected the same day after
+     verification): those pilot numbers are MACHINE-computed by
+     `build/analyze_gplr13_ladder.py` — an untracked one-off that lives
+     INSIDE the gitignored `/build/` tree, so it does not survive a clean
+     checkout and the numbers are not reproducible from tracked tooling
+     alone (its regeneration command is documented in the bottlenecks doc
+     section 5). The analyzer's re-derivation replaces them as evidence,
+     and any disagreement is investigated and recorded before the gate run
+     rather than silently resolved in either direction.
+   2. Analyze the new 256-token trace against the SDD statistic: the (b)
+     value at the declared retention (per-K curve reported) is the gate
+     input and the PASS/FAIL verdict. T5's re-sourced verdict is reported as
+     CONTEXT — it must be MEASURED with n_pairs = 10,200, and the hash
+     recompute must pass on every rowset_fetch (that check is the shared
+     union-parsing/integrity check, not the gate).
    3. No GPU work outside `tools/with-gpu-lock.ps1`; the probe run's
      recorded evidence per the model-run testing standard.
 
 Escalate before implementation if
 : the hit-rate gate cannot be evaluated from rowset_fetch telemetry; the
   aggregate-vs-per-layer tension above makes the 0.6 threshold ambiguous
-  as product intent; or owner priority favors handoff (which already
-  reaches 64.63 tok/s TG on fits-regime shapes).
+  as product intent; the (b) verdict is K-sensitive inside the SDD's
+  reference retention band (a VRAM/product tradeoff, not an implementer
+  call); the Phase A spec `docs/rowset-fetch-telemetry-schema-draft.md`
+  stays UNTRACKED while this contract cites it normatively (track it or
+  inline the spec — owner decision); or owner priority favors handoff
+  (which already reaches 64.63 tok/s TG on fits-regime shapes).
 
 ---
 

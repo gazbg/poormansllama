@@ -7,6 +7,9 @@ Amended 2026-09-13: per-layer row cache (`moe-row-cache`, the F2 class) defined
 as a TG-phase residency class under `moe-row-set`, so that measured row reuse
 is realizable and T-GPLR-15's cumulative-resident-set ceiling is measurable;
 see sections 1, 4, 6, 7, 8, 9, 10, 11, 12.
+Amended 2026-09-13: gate 9 decision rule stated by owner direction (T-GPLR-15
+metric reconciliation), so the verdict statistic is single-owned here; see
+sections 10 and 11 (gate 9).
 
 Reference implementation: `third_party/llama.cpp/src/llama-layer-streaming.*`
 
@@ -404,7 +407,7 @@ retention over the recorded union streams, and additionally well-defined at
 runtime once per-layer persistence exists (the cache-served-row telemetry
 above is that runtime form, and is the positive-reuse check of gate 10).
 
-Gate 9 decision rule (sole owner; clarified 2026-09-13): the T-GPLR-15
+Gate 9 decision rule (sole owner; owner-directed 2026-09-13): the T-GPLR-15
 verdict statistic is (b), the realized predictor ceiling — the fraction of
 the NEXT window's routed expert rows that a persisting per-layer cache
 (retention K windows, W=1) would already hold, with the next window in the
@@ -449,7 +452,9 @@ must not be described as controlled cold-cache evidence.
 9. `moe-row-set` performance is claimed only if wall TG tok/s improves over
    the reactive row-set baseline at equal shape (T-GPLR-15's gate), and the
    measured token-level temporal hit rate reaches 0.6 before any predictive
-   variant is implemented; below 0.6 the predictive task closes as
+   variant is implemented (the statistic the phrase names, its definition,
+   and the direction of every containment figure are owned by the gate 9
+   decision rule in section 10); below 0.6 the predictive task closes as
    falsified-by-evidence.
 10. `moe-row-cache` (amended 2026-09-13): with the cache enabled, executed
     coverage still equals the router's exact IDs for every layer and window

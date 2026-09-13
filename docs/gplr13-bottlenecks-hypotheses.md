@@ -65,12 +65,14 @@ the exact lower bound, containment `|A n B| / |B|` is exact (full lists).
 | containment mean (consecutive windows) | 0.377 | 0.370 | 0.389 | 0.358 |
 | rows_reused reported by runner | 0 | 0 | 0 | 0 |
 
-Provenance caveat (2026-09-13): the two statistics above were hand-computed
-from `build/llama-cuda/gplr13-ladder/analysis-stats.json` — an UNTRACKED
-build artifact (`.gitignore:/build/`) whose producing script is not present
-in the repository (`hash_equal` / `containment_mean` appear in no file under
-`tools/`). They are therefore NOT reproducible from tracked tooling today.
-The tracked replacement is the T-GPLR-15 Phase A re-derivation in
+Provenance caveat (2026-09-13; corrected the same day after verification):
+the two statistics above are MACHINE-computed by
+`build/analyze_gplr13_ladder.py`, the untracked one-off already named in
+section 1. That script lives INSIDE the gitignored `/build/` tree
+(`.gitignore:/build/`), so it does not survive a clean checkout and the
+numbers are not reproducible from tracked tooling alone — the regeneration
+command in section 5 works only while that untracked file is present. The
+tracked replacement is the T-GPLR-15 Phase A re-derivation in
 `tools/route_overlap/analyze.py`, which becomes the producer of record. The
 containment direction is owned by the SDD section 10 gate 9 decision rule
 (`|A n B| / |B|`, next window in the denominator).
