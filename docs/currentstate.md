@@ -1,5 +1,35 @@
 # Current State
 
+## 2026-09-13: Rowset telemetry schema draft brought into version control (tracked, not inlined) — the T-GPLR-15 contract no longer cites a spec a clean checkout would not contain
+
+Owner decision on the open question flagged in the T-GPLR-15 contract's
+escalation clause. Documentation only: no code changed, no GPU runs, no new
+task scope. The schema's content is unchanged apart from its status header.
+
+- **Decision: TRACK, do not inline.**
+  `docs/rowset-fetch-telemetry-schema-draft.md` is now tracked in `docs/`
+  beside the SDD and the plans. Inlining into the plan was rejected because
+  three tracked docs cite it by section — the plan itself (sections 3, 4.2, 6),
+  `docs/currentstate.md` (section 6), and `docs/gplr13-bottlenecks-hypotheses.md`
+  (section 4.2 and open decision 3) — and because 221 lines of event/field
+  schema is detail the contract deliberately delegates, not task-contract
+  content; inlining would duplicate it with no single owner.
+- **The draft was documenting shipped behavior, not a proposal.** Its section 7
+  decision 2 is implemented as the ascending comma-joined `union_ids` canonical
+  string (`third_party/llama.cpp/src/llama-layer-streaming.cpp:3643`) and its
+  section 8 validations ran under T-GPLR-13. The header status is corrected
+  accordingly, with the original 2026-09-12 draft status retained as-written
+  inside a `[SUPERSEDED ...]` block.
+- **What this resolves.** The plan's T-GPLR-15 escalation clause no longer
+  lists "the Phase A spec stays UNTRACKED" as an escalation trigger; it records
+  the resolution instead. The earlier draft section 5/6 corrections (gate read
+  against SDD statistic (b), the reappearance-distance histogram, hash and
+  containment framed as context and integrity checks) land with this commit —
+  they were previously on disk but unversioned.
+- **Same defect class, still open (owner decision):** the plan also cites
+  `docs/model-run-testing-standard.md`, which remains untracked. Out of scope
+  here and not addressed.
+
 ## 2026-09-13: Gate 9 decision rule now single-owned by the SDD (T-GPLR-15 metric corrected); cited pilot numbers carry a provenance caveat; T-GPLR-13's commit recorded
 
 Audit follow-up. Three surgical documentation corrections. No code changed,

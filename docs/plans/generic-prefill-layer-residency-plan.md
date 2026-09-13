@@ -2191,10 +2191,16 @@ Escalate before implementation if
   aggregate-vs-per-layer tension above makes the 0.6 threshold ambiguous
   as product intent; the (b) verdict is K-sensitive inside the SDD's
   reference retention band (a VRAM/product tradeoff, not an implementer
-  call); the Phase A spec `docs/rowset-fetch-telemetry-schema-draft.md`
-  stays UNTRACKED while this contract cites it normatively (track it or
-  inline the spec — owner decision); or owner priority favors handoff
-  (which already reaches 64.63 tok/s TG on fits-regime shapes).
+  call); or owner priority favors handoff (which already reaches 64.63
+  tok/s TG on fits-regime shapes).
+
+RESOLVED 2026-09-13 (owner decision): the Phase A spec
+`docs/rowset-fetch-telemetry-schema-draft.md` is TRACKED in `docs/`. The
+alternative — inlining the schema into this plan — was rejected because three
+tracked docs cite it by section and its content is schema detail this contract
+delegates, so inlining would duplicate the schema in a second place with no
+single owner. The citation therefore resolves on a clean checkout; no
+escalation remains on this point.
 
 ---
 
