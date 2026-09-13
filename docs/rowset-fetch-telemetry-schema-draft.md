@@ -2,8 +2,11 @@
 
 Status: TRACKED design doc (tracked 2026-09-13; owner decision — track, do NOT
 inline into the plan). It is the normative Phase A spec cited by the T-GPLR-15
-contract in `docs/plans/generic-prefill-layer-residency-plan.md` (sections 3,
-4.2 and 6), and it records SHIPPED T-GPLR-13 behavior rather than a proposal:
+contract in `docs/plans/generic-prefill-layer-residency-plan.md` (section 6 for
+its analyzer extensions, section 3 for the `union_ids` rule), by
+`docs/currentstate.md` (section 6) and by
+`docs/gplr13-bottlenecks-hypotheses.md` (section 4.2 and open decision 3), and
+it records SHIPPED T-GPLR-13 behavior rather than a proposal:
 the `union_ids` canonical string of section 7 decision 2 is implemented
 (`third_party/llama.cpp/src/llama-layer-streaming.cpp:3643`) and the section 8
 validations ran under T-GPLR-13 (see the T-GPLR-13 entries in

@@ -9,7 +9,7 @@ task scope. The schema's content is unchanged apart from its status header.
 - **Decision: TRACK, do not inline.**
   `docs/rowset-fetch-telemetry-schema-draft.md` is now tracked in `docs/`
   beside the SDD and the plans. Inlining into the plan was rejected because
-  three tracked docs cite it by section — the plan itself (sections 3, 4.2, 6),
+  three tracked docs cite it by section — the plan (sections 3 and 6),
   `docs/currentstate.md` (section 6), and `docs/gplr13-bottlenecks-hypotheses.md`
   (section 4.2 and open decision 3) — and because 221 lines of event/field
   schema is detail the contract deliberately delegates, not task-contract
@@ -26,9 +26,12 @@ task scope. The schema's content is unchanged apart from its status header.
   against SDD statistic (b), the reappearance-distance histogram, hash and
   containment framed as context and integrity checks) land with this commit —
   they were previously on disk but unversioned.
-- **Same defect class, still open (owner decision):** the plan also cites
-  `docs/model-run-testing-standard.md`, which remains untracked. Out of scope
-  here and not addressed.
+- **Same defect class, still open (owner decision):** the plan defers to
+  `docs/model-run-testing-standard.md` by name only, never by path ("per the
+  model-run testing standard" and "per the testing standard", both in the
+  T-GPLR-15 block), while `docs/gplr13-bottlenecks-hypotheses.md:169` cites it
+  by path. The file remains untracked, so the same clean-checkout gap applies.
+  Out of scope here and not addressed.
 
 ## 2026-09-13: Gate 9 decision rule now single-owned by the SDD (T-GPLR-15 metric corrected); cited pilot numbers carry a provenance caveat; T-GPLR-13's commit recorded
 
