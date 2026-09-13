@@ -2861,8 +2861,9 @@ through `third_party/llama.cpp` **a61528b47** (the accumulated-backlog commit �
 see the attribution limit in the convention section above: it carries
 T-GPLR-12/13/16/18/19's vendored halves as one unit, so this hash makes the
 mechanism reproducible, not genuinely per-task history); outer docs/tools in the
-`Record ...` commit that bumps the gitlink (hash recorded in the follow-up, per
-the plan's existing field format). Previously recorded as: none — the
+`Record ...` commit that bumps the gitlink: **54c6df4** (hash recorded in the
+follow-up commit, per the plan's existing field format). Previously recorded as:
+none — the
 vendored-fork convention is an open owner call (this task's Escalate clause),
 and the mechanism lives in `third_party/llama.cpp`, so no hash can be recorded
 until that is settled. The T-GPLR-16 MIN_BATCH=1 revert is NOT displaced and
@@ -2892,7 +2893,7 @@ this task's bytes); the SDD section 4 moe-row-cache treatment (written
 2026-09-13, owner-directed); T-GPLR-15 (DONE-falsified-by-evidence — supplies
 the (b) statistic the prediction rests on, at the retention band the owner
 already approved). Commit: vendored half in `third_party/llama.cpp` a61528b47;
-outer half in the gitlink-bump commit recorded in the follow-up.
+outer half (docs, tools, gitlink bump) in 54c6df4.
 
 RESULT 2026-09-13 — the four-arm gate RAN and PASSED (`tools/run-gplr19-rowcache-ab.ps1`,
 arms A,B,A,B inside ONE GPU-mutex session, poller attached, checker per trace;

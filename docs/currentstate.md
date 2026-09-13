@@ -39,7 +39,11 @@ CMakeLists.txt}`. Checked before staging: no absolute or host paths anywhere in
 the added lines, no new `TODO`/`FIXME`, and every diagnostic print is env-gated
 (`LLAMA_LAYER_STREAMING_DEBUG`, `GGML_LS_GRAPH_EXEC_MARKERS`,
 `LLAMA_LS_TG_ROUTER_PROBE`), so default behaviour and the CPU path are untouched.
-`git diff --cached --check` clean; nested worktree clean after the commit.
+`git diff --cached --check` clean; nested worktree clean after the commit. The
+outer half — docs, tools, and the 2-line gitlink bump
+(`099a27a7e` → `a61528b47`) — is root commit **54c6df4**, recorded in a follow-up
+commit because a commit cannot name its own hash; that two-step is the plan's own
+existing field pattern ("...through 84be194 (follow-up 7bfe83b)").
 
 **Attribution limit, stated rather than hidden.** The commit spans five tasks
 (T-GPLR-12/13/16/18/19) as one unit and therefore cannot tell you which hunk
