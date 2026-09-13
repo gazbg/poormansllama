@@ -16,19 +16,22 @@ chosen over the T-GPLR-16 escalation options; implementation COMPLETE
 2026-09-13 incl. 512-token row-set run, qa-smoke regression, and the
 50/512/4k/200k ladder — all PASS; residual follow-ups in its status note);
 T-GPLR-15
-predictive per-token prefetch IN PROGRESS 2026-09-13 as a
-gate-measurement-first task (Phase A analyzer half DONE: the
-`tools/route_overlap/analyze.py` extension and the statistic (b) simulation
-are implemented and the ladder cross-validation PASSED exactly — K=1
-reproduces the recorded pilot 0.377/0.370/0.389/0.358 with 0/80 hash-equal,
-first K=2 values 0.403/0.403/0.427/0.400, both below 0.6 on this stream;
-remaining Phase A step is the one 256-token batch-major generation probe;
-below 0.6 the task closes falsified-by-evidence per SDD
-gate 9; Phase B implementation only on PASS + owner review); T-GPLR-18
-pinned row-set staging READY 2026-09-13 (F1 from the T-GPLR-13 close-out;
-tests the existing `--copy-source pinned` path against the measured
-13.7 GB/s link ceiling and the T-Q38PERF-03 counter-evidence; 512 A/B gate,
-negative result is a legitimate close). T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
+predictive per-token prefetch IN PROGRESS 2026-09-13, gate MEASURED (Phase A
+DONE: the `tools/route_overlap/analyze.py` extension and the statistic (b)
+simulation are implemented, the ladder cross-validation reproduced the
+recorded pilot exactly — 0.377/0.370/0.389/0.358, 0/80 hash-equal — and the
+one 256-token batch-major probe ran: 10,200 pairs, exit 0, check-telemetry OK.
+The gate FAILS inside the SDD's reference band (K=1 0.3088, K=2 0.4343 vs 0.6)
+but the T8 oracle ceiling is 0.9385 and the curve crosses 0.6 at K=4 = 2.26 GB,
+so the verdict turns on a VRAM/product decision that is ESCALATED to the owner
+(see currentstate 2026-09-13); Phase B only on an adopted retention + owner
+review); T-GPLR-18
+pinned row-set staging DONE-falsified-by-evidence 2026-09-13 (F1 from the
+T-GPLR-13 close-out; the paired 512 A/B found pinned only RELOCATES the
+staging copy — submit 1,918 -> 927 us, ready-wait 110 -> 1,058 us, per-fetch
+transfer flat and inside the within-arm repeat spread — while costing ~1.8 GiB
+more pinned host memory, so F1 is dead on this hardware; table and verdict in
+currentstate 2026-09-13). T-GPLR-16 (mixed-placement TG mode) DEPRIORITIZED to DRAFT
 (2026-09-12, owner gate (b) decision): in-progress implementation
 parked; MIN_BATCH=1 disposition = option (a) revert; options (b)/(c)
 unprioritized.
@@ -113,18 +116,25 @@ MoE TG row-set program (2026-09-09): T-GPLR-14 (route-overlap instrument)
 done; T-GPLR-13 (reactive row-set) DONE 2026-09-13 (owner review) -- gate (a)
 resolved (moe-row-set SDD amendment) and gate (b) decided 2026-09-12 (owner):
 chosen over the T-GPLR-16 escalation options; T-GPLR-15 (predictive per-token
-prefetch) IN PROGRESS 2026-09-13, gate-measurement-first (Phase A: the
-analyzer extension and the statistic (b) simulation are DONE and
-cross-validated against the recorded ladder pilot; the 256-token probe run
-remains; below 0.6 the task closes falsified-by-evidence per SDD gate 9);
-T-GPLR-18 (pinned row-set staging, F1) READY 2026-09-13 with a 512 A/B gate
--- two ready tasks now exist (T-GPLR-15 Phase A and T-GPLR-18); they are
-independent (host-only analyzer + probe vs one small library change + GPU
-A/B), and the owner selects order while implementation stays one at a time;
+prefetch) IN PROGRESS 2026-09-13, gate MEASURED (Phase A DONE: the analyzer
+extension and the statistic (b) simulation are cross-validated against the
+recorded ladder pilot, and the 256-token batch-major probe ran -- 10,200
+pairs, exit 0, check-telemetry OK. The gate FAILS inside the SDD's reference
+band (K=1 0.3088, K=2 0.4343 vs 0.6) while the T8 oracle ceiling is 0.9385 and
+the curve crosses 0.6 at K=4 = 2.26 GB, so the closing retention is ESCALATED
+to the owner rather than picked here; Phase B only on an adopted retention +
+owner review);
+T-GPLR-18 (pinned row-set staging, F1) DONE-falsified-by-evidence 2026-09-13
+-- the paired 512 A/B (A/B/A/B inside one GPU-mutex session) found pinned
+merely RELOCATES the staging copy (submit 1,918 -> 927 us, ready-wait
+110 -> 1,058 us, per-fetch transfer flat and inside the within-arm spread) at
+~1.83 GB more pinned host memory, so F1 is dead on this hardware and the TG
+lever reverts to F2 (bytes) or T-GPLR-15 hiding;
 T-GPLR-16 (mixed-placement TG mode)
 DEPRIORITIZED to DRAFT (2026-09-12, owner gate (b) decision) --
 in-progress implementation parked, MIN_BATCH=1 disposition = option (a)
-revert, (b)/(c) unprioritized. One ready task at a time.
+revert, (b)/(c) unprioritized. No implementation task is currently ready:
+T-GPLR-15 waits on the owner's retention decision and T-GPLR-18 is closed.
 ```
 
 ### T-GPLR-00: Inventory the MoE artifact and capacity
@@ -2058,10 +2068,31 @@ window-equal at every rung; (b) at K=1 = 0.3766 / 0.3703 / 0.3891 / 0.3578
 0.4031 / 0.4266 / 0.4000 (first measured values, 1,132.5 MB over 40 layers
 vs 566.2 MB at K=1); per-layer spread at 512 is min 0.0625 / mean 0.3703 /
 max 0.7500 — the escalation clause's aggregate-vs-per-layer tension, with
-numbers attached. REMAINING Phase A step: the one 256-token batch-major
-generation probe under the GPU mutex (~10,200 pairs), which is what produces
-the gate verdict; the ladder rungs carry only 2 windows with a predecessor per
-layer and are cross-validation, never the verdict.
+numbers attached. The last Phase A step — the one 256-token batch-major
+generation probe under the GPU mutex — was PERFORMED 2026-09-13; the ladder
+rungs carry only 2 windows with a predecessor per layer and are
+cross-validation, never the verdict.
+PROBE RESULT 2026-09-13 (the gate on a real 10,200-pair stream; recorded
+evidence in `docs/currentstate.md`): runner exit 0, `--check-telemetry` OK
+(21,020 events, 4 slots), TG 256 tokens at 11.578 tok/s, peak VRAM 5,723.56
+MiB. The probe also RESOLVED the flagged uncertainty — row-set TG after a
+batch-major PP works (`run_start` carries `"rowset":"on"` with
+`"schedule":"batch-major"`, 10,240 `rowset_fetch`, 0 `rowset_refused`), so no
+fallback vehicle is needed. Gate reading: statistic (b) = **0.3088 at K=1 and
+0.4343 at K=2 — below 0.6, so the gate FAILS inside the SDD's reference
+retention band**; per-layer at K=2 min 0.1946 / mean 0.4343 / max 0.5353, so
+the "aggregate passes only because a few layers sit near 1.0" escalation does
+NOT fire. However the T8 oracle ceiling is **0.9385** and the curve crosses 0.6
+at **K=4 = 32 rows/layer = 2.26 GB** (K=8 4.53 GB → 0.7775; K=16 9.06 GB →
+0.9376), so the verdict now turns on which retention is declared — a VRAM /
+product tradeoff. That is ESCALATED to the owner under this task's escalation
+condition rather than picked here; T-GPLR-15 stays in-progress. Caveat that
+travels with the ceiling: the generated text is an echo loop of the anchor
+document (463 chars, the document's code phrase 6x, `<think>` 7x; token
+periodicity 0.479 at lag 39, immediate repeats only 8.6%), and repetition can
+only INCREASE temporal reuse — so the in-band FAIL is conservative, while the
+K=4 crossing and the 0.9385 ceiling are likely optimistic and should not
+justify committing 2.26 GB until re-measured on a non-echoing stream.
 The analyzer also reports a T8 ORACLE ceiling (added on owner request
 2026-09-13): statistic (b) under UNBOUNDED retention, i.e. the fraction of each
 window covered by the union of all prior windows, which no cache policy of any
@@ -2505,13 +2536,25 @@ Escalate before implementation if
 
 ### T-GPLR-18: Pinned staging for row-set fetches (F1 — pageable per-call H2D vs the existing pinned path)
 
-Status: READY (2026-09-13; drafted from the T-GPLR-13 close-out, bottlenecks
-doc section 6.3 "F1", and immediately constrained by the counter-evidence
-recorded in section 6.7 of that file). This task TESTS a hypothesis; a
-negative result is a legitimate close. Depends on: T-GPLR-13 (DONE — the
+Status: DONE-falsified-by-evidence (2026-09-13). The paired 512 A/B was run:
+all four arms exit 0 with `--check-telemetry` OK, staged bytes / route streams /
+greedy token IDs identical between arms, but the pinned arm's per-fetch
+transfer mean (1,984.6 us over 120 fetches) beats the direct arm's (2,027.9 us)
+by only 43.3 us — LESS than the largest within-arm repeat spread (58.7 us) —
+while submission fell (1,918 -> 927 us) and the availability wait rose by the
+same ~1,050 us (110 -> 1,058 us). That is T-Q38PERF-03's signature reproduced
+on the row-set regime, so acceptance criterion 2 FAILS and the task closes
+falsified-by-evidence; criterion 3 (a performance claim) is therefore never
+reached. The pinned arm also costs ~1.83 GB of non-pageable host memory (one
+staging buffer per slot, ~458 MB x 4; poller host commit peak 21.25/22.09 GiB
+vs 19.95/20.07 GiB direct). Evidence in `docs/currentstate.md` (2026-09-13) and
+`build/llama-cuda/gplr18-pinned-ab/`. Depends on: T-GPLR-13 (DONE — the
 row-set path and its telemetry); the existing pinned staging machinery and
 `--copy-source pinned` (T-Q38PERF-03, done 2026-08-20; dense pinned CTest
-fixture present). Commit: none.
+fixture present; still passing 4/4 with the row-set change in place). Commit: none.
+Note: the `load_row_set` change itself is UNCOMMITTED in the dirty
+`third_party/llama.cpp` working tree (owner convention for the vendored fork),
+so the pinned arm is not reproducible from a clean checkout.
 
 Known evidence (counter-evidence first — this task exists to test, not assume)
 : - Row-set staging today: `load_row_set` issues 24

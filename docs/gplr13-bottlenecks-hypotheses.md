@@ -512,3 +512,86 @@ unchanged. F2 does not yet have a task ID.
 
 No GPU runs were performed for this correction; it transcribes recorded
 measurements (T-Q38TG-00, T-Q38PERF-03) that 6.3 did not account for.
+
+## 7. T-GPLR-15 gate measured on a real 256-token generation stream (2026-09-13): fails the reference band, ceiling 0.94, crossing at 2.26 GB
+
+The section 2 pilot was 80 pairs over 3 TG windows and was explicitly "never a
+gate verdict". The gate has now been measured on the stream it is defined over:
+one batch-major run, 256 greedy tokens, 10,200 pairs (255 per layer x 40
+layers), runner exit 0, `--check-telemetry` OK (21,020 events, 4 slots).
+
+| statistic (SDD section 10) | value | retention cost |
+| --- | --- | --- |
+| (b) K=1 (W=1) | 0.3088 | 8 rows/layer = 566 MB |
+| (b) K=2 | 0.4343 | 16 rows/layer = 1.13 GB |
+| (b) K=3 | 0.5330 | 1.70 GB |
+| (b) K=4 | 0.6284 | 2.26 GB <- first reading at or above the 0.6 threshold |
+| (b) K=8 | 0.7775 | 4.53 GB |
+| (b) K=16 | 0.9376 | 9.06 GB |
+| T8 oracle (unbounded) | 0.9385 | 18.12 GB = the full 256-row bank resident |
+
+So the SDD's reference retention band (K=1-2) FAILS the 0.6 gate while the
+honest ceiling is 0.94: the predictive hypothesis is not falsified, the
+budgeted variant is. Per-layer (b) at K=2 spans 0.1946-0.5353, so no small
+subset of layers is carrying the aggregate, and no layer reaches 0.6 there.
+
+Two caveats that must travel with the table:
+
+- The generated text is an echo loop of the anchor document (463 characters,
+  its code phrase repeated 6x, `<think>` 7x; token periodicity 0.479 at lag 39,
+  immediate repeats only 8.6%). Repetition can only INCREASE temporal reuse, so
+  the in-band FAIL is CONSERVATIVE (a cleaner stream measures the same or
+  lower) while the K=4 crossing and the 0.9385 ceiling are likely OPTIMISTIC
+  and should not justify a VRAM commitment until re-measured on a stream that
+  does not echo its own prompt.
+- The oracle is a generous bound by construction: reaching it means the whole
+  expert bank is resident, which is the outcome the row-set policy exists to
+  avoid. The informative number is the retention cost of crossing 0.6.
+
+Related instrument facts from the same run: T5 consecutive-window hash equality
+is 0.0019 (19 of 10,200) — near zero, as the top_k=8 over n_expert=256 sparsity
+predicts — and T7 reappearance coverage at retention 1/2/4/8 windows is
+0.329 / 0.428 / 0.554 / 0.703. No throughput claim is made here: this section
+measures routing predictability only. Whether 2.26 GB of retention is
+acceptable is a product decision, escalated to the owner (see
+`docs/currentstate.md`, 2026-09-13).
+
+## 8. T-GPLR-18 closed falsified-by-evidence (2026-09-13): pinned row-set staging relocates the copy, it does not speed it up
+
+Section 6.7 predicted this result from T-Q38PERF-03 and T-Q38TG-00 and the
+narrow surviving hypothesis was the only reason to test it: the row-set regime
+issues 24 slabs of ~0.59 MB per 14.16 MB fetch, where per-call driver cost
+could dominate. The paired 512 A/B says it does not. Arms differ only by
+`--copy-source`; four arms (direct, pinned, direct, pinned) ran inside one
+GPU-mutex session with the memory poller attached, 120 fetches each.
+
+| arm | source | submit_us | ready_us | transfer_us | staged bytes | commit peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| A1 | direct | 1,937 | 110 | 2,046.6 | 1,718,157,312 | 19.95 GiB |
+| B1 | pinned | 898 | 1,057 | 1,955.2 | 1,718,157,312 | 21.25 GiB |
+| A2 | direct | 1,899 | 110 | 2,009.2 | 1,718,157,312 | 20.07 GiB |
+| B2 | pinned | 955 | 1,058 | 2,013.9 | 1,718,157,312 | 22.09 GiB |
+
+- Per-fetch means; direct mean 2,027.9 us vs pinned 1,984.6 us, a 43.3 us gap
+  BELOW the largest within-arm repeat spread (58.7 us). Criterion 2 FAILS.
+- The signature is T-Q38PERF-03's, reproduced on the row-set regime: submission
+  falls (~1,050 us) and the availability wait rises by the same amount, so the
+  pageable source is not being staged slower than pinned - pinned merely makes
+  the same staging explicit as a host memcpy.
+- The 6.7 pre-registered ~1.03 ms per-fetch floor (14.16 MB at the measured
+  13.7 GB/s link ceiling) is not approached by either arm; both sit near 2.0 ms,
+  so there was no per-call overhead to recover at 24 slabs per fetch.
+- Pinned is also the more expensive arm: one staging buffer per slot
+  (~458 MB x 4 slots = ~1.83 GB of non-pageable host memory), visible as the
+  1.3-2.0 GiB higher host commit peak.
+- Feasibility and immunity held: staged bytes, route streams (SHA-256 over the
+  ordered `layer|union_ids|hash` stream) and greedy token IDs identical across
+  arms; host suite 23/23, the dense pinned CTest fixture 4/4, and the qa-smoke
+  512 default-off rung PASS with the negative control failing as designed.
+
+**Ranking consequence.** With F1 closed, the TG lever for the not-fitting
+regime is F2 (bytes across the link) or T-GPLR-15 hiding, which is what 6.7's
+ranking already said once F1's upside collapsed - the difference is that the
+collapse is now measured rather than predicted. No throughput claim is made:
+wall time across the four arms (10.4-16.5 s) is dominated by shared-GPU noise
+and the two `direct` arms are both the fastest and the slowest.

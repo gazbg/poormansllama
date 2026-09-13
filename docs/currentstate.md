@@ -1,5 +1,139 @@
 # Current State
 
+## 2026-09-13: T-GPLR-18 pinned row-set staging CLOSED DONE-falsified-by-evidence — the 512 A/B shows pinned only RELOCATES the staging copy (submit 1,918 -> ~927 us, ready-wait 110 -> ~1,058 us, per-fetch transfer flat) and costs ~1.8 GiB more pinned host memory
+
+F1 (bottlenecks section 6.3) tested against its own recorded counter-evidence
+(section 6.7). One library change: `load_row_set` honors `slot.buf_staging`
+when `--copy-source pinned` (pack each fetched slab into the pinned buffer and
+enqueue from there; natural destination offsets `e * slab_bytes`; byte-exact
+memcpy). [UNCOMMITTED 2026-09-13: the `load_row_set` change sits in the dirty
+`third_party/llama.cpp` working tree and is excluded from this commit per the
+owner's vendored-fork convention, so a clean checkout does not contain it and
+the pinned-arm numbers below are not reproducible from the tracked tree alone.]
+New driver `tools/run-gplr18-pinned-ab.ps1`; the four arms run
+A(direct), B(pinned), A, B inside ONE acquisition of the shared-GPU mutex (same
+mutex name and wait/release behavior as `tools/with-gpu-lock.ps1`), with
+`tools/gpu-mem-poll.ps1` attached per arm; the arms differ ONLY by
+`--copy-source`, everything else the T-GPLR-13 512 ladder shape.
+
+Recorded evidence (`build/llama-cuda/gplr18-pinned-ab/`: `driver.log`,
+`summary.json`, four traces, four poller CSVs). Anchor: the calibrated
+512-token prompt; 3 TG tokens per arm.
+
+```
+arm  source  exit  check  wall_ms  pp tok/s  submit_us  ready_us  transfer_us  staged_bytes   peak_vram
+A1   direct    0     0    10,419    87.7      1,937      109.5     2,046.6      1,718,157,312  6,005,784,576
+B1   pinned    0     0    12,117    83.9        898    1,057.4     1,955.2      1,718,157,312  6,005,784,576
+A2   direct    0     0    16,527    72.6      1,899      110.4     2,009.2      1,718,157,312  6,005,784,576
+B2   pinned    0     0    14,449    83.4        955    1,058.4     2,013.9      1,718,157,312  6,005,784,576
+```
+
+Means in the transfer/wait columns are per `rowset_fetch` (120 fetches per arm);
+staged bytes are the run total.
+
+- **Criterion 1 feasibility PASS.** Four runs exit 0, four `--check-telemetry`
+  passes (0 `rowset_refused`), staged bytes identical (1,718,157,312 B =
+  3 rounds x 572,719,104 B/round = 3.125% of the 18,327,011,328 B bank),
+  route streams identical (one SHA-256 over the ordered
+  `layer|union_ids|hash` stream, equal across all four arms), greedy token IDs
+  identical (`248046,198,248045`), peak VRAM identical. `run_start` carries
+  `"copy_source":"direct"/"pinned"` labelling the arm, with `"rowset":"on"` and
+  `"handoff_mode":"off"` in both.
+- **Criterion 2 instrumentation gate FAIL — falsified-by-evidence.** Direct
+  transfer mean 2,027.9 us vs pinned 1,984.6 us: delta 43.3 us, BELOW the
+  largest within-arm repeat spread (58.7 us). The signature is exactly
+  T-Q38PERF-03's: host submission FALLS (1,918 -> 927 us) while the
+  availability wait RISES by about the same ~1,050 us (110 -> 1,058 us),
+  leaving the per-fetch total flat. Pinned does not stage faster; it makes the
+  same staging explicit as a host memcpy. Both arms also sit near 2x the
+  pre-registered ~1.03 ms floor (14.16 MB at the measured 13.7 GB/s Gen4 x8
+  ceiling), so no per-call pageable-staging overhead was recoverable at 24
+  slabs per fetch.
+- **A cost, not a benefit.** The pinned arm allocates one staging buffer per
+  slot (slot_bytes ~= 458 MB x 4 slots ~= 1.83 GB of non-pageable host
+  memory). Poller host commit peak: direct 19.95 / 20.07 GiB vs pinned
+  21.25 / 22.09 GiB. The falsified arm is also the more expensive one.
+- **Criterion 3 (performance claim) NOT reached** - there is nothing to claim,
+  and the contract's pre-registered bound forbids claiming more than the
+  1.93 -> >= 1.03 ms conversion anyway.
+- **Criterion 4 default-off immunity PASS.** The `direct` arms reproduce the
+  recorded ladder baseline (572,719,104 B/round, 120 fetches, 3.125%, same
+  field semantics); `tools/run-tests.ps1 -Suite host` 23/23 PASS; ctest
+  `layer-streaming-pinned-1024|qwen38-layer-boundary|layer-slot-lifecycle` 4/4
+  PASS with `Q38LS_MODEL_PATH` set (the dense pinned fixture shares the pinned
+  path this task touched); `-Suite qa-smoke` 512 default-off rung PASS
+  (`check-telemetry` OK, answer PASS 5/5 needles, negative control FAILs as
+  designed).
+
+**Verdict:** F1 is dead on this hardware. Wall time is not claimed either way -
+it is dominated by shared-GPU noise at this shape (10.4-16.5 s across four
+arms, with the two `direct` arms the fastest and the slowest), and the TG and
+PP rates overlap across arms. The TG lever for the not-fitting regime reverts
+to F2 (bytes) or to T-GPLR-15 hiding, not to staging mechanics - which is what
+the T-GPLR-18 escalation clause pre-registered for a flat result.
+
+## 2026-09-13: T-GPLR-15 Phase A probe RUN — the gate FAILS inside the SDD's reference retention band (0.3088 / 0.4343 vs 0.6) on 10,200 real pairs; the ceiling is 0.9385 and the curve crosses 0.6 at K=4 (2.26 GB), which is a VRAM/product decision, not an implementer's
+
+First real measurement of the gate on a stream long enough to mean something.
+One GPU run under the shared mutex with the memory poller attached; no library
+changes.
+
+Recorded evidence
+: - Command: `--model C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf
+    --prompt-file <ladder 512 anchor> --residency moe-expert-bank --residency-tg
+    --pp-schedule batch-major --pp-tokens 512 --ubatch 512 --tg-tokens 256
+    --layer-slots 4 --kv-cache q8 --greedy --no-mtp --pp-no-logits
+    --allow-full-residency --telemetry <probe-tg256.jsonl> --tg-text <probe-tg256.txt>`,
+    wrapped in `tools/with-gpu-lock.ps1 -TimeoutSeconds 900`, poller
+    `tools/gpu-mem-poll.ps1 -IntervalMs 500`; driver kept under the gitignored
+    `build/llama-cuda/gplr15-phaseA-probe/run-probe.ps1` (the tracked status of
+    the `tools/` harness is a separate open owner decision).
+  - Hardware: RTX 5090 (per `docs/AGENT_ENVIRONMENT.md`). Exits: runner 0,
+    `--check-telemetry` OK (21,020 events, 4 slots).
+  - Timings: PP 512 tokens at 76.934 tok/s (wall 6,655 ms); TG 256 tokens at
+    11.578 tok/s (wall 22,111 ms). Runner peak VRAM 5,723.56 MiB
+    (6,001,590,272 B); poller adapter peak 4,641 MiB, commit peak 18.6 GiB,
+    avail min 34.7 GiB. Artifacts under `build/llama-cuda/gplr15-phaseA-probe/`
+    (`probe-tg256.jsonl`, `.log`, `.txt`, `mem.csv`, `analysis.{txt,json}`).
+- **The plan's flagged uncertainty is RESOLVED: row-set TG after a batch-major
+  PP works.** `run_start` carries `"rowset":"on"` with `"schedule":"batch-major"`
+  and `"handoff_mode":"off"`; 10,240 `rowset_fetch` events (40 layers x 256
+  tokens), 256 `rowset_round`, 1 `rowset_init`, 0 `rowset_refused`. No fallback
+  (repeated-3-token prompt family, or lifting the layer-major cap) is needed.
+- **Gate reading (SDD section 10 statistic (b), 10,200 pairs):**
+  K=1 **0.3088**, K=2 **0.4343** — both BELOW the 0.6 threshold, so the gate
+  FAILS at the SDD's reference retention band. Per-layer at K=2: min 0.1946 /
+  mean 0.4343 / max 0.5353, so no layer reaches 0.6 and the "aggregate passes
+  only because a few layers are near 1.0" escalation does NOT fire.
+- **But the stream is highly predictable with more retention:** the T8 oracle
+  ceiling is **0.9385**, and the curve crosses 0.6 at **K=4 (32 rows/layer,
+  2.26 GB over 40 layers)**: K=3 0.5330 (1.70 GB), K=4 0.6284 (2.26 GB),
+  K=8 0.7775 (4.53 GB), K=16 0.9376 (9.06 GB), reaching the 0.9385 oracle
+  value by K=24 (13.59 GB, 192 rows/layer); the full 256-row bank is 18.12 GB
+  at K=32, which adds nothing over K=24. T7 agrees: cumulative reappearance coverage at
+  retention 1/2/4/8 windows is 0.329 / 0.428 / 0.554 / 0.703.
+- **Sample caveat that must travel with the ceiling (do not quote 0.94 as a
+  property of "real generation").** The generated text is an echo loop of the
+  anchor document: 463 characters, the document's code phrase repeated 6x,
+  `<think>` 7x. Token-level periodicity is real but partial — best match 0.479
+  at lag 39, immediate-repeat rate only 8.6%. Repetition can only INCREASE
+  temporal reuse, which cuts two ways and both are useful:
+  (a) the FAIL at K=1-2 is CONSERVATIVE — a non-repetitive stream would measure
+      the same or lower, so "the gate fails inside the reference band" is the
+      robust half of this result;
+  (b) the K=4 crossing and the 0.9385 ceiling are likely OPTIMISTIC and are not
+      a sound basis for committing 2.26 GB of VRAM until they are re-measured
+      on a stream that does not echo its own prompt.
+- **Escalated, not decided** (the contract's own escalation condition: the (b)
+  verdict is K-sensitive and the retention/VRAM tradeoff is product intent).
+  The owner's choice: (i) declare K=4 (2.26 GB) as the adopting task's
+  retention, which makes the gate pass and Phase B eligible for review; or
+  (ii) keep the K=1-2 reference band, in which case T-GPLR-15 closes
+  falsified-by-evidence per gate 9; or (iii) re-probe on a non-repetitive
+  prompt first, because the crossing point is measured on an echoing stream.
+  Nothing here claims a speedup, a quality result, or an F2 implementation;
+  T-GPLR-15 stays in-progress.
+
 ## 2026-09-13: T8 oracle retention ceiling added to the analyzer — on the ladder samples NO policy can reach the 0.6 gate, but those samples structurally cannot settle it
 
 Owner-requested follow-up on the Phase A analyzer; the analyzer change and this
@@ -71,9 +205,12 @@ of this commit.
 - **Retires the earlier flag** rather than rewriting it: the previous entry's
   "same defect class, still open" bullet is annotated RESOLVED in place.
 - **Partly closed 2026-09-13:** `tools/route_overlap/analyze.py` — the tool
-  that produces the statistic (b) numbers — is now TRACKED. Still untracked and
+  that produces the statistic (b) numbers — is now TRACKED, and
+  `tools/gpu-mem-poll.ps1` followed it into history on 2026-09-13 because the
+  T-GPLR-18 A/B driver invokes it (a cited file a clean checkout lacks is a
+  defect). Still untracked and
   left to the owner: the T-GPLR-14 `.ps1` runners (`run-gplr13-ladder.ps1`,
-  `run-gplr13-negfix.ps1`, `run-gplr13-rowset-probe.ps1`), `tools/gpu-mem-poll.ps1`,
+  `run-gplr13-negfix.ps1`, `run-gplr13-rowset-probe.ps1`),
   `tools/gplr16-dump.cpp` and `tools/run-memprobe-dense.ps1` — pre-existing work
   not authored in this thread. `.lean-ctx*.toml*` are agent tooling artifacts
   that belong in `.gitignore`, not history.
