@@ -143,6 +143,10 @@ real traces:
   probe (`--residency-tg --tg-tokens 256 --greedy --no-mtp`, GPU mutex,
   poller attached) yielding 10,200 consecutive-window pairs at ~2.4 MB
   trace.
+  [CORRECTED 2026-09-13: the pilot is MACHINE-computed, not hand-computed —
+  produced by the untracked `build/analyze_gplr13_ladder.py`; see the
+  provenance caveat at the top of this file. The wording above is retained as
+  written.]
 - Gate rule: primary = hash-equal consecutive-window rate (exact, W=1).
   [SUPERSEDED 2026-09-13 by the gate-rule entry at the top of this file — the
   SDD section 10 rule governs; this line is retained as written.]
