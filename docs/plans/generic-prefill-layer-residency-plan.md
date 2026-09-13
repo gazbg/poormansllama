@@ -16,16 +16,14 @@ chosen over the T-GPLR-16 escalation options; implementation COMPLETE
 2026-09-13 incl. 512-token row-set run, qa-smoke regression, and the
 50/512/4k/200k ladder — all PASS; residual follow-ups in its status note);
 T-GPLR-15
-predictive per-token prefetch IN PROGRESS 2026-09-13, gate MEASURED (Phase A
-DONE: the `tools/route_overlap/analyze.py` extension and the statistic (b)
-simulation are implemented, the ladder cross-validation reproduced the
-recorded pilot exactly — 0.377/0.370/0.389/0.358, 0/80 hash-equal — and the
-one 256-token batch-major probe ran: 10,200 pairs, exit 0, check-telemetry OK.
-The gate FAILS inside the SDD's reference band (K=1 0.3088, K=2 0.4343 vs 0.6)
-but the T8 oracle ceiling is 0.9385 and the curve crosses 0.6 at K=4 = 2.26 GB,
-so the verdict turns on a VRAM/product decision that is ESCALATED to the owner
-(see currentstate 2026-09-13); Phase B only on an adopted retention + owner
-review); T-GPLR-18
+predictive per-token prefetch DONE-falsified-by-evidence 2026-09-13 (gate
+MEASURED: Phase A DONE, the ladder cross-validation reproduced the recorded
+pilot exactly — 0.377/0.370/0.389/0.358, 0/80 hash-equal — and the 256-token
+batch-major probe ran: 10,200 pairs, exit 0, check-telemetry OK. (b) measures
+0.3088 at K=1 and 0.4343 at K=2, BELOW 0.6, so the gate FAILS at the SDD
+section 4 reference sizing; the retention choice escalated 2026-09-13 is now
+CLOSED in favour of that band, and the K=4 = 2.26 GB crossing was rejected as
+the biased half of a self-echoing stream. Phase B not entered); T-GPLR-18
 pinned row-set staging DONE-falsified-by-evidence 2026-09-13 (F1 from the
 T-GPLR-13 close-out; the paired 512 A/B found pinned only RELOCATES the
 staging copy — submit 1,918 -> 927 us, ready-wait 110 -> 1,058 us, per-fetch
@@ -116,14 +114,17 @@ MoE TG row-set program (2026-09-09): T-GPLR-14 (route-overlap instrument)
 done; T-GPLR-13 (reactive row-set) DONE 2026-09-13 (owner review) -- gate (a)
 resolved (moe-row-set SDD amendment) and gate (b) decided 2026-09-12 (owner):
 chosen over the T-GPLR-16 escalation options; T-GPLR-15 (predictive per-token
-prefetch) IN PROGRESS 2026-09-13, gate MEASURED (Phase A DONE: the analyzer
-extension and the statistic (b) simulation are cross-validated against the
-recorded ladder pilot, and the 256-token batch-major probe ran -- 10,200
-pairs, exit 0, check-telemetry OK. The gate FAILS inside the SDD's reference
-band (K=1 0.3088, K=2 0.4343 vs 0.6) while the T8 oracle ceiling is 0.9385 and
-the curve crosses 0.6 at K=4 = 2.26 GB, so the closing retention is ESCALATED
-to the owner rather than picked here; Phase B only on an adopted retention +
-owner review);
+prefetch) DONE-falsified-by-evidence 2026-09-13, gate MEASURED (Phase A DONE:
+the analyzer extension and the statistic (b) simulation are cross-validated
+against the recorded ladder pilot, and the 256-token batch-major probe ran --
+10,200 pairs, exit 0, check-telemetry OK. (b) is 0.3088 at K=1 and 0.4343 at
+K=2 against the 0.6 gate, so the gate FAILS at the SDD section 4 reference
+sizing and the task closes per gate 9. The escalated retention choice was
+CLOSED 2026-09-13 by adopting that band: the K=4 = 2.26 GB crossing was
+rejected as the optimistically biased half of the measurement, and a
+non-echoing re-probe is recorded as a precondition for any future retention
+above the band. The T8 oracle ceiling is 0.9385, so the predictor's existence
+is not falsified -- only the budgeted variant is; Phase B not entered);
 T-GPLR-18 (pinned row-set staging, F1) DONE-falsified-by-evidence 2026-09-13
 -- the paired 512 A/B (A/B/A/B inside one GPU-mutex session) found pinned
 merely RELOCATES the staging copy (submit 1,918 -> 927 us, ready-wait
@@ -133,8 +134,9 @@ lever reverts to F2 (bytes) or T-GPLR-15 hiding;
 T-GPLR-16 (mixed-placement TG mode)
 DEPRIORITIZED to DRAFT (2026-09-12, owner gate (b) decision) --
 in-progress implementation parked, MIN_BATCH=1 disposition = option (a)
-revert, (b)/(c) unprioritized. No implementation task is currently ready:
-T-GPLR-15 waits on the owner's retention decision and T-GPLR-18 is closed.
+revert, (b)/(c) unprioritized. With T-GPLR-15 and T-GPLR-18 both closed, the
+only READY task is T-GPLR-17 (two-process hybrid bridge), which the owner has
+not selected; implementation stays one task at a time.
 ```
 
 ### T-GPLR-00: Inventory the MoE artifact and capacity
@@ -2054,13 +2056,33 @@ Escalate before reuse if
 
 ### T-GPLR-15: Predictive per-token expert prefetch (one-window-ahead)
 
-Status: in-progress (2026-09-13). Contract rewritten on owner request
-2026-09-13 now that T-GPLR-13 is DONE and `rowset_fetch` telemetry exists in
-real traces. GATE-MEASUREMENT-FIRST contract: Phase A measures the 0.6
-temporal hit-rate gate with NO library changes and NO implementation of
+Status: DONE-falsified-by-evidence (2026-09-13). Contract rewritten on owner
+request 2026-09-13 now that T-GPLR-13 is DONE and `rowset_fetch` telemetry
+exists in real traces. GATE-MEASUREMENT-FIRST contract: Phase A measures the
+0.6 temporal hit-rate gate with NO library changes and NO implementation of
 prediction; the task closes as falsified-by-evidence if the gate measures
 below 0.6 (SDD gate 9). Only a PASS advances to Phase B (implementation,
 separately owner-reviewed).
+RETENTION DECISION 2026-09-13 (the escalated choice, now CLOSED): the gate is
+read at the SDD section 4 reference sizing — one-to-two window retention, K=1-2,
+566 MB / 1.13 GB over the 40 MoE layers — and (b) measures 0.3088 / 0.4343
+there, BELOW 0.6, so the task closes falsified-by-evidence per gate 9. The
+three options were (i) declare K=4 = 2.26 GB, which makes the gate pass and
+Phase B eligible; (ii) keep the SDD's band, which closes the task falsified;
+and (iii) re-probe on a non-echoing prompt before deciding. Option (ii) is
+adopted. (i) is REJECTED on evidence: the K=4 crossing sits on a stream that
+echoes its own anchor document, and repetition can only INCREASE temporal
+reuse, so 0.6284 is the optimistically biased half of the measurement —
+committing 2.26 GB of VRAM to it is exactly what the pre-registered caveat
+forbids. (iii) is not a prerequisite for this close, but is recorded as a
+PRECONDITION for any future retention above the band: by the same monotonicity
+it can only LOWER (b), so it can never rescue (i) and can only confirm the
+in-band FAIL more strongly. What is falsified is the BUDGETED variant, not the
+predictor's existence — the T8 oracle ceiling is 0.9385 — so a future task may
+declare a retention and re-read the same statistic; nothing here forbids that,
+and F2's per-layer cache class is unaffected (its SDD treatment exists).
+Phase B is NOT entered, no library change was made, and the reactive row-set
+path plus the closed handoff remain the program's TG answer.
 Phase A status (2026-09-13): the analyzer half is DONE and its cross-validation
 step PASSED. `tools/route_overlap/analyze.py` now accepts the `rowset_*`
 events, validates every `rowset_fetch` (canonical `union_ids`, count,
@@ -2091,7 +2113,10 @@ NOT fire. However the T8 oracle ceiling is **0.9385** and the curve crosses 0.6
 at **K=4 = 32 rows/layer = 2.26 GB** (K=8 4.53 GB → 0.7775; K=16 9.06 GB →
 0.9376), so the verdict now turns on which retention is declared — a VRAM /
 product tradeoff. That is ESCALATED to the owner under this task's escalation
-condition rather than picked here; T-GPLR-15 stays in-progress. Caveat that
+condition rather than picked here; T-GPLR-15 stays in-progress until that
+choice is made — DECIDED 2026-09-13: option (ii) adopted, so the task closes
+falsified-by-evidence; see the RETENTION DECISION paragraph in the Status
+field above. Caveat that
 travels with the ceiling: the generated text is an echo loop of the anchor
 document (463 chars, the document's code phrase 6x, `<think>` 7x; token
 periodicity 0.479 at lag 39, immediate repeats only 8.6%), and repetition can
@@ -2129,7 +2154,9 @@ permitted execution shapes, loud cache failures, cache-vs-link telemetry
 classes, gate 10, and the cache risk list. A Phase B / F2 contract is no
 longer blocked on design.
 Depends on: T-GPLR-13 (DONE); T-GPLR-14 (instrument, closed).
-Commit: none.
+Commit: the closing commit is the one carrying the 2026-09-13 RETENTION
+DECISION above; its hash is recorded by the short bookkeeping commit that
+follows it (the same two-step pattern used for T-GPLR-18's ba1f31e).
 
 Goal
 : Raise MoE TG tok/s by staging the NEXT token window's row set while

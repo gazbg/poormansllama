@@ -1,5 +1,55 @@
 # Current State
 
+## 2026-09-13: T-GPLR-15 CLOSED DONE-falsified-by-evidence — the escalated retention choice resolved in favour of the SDD's reference band (K=1-2: 0.3088 / 0.4343 vs 0.6); the 2.26 GB crossing rejected as the biased half of a self-echoing stream
+
+Owner-directed close of the escalation recorded in the probe entry below.
+Decision only: no library change, no GPU run, no new task scope.
+
+The gate is read at the retention the adopting task declares, and the SDD's own
+sizing is the only non-arbitrary declaration available (SDD section 4: capacity
+`min(n_expert, K*W*top_k)` rows x member slab bytes, "a one-to-two window
+retention is ~0.57-1.13 GB across 40 MoE layers"). Measured there:
+statistic (b) = **0.3088 at K=1 (566 MB) and 0.4343 at K=2 (1.13 GB)**, both
+below the 0.6 threshold, so the gate FAILS and the task closes falsified per
+SDD gate 9.
+
+The three options as they stood, and what each would have cost:
+
+| option | retention / VRAM | gate | Phase B |
+| --- | --- | --- | --- |
+| (i) declare K=4 | 32 rows/layer = 2.26 GB over 40 layers | PASS (0.6284) | eligible on owner review |
+| (ii) keep the SDD's band | K=1-2 = 566 MB / 1.13 GB | FAIL (0.3088 / 0.4343) | not entered; task closed falsified |
+| (iii) re-probe non-echoing | unchanged until run | undetermined | deferred |
+
+- **Adopted: (ii).** The FAIL is the ROBUST half of the measurement: repetition
+  can only INCREASE temporal reuse, so a non-repetitive stream measures the same
+  or lower. The gate therefore fails on evidence whose bias direction reinforces
+  the verdict rather than undermining it.
+- **(i) rejected on evidence, not on caution.** The K=4 crossing (0.6284, first
+  reading at or above 0.6) is the OPTIMISTIC half: it sits on a stream that
+  echoes its own anchor document (463 chars, the document's code phrase 6x,
+  `<think>` 7x). Committing 2.26 GB of VRAM to a number known to be biased
+  upward is exactly what the pre-registered caveat forbids. Rejecting it does
+  not dispute the ceiling (0.9385) — it declines to spend VRAM on the crossing.
+- **(iii) is not a prerequisite for this close, but is recorded as a
+  PRECONDITION for any future retention above the band.** By the same
+  monotonicity it can only LOWER (b), so it cannot rescue (i) — it can only
+  confirm the in-band FAIL more strongly. Its value is forward-looking: no
+  higher-retention commitment should be made until the stream is not an echo.
+- **What is NOT falsified.** Only the BUDGETED variant. The T8 oracle ceiling is
+  0.9385, so the predictor's existence is untouched, and a future task may
+  declare a retention and re-read the same statistic under SDD gate 9. F2's
+  per-layer row-cache class is unaffected (its SDD section 4 treatment already
+  exists), and the reactive row-set path plus the closed handoff remain the
+  program's TG answer. Nothing here is a throughput, quality, or equivalence
+  claim.
+- **Residual risk carried forward.** The verdict is K-sensitive by construction
+  and this close fixes it at the SDD's band; if F2 later adopts a larger
+  retention, it inherits the echo-stream caveat as its own measurement problem,
+  not this task's. The per-layer spread at K=2 (0.1946-0.5353, no layer reaching
+  0.6) means the aggregate-vs-per-layer escalation never fired, so no per-layer
+  policy question is left open here either.
+
 ## 2026-09-13: Closing-hash and tracked-status bookkeeping after ba1f31e
 
 Documentation only; this record lands with its own commit. AGENTS.md requires the
@@ -7,6 +57,11 @@ closing commit hash in the task plan (the four-dimension audit found T-GPLR-13
 missing exactly this), so `ba1f31e` is now in the T-GPLR-18 `Commit:` field.
 T-GPLR-15 stays `Commit: none` — it is in-progress with the gate reading
 measured but a retention decision outstanding, so no close exists to cite.
+[SUPERSEDED 2026-09-13: the retention decision was then made and T-GPLR-15
+closed DONE-falsified-by-evidence — see the newest entry at the top of this
+file; its closing hash is recorded by the bookkeeping commit that follows this
+one. The wording above describes the state at the time of the commit it
+records.]
 T-GPLR-14's field said `Commit: none` too, which stopped matching reality once
 its instrument entered history: it now records that the tool was untracked at
 close, that the instrument landed as `1dbdaf3` and its poller helper as
@@ -156,7 +211,10 @@ Recorded evidence
   falsified-by-evidence per gate 9; or (iii) re-probe on a non-repetitive
   prompt first, because the crossing point is measured on an echoing stream.
   Nothing here claims a speedup, a quality result, or an F2 implementation;
-  T-GPLR-15 stays in-progress.
+  T-GPLR-15 stays in-progress. [DECIDED 2026-09-13: option (ii), the SDD's
+  K=1-2 reference band — the task closed DONE-falsified-by-evidence; see the
+  newest entry at the top of this file. The wording above is retained as
+  written: it describes the state before the choice was made.]
 
 ## 2026-09-13: T8 oracle retention ceiling added to the analyzer — on the ladder samples NO policy can reach the 0.6 gate, but those samples structurally cannot settle it
 

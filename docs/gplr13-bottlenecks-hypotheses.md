@@ -556,6 +556,19 @@ measures routing predictability only. Whether 2.26 GB of retention is
 acceptable is a product decision, escalated to the owner (see
 `docs/currentstate.md`, 2026-09-13).
 
+**DECIDED 2026-09-13 (owner-directed close).** The verdict is read at the SDD's
+own reference sizing — one-to-two window retention, K=1-2, 566 MB-1.13 GB — where
+(b) is 0.3088 / 0.4343, so the gate FAILS and T-GPLR-15 closes
+falsified-by-evidence per gate 9. The 2.26 GB K=4 crossing is REJECTED as the
+optimistically biased half of the measurement: it sits on a stream that echoes
+its own anchor, and repetition can only inflate reuse, so it is not a sound
+basis for committing VRAM. A non-echoing re-probe is recorded as a precondition
+for any future retention above the band — by the same monotonicity it can only
+LOWER (b), so it can confirm this FAIL but can never rescue the crossing. What
+is falsified is the budgeted variant, not the predictor's existence (the oracle
+ceiling is 0.9385), so a later task may declare a retention and re-read the same
+statistic under gate 9.
+
 ## 8. T-GPLR-18 closed falsified-by-evidence (2026-09-13): pinned row-set staging relocates the copy, it does not speed it up
 
 Section 6.7 predicted this result from T-Q38PERF-03 and T-Q38TG-00 and the
