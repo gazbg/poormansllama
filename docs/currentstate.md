@@ -1,5 +1,29 @@
 # Current State
 
+## 2026-09-13: Closing-hash and tracked-status bookkeeping after ba1f31e
+
+Documentation only; this record lands with its own commit. AGENTS.md requires the
+closing commit hash in the task plan (the four-dimension audit found T-GPLR-13
+missing exactly this), so `ba1f31e` is now in the T-GPLR-18 `Commit:` field.
+T-GPLR-15 stays `Commit: none` — it is in-progress with the gate reading
+measured but a retention decision outstanding, so no close exists to cite.
+T-GPLR-14's field said `Commit: none` too, which stopped matching reality once
+its instrument entered history: it now records that the tool was untracked at
+close, that the instrument landed as `1dbdaf3` and its poller helper as
+`ba1f31e`.
+
+The tracked/untracked statements were re-swept after `tools/gpu-mem-poll.ps1`
+and `tools/run-gplr18-pinned-ab.ps1` became tracked. One was stale: the schema
+draft's section 6 still called `tools/route_overlap/analyze.py` UNTRACKED, so it
+now dates the tracking (`1dbdaf3`) and separates what a clean checkout does
+contain from what it does not (the `.ps1` runners, the MEMPROBE tools, and the
+gitignored `build/` traces). All other such statements — the T-GPLR-14 harness
+list, the `build/analyze_gplr13_ladder.py` provenance caveat, and the
+retained-as-written blocks carrying their own RESOLVED annotations — were
+checked and still hold. The caveat that the pinned arm is unreproducible from a
+clean checkout until the vendored `load_row_set` change is committed stands
+unchanged; that stays the owner's repo-convention call.
+
 ## 2026-09-13: T-GPLR-18 pinned row-set staging CLOSED DONE-falsified-by-evidence — the 512 A/B shows pinned only RELOCATES the staging copy (submit 1,918 -> ~927 us, ready-wait 110 -> ~1,058 us, per-fetch transfer flat) and costs ~1.8 GiB more pinned host memory
 
 F1 (bottlenecks section 6.3) tested against its own recorded counter-evidence

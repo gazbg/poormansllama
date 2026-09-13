@@ -1978,7 +1978,12 @@ Status: done (2026-09-09). Validated on real traces; the tool was
 reconstructed the same day after its isolated workspace was lost (see
 Provenance) and re-proven against the recorded artifacts
 byte-for-byte. Depends on: none (host-only, stdlib-only, read-only).
-Commit: none.
+Commit: none at close (the instrument was untracked then, and this commit
+records no close); the instrument entered version control as 1dbdaf3
+(2026-09-13) after the T-GPLR-15 Phase A extension, and its poller helper
+`tools/gpu-mem-poll.ps1` followed in ba1f31e — so both the Task 14 instrument
+and the poller its ladder runs use are present in a clean checkout, while the
+`.ps1` runners that drive them are still untracked (owner's call).
 
 Goal
 : Quantify, from existing telemetry traces only, the expert-union
@@ -2551,7 +2556,11 @@ vs 19.95/20.07 GiB direct). Evidence in `docs/currentstate.md` (2026-09-13) and
 `build/llama-cuda/gplr18-pinned-ab/`. Depends on: T-GPLR-13 (DONE — the
 row-set path and its telemetry); the existing pinned staging machinery and
 `--copy-source pinned` (T-Q38PERF-03, done 2026-08-20; dense pinned CTest
-fixture present; still passing 4/4 with the row-set change in place). Commit: none.
+fixture present; still passing 4/4 with the row-set change in place). Commit: ba1f31e
+(documentation close-out 2026-09-13: the A/B record in `docs/currentstate.md`,
+bottlenecks section 8, this status flip, and the driver +
+`tools/gpu-mem-poll.ps1`; the `load_row_set` change itself stays uncommitted in
+the vendored tree, see the note below).
 Note: the `load_row_set` change itself is UNCOMMITTED in the dirty
 `third_party/llama.cpp` working tree (owner convention for the vendored fork),
 so the pinned arm is not reproducible from a clean checkout.

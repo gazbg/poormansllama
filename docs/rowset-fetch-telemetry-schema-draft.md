@@ -184,8 +184,12 @@ The gate verdict is SDD statistic (b) per the SDD section 10 gate 9 decision
 rule; the remaining items are context or telemetry-integrity work.
 
 IMPLEMENTED 2026-09-13 (T-GPLR-15 Phase A): every item below is in
-`tools/route_overlap/analyze.py` (that file is in the working tree but is still
-UNTRACKED, like the rest of the T-GPLR-14 harness), verified by reproducing the
+`tools/route_overlap/analyze.py`. That file entered version control on
+2026-09-13 (commit 1dbdaf3), as did this spec, so the producer of these numbers
+is present in a clean checkout; the rest of the T-GPLR-14 harness (the `.ps1`
+runners, the MEMPROBE tools) is still untracked, and the `build/` traces the
+analyzer reads are gitignored, so re-deriving the numbers needs a fresh ladder
+run. Verified by reproducing the
 recorded ladder
 pilot exactly (0/80 hash-equal; statistic (b) at K=1 = 0.3766 / 0.3703 /
 0.3891 / 0.3578 at 50/512/4k/200k; first K=2 values 0.4031 / 0.4031 / 0.4266 /
