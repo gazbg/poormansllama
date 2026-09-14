@@ -2912,6 +2912,41 @@ half `third_party/llama.cpp` **4fcca3777**; outer half (docs, tools, gitlink
 bump) in the `Record ...` commit carrying this line: **a193028** (hash recorded
 in the follow-up commit, per the convention's existing field format).]
 
+[UPDATED 2026-09-14 (same day, owner-directed), DEFAULT DEPTH IS NOW FIT TO THE
+DEVICE: the footgun recorded with the K=4 default — an opt-in run on a tight
+device had no choice but a 2.19 GB allocation or a bring-up failure — is
+closed. The library exposes `row_cache_bytes_for(k)`, which predicts a depth's
+private VRAM by running the same per-member CUDA-alloc arithmetic the
+allocation runs (tensors created in a throwaway metadata context, no device
+memory), and `begin_row_cache()` was refactored onto that shared helper so the
+prediction and the allocation cannot drift. The tool owns the policy, as it
+already owns `--reserve-mib`: the budget is `free_now − reserve_mib −
+slot_window_estimate`, holding back the slot window because `begin_row_set()`
+runs AFTER the cache and those buffers would otherwise be starved by it (the
+preflight's `bounded` figure is deliberately not reused: it contains the
+already-allocated static/KV/state bytes and would have downscaled the default on
+the very device where K=4 is measured to work). ONLY the default is fitted; a
+NAMED depth allocates in full or fails loudly, so a gate run still gets the
+depth it declares, and the resolved depth is what `rowset_init.retain_k`
+reports. FIVE arms, one mutex session: F1 bare/default reserve -> K=4 "fitted to
+the device" (2,291,531,776 B of a 17,149,460,480 B budget); F2 reserve 780 ->
+still K=4; F3 depth NAMED 4 with the same reserve -> NO fit line at all;
+F4 reserve 15,000 -> budget 1,957,691,392 B, the downscale branch fires and
+provisions K=3 (40 x 24 rows = 1639.2 MiB); F5 reserve 16,500 -> budget
+384,827,392 B, the "not even K=1 fits" refusal fires, exit 1, no trace. Both
+bands are therefore EXECUTED, not argued — `--reserve-mib` is the lever that
+reaches them while keeping the preflight's own bounded+slabs+reserve check
+satisfied. Parity: F1 is byte-identical to F3 and to the recorded K=4 rung
+(staged 54,797,721,600 B, rows 30,641 / 51,279 / 29,361, greedy sha16
+f690bfa4), so the fitted default costs nothing on this device; F4's K=3 arm
+reproduces the offline-vs-runtime invariant at a third depth (runtime retained
+43,495 == offline `hits_total`, (b) = 0.533027). No gate verdict is created or
+changed: K=4 remains a provisional operating default whose crossing is still
+echo-biased, and the non-echoing re-probe remains its outstanding validation.
+Commit: vendored half `third_party/llama.cpp` **cc7cacc60**; outer half (the
+three docs and the gitlink bump) in the `Record ...` commit carrying this entry,
+whose hash the follow-up commit records, per the convention's two-hash form.]
+
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
 run has been made". The mechanism HAS since been implemented behind the

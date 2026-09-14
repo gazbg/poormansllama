@@ -1,5 +1,94 @@
 # Current State
 
+## 2026-09-14: the per-layer row cache's DEFAULT depth is now fitted to the device — K=4 where the device affords it (unchanged on the reference box), the largest depth that fits where it does not, a loud refusal when not even K=1 fits; a NAMED depth is still never reduced
+
+Owner direction: "make the K=4 default depth VRAM-adaptive … so an opt-in run
+on a tight device provisions what fits instead of failing loudly at 2.19 GB".
+Host + five GPU arms under one mutex. This closes the footgun recorded when
+K=4 became the default (an opt-in run on a tight device previously had no
+choice but a 2.19 GB allocation or a bring-up failure).
+
+**Shape of the change.** `llama_layer_streaming::row_cache_bytes_for(k)`
+(library, public, `const`) predicts the private VRAM a depth would need by
+running the *same* per-member sizing the allocation runs — it creates the cache
+tensors in a throwaway metadata context (no device memory) and sums the CUDA
+alloc sizes, so the prediction and the allocation cannot drift. The per-layer
+loop in `begin_row_cache()` was refactored onto that shared helper; the two
+sites are now one arithmetic. The tool owns the policy, as it already owns
+`--reserve-mib`: `row_cache_fit_depth()` in `tools/layer-streaming/main.cpp`
+picks the largest depth in `[1, requested]` whose prediction fits the budget.
+
+**The budget is free VRAM minus what the run must still allocate.**
+`budget = free_now − reserve_mib − slot_window_estimate`. The slot window is
+held back deliberately: `begin_row_set()` runs *after* the cache (~line 3638 vs
+~3195), so those slot buffers do not exist yet and an unfitted cache would eat
+those bytes and fail mid-generation — the loud-at-bring-up rule would be broken.
+Nothing is double-counted: the preflight's `bounded` figure is *not* reused for
+this because it contains the already-allocated static/KV/state bytes, which
+would have downscaled the default on the very device where K=4 is measured to
+work.
+
+**Only the default is fitted.** A depth the operator names is a contract and is
+never reduced — a gate run must get the depth it declares, never a silently
+shallower (b). `--residency-tg-retain N` therefore allocates in full or fails
+loudly exactly as before; the fit runs only for the bare flag. The resolved
+depth is what `rowset_init.retain_k` reports, so any (b) claim stays anchored to
+the depth actually provisioned rather than to the one that was asked for.
+
+Device facts and the five arms (same 512-token anchor, batch-major probe shape,
+`--layer-slots 4`, `--kv-cache q8`, 256 TG tokens; K=4 needs 2,291,531,776 B,
+K=3 1,718,812,672 B, and each K step adds 572,719,104 B = 8 rows/layer):
+
+- total VRAM 25,650,855,936 B; free at the fit 19,775,094,784 B; slot-window
+  estimate 2,088,763,392 B.
+
+| arm | reserve | budget | resolved | evidence |
+| --- | --- | --- | --- | --- |
+| F1 | 512 (default) | 17,149,460,480 B | **K=4** | "fitted to the device"; 40 layers x 32 rows = 2185.4 MiB |
+| F2 | 780 | 16,868,442,112 B | **K=4** | budget still ample — the branch is not near its edge here |
+| F3 | 780, depth NAMED 4 | (fit not run) | **K=4** | no fit line at all: a named depth bypasses the fit |
+| F4 | 15,000 | 1,957,691,392 B | **K=3** | downscale branch: "default depth K=4 needs 2291531776 B but only 1957691392 B … is available to the cache; provisioning the largest fitting depth K=3"; allocated 40 x 24 rows = 1639.2 MiB |
+| F5 | 16,500 | 384,827,392 B | **refused, exit 1** | "the cache budget is only 384827392 B … not even K=1 fits"; no trace written |
+
+`--reserve-mib` is the only lever that shrinks the cache budget while keeping
+the preflight's own `bounded(4,717,996,544) + slabs + reserve <= free(22,226,665,472)`
+check satisfied, which is how F4/F5 reach the downscale and refusal bands on a
+device that affords K=4. Both bands were therefore *executed*, not merely
+argued.
+
+**Parity.** F1 (bare flag) is byte-identical to F3 (named K=4) **and to the
+recorded K=4 rung**: `retain_k` 4, staged 54,797,721,600 B (5,351,340 B/fetch),
+rows fetched/retained/retired 30,641 / 51,279 / 29,361, greedy text sha16
+f690bfa4. So on this device the fitted default is indistinguishable from the
+recorded operating point — the adaptivity costs nothing here. F4's K=3 arm
+reproduces the campaign invariant at a *third* depth (K=3 was not in the
+crosschecked K=1/2/4/8 set): runtime `n_rows_retained` 43,495 equals the offline
+statistic's `hits_total` exactly, at offline (b) = 0.533027.
+
+**Validation.** Build clean; host suite 23/23; QA smoke 512 PASS (check-telemetry
+OK 23,326 events, all five needles found, negative control FAILS as designed);
+ctest `layer-streaming-pinned-1024` 2/2, `qwen38-layer-boundary` 1/1,
+`layer-slot-lifecycle` 1/1; all four completed arms exit 0 with
+`--check-telemetry` OK; GPU-free parser checks unchanged for a bad depth
+("expects 1..64 windows (got 0)") and the `--help` text documents the fit.
+
+**Residual risk.** The fit's *inputs* are estimates: `pf_slot_window` is the
+preflight's host-derived slot-window figure (measured slot VRAM was 1,950,367,744 B
+against the 2,088,763,392 B estimate, so the hold-back is slightly conservative —
+the safe direction), and the budget is evaluated once at bring-up, so a later
+allocation by a foreign process can still make the cache itself fail loudly.
+No gate verdict is created or changed by any of this: the K=4 default remains a
+provisional operating default whose (b) crossing is still echo-biased, and the
+non-echoing re-probe remains its outstanding validation. F5's refusal leaves the
+run unstarted, which is the intended "loud, pre-work" behaviour, not a regression.
+
+**Commit.** Vendored half in `third_party/llama.cpp` **cc7cacc60** (three files,
++165/−20); outer half — this entry, the SDD amendment clause, the plan's T-GPLR-19
+update, and the 2-line gitlink bump (`4fcca3777` → `cc7cacc60`) — in the root
+`Record ...` commit carrying these records. That outer hash lands in a follow-up
+commit because a commit cannot name its own, matching the convention's existing
+two-step.
+
 ## 2026-09-14: K=4 set as the per-layer row cache's provisional DEFAULT depth (owner-directed) — bare-flag arm reproduces the recorded K=4 rung exactly; the mechanism stays opt-in and default-off
 
 Owner direction: "set K=4 as default for now". Host + one GPU arm under the

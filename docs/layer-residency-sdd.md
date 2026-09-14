@@ -78,8 +78,15 @@ the first requirement of any task that claims a K=4 gate PASS — it is no longe
 a precondition for provisioning the depth. The mechanism itself remains opt-in
 and default-off: disabling the experimental option changes no default placement
 and no non-experimental behaviour, and the depth applies only when an operator
-selects the cache. `--residency-tg-retain` with no value selects K=4; any depth
-in 1..64 may still be named explicitly, and naming one overrides this default.
+selects the cache. `--residency-tg-retain` with no value selects K=4 where the
+device affords it and otherwise the largest depth that does, so K=4 is a depth
+CEILING for the bare flag rather than a fixed allocation: the depth is fitted at
+bring-up to free VRAM less the operator's `--reserve-mib` and less the slot
+window the run has not allocated yet, and a device that cannot take even K=1 is
+refused loudly before any timed work. A NAMED depth is never reduced — any depth
+in 1..64 may still be named explicitly and is allocated in full or fails loudly
+— so the depth a task declares for a gate reading is always the depth actually
+provisioned, and the fitted result is what the `rowset_init` telemetry reports.
 
 ## 2. Fixed Acceptance Targets
 
@@ -239,10 +246,12 @@ arrives.
   declared capacity is a loud refusal — never silent growth, and never
   eviction of an entry a running consumer may still read. **Default depth
   (owner-directed 2026-09-14): K=4** (32 rows/layer, ~2.19 GB over 40 MoE
-  layers). A caller that selects the cache without naming a depth gets K=4; the
-  capacity arithmetic above is unchanged and any K in 1..64 may be named
-  explicitly. See the 2026-09-14 scope amendment for why this is a provisional
-  operating default rather than a gate verdict.
+  layers), fitted to the device — a caller that selects the cache without naming
+  a depth gets K=4 where the device affords it and otherwise the largest depth
+  that fits, while a NAMED depth is never reduced. The capacity arithmetic above
+  is unchanged and any K in 1..64 may be named explicitly. See the 2026-09-14
+  scope amendment for the fit and for why this is a provisional operating
+  default rather than a gate verdict.
 - **Atomicity per window.** A window's rows become ready together and retire
   together; a row-consuming graph observes only ready entries, and a cached
   row consumed by a layer's row-consuming phase is ordered after the matching

@@ -5,6 +5,12 @@
 # default arm stays K=1 so that -AnalyzeOnly still regenerates the recorded K=1
 # report in place; pass -RetainK to compare another depth.
 #
+# NOTE (2026-09-14, second): the bare-flag DEFAULT is now fitted to the device
+# (largest depth that fits free VRAM less --reserve-mib and the slot window).
+# This driver always passes an EXPLICIT depth, which is never reduced, so every
+# gate reading here is anchored to the depth the arm declares and cannot be
+# silently shallowed by a tight device. Do not switch an arm to the bare flag.
+#
 # Arms are A,B,A,B where A = the reactive row-set path (row-retention off, the
 # recorded baseline) and B = `--residency-tg-retain 1`, the resolved
 # row-capacity LRU cache. All four arms run back to back inside ONE acquisition
