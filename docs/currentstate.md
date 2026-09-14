@@ -57,9 +57,9 @@ reference band). Any task that claims a K=4 gate PASS inherits that requirement.
 
 **Commit.** Vendored half in `third_party/llama.cpp` **4fcca3777** (the two
 files, +47/−8); outer half — this docs set, the driver note, and the 2-line
-gitlink bump (`a61528b47` → `4fcca3777`) — in the root `Record ...` commit that
-carries this entry. The outer hash lands in a follow-up commit because a commit
-cannot name its own, matching the convention's existing two-step.
+gitlink bump (`a61528b47` → `4fcca3777`) — in root commit **a193028**. That hash
+is recorded here in a follow-up commit because a commit cannot name its own,
+matching the convention's existing two-step.
 
 ## 2026-09-13: T-GPLR-19 deferred rungs RUN at K=2, K=4, K=6, K=8 — every rung passes, the runtime reproduces the offline statistic exactly, and the byte-to-time conversion is now measured as DEGRADING with depth
 

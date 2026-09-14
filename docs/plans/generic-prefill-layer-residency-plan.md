@@ -2909,8 +2909,8 @@ RE-PROBE is still outstanding and is now the VALIDATION of this default rather
 than a precondition for provisioning it. Commit for THIS change only (the rest
 of the block's history sits under the hashes recorded further down): vendored
 half `third_party/llama.cpp` **4fcca3777**; outer half (docs, tools, gitlink
-bump) in the `Record ...` commit carrying this line, whose hash the follow-up
-commit records, per the convention's two-hash form.]
+bump) in the `Record ...` commit carrying this line: **a193028** (hash recorded
+in the follow-up commit, per the convention's existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
