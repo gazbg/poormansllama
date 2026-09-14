@@ -2944,8 +2944,9 @@ reproduces the offline-vs-runtime invariant at a third depth (runtime retained
 changed: K=4 remains a provisional operating default whose crossing is still
 echo-biased, and the non-echoing re-probe remains its outstanding validation.
 Commit: vendored half `third_party/llama.cpp` **cc7cacc60**; outer half (the
-three docs and the gitlink bump) in the `Record ...` commit carrying this entry,
-whose hash the follow-up commit records, per the convention's two-hash form.]
+three docs, the driver note and the gitlink bump) in the `Record ...` commit
+carrying this entry: **9564ca5** (hash recorded in the follow-up commit, per the
+convention's existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU

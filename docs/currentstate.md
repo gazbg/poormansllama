@@ -85,9 +85,9 @@ run unstarted, which is the intended "loud, pre-work" behaviour, not a regressio
 **Commit.** Vendored half in `third_party/llama.cpp` **cc7cacc60** (three files,
 +165/−20); outer half — this entry, the SDD amendment clause, the plan's T-GPLR-19
 update, and the 2-line gitlink bump (`4fcca3777` → `cc7cacc60`) — in the root
-`Record ...` commit carrying these records. That outer hash lands in a follow-up
-commit because a commit cannot name its own, matching the convention's existing
-two-step.
+`Record ...` commit carrying these records: **9564ca5**. That outer hash is
+recorded here in a follow-up commit because a commit cannot name its own,
+matching the convention's existing two-step.
 
 ## 2026-09-14: K=4 set as the per-layer row cache's provisional DEFAULT depth (owner-directed) — bare-flag arm reproduces the recorded K=4 rung exactly; the mechanism stays opt-in and default-off
 
