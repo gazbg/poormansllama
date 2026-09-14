@@ -3035,7 +3035,7 @@ trace (40 `pkg_member` records, no `run_start`, which `--check-telemetry`
 rejects) plus stderr — unchanged by this pass and true of F5 before it.
 Commit: vendored half `third_party/llama.cpp` **ad565487a**; outer half (these
 docs, this entry and the gitlink bump) in the `Record ...` commit carrying this
-entry: **<pending>** (hash recorded in the follow-up commit, per the
+entry: **05bbdd5** (hash recorded in the follow-up commit, per the
 convention's existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and

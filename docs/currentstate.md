@@ -97,7 +97,7 @@ slot-window hold-back is a conservative estimate (2,088,763,392 B against
 
 **Commit.** Vendored half in `third_party/llama.cpp` **ad565487a** (one file,
 +86/-31); the outer half (this entry, the SDD scope amendment, the plan entry
-and the gitlink bump) in the `Record ...` commit for this pass: **<pending>**
+and the gitlink bump) in the `Record ...` commit for this pass: **05bbdd5**
 (hash recorded in the follow-up commit, per the convention's existing field
 format).
 
