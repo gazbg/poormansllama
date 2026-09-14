@@ -70,8 +70,8 @@ foreign allocation can make the cache itself fail loudly.
 
 **Commit.** Vendored half in `third_party/llama.cpp` **89e86f275** (one file,
 +143/-59); the outer half (this entry, the SDD sentence, the plan amendment and
-the gitlink bump) in the `Record ...` commit for this pass, whose hash is
-recorded in the follow-up commit per the convention's existing field format.
+the gitlink bump) in the `Record ...` commit for this pass: **0d9bc38** (hash
+recorded in the follow-up commit, per the convention's existing field format).
 
 ## 2026-09-14: the per-layer row cache's DEFAULT depth is now fitted to the device — K=4 where the device affords it (unchanged on the reference box), the largest depth that fits where it does not, a loud refusal when not even K=1 fits; a NAMED depth is still never reduced
 

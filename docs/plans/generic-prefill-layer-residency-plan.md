@@ -2972,8 +2972,8 @@ still caps only the bounded window: the cache budget stays free-derived and is
 deliberately NOT clamped by it — recorded as a named decision rather than left
 implicit. Commit: vendored half `third_party/llama.cpp` **89e86f275**; outer
 half (these docs, the plan entry and the gitlink bump) in the `Record ...`
-commit carrying this entry, whose hash is recorded in the follow-up commit per
-the convention's existing field format.]
+commit carrying this entry: **0d9bc38** (hash recorded in the follow-up commit,
+per the convention's existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
