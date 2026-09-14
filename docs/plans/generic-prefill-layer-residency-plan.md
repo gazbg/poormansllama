@@ -1239,6 +1239,40 @@ Escalate before implementation if
   experimental path), an LLM judge in the gate (dependency + nondeterminism
   policy), or ladder lengths re-batched (GPU budget decision).
 
+[LADDER 2026-09-14 (owner-invoked): rungs 4k and 50k RUN and PASS, one length at
+a time under the GPU mutex, on the MoE probe model in the reactive
+streaming-TG shape (`--no-handoff`). 4k via the documented default shape
+(`-Suite qa-smoke -SmokeLengths 4096`: whole prompt in ONE 4096-token ubatch) ->
+exit 0, check-telemetry OK (23,326 events), PP 4096 tok in 6.23 s, TG 96 tok in
+182.1 s, peak VRAM 5,059.56 MiB, all five needles PASS, negative control FAILS
+as designed. 50k via `-SmokeLengths 50000 -SmokeUbatch 512` -> exit 0,
+check-telemetry OK (46,606 events), PP 50,000 tok in 209.1 s (239.2 tok/s,
+transfer 186.1 s, wait 0.65 ms, compute 22.4 s), TG 96 tok in 181.3 s, peak VRAM
+4,957.56 MiB, same five needles PASS, negative control FAILS as designed. Traces
+`build/llama-cuda/gplr07-qa-4096.jsonl` and `gplr07-qa-50000.jsonl`.
+
+HARNESS FINDING, and the reason the 50k command gained a parameter: run as the
+suite documented it — the whole prompt in one ubatch — the 50k rung ABORTS inside
+the first prefill ubatch at `ggml/src/ggml-cuda/mmid.cu:138:
+GGML_ASSERT(nbytes_shared <= smpbo) failed`, the upstream CUDA MoE-matmul
+shared-memory limit whose demand grows with the tokens in the batch. The recorded
+24k rung ran at 24,575 tokens, so the one-ubatch shape has a ceiling between
+~24.6k and 50k. Classification: harness/test-expectation, not task-owned — the
+run reaches the timed PP (byte_account and graph_footprint are emitted first) and
+nothing in the layer-residency path is involved. Isolation: same rung, same
+flags, only `--ubatch 512` -> exit 0 with the same answer, reproduced twice
+(through the suite, and by a direct one-off whose failing artifacts are preserved
+as `build/llama-cuda/gplr07-qa-50000-oneubatch-fail.*`). Smallest repair:
+`tools/run-tests.ps1` now takes `-SmokeUbatch N`, default 0 = the recorded
+one-ubatch shape, so the 50/512/4k rungs are unchanged; ladder lengths above the
+~24.6k the 24k rung ran at must pass an explicit width. Provenance: both rung
+commands are reproducible from TRACKED tooling (`tools/run-tests.ps1` plus
+`tools/semantic-qa/gen-needle-prompt.py` / `check-answer.py`); the trace files
+and the direct one-off probe live under the gitignored `build/` root and do not
+survive a clean checkout. Residual: 100k and 200k remain unrun, each needing its
+own owner-invoked run and an explicit prefill width. No gate verdict is created
+or changed by these rungs — they are answer-stability measurements.]
+
 ### T-GPLR-08: One-layer-ahead PrefetchVirtualMemory probe (streaming tier)
 
 Status: done (2026-09-09; implemented and probed). Primary wall/transfer

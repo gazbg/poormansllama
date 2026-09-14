@@ -26,7 +26,8 @@
 #   boundary          - qwen38-layer-boundary + layer-slot-lifecycle only
 #   telemetry         - host-side telemetry validator targets only (no GPU, no lock)
 #   host              - host-only chunk-layout unit test + lm40/tail513/tail1025
-#                       telemetry fixtures (T-Q38CTX-01/02, no GPU, no lock)
+#                       telemetry fixtures (T-Q38CTX-01/02, no GPU, no lock) +
+#                       the T-GPLR-19 byte_account residency-cap fixtures
 #   pp20k             - one experimental run: PP 20480 tokens (ubatch 512) + TG 3 tokens,
 #                       --pp-no-logits, ~10-20 min, GPU (BLOCKED/superseded by
 #                       layer-major; kept for the owner to remove explicitly)#   pp20k-layer-major - T-Q38LM-03: PP 20480 tokens (ubatch 512, 40 chunks) in
@@ -38,7 +39,10 @@
 #               50-token rung is opt-in via -SmokeLengths 50 (comma list; the
 #               quoted-string form silently binds as one int and must not be
 #               used). 4k+ ladder lengths are manual owner-invoked commands, never
-#               part of this suite. The gate a developer runs after
+#               part of this suite; above ~24.6k tokens they must pass an explicit
+#               prefill width, e.g. -SmokeLengths 50000 -SmokeUbatch 512 (the
+#               default one-ubatch shape aborts in the upstream CUDA MoE matmul).
+#               The gate a developer runs after
 #               every runner change that touches the experimental path: calibrated
 #               needle prompt (gen-needle-prompt.py, exact token count) -> runner with
 #               --prompt-file + dedicated --telemetry JSONL under the GPU mutex ->
@@ -61,7 +65,16 @@ param(
     # qa-smoke rung selection: default = 512 only; the 50-token rung is opt-in
     # via -SmokeLengths 50 (comma list). 4k+ ladder lengths are manual
     # owner-invoked commands, never part of this suite.
-    [int[]] $SmokeLengths = @(512)
+    [int[]] $SmokeLengths = @(512),
+
+    # qa-smoke prefill width. 0 (default) keeps the recorded shape: the whole
+    # prompt in ONE ubatch (fine at 50/512/4k). The one-ubatch shape is NOT
+    # usable at 50k+ on the MoE model -- it aborts inside the upstream CUDA
+    # MoE matmul (ggml-cuda/mmid.cu: GGML_ASSERT(nbytes_shared <= smpbo)),
+    # whose shared-memory demand grows with the tokens in the batch. Ladder
+    # lengths above the ~24.6k that the recorded 24k rung ran at must pass an
+    # explicit chunk width, e.g. -SmokeUbatch 512.
+    [int] $SmokeUbatch = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -298,7 +311,10 @@ elseif ($spec.QaSmoke) {
         $log = Join-Path $buildDirResolved "gplr07-qa-$len.log"
         # T-GPLR-12: --no-handoff pins this gate to the recorded streaming-TG
         # shape (the default-profile QA rungs run separately with auto).
-        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $achieved --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --no-handoff --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
+        # -SmokeUbatch 0 keeps the recorded one-ubatch shape; a nonzero value
+        # chunks the prefill (required above ~24.6k tokens, see the param).
+        $ubatch = if ($SmokeUbatch -gt 0) { $SmokeUbatch } else { $achieved }
+        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $ubatch --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --no-handoff --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
         Write-Host "[qa-smoke] $len tokens: runner under GPU mutex (log $log)..."
         & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
             -TimeoutSeconds $spec.TimeoutSeconds -Command $runCmd

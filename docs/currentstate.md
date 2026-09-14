@@ -1,6 +1,80 @@
 # Current State
 
-## 2026-09-14 (latest): the TOTAL residency cap is now provable from JSONL — `byte_account` carries the provisioned row cache and the cap, and the checker enforces containment
+## 2026-09-14 (latest): T-GPLR-07 ladder rungs 4k and 50k PASS (owner-invoked, one at a time) — and the 50k rung exposed a HARNESS limit, not a mechanism one
+
+Owner-invoked acceptance runs on the semantic-QA ladder, one length at a time
+under the GPU mutex, on the MoE probe model in the reactive streaming-TG shape
+(`--no-handoff`, no retention). These are answer-stability measurements; no gate
+verdict is created or changed by them.
+
+| rung | command | result |
+| --- | --- | --- |
+| 4k | `tools/run-tests.ps1 -Suite qa-smoke -SmokeLengths 4096` (documented shape: whole prompt in ONE 4096-token ubatch) | **PASS** |
+| 50k | `tools/run-tests.ps1 -Suite qa-smoke -SmokeLengths 50000 -SmokeUbatch 512` | **PASS** |
+
+**4k**: prompt 4096 tokens exact (needles at rows 27/55/84/106 = 25/50/75/95%
+depth); exit 0; `--check-telemetry` OK (23,326 events, 1 slot); PP 4096 tok in
+6.23 s (657 tok/s, transfer 5.45 s, wait 6.7 ms); TG 96 tok in 182.1 s
+(0.527 tok/s); peak VRAM 5,059.56 MiB; answer `QX-7741 TR-2918 MK-5501 LD-8834
+Paris` -> aggregate PASS (all 5 items); negative control FAILS as designed.
+Trace `build/llama-cuda/gplr07-qa-4096.jsonl`.
+
+**50k**: prompt 50,000 tokens exact (needles at rows 346/693/1040/1318); exit 0;
+`--check-telemetry` OK (46,606 events, 1 slot); PP 50,000 tok in 209.1 s
+(239.2 tok/s, transfer 186.1 s, wait 0.65 ms, compute 22.4 s, 3,919 evictions,
+graph_builds 0); TG 96 tok in 181.3 s (0.529 tok/s); peak VRAM 4,957.56 MiB
+(LOWER than the 4k rung: single-slot batch-major peaks on the slot window, not
+on the context); same five-needle answer -> aggregate PASS; negative control
+FAILS as designed. Trace `build/llama-cuda/gplr07-qa-50000.jsonl`.
+
+**The 50k rung first FAILED, and the failure belongs to the ladder harness, not
+the residency path.** Run exactly as the suite documents it — the WHOLE prompt in
+one ubatch — 50k aborts inside the first prefill ubatch with
+`ggml/src/ggml-cuda/mmid.cu:138: GGML_ASSERT(nbytes_shared <= smpbo) failed`, an
+upstream CUDA MoE-matmul shared-memory limit whose demand grows with the tokens
+in the batch. Classification: harness/test-expectation, NOT task-owned — nothing
+in the layer-residency path is involved (the run reaches the timed PP, emitting
+`byte_account` and `graph_footprint` first), and the recorded 24k rung ran at
+24,575 tokens, so the shape worked to ~24.6k and breaks by 50k. Isolation: the
+SAME rung and flags with only the prefill width changed (`--ubatch 512`) exits 0,
+passes check-telemetry and produces the same answer — reproduced twice, once
+through the suite and once by a direct one-off
+(`build/llama-cuda/gplr07-qa-50000-chunked.*`: PP 50,000 tok in 210.1 s =
+238.0 tok/s, same five needles; its first cut produced an ungraded trace because
+a PowerShell `ErrorActionPreference` quirk turned the checker's stderr into a
+terminating error — fixed in the one-off, noted here rather than left silent).
+Failing artifacts preserved: `build/llama-cuda/gplr07-qa-50000-oneubatch-fail.{jsonl,log,suite.out}`
+(47 events: 40 `pkg_member`, `byte_account`, `run_start`, `graph_footprint`, one
+copy/slot pair, then the abort).
+
+Smallest repair made: `tools/run-tests.ps1` gains `-SmokeUbatch N` (default 0 =
+the recorded one-ubatch shape, so the 50/512/4k rungs are bit-for-bit
+unchanged); ladder lengths above the ~24.6k the 24k rung ran at must pass an
+explicit width. Recorded in the T-GPLR-07 contract.
+
+**The new `byte_account` fields are also exercised on these real traces** (not
+only on fixtures): both rungs run with retention OFF and their records carry
+`row_cache` 0 / `residency_cap` 0 with `bounded_window` 3,190,417,920 B (4k) /
+3,688,983,040 B (50k), and both pass `--check-telemetry` with the new rule live.
+These rungs emit no `rowset_init` at all (the streaming-TG shape has no row-set
+policy header), so the deferred retention tie is correctly SKIPPED rather than
+fired on an absent field — the immunity branch, on real data.
+
+**Residual / open.** The ladder is now green at 50/512/4k/50k (24k was green
+earlier in the campaign); 100k and 200k remain unrun, each needing its own
+owner-invoked run and, per the finding above, an explicit prefill width. The
+one-ubatch ceiling is an upstream CUDA limitation this repository cannot repair;
+the harness records it instead of hiding it. Provenance: both rung commands are
+reproducible from TRACKED tooling (`tools/run-tests.ps1` plus
+`tools/semantic-qa/gen-needle-prompt.py` and `check-answer.py`); the traces and
+the direct one-off probe live under the gitignored `build/` root and do not
+survive a clean checkout.
+
+**Commit.** This entry, the T-GPLR-07 contract note and the `-SmokeUbatch`
+parameter: the `Record ...` commit for this pass (hash recorded in the follow-up
+commit, per the convention's existing field format).
+
+## 2026-09-14 (later): the TOTAL residency cap is now provable from JSONL — `byte_account` carries the provisioned row cache and the cap, and the checker enforces containment
 
 Owner direction: "Add the provisioned row-cache bytes and the total residency cap to
 the byte_account record and teach the checker to verify that bounded residency
@@ -94,7 +168,7 @@ targets); outer half (this entry, the SDD amendment, the plan entry,
 pass: **e18188a** (hash recorded in this follow-up commit, per the convention's
 existing field format).
 
-## 2026-09-14 (later): `--residency-budget-mib` is now a TOTAL residency cap — the row cache must fit under it, and a NAMED depth past the cap is refused rather than allocated
+## 2026-09-14: `--residency-budget-mib` is now a TOTAL residency cap — the row cache must fit under it, and a NAMED depth past the cap is refused rather than allocated
 
 Owner direction: "make --residency-budget-mib a true total residency cap that the
 row cache must also fit under, so the cache cannot allocate on top of a budget
