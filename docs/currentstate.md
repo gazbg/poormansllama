@@ -91,8 +91,8 @@ cache-byte record, the shared `byte_account` emission, the runner's drift check
 and both validators, the fixture generator, five fixtures and the ctest
 targets); outer half (this entry, the SDD amendment, the plan entry,
 `tools/run-tests.ps1` and the gitlink bump) in the `Record ...` commit for this
-pass (hash recorded in the follow-up commit, per the convention's existing field
-format).
+pass: **e18188a** (hash recorded in this follow-up commit, per the convention's
+existing field format).
 
 ## 2026-09-14 (later): `--residency-budget-mib` is now a TOTAL residency cap — the row cache must fit under it, and a NAMED depth past the cap is refused rather than allocated
 

@@ -3106,8 +3106,8 @@ still make the cache fail loudly; activation slabs stay outside the cap, as
 recorded. Commit: vendored half `third_party/llama.cpp` **3f70b64d7**
 (record + emission + validator + fixtures + ctest); outer half (these docs,
 `tools/run-tests.ps1` and the gitlink bump) in the `Record ...` commit for this
-pass, recorded in the follow-up commit per the convention's existing field
-format.]
+pass: **e18188a** (recorded in this follow-up commit, per the convention's
+existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
