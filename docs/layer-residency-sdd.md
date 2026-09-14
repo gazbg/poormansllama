@@ -93,6 +93,19 @@ in 1..64 may still be named explicitly and is allocated in full or fails loudly
 — so the depth a task declares for a gate reading is always the depth actually
 provisioned, and the fitted result is what the `rowset_init` telemetry reports.
 
+Scope amendment 2026-09-14 (owner-directed): `--residency-budget-mib` is a TOTAL
+residency cap, not a window-only cap. The bounded residency (static + per-layer
+resident + slot window + KV + state) PLUS the row cache must fit under it, so no
+retain flag — bare or named — can place a cache on top of a budget the operator
+set. The fit's allowance is the smaller of what free VRAM leaves and what the
+budget leaves after the bounded residency; a NAMED depth that does not fit that
+allowance is refused loudly exactly as a named depth that does not fit free VRAM
+is, never silently reduced and never allocated past the cap. Activation slabs
+remain outside the cap: they are a measured runtime class gated against observed
+free VRAM, not a residency this mechanism manages. A run that sets no
+`--residency-budget-mib` is unaffected — the bounded window stays its own cap and
+the cache stays free-derived, so no existing measurement moves.
+
 ## 2. Fixed Acceptance Targets
 
 ### Dense reference
@@ -254,9 +267,13 @@ arrives.
   layers), fitted to the device — a caller that selects the cache without naming
   a depth gets K=4 where the device affords it and otherwise the largest depth
   that fits, while a NAMED depth is never reduced. The capacity arithmetic above
-  is unchanged and any K in 1..64 may be named explicitly. See the 2026-09-14
-  scope amendment for the fit and for why this is a provisional operating
-  default rather than a gate verdict.
+  is unchanged and any K in 1..64 may be named explicitly. An explicit
+  `--residency-budget-mib` caps the cache too: the allowance is the smaller of
+  free VRAM and the budget's remainder after the bounded residency, and a named
+  depth that does not fit it is refused loudly rather than allocated (see the
+  2026-09-14 TOTAL residency cap scope amendment). See the 2026-09-14 scope
+  amendment for the fit and for why this is a provisional operating default
+  rather than a gate verdict.
 - **Atomicity per window.** A window's rows become ready together and retire
   together; a row-consuming graph observes only ready entries, and a cached
   row consumed by a layer's row-consuming phase is ordered after the matching

@@ -2970,10 +2970,73 @@ deterministic accounting and the greedy text are unchanged (30,641 / 51,279 /
 `--residency-budget-mib` is now owned by the model as `bounded_budget_bytes` but
 still caps only the bounded window: the cache budget stays free-derived and is
 deliberately NOT clamped by it — recorded as a named decision rather than left
-implicit. Commit: vendored half `third_party/llama.cpp` **89e86f275**; outer
+implicit. [SUPERSEDED 2026-09-14 (same day, owner-directed): that open decision
+was closed — the field is now `residency_budget_bytes` and it caps the row cache
+as well. See the TOTAL RESIDENCY CAP entry below.] Commit: vendored half
+`third_party/llama.cpp` **89e86f275**; outer
 half (these docs, the plan entry and the gitlink bump) in the `Record ...`
 commit carrying this entry: **0d9bc38** (hash recorded in the follow-up commit,
 per the convention's existing field format).]
+
+[UPDATED 2026-09-14 (same day, owner-directed), TOTAL RESIDENCY CAP:
+`--residency-budget-mib` no longer caps only the bounded window — the row cache
+must fit under it too, so no retain flag can place a cache on top of a budget
+the operator set. The one budget model gains the two-sided allowance:
+`cache_cap_free` (free VRAM less `--reserve-mib` and the not-yet-allocated slot
+window, the existing rule) and `cache_cap_budget` (`residency_budget_bytes`
+minus the bounded residency, which already counts the slot window
+`begin_row_set()` allocates later), with `cache_budget` = the binding minimum of
+the two; with no explicit budget `cache_cap_budget` does not bind and the run is
+byte-for-byte the old one. A NAMED depth is now checked against the same
+allowance: it is still never reduced, but a depth that does not fit is refused
+loudly rather than allocated past the cap (previously a named depth was not
+checked at all). Refusals and downscale notices name whichever cap bound them,
+so the operator is sent to `--residency-budget-mib` rather than to free VRAM
+when the budget is what ran out.
+
+TEN GPU arms in one mutex session (probe: 512-token PP + 256-token TG, Qwen3.6
+35B-A3B, `--reserve-mib` 512 unless noted; bounded residency 4,717,996,544 B,
+slot window 2,088,763,392 B, free 19,775,094,784 B). They ran from an untracked
+one-off under the gitignored `build/` root
+(`build/llama-cuda/gplr19-budgetcap/run-cap.ps1` with its `arm-*.jsonl` /
+`arm-*.log` evidence), so these figures are not reproducible from tracked tooling
+alone — the tracked gate driver `tools/run-gplr19-rowcache-ab.ps1` passes no
+`--residency-budget-mib` and does not exercise this cap:
+
+| arm | flags | outcome (measured) |
+| --- | --- | --- |
+| R1 | bare | K=4, allowance 17,149,460,480 B |
+| R2 | bare, reserve 780 | K=4, allowance 16,868,442,112 B |
+| R3 | NAMED 4 | K=4, no fit line |
+| R4 | bare, reserve 15000 | K=3 downscale, allowance 1,957,691,392 B |
+| R5 | bare, reserve 16500 | refusal, allowance 384,827,392 B, exit 1 |
+| C1 | bare, budget 16384 | K=4 of a 12,461,872,640 B allowance — cap does not bind, accounting identical to R1/R3 |
+| C2 | bare, budget 6000 | allowance 1,573,459,456 B -> **downscale to K=2** (K=3 needs 1,718,812,672 B), notice names the budget |
+| C3 | bare, budget 4700 | allowance 210,310,656 B < K=1 (573,374,464 B) -> refusal naming `--residency-budget-mib`, exit 1 |
+| C4 | NAMED 4, budget 6000 | refusal: explicit depth 4 needs 2,291,531,776 B, allowance 1,573,459,456 B, largest fitting K=2, exit 1 |
+| C5 | NAMED 2, budget 6000 | runs at K=2 with NO fit line — a fitting named depth is untouched |
+
+R1-R5 reproduce the recorded F1-F5 evidence exactly (identical `byte_account`
+bar `run_id`, identical deterministic accounting, greedy text sha16
+`f690bfa4df173b7c`), so the cap did not touch a run that sets no budget; C1 is
+byte-identical to R1; C2 and C5 are the same K=2 run by two routes (46,484 rows
+fetched / 35,436 retained / 83,147,218,944 B staged — the recorded K=2 rung's
+35,436 retained exactly), which is the strongest available proof that the fit
+and an explicit depth resolve to one configuration. No gate verdict is created
+or changed: every run above is either budget-free (K=4/K=3, unchanged) or a
+bring-up refusal. Validation: build clean; host suite 23/23; ctest
+`layer-streaming-pinned-1024` 2/2, `qwen38-layer-boundary` 1/1,
+`layer-slot-lifecycle` 1/1 (all with the canonical
+`Q38LS_MODEL_PATH=C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`);
+QA smoke 512 PASS (check-telemetry OK 23,326 events, negative control FAILS as
+designed); all seven completed arms exit 0 with `--check-telemetry` OK. Residual:
+a pre-work refusal still writes no structured telemetry event, only a partial
+trace (40 `pkg_member` records, no `run_start`, which `--check-telemetry`
+rejects) plus stderr — unchanged by this pass and true of F5 before it.
+Commit: vendored half `third_party/llama.cpp` **ad565487a**; outer half (these
+docs, this entry and the gitlink bump) in the `Record ...` commit carrying this
+entry: **<pending>** (hash recorded in the follow-up commit, per the
+convention's existing field format).]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU

@@ -1,5 +1,106 @@
 # Current State
 
+## 2026-09-14 (latest): `--residency-budget-mib` is now a TOTAL residency cap — the row cache must fit under it, and a NAMED depth past the cap is refused rather than allocated
+
+Owner direction: "make --residency-budget-mib a true total residency cap that the
+row cache must also fit under, so the cache cannot allocate on top of a budget
+the operator set." Host compiler + TEN GPU arms in one mutex session. This closes
+the open owner call recorded at the end of the shared-budget-model pass ("it
+remains an owner call whether an explicit residency budget should also cap the
+cache"). No gate verdict is created or changed.
+
+**Shape of the change** (`tools/layer-streaming/main.cpp`, one file, +86/-31).
+The single budget model gains a two-sided cache allowance instead of one:
+`cache_cap_free` (the existing rule — the post-`ls.init` reading less
+`--reserve-mib` less the slot window the run has not allocated yet) and
+`cache_cap_budget` (`residency_budget_bytes` minus `bounded`, which already
+counts the slot window `begin_row_set()` allocates later), with `cache_budget` =
+the binding minimum of the two. `bounded_budget_bytes` is renamed
+`residency_budget_bytes` because the field's role widened. With no explicit
+budget, `cache_cap_budget` equals `cache_cap_free` and does not bind. Both caps
+are reported by a new `ls_vram_budget_cache_capped_by_budget()`, so a refusal
+sends the operator to `--residency-budget-mib` when the budget — not free VRAM —
+is what ran out. The fit itself now runs for a NAMED depth too (it previously ran
+only for the bare flag): a named depth is still never reduced, but one that does
+not fit the allowance is refused loudly instead of being allocated past the cap.
+
+**Ten arms, one session** (probe: 512-token PP + 256-token TG, Qwen3.6-35B-A3B,
+`--reserve-mib` 512 unless noted; bounded residency 4,717,996,544 B, slot window
+2,088,763,392 B, free VRAM 19,775,094,784 B). They ran from an untracked one-off
+under the gitignored `build/` root (`build/llama-cuda/gplr19-budgetcap/run-cap.ps1`
+plus its `arm-*.jsonl` / `arm-*.log` evidence), so these figures are **not
+reproducible from tracked tooling alone**: the tracked gate driver
+`tools/run-gplr19-rowcache-ab.ps1` passes no `--residency-budget-mib` and so does
+not exercise this cap. R1-R5 are regression arms with no budget flag; C1-C5
+exercise the new cap (`budget` column = `--residency-budget-mib`):
+
+| arm | flags | resolved | evidence |
+| --- | --- | --- | --- |
+| R1 | bare | **K=4** | allowance 17,149,460,480 B — the recorded F1 line, reproduced |
+| R2 | bare, reserve 780 | **K=4** | allowance 16,868,442,112 B — the recorded F2 line |
+| R3 | NAMED 4 | **K=4** | still no fit line at all (the check runs, passes, prints nothing) |
+| R4 | bare, reserve 15000 | **K=3** | free-bound downscale at allowance 1,957,691,392 B |
+| R5 | bare, reserve 16500 | **refused, exit 1** | allowance 384,827,392 B; "not even K=1 fits" |
+| C1 | bare, budget 16384 | **K=4** | allowance 12,461,872,640 B — the cap does not bind, accounting identical to R1/R3 |
+| C2 | bare, budget 6000 | **K=2** | allowance 1,573,459,456 B; budget-bound downscale (K=3 needs 1,718,812,672 B), notice names the budget |
+| C3 | bare, budget 4700 | **refused, exit 1** | allowance 210,310,656 B < K=1's 573,374,464 B; "not even K=1 fits. Raise --residency-budget-mib (or --reserve-mib)" |
+| C4 | NAMED 4, budget 6000 | **refused, exit 1** | "explicit depth … needs 2291531776 B but the row cache is allowed only 1573459456 B … the largest depth that fits is K=2" — new: a named depth may not exceed the cap |
+| C5 | NAMED 2, budget 6000 | **K=2** | no fit line; same run as C2 by the other route (see parity) |
+
+**Regression is exact, and the cap is visible in the arithmetic.** R1-R5
+reproduce the recorded F1-F5 evidence byte-for-byte — identical `byte_account`
+apart from `run_id`, identical deterministic accounting, greedy text sha16
+`f690bfa4df173b7c` in every arm, identical `tg_tokens` id vectors — so the cap
+touched nothing on a run that sets no budget. C1 (non-binding budget) is
+byte-identical to R1. C2's fitted K=2 and C5's named K=2 are the *same* run:
+46,484 rows fetched / 35,436 retained / 45,844 retired, 83,147,218,944 B staged,
+and 35,436 retained is exactly the recorded K=2 rung's figure — so the fit and a named depth resolve to one configuration rather than
+two that merely agree. The K byte model behind the arm design
+(`bytes(K) = 655,360 + 572,719,104*K`) was fitted to the recorded K=3/K=4 cache
+sizes and reproduces the published curve's 546.8/1093.0/3277.8/4370.1 MiB for
+K=1/2/6/8; every predicted byte figure (12,461,872,640 / 1,573,459,456 /
+210,310,656 / 1,146,093,568) printed exactly as computed.
+
+**Validation.** Build clean (no new warnings; the four `C4477` are pre-existing
+in `llama-layer-streaming.cpp` 1764/1778/1872/1878); host suite 23/23; ctest
+`layer-streaming-pinned-1024` 2/2, `qwen38-layer-boundary` 1/1,
+`layer-slot-lifecycle` 1/1, all with the canonical
+`Q38LS_MODEL_PATH=C:/Models/ALL/other/qwen-3.8/Qwen3.8-27B-UD-Q6_K_XL.gguf`;
+QA smoke 512 PASS (check-telemetry OK 23,326 events, all five needles found,
+negative control FAILS as designed); all seven completed arms exit 0 with
+`--check-telemetry` OK; analyzer self-test PASS (55 checks).
+
+**Environment note (cost me one red run, now recorded).** The three GPU ctest
+targets bake `Q38LS_MODEL_PATH` at configure time, and running them against the
+Qwen3.6-35B-A3B MoE model makes `layer-slot-lifecycle` fail with
+"run_start declared handoff_mode on/auto-on but no handoff events followed": with
+`--layer-slots 1`, `--pp-tokens 512` and no `--handoff`/`--handoff-mode` flag the
+default `auto` resolves ON for that policy, and no handoff event follows. That is
+unrelated to this change (nothing here touches handoff or `run_start`) and does
+not occur with the canonical dense Qwen3.8 model, where the same target passes
+1/1. Left as an observation for the owner, not fixed here.
+
+**Residual / open.** (1) A pre-work refusal still emits no structured telemetry
+event: the run exits 1 with the byte arithmetic on stderr and leaves a partial
+trace (40 `pkg_member` records, no `run_start`), which `--check-telemetry`
+rejects with 3 invariant violations. That is unchanged by this pass and was
+already true of F5 — but the earlier record of F5 as "no trace written" was
+inaccurate and is corrected in place above. (2) Activation slabs stay outside
+the cap by design: they are a measured runtime class gated against observed free
+VRAM (preflight condition 3), not a residency this mechanism manages; if the
+owner wants `--residency-budget-mib` to cover them too, that is a further,
+explicit widening. (3) The `byte_account` record still carries no cache figure,
+so the cap is auditable from stderr and `rowset_init`'s `retain_k` but not from
+JSONL alone. (4) As before, the allowance is evaluated once at bring-up and the
+slot-window hold-back is a conservative estimate (2,088,763,392 B against
+1,950,367,744 B measured).
+
+**Commit.** Vendored half in `third_party/llama.cpp` **ad565487a** (one file,
++86/-31); the outer half (this entry, the SDD scope amendment, the plan entry
+and the gitlink bump) in the `Record ...` commit for this pass: **<pending>**
+(hash recorded in the follow-up commit, per the convention's existing field
+format).
+
 ## 2026-09-14 (later): the capacity preflight and the row-cache fit now share ONE VRAM budget model — two parallel arithmetics and two unowned device readings collapsed into `llama_ls_vram_budget`; no number moves
 
 Owner direction: "make the capacity preflight and the cache fit share one VRAM
@@ -62,7 +163,10 @@ now owned by the model as `bounded_budget_bytes`, but it still governs only the
 not clamped by it, so a run that sets an explicit residency budget *and* a bare
 retain flag can still place a cache on top of that budget. That is now a named,
 recorded decision instead of an accident of two arithmetics — but it remains an
-owner call whether an explicit residency budget should also cap the cache. The
+owner call whether an explicit residency budget should also cap the cache.
+[CLOSED 2026-09-14 (owner-directed): the cache is now clamped by the same budget
+— the field is `residency_budget_bytes` and a named depth past the cap is
+refused; see the TOTAL residency cap entry above.] The
 fit's inputs remain estimates (the slot-window hold-back is
 2,088,763,392 B against 1,950,367,744 B measured slot VRAM — conservative, the
 safe direction), and the budget is still evaluated once at bring-up, so a later
@@ -121,7 +225,7 @@ K=3 1,718,812,672 B, and each K step adds 572,719,104 B = 8 rows/layer):
 | F2 | 780 | 16,868,442,112 B | **K=4** | budget still ample — the branch is not near its edge here |
 | F3 | 780, depth NAMED 4 | (fit not run) | **K=4** | no fit line at all: a named depth bypasses the fit |
 | F4 | 15,000 | 1,957,691,392 B | **K=3** | downscale branch: "default depth K=4 needs 2291531776 B but only 1957691392 B … is available to the cache; provisioning the largest fitting depth K=3"; allocated 40 x 24 rows = 1639.2 MiB |
-| F5 | 16,500 | 384,827,392 B | **refused, exit 1** | "the cache budget is only 384827392 B … not even K=1 fits"; no trace written |
+| F5 | 16,500 | 384,827,392 B | **refused, exit 1** | "the cache budget is only 384827392 B … not even K=1 fits"; no trace written [CORRECTED 2026-09-14: a refusal does leave a partial trace — 40 `pkg_member` records, no `run_start`, which `--check-telemetry` rejects; "no trace" meant no run trace. The refusal wording also changed to "the row cache is allowed only …" when the cap was made total.] |
 
 `--reserve-mib` is the only lever that shrinks the cache budget while keeping
 the preflight's own `bounded(4,717,996,544) + slabs + reserve <= free(22,226,665,472)`
