@@ -106,6 +106,24 @@ free VRAM, not a residency this mechanism manages. A run that sets no
 `--residency-budget-mib` is unaffected — the bounded window stays its own cap and
 the cache stays free-derived, so no existing measurement moves.
 
+Provability (same direction, 2026-09-14): the cap is checkable from the run's own
+structured record, not from stderr alone. The `byte_account` event carries
+`row_cache` — the private VRAM the per-layer cache ACTUALLY allocated, recorded
+from the allocation and cross-checked in the runner against the fit's prediction
+for the resolved depth, so the two cannot silently disagree — and
+`residency_cap`, the operator's `--residency-budget-mib` in bytes with 0 meaning
+"no explicit cap". The host checker holds the bounded residency plus `row_cache`
+under `residency_cap`, requires the byte cap to be the MiB flag it claims, and
+ties `row_cache` to the declared retention policy (retention ON implies a nonzero
+cache; retention OFF implies zero), so a zero cannot pass as a real account.
+Traces recorded before the fields existed carry neither and are accepted: the
+rule is enforced exactly where the producer reports it. This closes the T-GPLR-19
+contract's residual that the total cap was auditable from stderr and
+`retain_k` but not from JSONL alone. The record states the configuration the
+run PROVED at bring-up; it does not make a later foreign allocation safe, which
+remains a loud-failure condition, and activation slabs stay outside the cap as
+recorded above.
+
 ## 2. Fixed Acceptance Targets
 
 ### Dense reference
