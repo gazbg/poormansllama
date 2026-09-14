@@ -83,7 +83,12 @@ device affords it and otherwise the largest depth that does, so K=4 is a depth
 CEILING for the bare flag rather than a fixed allocation: the depth is fitted at
 bring-up to free VRAM less the operator's `--reserve-mib` and less the slot
 window the run has not allocated yet, and a device that cannot take even K=1 is
-refused loudly before any timed work. A NAMED depth is never reduced — any depth
+refused loudly before any timed work. That arithmetic has exactly one owner: a
+single budget model in the runner (`llama_ls_vram_budget`) that holds the flags,
+the bounded-window estimate, both device readings and every derived byte
+quantity, and that the T-GPLR-04 capacity preflight and this fit both read — so
+the preflight's numbers and the fit's numbers cannot disagree about what is
+already allocated. A NAMED depth is never reduced — any depth
 in 1..64 may still be named explicitly and is allocated in full or fails loudly
 — so the depth a task declares for a gate reading is always the depth actually
 provisioned, and the fitted result is what the `rowset_init` telemetry reports.

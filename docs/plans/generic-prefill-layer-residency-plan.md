@@ -2948,6 +2948,33 @@ three docs, the driver note and the gitlink bump) in the `Record ...` commit
 carrying this entry: **9564ca5** (hash recorded in the follow-up commit, per the
 convention's existing field format).]
 
+[UPDATED 2026-09-14 (same day, owner-directed), ONE VRAM BUDGET MODEL: the
+capacity preflight and the cache fit no longer run parallel arithmetics. The
+runner owns `llama_ls_vram_budget`, holding the budget flags (`--reserve-mib`,
+`--residency-budget-mib`), the bounded-window estimate, both device readings
+and every derived byte quantity (`reserve_bytes`, `bounded_budget_bytes`,
+`cache_budget`), computed by one `ls_vram_budget_derive`; the preflight and the
+fit both read it, so neither can invent a third reserve or its own notion of
+what is already allocated, and the slot window no longer travels between them
+through a hoisted local (that local is deleted). Two readings are kept on
+purpose and documented in the struct: `free_start` (pre-`ls.init`, what the
+preflight proves against and what `run_start` telemetry reports) and `free_now`
+(refreshed after `ls.init`, where the static/KV/state classes are already
+outside free VRAM — the reading the fit budgets from). NO NUMBER MOVES: all five
+fit arms reproduce byte-for-byte (F1/F2 "fitted to the device" K=4 of a
+17,149,460,480 B / 16,868,442,112 B budget, F4's K=3 downscale at budget
+1,957,691,392 B, F5's "not even K=1 fits" refusal at budget 384,827,392 B), the
+deterministic accounting and the greedy text are unchanged (30,641 / 51,279 /
+54,797,721,600 B staged; sha16 f690bfa4df173b7c), and the `byte_account` and
+`run_start` records differ only in `run_id`/`t0_us`. Explicit
+`--residency-budget-mib` is now owned by the model as `bounded_budget_bytes` but
+still caps only the bounded window: the cache budget stays free-derived and is
+deliberately NOT clamped by it — recorded as a named decision rather than left
+implicit. Commit: vendored half `third_party/llama.cpp` **89e86f275**; outer
+half (these docs, the plan entry and the gitlink bump) in the `Record ...`
+commit carrying this entry, whose hash is recorded in the follow-up commit per
+the convention's existing field format.]
+
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
 run has been made". The mechanism HAS since been implemented behind the

@@ -1,5 +1,78 @@
 # Current State
 
+## 2026-09-14 (later): the capacity preflight and the row-cache fit now share ONE VRAM budget model — two parallel arithmetics and two unowned device readings collapsed into `llama_ls_vram_budget`; no number moves
+
+Owner direction: "make the capacity preflight and the cache fit share one VRAM
+budget model instead of two parallel arithmetics, so a device's reported numbers
+cannot disagree about what is already allocated." Host compiler + five GPU arms
+under one mutex. This is a **refactor with no behaviour change claimed or
+observed** — no gate verdict is created or changed, and no arithmetic changed
+value.
+
+**What was actually duplicated.** Three things. (1) `reserve_bytes` was derived
+from `--reserve-mib` at *three* independent sites (the preflight, the cache fit,
+and the `byte_account` emission). (2) The device reading was two unowned locals:
+`free_vram` before `ls.init` and a second `free_now` re-read inside the fit, with
+nothing recording that they measure different moments. (3) The "what is left to
+allocate" quantity was inline in the preflight's checks but a separate expression
+in the fit, and the slot window travelled between them through a bare local
+(`pf_slot_window`) hoisted out of the preflight block for that single reuse.
+
+**The one model.** `llama_ls_vram_budget` (tools/layer-streaming/main.cpp) owns
+the inputs (`reserve_mib`, `residency_budget_mib`, `bounded`, `slot_window`), both
+readings (`free_start`, `free_now`, `total`) and every derived quantity
+(`reserve_bytes`, `bounded_budget_bytes`, `cache_budget`). One
+`ls_vram_budget_derive` computes them; `ls_vram_budget_measure_start`,
+`ls_vram_budget_adopt_window` and `ls_vram_budget_refresh` are the only writers
+and the only callers of the device read. The T-GPLR-04 preflight, the T-GPLR-10
+and T-GPLR-16 handoff gates, the T-GPLR-19 fit and the `byte_account`/`run_start`
+emissions now all read its fields. The hoisted `pf_slot_window` local is deleted.
+
+**Two readings, kept deliberately and documented in the struct.** `free_start` is
+taken before `ls.init` — the preflight proves its out-of-core and capacity
+conditions against it and `run_start` telemetry reports it. `free_now` is
+refreshed after `ls.init`, where the static/KV/state classes the preflight's own
+reading still counted are already outside free VRAM; that is the reading the fit
+budgets from, which is *why* the fit never needed to re-derive what was already
+allocated. Collapsing these two into one number was explicitly NOT done: they
+measure different moments and both are load-bearing. What was removed is the
+ambiguity, not a reading.
+
+**No number moves.** All five fit arms re-ran in one GPU session and reproduce
+the recorded values byte-for-byte: F1/F2 "fitted to the device" K=4 of a
+17,149,460,480 B / 16,868,442,112 B cache budget; F3 (named depth) still emits no
+fit line at all; F4 the K=3 downscale at budget 1,957,691,392 B; F5 the "not even
+K=1 fits" refusal at 384,827,392 B, exit 1, no trace. Per-arm deterministic
+accounting is identical old vs new (F1/F2/F3 30,641 fetched / 51,279 retained /
+54,797,721,600 B staged = 214,053,600 B/token; F4 38,425 / 43,495 /
+68,723,490,816 B), greedy text sha16 is `f690bfa4df173b7c` in every arm both
+before and after, and the `byte_account` and `run_start` records are identical
+except for `run_id` / `t0_us`. F1 still equals the recorded K=4 rung exactly.
+
+**Validation.** Build clean (no new warnings; the four `C4477` are pre-existing
+in `llama-layer-streaming.cpp` 1764/1778/1872/1878); host suite 23/23; ctest
+`layer-streaming-pinned-1024` 2/2, `qwen38-layer-boundary` 1/1,
+`layer-slot-lifecycle` 1/1; QA smoke 512 PASS (check-telemetry OK 23,326 events,
+all five needles found, negative control FAILS as designed); all four completed
+fit arms exit 0 with `--check-telemetry` OK (21,020 events, 4 slots).
+
+**Residual risk / open decision.** The explicit `--residency-budget-mib` cap is
+now owned by the model as `bounded_budget_bytes`, but it still governs only the
+*bounded* window: the cache budget is derived from free VRAM and is deliberately
+not clamped by it, so a run that sets an explicit residency budget *and* a bare
+retain flag can still place a cache on top of that budget. That is now a named,
+recorded decision instead of an accident of two arithmetics — but it remains an
+owner call whether an explicit residency budget should also cap the cache. The
+fit's inputs remain estimates (the slot-window hold-back is
+2,088,763,392 B against 1,950,367,744 B measured slot VRAM — conservative, the
+safe direction), and the budget is still evaluated once at bring-up, so a later
+foreign allocation can make the cache itself fail loudly.
+
+**Commit.** Vendored half in `third_party/llama.cpp` **89e86f275** (one file,
++143/-59); the outer half (this entry, the SDD sentence, the plan amendment and
+the gitlink bump) in the `Record ...` commit for this pass, whose hash is
+recorded in the follow-up commit per the convention's existing field format.
+
 ## 2026-09-14: the per-layer row cache's DEFAULT depth is now fitted to the device — K=4 where the device affords it (unchanged on the reference box), the largest depth that fits where it does not, a loud refusal when not even K=1 fits; a NAMED depth is still never reduced
 
 Owner direction: "make the K=4 default depth VRAM-adaptive … so an opt-in run
