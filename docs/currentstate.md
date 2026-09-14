@@ -71,8 +71,8 @@ the direct one-off probe live under the gitignored `build/` root and do not
 survive a clean checkout.
 
 **Commit.** This entry, the T-GPLR-07 contract note and the `-SmokeUbatch`
-parameter: the `Record ...` commit for this pass (hash recorded in the follow-up
-commit, per the convention's existing field format).
+parameter: the `Record ...` commit for this pass is **3dd3a6a** (hash recorded
+in this follow-up commit, per the convention's existing field format).
 
 ## 2026-09-14 (later): the TOTAL residency cap is now provable from JSONL — `byte_account` carries the provisioned row cache and the cap, and the checker enforces containment
 
