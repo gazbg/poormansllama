@@ -1,5 +1,66 @@
 # Current State
 
+## 2026-09-14: K=4 set as the per-layer row cache's provisional DEFAULT depth (owner-directed) — bare-flag arm reproduces the recorded K=4 rung exactly; the mechanism stays opt-in and default-off
+
+Owner direction: "set K=4 as default for now". Host + one GPU arm under the
+mutex. Code: `kRowSetRetainDefault = 4` in `tools/layer-streaming/main.cpp`,
+selected when `--residency-tg-retain` is passed with NO value (a new optional
+argument; `is_decimal_token` keeps a following flag from being eaten as one),
+and `llama-layer-streaming.h`'s `row_set_retain_k` default raised 1 -> 4. Any
+depth in 1..64 may still be named explicitly and overrides the default.
+
+What did NOT change, and that is the point: the mechanism is still opt-in and
+default-off (`row_set_retain` false unless the flag is given; `--residency-tg`
+still required), so nothing about default placement, the CPU path, or the
+non-experimental build moves. This is a PROVISIONAL OPERATING DEFAULT, **not a
+gate verdict**: no gate PASS is created or established at any depth (every
+reading above 0.6, at K>=4, comes from the self-echoing stream), T-GPLR-15's
+close stands (gate read at the depth a claiming task declares; BELOW 0.6 at the
+SDD's reference sizing), and the K=4 crossing it rests on is the echo-biased
+half of the measurement. SDD scope amendment 2026-09-14 owns the decision; the plan's
+T-GPLR-19 and T-GPLR-15 blocks cite it rather than restating a rule.
+
+Evidence that the bare flag resolves to K=4 end to end — ONE arm, this task's
+probe settings, retention flag bare:
+`build/llama-cuda/gplr19-k4default/run-bare.ps1` (untracked harness, same shape
+as the driver's mutex acquisition). Exit 0, wall 41.5 s, `--check-telemetry`
+OK (21,020 events, 4 slots), `rowset_init retain_k 4`.
+
+| quantity | bare-flag arm | recorded K=4 rung (B1/B2) |
+| --- | --- | --- |
+| `retain_k` | **4** | 4 |
+| staged total (B) | 54,797,721,600 | 54,797,721,600 |
+| B/fetch (x40 = B/token) | 5,351,340 (214,053,600) | 5,351,340 (214,053,600) |
+| rows fetched / retained / retired | 30,641 / 51,279 / 29,361 | 30,641 / 51,279 / 29,361 |
+| greedy text sha16 | f690bfa4df173b7c | f690bfa4df173b7c |
+
+Every deterministic quantity is byte-identical to the recorded rung, so the
+default path and the explicitly-named `--residency-tg-retain 4` path are
+indistinguishable. Throughput was NOT comparable and is not claimed: this arm
+measured 63.998 PP / 17.413 TG tok/s against the rung's 92.0-92.6 / 19.7,
+consistent with cross-session machine load (the mutex serializes GPU use, not
+the rest of the host), and the driver's paired design exists precisely because
+single cross-session timings are not evidence.
+
+GPU-free parser checks on the new optional value, all as designed:
+`--residency-tg-retain` at the end of argv no longer exits with "missing
+value" (it takes the default), `--residency-tg-retain nonsense` reports
+`unknown argument: nonsense` rather than silently eating the token, and
+`--residency-tg-retain 0` still fails loudly with "expects 1..64 windows (got
+0)". Build clean; the `--help` text documents N defaults to 4.
+
+**Residual risk carried forward.** The default is provably implemented but its
+GATE reading is not validated: K=4's 0.6284 comes from the self-echoing probe
+stream, so the non-echoing re-probe is now the outstanding validation of this
+default (previously it was the precondition for adopting any depth above the
+reference band). Any task that claims a K=4 gate PASS inherits that requirement.
+
+**Commit.** Vendored half in `third_party/llama.cpp` **4fcca3777** (the two
+files, +47/−8); outer half — this docs set, the driver note, and the 2-line
+gitlink bump (`a61528b47` → `4fcca3777`) — in the root `Record ...` commit that
+carries this entry. The outer hash lands in a follow-up commit because a commit
+cannot name its own, matching the convention's existing two-step.
+
 ## 2026-09-13: T-GPLR-19 deferred rungs RUN at K=2, K=4, K=6, K=8 — every rung passes, the runtime reproduces the offline statistic exactly, and the byte-to-time conversion is now measured as DEGRADING with depth
 
 Owner-directed ("run the deferred K=2 and K=4 and K=6 and K=8"). GPU work

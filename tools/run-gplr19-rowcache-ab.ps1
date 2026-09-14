@@ -1,5 +1,10 @@
 # T-GPLR-19: paired four-arm A/B for per-layer row residency at K=1.
 #
+# NOTE (2026-09-14): the MECHANISM's default depth is now K=4 (bare
+# `--residency-tg-retain`; SDD scope amendment 2026-09-14). This driver's own
+# default arm stays K=1 so that -AnalyzeOnly still regenerates the recorded K=1
+# report in place; pass -RetainK to compare another depth.
+#
 # Arms are A,B,A,B where A = the reactive row-set path (row-retention off, the
 # recorded baseline) and B = `--residency-tg-retain 1`, the resolved
 # row-capacity LRU cache. All four arms run back to back inside ONE acquisition

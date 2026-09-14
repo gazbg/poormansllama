@@ -62,6 +62,25 @@ at K=2/K=4 is 0.4343/0.6284 under the resolved policy against
 the offline analyzer are pinned together by
 `tools/route_overlap/crosscheck-retention.py`, which fails on any divergence.
 
+Scope amendment 2026-09-14 (owner-directed): the per-layer row cache's DEFAULT
+retention depth is K=4 — 32 rows per layer, ~2.19 GB across the 40 MoE layers,
+the shallowest depth whose offline statistic (b) clears gate 9's 0.6 threshold
+(0.6284, first crossing ~K=3.6). This is a PROVISIONAL OPERATING DEFAULT, not a
+gate verdict. T-GPLR-15's close stands unchanged: the gate is read at the depth
+a claiming task declares, and at the SDD's own reference sizing (K=1-2) it was
+measured BELOW 0.6 on the bias-robust half of the measurement. No gate PASS is
+ESTABLISHED at any depth, here or since: every reading above 0.6 (K>=4) comes
+from the stream that echoes its own anchor, so its absolute (b) is optimistic
+and none of them was validated on a non-echoing stream. The non-echoing
+re-probe recorded as the precondition for any retention above the reference
+band therefore becomes the outstanding VALIDATION of this default and
+the first requirement of any task that claims a K=4 gate PASS — it is no longer
+a precondition for provisioning the depth. The mechanism itself remains opt-in
+and default-off: disabling the experimental option changes no default placement
+and no non-experimental behaviour, and the depth applies only when an operator
+selects the cache. `--residency-tg-retain` with no value selects K=4; any depth
+in 1..64 may still be named explicitly, and naming one overrides this default.
+
 ## 2. Fixed Acceptance Targets
 
 ### Dense reference
@@ -218,7 +237,12 @@ arrives.
   is bounded, which is what the VRAM bound requires. A row needed by the
   current window is never an eviction victim, so a write that would exceed the
   declared capacity is a loud refusal — never silent growth, and never
-  eviction of an entry a running consumer may still read.
+  eviction of an entry a running consumer may still read. **Default depth
+  (owner-directed 2026-09-14): K=4** (32 rows/layer, ~2.19 GB over 40 MoE
+  layers). A caller that selects the cache without naming a depth gets K=4; the
+  capacity arithmetic above is unchanged and any K in 1..64 may be named
+  explicitly. See the 2026-09-14 scope amendment for why this is a provisional
+  operating default rather than a gate verdict.
 - **Atomicity per window.** A window's rows become ready together and retire
   together; a row-consuming graph observes only ready entries, and a cached
   row consumed by a layer's row-consuming phase is ordered after the matching

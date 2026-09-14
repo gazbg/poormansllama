@@ -2180,6 +2180,15 @@ declare a retention and re-read the same statistic; nothing here forbids that,
 and F2's per-layer cache class is unaffected (its SDD treatment exists).
 Phase B is NOT entered, no library change was made, and the reactive row-set
 path plus the closed handoff remain the program's TG answer.
+[UPDATED 2026-09-14: (i) was rejected as a GATE DECLARATION and that rejection
+stands — no gate PASS is ESTABLISHED at any depth, here or since, because every
+reading above 0.6 comes from the echoing stream. A later owner
+direction the same campaign nonetheless set K=4 as the mechanism's PROVISIONAL
+OPERATING DEFAULT (SDD scope amendment 2026-09-14 owns the decision), which
+provisions the 2.19 GB at the K=4 crossing without reading the crossing as a
+verdict. (iii) accordingly moves from "precondition for future adoption" to the
+outstanding VALIDATION of that default: no task may claim a K=4 gate PASS until
+it re-probes on a non-echoing stream.]
 Phase A status (2026-09-13): the analyzer half is DONE and its cross-validation
 step PASSED. `tools/route_overlap/analyze.py` now accepts the `rowset_*`
 events, validates every `rowset_fetch` (canonical `union_ids`, count,
@@ -2882,6 +2891,26 @@ below. The one item still outstanding for this task is the NON-ECHOING RE-PROBE
 that the contract set as the precondition for trusting a `K > 1` gate standing;
 the rungs were run on the echoing stream, so their absolute (b) values are
 optimistic and they are recorded as an internal-consistency result only.]
+
+[UPDATED 2026-09-14, owner-directed: the retention DEFAULT is now K=4 — 32
+rows/layer, ~2.19 GB over the 40 MoE layers — exposed as `--residency-tg-retain`
+with NO value; any depth in 1..64 may still be named and overrides it. The
+mechanism itself stays opt-in and default-off, so disabled behaviour is
+unchanged. This is a PROVISIONAL OPERATING DEFAULT, not a gate verdict: no gate
+PASS is created and T-GPLR-15's close is untouched (SDD scope amendment
+2026-09-14 owns the decision). End-to-end evidence that the bare flag resolves
+to that depth: ONE arm at this task's probe settings with the retention flag
+passed bare — exit 0, `--check-telemetry` OK (21,020 events, 4 slots),
+`rowset_init retain_k 4`, staged 54,797,721,600 B = 5,351,340 B/fetch
+(x40 fetches/token = 214,053,600 B/token, the recorded K=4 rung exactly),
+fetched/retained/retired 30,641 / 51,279 / 29,361 identical to that rung, and
+greedy text sha16 f690bfa4 identical to both of its arms. The NON-ECHOING
+RE-PROBE is still outstanding and is now the VALIDATION of this default rather
+than a precondition for provisioning it. Commit for THIS change only (the rest
+of the block's history sits under the hashes recorded further down): vendored
+half `third_party/llama.cpp` **4fcca3777**; outer half (docs, tools, gitlink
+bump) in the `Record ...` commit carrying this line, whose hash the follow-up
+commit records, per the convention's two-hash form.]
 
 Drafted 2026-09-13 on owner request from the T-GPLR-13 close-out's F2 item and
 the T-GPLR-15 gate reading. [CORRECTED 2026-09-13: the draft said "nothing is implemented, no GPU
