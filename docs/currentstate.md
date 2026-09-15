@@ -36,8 +36,8 @@ AGENTS.md gained three sections/notes, binding every future session:
 No code, plan, or SDD content changed. This entry records the governance
 change only; the summaries already produced this session (slot ladder,
 async-feed A/B, refusal-path test, residue fix, proof ledger) follow the
-now-required structure. [Committed 2026-09-15 as d91fd1e together with this
-entry.]
+now-required structure. [Governance commit: 49c270d (2026-09-15); recorded
+here in a follow-up record commit per the repo's hash-recording convention.]
 
 ## 2026-09-15: Pending owner decisions (item 4 gate-eligibility, item 6 second-architecture) recorded as plan task drafts T-GPLR-26 / T-GPLR-27
 
