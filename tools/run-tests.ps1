@@ -74,7 +74,22 @@ param(
     # whose shared-memory demand grows with the tokens in the batch. Ladder
     # lengths above the ~24.6k that the recorded 24k rung ran at must pass an
     # explicit chunk width, e.g. -SmokeUbatch 512.
-    [int] $SmokeUbatch = 0
+    [int] $SmokeUbatch = 0,
+
+    # qa-smoke TG placement mode. 'streaming' (default) is the RECORDED shape
+    # and is byte-for-byte what every 50/512/4k/50k rung has run: batch-major
+    # PP, `--no-handoff`, no row-set -- the paged full-bank TG. The three
+    # opt-in modes change ONLY the TG placement flags, so arms are like-for-
+    # like on prompt/model/PP/ubatch/tg-tokens:
+    #   reactive   `--residency-tg`               (reactive expert row windows)
+    #   retention  `--residency-tg --residency-tg-retain` (per-layer row cache,
+    #              bare flag = the device-fitted default depth)
+    #   handoff    `--handoff`                    (weights migrate to VRAM
+    #              after PP; stock decode, no row-set)
+    # A non-default mode tags the trace/tg-text/log names with the mode so arms
+    # cannot overwrite each other or the recorded rung artifacts.
+    [ValidateSet('streaming', 'reactive', 'retention', 'handoff')]
+    [string] $SmokeMode = 'streaming'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,7 +148,10 @@ $suites = @{
         # lift, dense legal combos). Exclude the tail513 GPU run targets AND the
         # tail513-lm / tail513-bm host checks that FIXTURES-require those GPU
         # runs (the fixture files under fixtures/ are what the host suite uses).
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal)(-|$)|test-layer-streaming-(layout|model-inspect)'
+        # T-GPLR-22: the run_refused PRE-WORK refusal-trace fixtures (1 positive /
+        # 4 WILL_FAIL negatives, incl. the pre-event shape that must stay
+        # rejected) join the host suite.
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal)(-|$)|test-layer-streaming-(layout|model-inspect)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -306,15 +324,29 @@ elseif ($spec.QaSmoke) {
             break
         }
 
-        $trace = Join-Path $buildDirResolved "gplr07-qa-$len.jsonl"
-        $tgtext = Join-Path $buildDirResolved "gplr07-qa-$len.txt"
-        $log = Join-Path $buildDirResolved "gplr07-qa-$len.log"
+        # Mode tag: 'streaming' keeps the recorded artifact names exactly; an
+        # opt-in mode gets its own names so no arm can clobber another's
+        # evidence (or the recorded rung traces).
+        $modeTag = if ($SmokeMode -eq 'streaming') { '' } else { "-$SmokeMode" }
+        $trace = Join-Path $buildDirResolved "gplr07-qa-$len$modeTag.jsonl"
+        $tgtext = Join-Path $buildDirResolved "gplr07-qa-$len$modeTag.txt"
+        $log = Join-Path $buildDirResolved "gplr07-qa-$len$modeTag.log"
         # T-GPLR-12: --no-handoff pins this gate to the recorded streaming-TG
         # shape (the default-profile QA rungs run separately with auto).
         # -SmokeUbatch 0 keeps the recorded one-ubatch shape; a nonzero value
         # chunks the prefill (required above ~24.6k tokens, see the param).
         $ubatch = if ($SmokeUbatch -gt 0) { $SmokeUbatch } else { $achieved }
-        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $ubatch --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --no-handoff --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
+        # The TG placement is the ONLY variable between modes; every other flag
+        # (prompt anchor, model, batch-major PP, ubatch, tg-tokens, kv-cache,
+        # allow-full-residency) is held fixed.
+        $modeFlags = switch ($SmokeMode) {
+            'reactive'  { '--no-handoff --residency-tg' }
+            'retention' { '--no-handoff --residency-tg --residency-tg-retain' }
+            'handoff'   { '--handoff' }
+            default     { '--no-handoff' }
+        }
+        $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $ubatch --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 $modeFlags --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
+        Write-Host "[qa-smoke] $len tokens: mode=$SmokeMode"
         Write-Host "[qa-smoke] $len tokens: runner under GPU mutex (log $log)..."
         & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
             -TimeoutSeconds $spec.TimeoutSeconds -Command $runCmd

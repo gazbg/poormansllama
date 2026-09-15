@@ -123,6 +123,28 @@ Proposed measurement (not run): in-process `cudaMemGetInfo` at phase
 boundaries plus a same-instant adapter-counter read, isolating the delta at
 CUDA-init time before any model allocation.
 
+**A SECOND, different gap in the same statistic - MEASURED 2026-09-14
+(lifetime, not counter).** `peak_vram_bytes` is sampled exactly once, at the
+end of the run (main.cpp:4662-4663, `total - min(free_after, free_start)`), so
+any allocation released before that reading is invisible to it regardless of
+how much device memory it held. The T-GPLR-19 per-layer row cache is precisely
+that case: `ls.end_row_set()` (main.cpp:4557 -> `end_row_cache()`,
+llama-layer-streaming.cpp:3653) frees it before the sample. Two 4k qa-smoke
+arms that differ ONLY by the retention flag report the SAME peak
+(5,311,627,264 B; 5,204,672,512 B at 50k) while `byte_account` records
+`row_cache` 2,291,531,776 B in one and 0 in the other - and with
+`tools/gpu-mem-poll.ps1` attached, per-process dedicated peaks are 3,978.8 MiB
+(reactive) vs 6,242.8 MiB (retention), +2,264.0 MiB (one run per arm, 500 ms
+sampling; the two poll files overlap, so each run's process is separated by its
+absolute window, not by file name). Cross-checked against 3.1: for the reactive
+arm the JSONL figure exceeds the polled one by 1,086.8 MiB (the 1.09 GB class
+above); for the retention arm it falls 1,177.3 MiB *below* (5,065.6 vs 6,242.8),
+i.e. the cache is missing. So the
+statistic has two independent blind spots of different kinds - a counter blind
+spot (3.1) and this lifetime blind spot - and they must not be conflated: a
+phase-boundary sample fixes the first and still misses the second unless the
+sample lands while the cache is live.
+
 ### 3.2 TG tok/s decline 10.10 -> 7.67 - EXPLAINED: staging-bound, context-independent staging rate
 
 Per-token TG wall grows 99.0 -> 130.4 ms while the staged bytes per token are
@@ -179,7 +201,9 @@ progressively warmer, so treat the absolute page-in number as an upper
 bound. The small-size runs show the same mechanism mildly (74.6-78.1%
 ready share of transfer phase).
 
-### 3.6 New: TG compute timings are all zero - OPEN (instrumentation gap)
+### 3.6 New: TG compute timings are all zero - CLOSED 2026-09-14 (F3/H8 fixed)
+
+[CLOSED 2026-09-14 - original text retained as written; amendment below]
 
 All 120 TG `layer_compute` events per run carry `compute_us=0, setup_us=0`
 (PP events are properly timed). The schema draft's open decision #3
@@ -188,6 +212,50 @@ decomposition in 3.2 cannot separate FFN/attention compute from scheduler
 overhead; only staging-vs-residual attribution is possible. Fix belongs to
 telemetry (time the two graph parts around `load_row_set`), not to this
 analysis.
+
+**Amendment 2026-09-14 (F3/H8 implemented; measurement, not a claim).** The
+fix named above is now in the code: the row-set TG executor times each of the
+two graph parts around the staging (`run_graph_plain` gained the same
+setup/reset-alloc vs compute/launch-execute-sync split the other executors
+record) and `tel_layer_compute_parts` emits ONE `layer_compute` per
+layer/window whose `compute_us`/`setup_us` keep their exact prior meaning (the
+A+B sums) plus four new fields `attn_compute_us`/`attn_setup_us` (part A =
+attention+residual+post-norm+router) and `ffn_compute_us`/`ffn_setup_us`
+(part B = FFN + shared experts on the staged rows). Event cardinality is
+unchanged, so no consumer of the old fields moves.
+
+Re-run of the recorded rowset probe shape (identical flags,
+`--residency moe-expert-bank --residency-tg --pp-tokens 64 --ubatch 64
+--tg-tokens 3 --layer-slots 4 --allow-full-residency`; fresh output path, the
+2026-09-13 trace is preserved): 120 TG `layer_compute` events, and the totals
+move from `compute_us=0, setup_us=0` to `compute_us=66,822,
+setup_us=4,788` - attn 43,000 (setup 2,737) / ffn 23,822 (setup 2,051) us.
+On the fuller 512/256-token batch-major stream with retention at the default
+K=4 (`--residency-tg-retain 4`): 10,240 TG `layer_compute` events, **0/10,240
+zero-valued in either part**, and the row split is
+
+| term | per TG token | share of TG wall |
+| --- | --- | --- |
+| submit (pageable host loop) | 23,574.9 us | 48.9% |
+| copy completion (ready latency) | 7,959.9 us | 16.5% |
+| compute, part A (attn+router) | 8,019.6 us | 16.6% |
+| compute, part B (FFN) | 4,224.2 us | 8.8% |
+| graph setup (both parts) | 1,297.6 us | 2.7% |
+| accounted above | 45,076.1 us | **93.5%** |
+| not yet instrumented | 3,148.9 us | 6.5% |
+
+TG wall for that trace is 48,225 us/token (256 tokens at 20.736 tok/s). So
+`transfer` = submit + copy completion = 65.4% of the token and compute+setup =
+28.1%, which is the split 3.2 could not make before. The residual 6.5% is
+NOT attributed by this fix and is not claimed to be: the router's blocking
+device-to-host probs read, sampling/argmax and the round boundaries all sit
+outside the four timed windows. Its shares are this shape's own; do not read
+them back onto the ladder rungs, which run a different schedule.
+
+No behavior change accompanies the timing: the 10,240-event `rowset_fetch`
+stream (layer, chunk, union hash, fetched/retained counts, staged bytes), the
+256 `rowset_round` byte accounts, `byte_account` on every original field and
+the greedy text sha256 are all identical to the recorded K=4 arm.
 
 ### 3.7 New: PP floor ~5.5 s is staging-bound; per-token PP cost is amortization of one full-bank pass
 
@@ -313,6 +381,14 @@ same-instant adapter reads; the gap's onset timing isolates the class
 (proposed; also serves the T-MEMPROBE-01 owner decision (a) vs (b)).
 Candidate fix: relabel `peak_vram_bytes` (option (b), docs-only) or sample
 true peaks at phase boundaries (option (a), small library change).
+Second, now-MEASURED defect in the same statistic (3.1, 2026-09-14): it is a
+single post-run sample, so an allocation freed before it - the T-GPLR-19 row
+cache, 2,291,531,776 B - is invisible (two 4k arms with and without it report
+identical peaks). Relabelling is now the MINIMUM repair, not an option, and
+option (a) must sample at the run's true peak (while the cache is live) or it
+inherits the same blind spot; a cheap third option is to have the runner add
+the high-water mark of its own allocations instead of inferring from free
+VRAM.
 
 ### H7 - Attribute the ~5 GB non-KV commit growth at 200k (safety margin question)
 
@@ -327,7 +403,13 @@ Candidate fix: none if background drift; if runner-owned, bound it before
 larger-context runs (the T-GPLR-09 RAM admission rule works on avail-phys
 and is unaffected either way - measured avail stayed >= 35.9 GB).
 
-### H8 - Fix zero TG compute timings (telemetry debt; unblocks H2/H3 attribution)
+### H8 - Fix zero TG compute timings (telemetry debt; unblocks H2/H3 attribution) - DONE 2026-09-14
+
+[STATUS 2026-09-14: implemented and measured; see the 3.6 amendment above for
+the numbers. The two graph parts are now timed around `load_row_set` and
+`layer_compute` carries `attn_*`/`ffn_*` alongside the unchanged `compute_us`.
+H2's KV-vs-staging decomposition can now be made exact; the router-read
+residual noted in 3.6 is a separate, still-open gap.]
 
 Observation: all TG `layer_compute` timings zero (3.6).
 Candidate cause: the split graph (attn+router part / FFN part around
@@ -426,9 +508,14 @@ timeline reconstruction already suggested.
   it turns T-GPLR-15's 0.6 hit-rate gate from a 2-step pilot into a
   measurable stream. Task-sized; multiplies with F1 (fewer bytes through the
   same faster pipe).
-- **F3 — nonzero TG per-part timings (H8).** Cheap telemetry change; required
-  to attribute F1's gain exactly (compute vs staging) and to bound the KV
-  term. Do alongside F1, not after.
+- **F3 — nonzero TG per-part timings (H8).** [DONE 2026-09-14: implemented and
+  measured, see the 3.6 amendment. One `layer_compute` per layer/window now
+  carries `attn_compute_us`/`attn_setup_us`/`ffn_compute_us`/`ffn_setup_us`
+  beside the unchanged `compute_us`; 0/10,240 events zero-valued on the
+  512/256-token K=4 stream and 93.5% of TG wall accounted vs 0% attribution
+  before.] It was required to attribute F1's gain exactly (compute vs staging)
+  and to bound the KV term; F2's staged-byte reduction can now be read against
+  a real compute term rather than a zero.
 - **F4 — W>1 window (H4).** Unchanged as a probe, but its leverage shrinks
   once F1/F2 cut the per-fetch and per-byte costs it amortizes.
 
@@ -638,3 +725,207 @@ rate past the first window is ~8-9.5 GB/s, near this path's effective per-fetch
 rate rather than the link ceiling. (c) New: the second clause above is now a
 measured statement at K=4 rather than an inference, but only on the echoing
 stream.]
+
+### 6.8 New: the non-echoing re-probe has been RUN — K=4 does NOT clear the gate on it (2026-09-14)
+
+One measurement, one GPU session, no code changed by this section. This closes
+the "(a) caveat STANDS" clause immediately above: the gate-bearing run is no
+longer outstanding.
+
+**What was run, and the honest provenance of the definition.** The recorded
+T-GPLR-15 Phase A probe invocation with exactly ONE change — the prompt BODY:
+`build/calc-prompt.txt` (the natural-language code prompt already recorded for
+the gplr06 code-prompt runs, 885 tokens) in place of the echoing needle
+document `build/llama-cuda/gplr13-ladder/512/anchor-512.txt`. Everything else
+held: `--residency moe-expert-bank --residency-tg --pp-schedule batch-major
+--ubatch 512 --tg-tokens 256 --layer-slots 4 --kv-cache q8 --greedy --no-mtp
+--pp-no-logits --allow-full-residency`. The reading definition and the decision
+rule were written down BEFORE this run but do NOT predate the original
+measurement — they are authored 2026-09-14, and that is stated rather than
+implied.
+
+*Reading definition.* Statistic (b) exactly as SDD section 10 / gate 9 defines
+it (the tracked analyzer, row-capacity-lru policy, W=1, next window in the
+denominator), read at the depth the SDD declares, plus the T8 oracle, T5 and T7
+for context. *Decision rule.* K=4 SURVIVES only if (b) at K=4 >= 0.6 on the
+non-echoing stream; otherwise the recorded 0.6284 is echo-inflated and no K=4
+gate PASS is available. Predicted direction, fixed in advance: repetition can
+only RAISE (b), so a non-echoing (b) <= the echoed (b) at every K.
+
+**Non-echoing check — PARTIAL, and its defect is mine.** The declared
+conjunction was `distinct 16-gram ratio >= 0.90` AND `zlib(id sequence)
+compression ratio >= 0.50`, calibrated beforehand on the known-echoing stream.
+Result: 16-gram ratio **1.0000** (echoed: 0.3734 — all 241 spans distinct) and
+zlib ratio **0.4238** (echoed: 0.1152). So one criterion is at its maximum and
+the other fails: zlib compresses structured HTML/CSS tokens well without any
+repetition, so that criterion measured the entropy of a code stream rather than
+repetition and was mis-chosen when declared. The stream is non-echoing on the
+criterion that measures repetition and on the generated text (a single-pass
+calculator document, no loop); the certification is recorded as partial rather
+than repaired after the fact. Distinct-token ratio 0.4102 vs 0.0977 echoed.
+
+**Result.**
+
+| K | echoed (recorded probe) | non-echoing (re-probe) | delta | VRAM over 40 layers |
+| --- | --- | --- | --- | --- |
+| 1 | 0.3088 | 0.2468 | -0.0620 | 566.2 MB |
+| 2 | 0.4343 | 0.3778 | -0.0565 | 1132.5 MB |
+| 3 | 0.5330 | 0.4704 | -0.0626 | 1698.7 MB |
+| 4 | 0.6284 | **0.5355** | **-0.0929** | 2264.9 MB |
+| 5 | 0.6803 | 0.5982 | -0.0821 | 2831.2 MB |
+| 6 | 0.7169 | 0.6487 | -0.0682 | 3397.4 MB |
+| 7 | 0.7483 | 0.6926 | -0.0557 | 3963.6 MB |
+| 8 | 0.7775 | 0.7283 | -0.0492 | 4529.8 MB |
+| T8 oracle | 0.9385 | 0.9143 | -0.0242 | unbounded |
+
+Every K falls, so the pre-registered direction holds and the bias is confirmed
+rather than merely asserted. **The 0.6 crossing moves from ~K=3.6 to ~K=5.1:
+the first depth clearing the threshold on the non-echoing stream is K=6
+(0.6487, ~3.40 GB), not K=4 (2.26 GB).** T4 consecutive-window containment
+0.3088 -> 0.2468 and T5 window-equality 0.0019 -> 0.0004 (exact window identity
+was never the discriminator, as the schema draft says); rows seen once 739/5342
+-> 1039/7311; cumulative coverage at retention 1/2/4/8 = 0.3291/0.4279/0.5535/
+0.7025 -> 0.2699/0.3832/0.5160/0.6498.
+
+**One correction to how the echo caveat has been quoted.** The re-probe's
+temporal-reuse ceiling is 0.9143, nowhere near this file's 0.4000-0.4266 range
+for the four preserved ladder rungs. Those rungs are 3-window streams, so their
+ceiling is structurally capped at two prior windows and is monotone in stream
+length — the 0.40-0.43 range is a STREAM-LENGTH artifact, not the non-echoing
+expectation. The only like-for-like comparison is 256 windows against 256
+windows: 0.9385 -> 0.9143.
+
+**Consequence.** No default, no gate verdict and no implementation changed:
+K=4 stays the mechanism's provisional operating default, and a K=4 gate PASS
+remains UNAVAILABLE — now on measured evidence rather than on a caveat. The
+first depth that would carry a gate reading on a non-echoing stream is K=6.
+Artifacts: `build/llama-cuda/gplr15-nononchoing/probe-tg256-nononchoing.jsonl`
+(10,240 `rowset_fetch`, 256 rounds, `--check-telemetry` OK, run exit 0) and the
+tracked analyzer's report beside it; the launching one-off is untracked under
+the gitignored `build/` root, so a clean checkout needs a fresh run.
+
+## 2026-09-14 late: full-length sweep (4k/50k; 200k attempt), bottleneck structure, and the 200k abort fix
+
+**Scope.** Owner-directed validation sweep of the pruned tree at 4k, 50k and
+200k on the recorded streaming shape (batch-major PP, `--no-handoff`, paged
+full-bank TG; `--ubatch 512` at 50k/200k). The 4k rung went through the
+suite's qa-smoke gate; the rest were direct runs under the GPU mutex with
+fresh artifact paths. Measurement pass; no gate verdict and no default
+changed.
+
+**Gate results.** 4k PASS (check-telemetry OK, 23,326 events; answer 5/5
+PASS; negative control FAILs as designed). 50k PASS (46,606 events; answer
+PASS; control FAILs). 200k crashed at graph build on the first attempt (root
+cause and fix below); the retry is recorded in currentstate when it lands.
+
+**Measured bottleneck structure (streaming TG = paged full-bank).**
+- Warm-cache recorded shape: TG 8.12 s / 96 tok (11.8 tok/s) vs PP 6.26 s /
+  4,096 tok (654 tok/s). Reactive TG stages 54.98 GB across 3,840
+  `rowset_fetch` in 6.00 s (9.16 GB/s effective on the link).
+- Retention K=4 arms: TG 5.11 s (18.8 tok/s, +59%); staged 21.05 GB (4k) /
+  17.93 GB (50k); hits 3,741/3,840 and 3,743/3,840 (~97.4%).
+- F3's part split exists in the writer but NO trace on disk carries the
+  attn/ffn part fields yet: the split is requested only by the row-set TG
+  executor, and every recorded streaming-mode run bypasses row-set. The
+  first producer will be a `--residency-tg` run on the new binary.
+  [2026-09-15: that prediction is now false in the good direction — the
+  4k retention proof run IS the first producer: 3,840 of 3,880
+  `layer_compute` events carry `attn_compute_us`/`ffn_compute_us` and the
+  setup parts. First real reading at 4k retention: attention 30.3 ms vs
+  staged FFN 1.1 ms per layer-window — TG compute is ~27x attention-dominated
+  at 4k context, so expert staging is the transfer story but NOT the
+  compute story.]
+
+**Discrepancies found (three real, one environmental).**
+1. COLD CACHE (environmental; reported per AGENTS.md, not a defect): the
+   22:36 re-run of the identical 4k rung took TG 185.2 s (0.52 tok/s) vs
+   8.1 s warm and PP 8.28 s vs 6.26 s. The 30x TG hit vs 1.3x PP hit is the
+   model page-in dominating TG; the trace is structurally identical (checker
+   OK, answer PASS) and the pruning touched no fetch path. Every cross-run
+   timing comparison must hold file-cache state fixed.
+2. TG phase_summary reports zeros: `total_transfer_us`, `total_wait_us`,
+   `total_compute_us` and `bytes_transferred` are all 0 in the TG phase
+   while 3,840 `rowset_fetch` events carry real values; the PP summary is
+   populated. The TG emitter never sums the row-set terms, so a consumer
+   reading phase_summary alone sees a free TG phase.
+   [2026-09-15: FIXED and proven on the real arm. The row-set TG executor
+   now feeds the same `add_layer_stats` pipeline as the streaming
+   executors — transfer/bytes accumulate in the two `rowset_fetch` emit
+   paths, the timing triple is stashed per layer (both hit and miss paths
+   update it, so no stale-carry), and `reset_stats()` zeroes it per phase.
+   The 4k retention proof run (`gplr07-qa-4096-retention.jsonl`) reports
+   TG `total_transfer_us` 20.47 s, `total_wait_us` 1.71 s,
+   `total_compute_us` 1.67 s, `bytes_transferred` 21.05 GB — non-zero,
+   and consistent with the 3,840 `rowset_fetch` events. Cold-start
+   caveat: that run is the cold branch of the file cache (machine
+   restart), so the absolute 20.47 s is not comparable to the warm 3.04
+   s; only the nonzero-ness and internal consistency are the claim.]
+3. `run_end.peak_vram_bytes` is blind to the row cache: the reactive and
+   retention 4k arms report the IDENTICAL 5,311,627,264 B peak although
+   retention holds a 2,291,531,776 B row cache -- the cache is allocated
+   outside the ggml pool the peak samples. byte_account carries `row_cache`,
+   but the headline peak understates true device usage by exactly the cache
+   size.
+   [2026-09-15: FIXED and proven on the real arm. Root cause was not the
+   ggml pool: main's peak was a TWO-SAMPLE max (free_start vs a free_after
+   taken after end_row_cache released the cache), so any allocation freed
+   before run_end vanished from it. Fix: the budget struct (the one owner
+   of VRAM state) now tracks free_min across every refresh point --
+   post-init, post-cache-bring-up, post-slot-window -- and tel_run_end
+   reports total - free_min. Non-retention runs are unaffected: free_min
+   equals the old two-sample max when no cache/slot allocation intervenes.
+   4k retention re-run now reports peak 7,675,117,568 B = old 5.31 GB +
+   row cache 2.29 GB + slot window, and check-telemetry/answer gate PASS
+   on the same trace. The reactive contrast arm was blocked the whole
+   window by another project's GPU-mutex hold (1,800 s lock timeout, no
+   contamination -- its recorded trace is untouched); the retention arm
+   alone proves the fix because the identical-peak artifact had reactive
+   == retention by construction.]
+4. Ready-latency inversion under retention: median `ready_latency_us` 198
+   (hit path) vs 101 (reactive miss path) at 4k, 185 vs ~101 at 50k -- the
+   cache DOUBLES the wait term even while halving the transfer term (766 vs
+   1,563 us/fetch). Net wall still favors retention (transfer dominates),
+   but the wait grows with retained-window bookkeeping.
+
+**Hypotheses (each tied to a measured discrepancy).**
+- H-A (TG zeros): the TG phase_summary emitter sums only ggml-scheduler
+  stats and row-set fetches bypass the scheduler's accounting. Cheap fix:
+  accumulate `transfer_us`/`ready_latency_us`/`bytes_staged` per phase in
+  the rowset_fetch emit path and add them at phase_summary. Makes TG wall
+  decomposable from the summary alone.
+- H-B (peak VRAM): the cache is a separate cudaMalloc outside the sampled
+  pool. Cheap fix: add `row_cache` (already in byte_account) into the
+  reported peak, or sample free VRAM across the TG loop.
+- H-C (ready-latency): the ~198 us hit-path wait is per-fetch slot event
+  synchronization on the K>0 cache (bookkeeping + retained-set verification),
+  not transfer. Predicts the wait grows sub-linearly with K and that the F3
+  submit/copy/ready split on a `--residency-tg` run will show it as neither
+  submit nor copy. Testable with the existing F3 writer, no new plumbing.
+- H-D (PP bandwidth): PP full-bank staging (39 evictions, 18.33 GB in
+  5.49 s = 3.34 GB/s) runs at barely a third of the TG reactive rate
+  (9.16 GB/s) -- PP copies whole banks on eviction with effectively no
+  overlap window, TG overlaps fetch with decode. Raising PP prefetch overlap
+  is the largest single PP lever left (~2.7 s at 4k, ~90 s at 50k of pure
+  transfer exposure).
+
+**200k abort: root cause and fix.** First attempt died at graph build:
+`attn_inp_kq_mask exceeds backing buffer (offset=421603680 size=128122880
+buffer=477102080)` -> `finish_build` failed -> `GGML_ABORT` at
+`qwen35moe.cpp:478`. byte_account PROVES this is not VRAM: bounded window
+5.32 GB vs 22.23 GB free, `bounded_within_free=true`. The budgeted host
+input buffer (n_masks * mask_bytes + embd + 64 MiB = 477,102,080 B exactly)
+undercounts when more persistent sets bind full-context masks than n_masks
+counts -- the same sizing-formula class T-GPLR-05 patched once before with
+a bigger constant. Fix (T-GPLR-24 candidate): a host-side SPILL allocator in
+`finish_build` -- tensors that no longer fit `buf_inputs` allocate into an
+extra host buffer (`buf_inputs_spill`) instead of failing the build. No
+VRAM, no placement change, and a shape that fits never creates a spill, so
+the allocation path of every existing recorded shape is unchanged.
+**Landed and proven:** the re-run COMPLETED at 200k (116,926 events,
+check-telemetry OK, answer 5/5 PASS, control FAILs; PP 1,022.1 s, TG
+185.1 s, peak 7.18 GB) and the 512 gate plus the host suite still pass.
+The first spill build had a real bug, caught by the re-run: the failed
+`alloc_tensors` pass had already allocated a prefix of the list into
+`buf_inputs`, and spilling the full list re-allocated bound tensors
+(`GGML_ASSERT(tensor->buffer == NULL)`); the spill now takes only the
+unallocated remainder. Evidence: `gplr24-sweep/rung-200000-fix.*`.

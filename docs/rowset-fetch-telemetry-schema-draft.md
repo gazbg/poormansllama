@@ -100,11 +100,23 @@ is the single per-token route record (one source of truth; the T5 code path in
 - `bytes_staged`: quantization-exact bytes actually copied this window
   (gate/up/down across fetched rows, natural offsets).
 - `bytes_full_bank`: this layer's complete expert-bank bytes — the constant
-  denominator for the union-width saving (SDD: measurable, never assumed).
-- `host_submit_us` / `transfer_us` / `ready_latency_us`: the staging batch's
-  distinct timings (SDD section 10); compute and graph-setup times stay on
-  the existing `layer_compute` events for the FFN graph; wall time stays in
+  denominator for the union-width saving (SDD: measurable, never assumed).- `host_submit_us` / `transfer_us` / `ready_latency_us`: the staging batch's
+  distinct timings (SDD section 10); compute and graph-setup times stay on the
+  existing `layer_compute` events for the FFN graph; wall time stays in
   `phase_summary`. No timing is double-booked.
+  [2026-09-15: the row-set TG executor now feeds the same `add_layer_stats`
+  pipeline the streaming executors use, so the TG `phase_summary` in
+  `moe-row-set`  modes reports non-zero `total_transfer_us` (submit+ready of the
+  window's staging), `total_wait_us` (ready-latency) and
+  `bytes_transferred` (staged bytes) instead of zeros. Additive; no
+  `rowset_*` field changed.]
+  [2026-09-14: that `layer_compute` event is now emitted by the row-set TG
+  executor through the single `tel_layer_compute` writer (the merge that removed
+  the short-lived `tel_layer_compute_parts`). Still exactly one per
+  layer/window, still with the unchanged `compute_us`/`setup_us` (the two-part
+  sums), plus `attn_compute_us`/`attn_setup_us` and
+  `ffn_compute_us`/`ffn_setup_us`. This field list is ADDITIVE to the schema
+  above; no `rowset_*` field changed.]
 
 ### rowset_round (per TG round)
 
@@ -128,6 +140,78 @@ byte-account symmetry point with `tel_byte_account` and the headline
 
 `reason` enum: `missing_row` | `stale_generation` | `insufficient_vram` |
 `bad_shape` | `coverage_gap`. Structured, never prose-only.
+
+### run_refused (T-GPLR-22; run-level refusal, TERMINAL; added 2026-09-14)
+
+```json
+{"event":"run_refused","run_id":U64,"reason":"...","detail":"...","exit_status":I,
+ "bytes_needed":U64,"bytes_allowed":U64,"cap_source":"free|budget|none",
+ "phase":I,"t_us":I64}
+```
+
+A *run-level* refusal, distinct from `rowset_refused` (which refuses one
+layer/window's staging inside a run that continues). `run_refused` is the LAST
+event in the trace and closes the sink: nothing may follow it. No timed phase
+may precede it either, but a `run_start` may — a pre-timed check that stops a
+run which already began writing is a refusal, not a crash (see the third shape
+below).
+
+There are two trace shapes, and three reachable refusals:
+- **PRE-SINK** (added 2026-09-14) — **before `ls.init` exists**: the T-GPLR-04
+  capacity preflight and the T-GPLR-10 / T-GPLR-16 handoff fit gates. A static
+  one-shot emitter opens the path, writes the record and closes it, so the
+  trace is that ONE line and nothing else — no `pkg_member` catalog, because no
+  catalog was ever written. No instance state and no init are involved, which
+  is why the emitter is static; it mirrors the existing one-shot `tel_off_run`
+  precedent.
+- **POST-INIT** — **after `ls.init` opened the sink**: the trace carries the
+  catalog `ls.init` wrote, so `run_refused` follows the 40 `pkg_member`
+  records, and `byte_account` / `run_start` (and, for a graph-budget refusal,
+  `graph_footprint`) appear in their normal order before it. Two refinements of
+  this shape:
+  - the pre-run gates (the row-cache and prefetch refusals) stop the run before
+    `run_start`;
+  - **PRE-TIMED ABORT** (added 2026-09-14) — a check between `run_start` and the
+    first timed phase stops an already-writing run, so `run_refused` is emitted
+    instead of the `run_end` it used to write. `--graph-budget-mib 1`, a failed
+    `ls.init` and a failed PP graph prebuild are the reachable instances. This
+    shape is why `run_start` is admissible without ever being required.
+
+- `reason` enum (both the emit sites and the checkers use this one list, so a
+  reason cannot be emitted without being checkable): `row_cache_derive` |
+  `row_cache_fit` | `row_cache_depth` | `row_cache_alloc` |
+  `row_cache_divergence` | `prefetch_configure` | `capacity_preflight` |
+  `handoff_preflight` | `init_failed` | `prebuild_failed` | `graph_budget`.
+  The two `*_preflight` reasons are the PRE-SINK ones; `detail` names the
+  exact gate (inventory, window parse, full-fit override, budget, free VRAM for
+  `capacity_preflight`; T-GPLR-10 full-handoff or T-GPLR-16 partial-handoff fit
+  for `handoff_preflight`) and `cap_source` the limiting term, so the deciding
+  condition stays readable from the JSONL alone. The last three are the
+  PRE-TIMED ABORT reasons: `init_failed` (`ls.init` returned false),
+  `prebuild_failed` (the PP persistent-graph prebuild failed) and
+  `graph_budget` (reserved io bytes exceeded `--graph-budget-mib`, the only
+  reason that carries a non-zero `bytes_needed`).
+- `detail`: free text; JSON-unsafe characters (quote, backslash, control) are
+  folded to spaces by the producer, so the line always parses.
+- `bytes_needed` / `bytes_allowed` / `cap_source`: the arithmetic that decided,
+  and which cap bound it; 0 / `none` where the refusal is not about bytes.
+- Present on every refusal the runner can reach: the ones that previously left
+  a partial trace (the row-cache and prefetch gates), since 2026-09-14 the ones
+  raised before the sink existed (the capacity and handoff preflights), and
+  since 2026-09-14 also the pre-timed aborts that used to leave a trace the
+  checker REJECTED (the `--graph-budget-mib` abort) or wrote nothing at all (a
+  failed `ls.init`). Still traceless: the load/setup failures (model load,
+  context creation, capability probe, `--inspect-model`) and the exit-2 usage
+  errors — none of those is a byte-arithmetic refusal, and the earliest happen
+  before the telemetry path is parsed. A pre-timed abort reached through the
+  `init_failed` path is emitted but cannot be persisted when the telemetry path
+  itself is the unopenable thing: the one-shot emitter uses the same `fopen`,
+  so it fails the same way and only warns on stderr.
+
+Why it exists: before this event a refused run left 40 `pkg_member` records and
+no `run_start`, so neither the checker nor a harness could tell "refused because
+of X" from a crash. The event makes the refusal recoverable from the JSONL
+alone, without stderr.
 
 ## 3. Canonicalization rules
 
@@ -166,6 +250,23 @@ Per event, all checkable offline from the JSONL + inventory:
    the acceptance gate reads this ratio, not a claimed speedup.
 9. Default-off immunity: with the option off, no `rowset_*` events exist and
    `run_start` carries no `"rowset"` key.
+10. Refusal trace (T-GPLR-22, added 2026-09-14): a trace carrying `run_refused`
+   (whether it also carries the `pkg_member` catalog, as a post-`ls.init` refusal
+   does; or is that single line alone, as a PRE-SINK refusal is; or begins with
+   `run_start` and stops before any timed phase, as a PRE-TIMED ABORT does) must
+   contain no `phase_summary` and no `run_end`, and its `reason` must be in the
+   enum above. `run_start` is ADMISSIBLE and neither required nor forbidden: it
+   is present exactly when the refusal was raised after the run began writing.
+   The three "missing run_start/phase_summary/run_end" rules describe a run that
+   started, so they are SUPPRESSED for a refusal trace and replaced by this one.
+   A trace with no `run_refused` is untouched by this rule, so traces and
+   fixtures written before it keep exactly their prior verdicts — including the
+   pre-event refusal shape (a bare `pkg_member` fragment), which is still
+   rejected rather than retroactively accepted. The one pre-existing negative
+   fixture that carries `run_start` keeps its verdict through the
+   no-`phase_summary` clause rather than through the old blanket `run_start`
+   rejection: accepting a started run as an aborted refusal is narrower than
+   accepting a started run that already completed a phase.
 
 ## 5. What T-GPLR-15's analysis consumes
 
@@ -176,7 +277,7 @@ Per event, all checkable offline from the JSONL + inventory:
 | Predictor benefit ceiling | `n_rows_reused` (reactive reuse already captured) vs exact containment of the next window in the cumulative resident set |
 | Window-size W decision | per-window `route_union` volatility and byte ratios at W=1 vs W>1 probe runs |
 | Slot-count decision | per-layer row reappearance distance, computed offline from the `union_ids` streams |
-| Timing attribution | `host_submit_us` / `transfer_us` / `ready_latency_us`; FFN compute/graph-setup on existing `layer_compute` |
+| Timing attribution | `host_submit_us` / `transfer_us` / `ready_latency_us`; per-part compute/graph-setup on the existing `layer_compute` (`compute_us` + `setup_us` unchanged, split by `attn_*` / `ffn_*` since 2026-09-14) |
 
 ## 6. tools/route_overlap/analyze.py extensions required
 
@@ -239,6 +340,14 @@ mismatch.
    vs a JSON array (`tg_tokens` style).
 3. Split point of the two-part graph and whether attn+router emits its own
    `layer_compute`-class event (SDD leaves the split point to review).
+   **RESOLVED 2026-09-14:** the split point is unchanged (part A ends at the
+   router; part B is the FFN graph) and part A does NOT emit its own event -
+   both parts are timed and reported on the SAME per-layer `layer_compute`
+   record via `attn_compute_us`/`attn_setup_us` and
+   `ffn_compute_us`/`ffn_setup_us`, so the event count stays one per
+   layer/window and every existing consumer of `compute_us` is unaffected.
+   Chosen over two events per layer to keep the "one authoritative record per
+   layer per window" rule and the trace-volume bound of decision 5.
 4. `chunk` semantics for W>1 (window-start ordinal, as specified here).
 5. Trace volume: ~40 events/token at ~230 B ~= 9 KB/token of JSONL
    (0.6 MB per 65-token QA run; ~9 MB per 1k-token TG run) — acceptable;

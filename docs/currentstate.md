@@ -1,6 +1,968 @@
 # Current State
 
-## 2026-09-14 (latest): T-GPLR-07 ladder rungs 4k and 50k PASS (owner-invoked, one at a time) — and the 50k rung exposed a HARNESS limit, not a mechanism one
+## 2026-09-15 (latest): H-A fixed and proven — row-set TG phase_summary carries transfer/wait/bytes; first real F3 part fields
+
+Continuation of the sweep's H-A hypothesis (vendored change, no default or
+gate verdict changed). The row-set TG executor now feeds the same
+`add_layer_stats` pipeline the streaming executors use: transfer/bytes
+accumulate beside the `rowset_round_*` sums in both `rowset_fetch` emit
+paths, the per-layer timing triple (`rowset_last_{submit,transfer,ready}_us`)
+
+is stashed on hit AND miss paths (no stale-carry), and `reset_stats()`
+zeroes it per phase. One owner per fact — no new checker rule needed.
+
+**Proof (real arm, 4k retention under the GPU mutex):**
+`build/llama-cuda/gplr07-qa-4096-retention.jsonl` — TG `phase_summary`
+now reports `total_transfer_us` 20.47 s, `total_wait_us` 1.71 s,
+`total_compute_us` 1.67 s, `bytes_transferred` 21.05 GB (was all zeros);
+consistent with its 3,840 `rowset_fetch` events. Full qa-smoke gate PASS
+(check-telemetry OK, answer 5/5, negative control FAILs as designed).
+Cold-start caveat per AGENTS.md: the run is the cold branch of the file
+cache (machine restart), so absolute times are not comparable to the warm
+recorded arms — the claim is the nonzero split and internal consistency,
+not a timing comparison.
+
+**First real F3 producer (same trace):** 3,840/3,880 `layer_compute`
+events carry `attn_compute_us`/`ffn_compute_us` + setup parts. First
+reading at 4k: attention 30.3 ms vs staged FFN 1.1 ms per layer-window —
+TG compute is ~27x attention-dominated at 4k context; expert staging is
+the transfer story, not the compute story. This sharpens H-C: the wait
+term to optimize next sits in attention, not expert copy.
+
+**Records:** hypothesis annotations in `docs/gplr13-bottlenecks-hypotheses.md`
+(discord item 2 and the F3-prediction line); schema note in
+`docs/rowset-fetch-telemetry-schema-draft.md` (phase_summary mapping).
+Host suite green on the fixed binary; ctest fixtures untouched (no
+checker rule changed). [Committed 2026-09-15 with the H-B fix below in
+`third_party/llama.cpp` **8e9757169**.]
+
+**Follow-on: H-B fixed the same way (2026-09-15, same session).** The
+`run_end.peak_vram_bytes` blindness had a precise mechanism: main's peak
+was a two-sample max (free_start vs free_after sampled AFTER
+`end_row_cache` released the cache), so the 2.29 GB cache plus the slot
+window vanished from the reported peak. Fix: `free_min` tracked in the
+budget struct (the one VRAM-state owner) across every refresh point
+(post-init, post-cache, post-slot-window); `tel_run_end` reports
+`total - free_min`. Non-retention shapes are byte-identical (free_min
+collapsed to the old max). Proof: 4k retention re-run
+(`gplr07-qa-4096-retention.jsonl`, archived H-A evidence at
+`gplr24-ha-4096-retention-ARCHIVE.jsonl`) now reports peak
+7,675,117,568 B vs the recorded identical 5,311,627,264 B, with
+check-telemetry OK and answer gate PASS on the same run. The reactive
+contrast arm could not run: another project held the GPU mutex for the
+whole window (1,800 s lock timeout; the recorded reactive trace is
+untouched). Host suite green after the H-B edit. [Committed 2026-09-15
+in `third_party/llama.cpp` **8e9757169** together with the deletion-first
+pass, the T-GPLR-22 refusal traces and the 200k spill fix.]
+
+---
+
+
+## 2026-09-14 (latest): full-length validation sweep 4k/50k/200k over the pruned tree — 4k and 50k PASS; 200k abort root-caused and fixed (host input-buffer spill)
+
+Owner-directed sweep of the post-pruning tree at the three ladder lengths
+(manual rungs, GPU mutex; measurement pass — no default and no gate verdict
+changed). Full analysis and hypotheses H-A..H-D in
+`docs/gplr13-bottlenecks-hypotheses.md` (2026-09-14 late section).
+
+**Gate results.**
+- **4k PASS** via the qa-smoke gate on the suite (check-telemetry OK, 23,326
+  events; answer 5/5 PASS; negative control FAILs as designed). Artifact:
+  `build/llama-cuda/gplr07-qa-4096.jsonl` (22:36 re-run; see the cold-cache
+  note below for its timing).
+- **50k PASS** direct run, recorded streaming shape, `--ubatch 512`
+  (`build/llama-cuda/gplr24-sweep/rung-50000.jsonl`, 46,606 events;
+  check-telemetry OK; answer PASS; control FAILs). PP 216.4 s / 231.0 tok/s
+  cold-ish; TG 184.5 s / 0.52 tok/s.
+- **200k first attempt ABORTED at graph build**: `attn_inp_kq_mask exceeds
+  backing buffer (offset=421,603,680 size=128,122,880 buffer=477,102,080)`
+  → `finish_build: input buffer exhausted` → `GGML_ABORT`
+  (`qwen35moe.cpp:478`); runner exit -1073740791. byte_account proves this
+  is NOT VRAM (bounded window 5.32 GB vs 22.23 GB free,
+  `bounded_within_free=true`). The trace ends at `run_start` and
+  `--check-telemetry` rejects it (missing phase_summary/run_end) — correct
+  failure behavior for a graph-build abort.
+- **200k retry after the fix COMPLETED**: `rung-200000-fix.jsonl`,
+  116,926 events, `--check-telemetry` OK; answer 5/5 PASS; negative control
+  FAILs as designed. PP 1,022.1 s / 195.7 tok/s / 15,639 evictions; TG
+  185.1 s / 0.519 tok/s; peak VRAM 7.18 GB. Same 5/5 needle set as every
+  other rung, so the answer gate holds at 200k. The first spill-fix build
+  had a real bug — the failed `alloc_tensors` pass had allocated a prefix
+  into `buf_inputs`, and spilling the FULL list re-allocated already-bound
+  tensors, tripping `GGML_ASSERT(tensor->buffer == NULL)`
+  (`ggml-backend.cpp:2057`); the spill now takes only the tensors the
+  failed pass left unallocated (transcript:
+  `gplr24-sweep/rung-200000-fix.transcript.txt`).
+
+**Root cause and fix (vendored).** `init()` sizes the persistent host input
+buffer as `n_masks * max_n_kv * max_ubatch * sizeof(f16) + embd_bytes +
+64 MiB` — exactly 477,102,080 B on this shape — but at 200k more persistent
+sets bind full-context masks than `n_masks` counts, so the cursor hits the
+budget with a 128 MB mask still unallocated. Same sizing-formula class
+T-GPLR-05 patched once with a bigger constant. Fix: a host-side SPILL
+allocator in `finish_build` — tensors that no longer fit `buf_inputs`
+allocate into an extra host buffer (`buf_inputs_spill`) instead of failing
+the build. Host memory only, no VRAM, no placement change, and a shape
+that fits never creates a spill, so every existing recorded shape's
+allocation path is unchanged. `llama-layer-streaming.{h,cpp}`
+(`llama_layer_streaming::alloc_spill`). Build clean; host suite re-run after
+the fix (see below).
+
+**Cold-cache caveat (per AGENTS.md).** The 22:36 4k re-run is the cold
+branch of an uncontrolled Windows file-cache state: TG 185.2 s (0.52 tok/s)
+vs the warm recorded 8.1 s (11.8 tok/s), PP 8.3 s vs 6.3 s. Structural
+equality was verified (checker OK, answer PASS); timing comparisons across
+runs must hold cache state fixed.
+
+**Measured bottleneck structure (from the recorded warm arms).** Streaming
+TG stages 54.98 GB across 3,840 reactive fetches in 6.00 s (9.16 GB/s);
+retention K=4 cuts that to 21.05 GB / 3.04 s (hits 3,741/3,840 ≈ 97.4%)
+and TG wall 8.12 → 5.11 s (+59% tok/s); PP full-bank staging runs at only
+3.34 GB/s (39 evictions, no overlap). Three trace-accounting discrepancies
+recorded as hypotheses: TG `phase_summary` sums are zero (H-A),
+`run_end.peak_vram_bytes` excludes the row cache (H-B), retention's hit
+path doubles median ready-latency 101 → 198 µs (H-C).
+
+---
+
+## 2026-09-14: DECISION BRIEF (item 6, owner call) — which second architecture should be the first to pass the generic gates?
+
+**Recommendation: Gemma-4 12B (`arch=gemma4`, `C:/Models/ALL/other/Gemma4/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf`),
+with the small `qwen35`-arch models run first as a cheap precursor that does NOT satisfy the gate.**
+This is a decision, not a task: no adapter, no code, no default and no gate verdict changed, and
+no task block exists yet — the choice stays the owner's.
+
+### 1. What a second architecture must actually satisfy
+
+The SDD §11 gates were written for the Qwen vehicles, so the first question is which of them
+generalize. Read against their own text, and against what the mechanism actually claims:
+
+| gate | carries over to a dense second arch? |
+|---|---|
+| 1. adapter reproduces reference package bytes / lifecycle / focused greedy ID / telemetry | **form only.** The *content* is per-arch: there is no existing gemma4 reference to reproduce, so the parity has to be established fresh against a non-residency control on the same build |
+| 2. Qwen3.6 MoE inventory before CUDA execution | **form only** ("inventory before execution" is gate 5's job); the 262,144-token Q8 configuration is Qwen3.6-specific |
+| 3. one complete expert bank per layer, exact router IDs and top-k vs a control | **N/A for dense.** Its dense analogue is gate 1's ID parity |
+| 4. 262K configuration completes or fails at the preflight; no accidental full-model placement | **N/A as written** — the model fits comfortably in VRAM, so the property is unobservable (§5.5) |
+| 5. unsupported models and insufficient budgets fail before timed execution | **carries over unchanged**, and is the cleanest generic gate; already implemented and now traced (`run_refused`) |
+| 6. default-off llama.cpp builds and behavior unchanged | **carries over unchanged** |
+| 7. any speed claim needs a paired normal-vs-residency run at equal shape | **carries over unchanged** — and binds only if a speed claim is made |
+| 8, 9, 10 (moe-row-set, the 0.6 gate, moe-row-cache) | **N/A unless the target is MoE** |
+
+So a dense second architecture is gated by **5, 6 and 7 unchanged**, the **form of 1** (per-arch
+parity instead of reproduced Qwen bytes), and gate 2's *intent* folded into 5. Nothing new has to
+be invented — which is the point of choosing a dense target first.
+
+**Existing suites, which carry over and which need an adapter path.** Carry over **unchanged**:
+`tools/run-tests.ps1 -Suite host` (39 tests — new descriptor and lifecycle fixtures join it),
+ctest `layer-slot-lifecycle`, `layer-streaming-pinned-1024`, `qwen38-layer-boundary` and
+`run-refused` (all default-off or host-only), and the `run_refused`/`--check-telemetry` rules
+(the refusal path is arch-independent by construction). Need an adapter path: the semantic-QA
+anchor — `tools/semantic-qa/gen-needle-prompt.py` calibrates the prompt to a token count with
+**the target model's own tokenizer**, so a 512-token anchor has to be re-generated and the
+checker's expected answers re-derived for the new model; and the T-GPLR-18/T-GPLR-19 A/B drivers,
+which hard-code the Qwen vehicle's model and flags, and are only needed if a speed claim is made.
+`tools/route_overlap/analyze.py` needs a `rowset_fetch` stream and is therefore **out of scope**
+for a dense target.
+
+### 2. What is really available on this disk
+
+Scanned the GGUF headers read-only (dependency-free header parse; throwaway script under
+`build/`, gitignored). The decisive finding is that **almost everything here is the same two
+architectures as the reference**:
+
+| arch key | models on disk |
+|---|---|
+| `qwen35` (the dense reference's own arch) | Qwen3.8-27B (reference), **Qwen3.6-27B**, **Bonsai-27B-Q1_0**, **Ornith-1.0-9B**, **Qwythos-9B**, **Qwen3.5-0.8B** |
+| `qwen35moe` (the MoE reference's own arch) | Qwen3.6-35B-A3B (reference), **Ornith-1.0-35B** |
+| `gemma4` | **Gemma-4 12B** (+ a 0.43 GB MTP file) |
+| `dflash` | Laguna-S-2.1 (~64 GB across 3 parts, + a vision/dflash file) |
+| `deepseek4` | DeepSeek-V4-Flash-Vision-Exp (~96 GB) — **explicitly out of scope by AGENTS.md** |
+
+So Ornith-9B/35B, Qwythos-9B, Bonsai-27B and Qwen3.6-27B are **not** second architectures:
+`llama_ls_select_adapter()` routes them through the **existing** adapters unchanged. Running one
+first is nearly free and would expose remaining geometry hard-coding, but it cannot close this
+gate and must not be recorded as if it had.
+
+### 3. The recommended target and why it is the cheapest credible one
+
+**Gemma-4 12B — `C:/Models/ALL/other/Gemma4/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf`** (6.26 GB,
+`general.file_type` 2 = mostly Q4_0, GGUF v3). Measured header facts:
+
+- `gemma4`, **48 blocks**, dense (no `expert_count`), `n_embd` 3840, `n_ff` 15360, head count 16;
+- **`sliding_window_pattern` = `1,1,1,1,1,0` repeating** — 40 SWA layers and 8 full-attention
+  layers, with `key/value_length` 512 (full) vs 256 (SWA) and two rope bases (1e6 / 1e4);
+- **`shared_kv_layers = 0`** and **`embedding_length_per_layer_input = 0`** — the two gemma4
+  features that would have complicated logical-layer KV ownership and the package member set are
+  *inactive in this checkpoint*, so they do not have to be solved to pass the gate;
+- `LLM_ARCH_GEMMA4` already exists in the vendored tree and `src/models/gemma4.cpp` already loads
+  its tensors into `llama_layer` fields through the standard `load_arch_tensors` pattern — so the
+  adapter can enumerate members exactly as the Qwen adapter does, and **no loader work is needed**.
+
+Why nothing else on disk competes: the `qwen35`/`qwen35moe` files are the same arch (§2);
+Laguna (`dflash`) is ~64 GB, multi-part, and not a plain decoder; DeepSeek V4 is excluded by the
+project instructions. Gemma-4 12B is the only genuinely distinct, small, dense, already-loadable
+architecture with a checkpoint on hand.
+
+### 4. What the adapter would have to implement, and what it costs
+
+The adapter interface is small (`name`, `policy`, `merge_resident`, `causal_implicit`, `package()`,
+`mtp_package()`); both Qwen adapters share a **194-line** file. The cost is not the descriptor —
+it is the four seams around it:
+
+| work item | where | rough size |
+|---|---|---|
+| gemma4 package descriptor + factory + registry entry | new `src/models/llama-layer-streaming-gemma4.cpp`; `llama_ls_select_adapter` | ~70-90 lines |
+| **split layer-major graph seam** — `params.layer_streaming` hook, `build_streaming_graphs()`, per-layer attn/ffn | `src/models/gemma4.cpp` (471 lines today, **no streaming seam at all**) | ~250-450 lines, by analogy with `qwen35.cpp`'s ~420-line seam |
+| metadata/inventory generalization | `llama_ls_model_inventory` in `llama-layer-streaming.cpp` | ~100-150 lines changed |
+| runner arch gates | `tools/layer-streaming/main.cpp` | ~30 lines |
+| tests, fixtures, anchor re-calibration | host suite + `tools/semantic-qa` | ~150-250 lines + fixtures |
+
+**The inventory is the sharpest hidden cost, and it is a hard stop today.**
+`llama_ls_model_inventory` opens with `if (arch != "qwen35" && arch != "qwen35moe") return fail(...)`
+and then *requires* Qwen-hybrid metadata: `ssm.conv_kernel`, `ssm.state_size`, `ssm.inner_size`,
+`ssm.group_count`, `full_attention_interval`, a `u32 attention.head_count_kv`, and a recurrent-layer
+mask. Gemma-4 has **none** of the `ssm.*` keys, and its `head_count_kv` is an **array**, so the
+preflight would `fail()` on it at the first missing key — before any GPU work. Generalizing this is
+the item most likely to regress the Qwen numbers, so it needs the existing Qwen capacity fixtures
+as the guard. Five further sites hard-code the arch string (`llama-layer-streaming.cpp` 4433/4436,
+`main.cpp` 412/3093/3097) and must become adapter-declared facts.
+
+Critically, **the streaming module has zero awareness of sliding windows or ISWA** — grep for
+`iswa` / `is_swa` / `sliding` / `n_swa` across `llama-layer-streaming.{h,cpp}` returns nothing. The
+graph input type it needs (`llm_graph_input_attn_kv_iswa`, with a builder) already exists, so this
+is wiring rather than new primitives — but it is the part of the estimate with the widest error bar.
+
+### 5. What stays unknown until it is tried
+
+1. **Whether gemma4's graph splits into a slot-bound one-layer graph without changing arithmetic.**
+   `qwen35.cpp` has its seam because it was written with one; `gemma4.cpp` has no `params.layer_streaming`
+   hook, no per-layer attn/ffn split, and its `graph` constructor is the standard single-graph form.
+2. **Whether ISWA attention survives the residency assumptions** — a layer can be either SWA or full,
+   with different head widths and rope bases, and the module currently models exactly one attention
+   shape per layer. The adapter interface has `causal_implicit` but nothing for a sliding-window mask.
+3. **Whether the byte arithmetic generalizes.** The Qwen package size derivation exists; gemma4's member
+   set differs (it adds `attn_q_norm`/`attn_k_norm`, `attn_post_norm`, `ffn_post_norm`, an optional
+   `out_scale`, and, when `embedding_length_per_layer_input > 0`, `per_layer_inp_gate`/`per_layer_proj`/
+   `per_layer_post_norm` — inactive here). No gemma4 per-layer package size is known until the adapter
+   enumerates it.
+4. **Whether the semantic-QA needle transfers** — the anchor must be re-calibrated to 512 tokens with
+   Gemma-4's tokenizer, and the checker's expected answers re-derived; a tokenizer with no `QX-`-style
+   tokens is fine (the checker is substring-based) but the calibration is not automatic.
+5. **Whether bounded residency is even observable on this target.** At 6.26 GB on a 25.6 GB card the
+   whole model fits, so gate 4 is vacuous without constraining free VRAM. A run here can prove
+   bounded slot generations, atomic package readiness and ID parity against a control — the
+   LIFECYCLE and parity claim — **not** a capacity claim. Worth stating up front, because a green
+   run will look like more than it is.
+6. **Whether the MTP checkpoint should be used.** `mtp-gemma-4-12B-it.gguf` (0.43 GB) is present. The
+   SDD's precedent for a first acceptance run is MTP inventoried but not executed, and that is the
+   cheaper choice.
+
+### 6. Where the gate decision for it would come from
+
+The gates are the owner's, not the agent's: `docs/layer-residency-sdd.md` §11 is the governing list
+and this brief does not amend it. Under the reading in §1, a Gemma-4 pass would be decided by
+**gate 5** (unsupported model and insufficient budget refuse before timed execution — already
+implemented, and now recoverable from JSONL via `run_refused`), **gate 6** (default-off host suite
+39/39 plus the qa-smoke 512 regression, re-run on the same build), and the **per-arch form of gate 1**
+(package bytes, slot lifecycle, and a focused greedy ID matched against a non-residency control on
+the same model, prompt and build). Gate 7 binds only if a speed claim is made, and no capacity
+claim is available on this target (§5.5). A new task would be drafted **only after the owner picks
+the architecture**, with its escalation condition returning the §5 unknowns to the owner if they
+resist.
+
+### 7. Scope of this brief
+
+No adapter, no code, no default, no gate verdict, and no new task block. Item 4's brief and the
+informational gate 9 decision are untouched. The measurement basis is a read-only GGUF header scan
+plus source inspection; the one artifact it created is the throwaway scanner under the gitignored
+`build/` tree, which is deliberately not part of the tracked tooling.
+
+## 2026-09-14: T-GPLR-22 PRE-TIMED ABORT — every abort in that family now leaves a trace the checker reads as a refusal (one rule extended, one new shape)
+
+Owner-directed close of the class an audit measured on two real aborts. Both were in
+item 3's class — the run read as a crash rather than "refused because of X" — and both
+are now refusals in the JSONL. No default changed, no gate verdict touched, no second
+rule added, nothing committed.
+
+**The two measured defects (audit, 2026-09-14).**
+- the `--graph-budget-mib` abort left `run_start` + `graph_footprint` +
+  `run_end(exit_status=1)` and `--check-telemetry` **rejected** it with two invariant
+  violations — a real abort whose own trace the checker refuses to read;
+- a failed `ls.init` write **no trace at all**.
+
+**The rule ONE owner, extended not forked.** `ls_refusal_trace_errors()` kept its
+signature and its call sites in both checkers; what changed is that a present
+`run_start` is no longer a contradiction on its own. The rule now rejects exactly two
+things on a refusal trace: a `phase_summary` (a completed phase means this was a failed
+run, not a refusal) and a `run_end` (`run_refused` is terminal and closes the sink).
+The "missing run_start/phase_summary/run_end" completeness rules keep their
+`&& !saw_run_refused` suppression, so nothing that passed before fails now.
+
+**The producer.** The abort sites sit AFTER `run_start` but before the run's own
+terminal write, so the runner records the deciding check and defers:
+- `abort_refusal_reason` / `abort_refusal_detail` / `abort_refusal_needed` /
+  `abort_refusal_allowed` / `abort_refusal_cap` carry the decision to the terminal
+  site;
+- the terminal write emits `run_refused` instead of the old
+  `run_end(exit_status=1, failed)` — which also removed the one `tel_error` call site,
+  since both checkers reject any `error` event;
+- `ls.init`-failure, prebuild-failure and graph-budget sites are wired; the enum (the
+  single owner shared by the emit sites and both checkers) gains `init_failed`,
+  `prebuild_failed` and `graph_budget`.
+- the emitter/enum duplication the audit also flagged was deliberately NOT refactored
+  this pass — the record shape literal still exists twice. Recorded as the next
+  cleanup, not silently dropped.
+
+**Proven on real arms** (GPU mutex, fresh paths, so no recorded artifact was touched):
+
+| arm | outcome |
+|---|---|
+| 512 `--graph-budget-mib 1` | exit 1; **44 events**, terminal `reason=graph_budget`, 201,326,592 / 1,048,576 B, `cap_source=budget`, detail = the `io_ctx_reserved` arithmetic. `--check-telemetry` exit 0: `OK (REFUSAL TRACE: 44 events, ...)`, reported as **ABORTED RUN - run_start was written, no timed phase completed, no run_end**. Strict `--validate-telemetry` exit 0, same shape |
+| 512 `--telemetry <nonexistent dir>` (a config that PASSES the preflight, so `ls.init`'s own `fopen` is what fails) | exit 1; `reason=init_failed` fires with `ls.init`'s real error and the one-shot write fails on that same path, so the stderr warning is the only record — see the honesty note below. Console evidence only (the probe is an untracked one-off); the shape is pinned by the `run-refused-init-failed` fixture |
+
+The graph-budget run's arithmetic and its `graph_footprint` row are byte-identical to the
+pre-change abort, which is the point: the same abort, now readable.
+
+**Non-breaking, falsified in both directions.** Nine refusal fixtures cover every branch
+of the rule — 4 accept (post-init pre-run, PRE-SINK single line, pre-timed abort after
+`run_start`, and the `init_failed` single line) and 5 reject (reason outside the enum,
+missing reason, `phase_summary` contradiction, `run_end` contradiction, and the pre-event
+bare-`pkg_member` shape). **Every pre-existing negative keeps its verdict.** The one that
+carried `run_start` (`run-refused-with-run-start`) still fails, now through the
+no-`phase_summary` clause rather than the old blanket `run_start` rejection — it is a
+refusal contradicted by a completed phase, and that is a NARROWER rejection, not a wider
+one. The new terminal negative (`run-refused-with-run-end`) pins that `run_refused` stays
+terminal even in the aborted shape. Host suite **37/37** (was 35; +2 net — see the
+pruning note below), ctest `run-refused` **9/9**. The
+recorded 512 qa-smoke gate re-ran and PASSES with the **same 23,326 events**, answer
+gate `aggregate=PASS` (all four needles + K1) and the negative control FAILs as
+designed; a structural compare against the recorded trace shows the event-name multiset
+is equal and there are **zero non-volatile field differences** — no event added, removed
+or reordered, no byte figure changed.
+
+**Honesty notes.** (1) A pre-timed abort raised through `init_failed` is emitted but
+cannot be persisted when the telemetry path itself is the unopenable thing: the one-shot
+emitter uses the same `fopen`, so it fails identically and only warns. That is inherent
+to the cause, not a gap in the rule. (2) The residual class is now genuinely only the
+load/setup failures and exit-2 usage errors — none of them a byte-arithmetic refusal.
+
+**Deletion pass (same day, same pass).** The audit's duplication findings were then
+closed rather than deferred, and the result is smaller and still proven byte-identical:
+- **one writer per record shape.** `tel_run_refused` and `tel_run_refused_oneshot` now
+  share a single static writer, and `tel_layer_compute` + `tel_layer_compute_parts`
+  collapsed into ONE `tel_layer_compute` (the F3 part split appends only when asked, via
+  a stack buffer) — so the record shapes read in one place instead of two.
+- **one fact-parser per checker.** The 7-line refusal parse and the OK report were
+  duplicated verbatim in `--check-telemetry` and `--validate-telemetry`; both now go
+  through `ls_refusal_facts` + `ls_parse_run_refused` + `ls_print_refusal_ok`.
+- **fixtures cut to branch coverage.** `run-refused-presink-badreason` and
+  `run-refused-aborted-prebuild` were removed: the enum check is shape-independent and the
+  enum is one array shared by the emit sites and both checkers, so a per-shape/per-reason
+  duplicate adds no branch. 11 -> 9 fixtures, 39 -> **37** host tests.
+  `run-refused-init-failed` was KEPT: it pins a different producer path (a failed bring-up
+  writes a trace, not just a preflight).
+- **equivalence evidence, not assertion.** The pruned writer was checked against the
+  RECORDED traces rather than re-reasoned: all **11,640** real `layer_compute` records
+  across the 4k-reactive and 50k-retention traces (7,680 carrying the F3 part split, 3,960
+  plain) re-render byte-for-byte, and the part sums equal `compute_us`/`setup_us` in every
+  one. The real graph-budget refusal trace still reports identically (`OK (REFUSAL TRACE:
+  44 events, reason=graph_budget, ...)`, same 44-event count), and the two known-bad
+  recorded traces still fail while all seven good ones still pass, under both checkers.
+  One real defect was caught and fixed mid-prune: routing the refusal parse through an
+  `else if (parse(...))` predicate initially set `saw` for EVERY unmatched event, not just
+  `run_refused`; the parser now checks the event name itself.
+
+Artifacts (gitignored `build/`): `gplr22-abort/qa-512-graphbudget.jsonl` and
+`gplr22-abort/qa-512-preabort.jsonl` (the post-change 512 gate re-run). **Nothing
+committed** (owner's standing instruction for this mission).
+
+## 2026-09-14: DECISION BRIEF (item 4, owner call) — should gate eligibility BIND provisioning or stay ADVISORY?
+
+**Recommendation: stay advisory.** Binding has no admissible input at bring-up today,
+and the only curve that exists is the echo-biased one. Decision material below; nothing
+was implemented, no default or gate verdict changed, and item 6 is untouched.
+
+### 1. The measured basis
+
+**(b) per depth, same rule and vehicle, two streams** (256 TG windows, W=1, 10,200
+pairs; `docs/plots/gplr15-b-vs-k.html`). The echo column is the recorded probe; the
+non-echoing column is the re-probe (one prompt changed, all flags held):
+
+| K | echoed | non-echoing | 40-layer rows |
+| --- | --- | --- | --- |
+| 1 | 0.3088 | 0.2468 | 566.2 MB |
+| 2 | 0.4343 | 0.3778 | 1132.5 MB |
+| 3 | 0.5330 | 0.4704 | 1698.7 MB |
+| 4 | **0.6284** | **0.5355** | 2264.9 MB |
+| 5 | 0.6803 | 0.5982 | 2831.2 MB |
+| 6 | 0.7169 | **0.6487** | 3397.4 MB |
+| 7 | 0.7483 | 0.6926 | 3963.6 MB |
+| 8 | 0.7775 | 0.7283 | 4529.8 MB |
+| oracle | 0.9385 | 0.9143 | unbounded |
+
+**The 0.6 crossing, and why the re-probe moved it.** Echoed, the first reading at or
+above 0.6 is K=4 (0.6284) and the interpolated crossing is ~K=3.6 (~2.26 GB). On the
+non-echoing stream **the crossing moves to ~K=5.1**, and the shallowest depth that
+actually clears the threshold is **K=6 (0.6487, ~3.40 GB)**. Per-K the shift is
+0.0492-0.0929 (widest at K=4), i.e. one to two whole K steps. A single prompt change
+bought that; nothing about the device or the mechanism changed.
+
+**The byte-to-time conversion degrades with depth** (T-GPLR-19 A/B, `--layer-slots 4`,
+256 TG tokens, reactive baseline held at 11.863-11.967 tok/s across five GPU sessions):
+
+| K | cache | saved B/token | TG off | TG on | gain | GB/s | marginal |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 546.8 MiB | 396,398,208 | 11.953 | 14.021 | +2.068 | 14.29 | - |
+| 2 | 1093.0 MiB | 324,793,824 | 11.967 | 15.820 | +3.853 | 12.18 | 8.93 |
+| 4 | 2185.4 MiB | 214,053,600 | 11.863 | 19.727 | +7.865 | 10.67 | 8.35 |
+| 6 | 3277.8 MiB | 163,659,552 | 11.878 | 22.074 | +10.196 | 10.52 | 9.55 |
+| 8 | 4370.1 MiB | 129,075,264 | 11.873 | 24.481 | +12.609 | 10.23 | 7.69 |
+
+Only the FIRST retained window converts above the link ceiling (14.29 > 13.7 GB/s);
+every deeper window converts at roughly the measured effective per-fetch rate (8.42
+GB/s). **But every depth still gains in tok/s** — deeper is slower per byte saved, not
+worse in outcome. Caveat that matters for this decision: this A/B was run on the
+512-token anchor vehicle and its `(b)off` column is the ECHOED series, so the gains are
+the optimistic pairing; a non-echoing stream would compress them by roughly the same
+0.06-0.09.
+
+### 2. Where today's K=4 default came from
+
+Owner direction, 2026-09-14: "set K=4 as default for now". It rests on the **echoed**
+crossing — K=4 is the first recorded reading at or above 0.6 (0.6284) — and it is
+explicitly a PROVISIONAL OPERATING DEFAULT, not a gate verdict: no PASS is established
+at any depth, and the SDD scope amendment (2026-09-14) owns that decision. The
+VRAM-adaptive fit added afterwards (`kRowSetRetainDefault = 4`) keeps K=4 wherever the
+device affords it (arms F1/F2, free 19,775,094,784 B) and downscales only the *bare*
+default on a tight device (F4 -> K=3; F5 -> refuse, not even K=1 fits). A depth the
+operator NAMES is a contract and is never reduced. So the default today is: chosen on a
+biased crossing, then fitted to VRAM.
+
+### 3. What the runner knows at provisioning, and what binding would need
+
+At bring-up the runner has: total/free VRAM, the budget and reserve, the package
+inventory, and the per-K row footprint (572,719,104 B per K step = 8 rows/layer). It
+has **no (b) figure at any depth, and cannot compute one there.**
+
+(b) is a property of a *routing stream*, not of the model, the device, or the depth:
+it is the fraction of each next window already resident under bounded retention, and it
+is obtained either offline (the analyzer simulating retention over a recorded
+`rowset_fetch` union stream) or live (after tokens have been routed). At bring-up zero
+tokens have been routed, and for TG the stream depends on tokens not yet generated.
+
+**So the information does not exist, and it is not merely uncollected.** For a binding
+rule to have an input, one of these would have to exist first, and none does:
+
+1. **A tracked `(b)`-vs-K oracle** for a declared workload class, produced by the
+existing analyzer over a recorded trace, with that trace's provenance recorded. Today
+there are measured points for exactly TWO streams on ONE model, and they differ by
+0.0492-0.0929 at every K. The four preserved ladder rungs disagree in the other
+direction too (ceilings 0.4000-0.4266), because their 3-window ceiling is a
+stream-length artifact. A scalar per (model, K) would be wrong-sized for a policy.
+2. **A live pre-run probe**: route a short sample, build the union stream, simulate
+retention per K, then provision. Cost: a GPU pass whose stream may not represent the
+run's, plus it changes what "provisioned once at bring-up" means.
+3. **A cheap bring-up proxy.** Nothing existing maps a quantity the runner already has
+(rows/layer, union size, top_k) to (b), and the measured spread — 0.2468-0.7283 over K
+on one stream, ceilings 0.4000-0.9385 across streams — is why a proxy should not be
+trusted. A proxy would also need its own error budget against the 0.6 line.
+
+### 4. The two options, and what each costs
+
+| | A: eligibility BINDS provisioning | B: eligibility stays ADVISORY |
+| --- | --- | --- |
+| Rule | refuse (or downscale) a depth whose (b) is not shown to clear the declared gate | provision on VRAM fit; report (b) as a reading; a gate claim is read at the depth a claiming task declares |
+| Input it needs | a `(b)`-vs-K oracle at bring-up (item 3.1/3.2) — **does not exist** | none beyond what it already reads |
+| Behaviour today | no oracle => refuse everything, or bind to the ECHOED curve, which is the number proven inflated by 0.0492-0.0929 | unchanged |
+| Cost on this device | the fit resolves K=4 here (F1/F2). Non-echoing (b) at K=4 is 0.5355 < 0.6, so a bind on the honest reading refuses the default where it was chosen; a bind on the echoed reading allows it on a number known wrong. Either way the operator loses the default or the honesty | an operator can run a depth whose (b) is unverified; the only guard is the reported reading, which today does not distinguish "known to clear" from "unknown/biased" |
+| Throughput | would trade away the measured gain at every depth (+7.865 tok/s at K=4, +12.609 at K=8) | none — every measured depth still gains |
+| Verdict effect | binding does NOT create a gate PASS; it converts an informational reading into a refuse/allow switch resting on a biased input | none; gate stays informational, no PASS at any depth |
+
+### 5. Recommendation
+
+**Keep it advisory.** Reasons, in order of weight:
+
+1. A binding rule today has no admissible input. The only curve available is the
+echo-biased one — the exact input the pre-registered caveat forbids committing VRAM on.
+2. Binding would decide nothing that is currently undecided. The gate is already
+informational and no PASS exists at any depth, so A's only real effect is to convert a
+reading into a switch — on a number we have measured to be wrong by 0.0492-0.0929.
+3. On the evidence, the current policy is not harmful to throughput: every measured
+depth still gains, so VRAM-fit provisioning does not trade TG speed away. The
+degradation with depth is in conversion efficiency (10.23-14.29 GB/s), not outcome.
+4. It is reversible in the honest direction: staying advisory keeps the operator's
+declared depth meaningful, and the moment an oracle exists the rule can be added
+without retracting anything measured here.
+
+**If the owner wants binding eventually, this is what must exist first** (and it is a
+prerequisite task, not part of this brief): a tracked `(b)`-vs-K surface for a declared
+workload class with recorded provenance for the streams behind it; a pre-registered rule
+fixing WHICH stream length, W and retention rule count for a verdict; a stated
+behaviour for a depth the surface has no entry for (refuse, or fall back to the SDD's
+reference band); and a refusal reason plus trace field so a gate-ineligible provisioning
+refusal is recoverable from the JSONL — the shape for that now exists (the PRE-SINK
+`run_refused` work landed this session), so the missing part is the oracle, not the
+plumbing.
+
+### 6. Scope of this brief
+
+No code, no default, no gate verdict, no new capability changed. Item 6 is NOT started:
+its model choice is a separate owner call. The K=4 default remains provisional and
+echo-biased; the SDD scope amendment still owns the informational-gate decision, and
+this brief does not supersede it — it is the material for the owner's call.
+
+## 2026-09-14: T-GPLR-22 PRE-SINK — a refusal raised before `ls.init` now leaves a recoverable `run_refused` trace instead of no file at all
+
+Owner-directed close of the one class mission item 3 left open. ONE event type, and
+**no new checker rule** — one producer and two fixtures. No default changed, no gate
+verdict touched, nothing committed.
+
+**The gap.** The T-GPLR-04 capacity preflight and the T-GPLR-10 / T-GPLR-16 handoff
+fit gates run BEFORE `ls.init` opens the telemetry sink (`llama_layer_streaming ls;`
+is constructed *after* the preflight block), so their refusals exited 1 with the
+arithmetic on stderr and wrote **no JSONL at all**. The 2026-09-14 50k `--handoff` arm
+hit exactly this. An absent file is unambiguous, but a harness still saw only a
+nonzero exit — the same "cannot tell refused-because-of-X from a crash" state the
+event exists to remove.
+
+**No second rule, proven before any edit.** `ls_refusal_trace_errors()` was NOT
+changed, because a trace whose ONLY content is `run_refused` already satisfies it: the
+pre-edit probe returned `OK (REFUSAL TRACE: 1 events, reason=row_cache_fit, ...)`. So
+this adds a *producer* only:
+- `llama_layer_streaming::tel_run_refused_oneshot(path, reason, detail, exit, needed,
+  allowed, cap_source)` — **static**, because no instance exists at those sites; it
+  opens the path, writes the SAME record through the same JSON-safe folding, closes,
+  mirroring the existing one-shot `tel_off_run` precedent.
+- a `refuse_before_sink()` helper in the runner, called at the seven pre-sink refusal
+  gates (inventory failure, window parse, the `--allow-full-residency` override,
+  residency budget, bounded-vs-free VRAM, the T-GPLR-10 handoff gate, the T-GPLR-16
+  partial-handoff gate). It is a no-op when no telemetry path was requested, so a
+  plain run never enters it.
+- the enum — the single owner shared by the emit sites and both checkers — gains TWO
+  reasons: `capacity_preflight` and `handoff_preflight`. `detail` carries the exact
+  condition and `cap_source` the limiting term.
+
+**Proven on real arms** (GPU mutex, fresh paths, so the recorded 2026-09-14 artifacts
+were not overwritten):
+
+| arm | outcome |
+|---|---|
+| 50k `--handoff`, the recorded arm's flags verbatim | exit 1; trace is ONE line: `reason=handoff_preflight`, 22,525,977,088 / 22,226,665,472 B, `cap_source=free`, detail = the T-GPLR-10 arithmetic. `--check-telemetry` exit 0 (REFUSAL TRACE); `--validate-telemetry` exit 0 |
+| 512 `--residency-budget-mib 64` | exit 1; ONE line: `reason=capacity_preflight`, 3,151,424,000 / 67,108,864 B, `cap_source=budget`. Checker exit 0 |
+
+Both traces reproduce the stderr arithmetic byte-for-byte, so the JSONL and the console
+now agree. The 50k re-run reproduces the recorded refusal exactly
+(`weights+KV+state 21,989,106,176 B ... = 22,525,977,088 B exceeds 22,226,665,472 B`).
+
+**Non-breaking, falsified in both directions.** No existing trace, fixture or recorded
+artifact was rewritten or rejected: the five pre-existing refusal fixtures keep their
+verdicts (1 passes / 4 rejected), the two new fixtures pin the new shape (single-line
+`handoff_preflight` passes; the same single line with an unknown reason is still
+rejected), host suite **35/35** (was 33), ctest `run-refused` **7/7**. The recorded 512
+qa-smoke gate was re-run and PASSES with the **same 23,326 events**; a field-by-field
+compare against the pre-change copy shows the ONLY differences are wall-clock values
+plus the timing-derived `ready_at_consumption` boolean (103 vs 99) — no event added,
+removed or reordered, no byte figure changed, and **0** `run_refused` records on a
+successful run.
+
+Artifacts (gitignored `build/`): `gplr22-presink/qa-50000-handoff.{jsonl,txt}`,
+`gplr22-presink/qa-512-budget.jsonl`, and `gplr22-presink/gplr07-qa-512-pre.jsonl`
+(the pre-change copy used for the structural compare). The recorded suite logs
+`gplr24-modes-50000-handoff.log` / `gplr07-qa-50000-handoff.log` are untouched.
+**Nothing committed** (owner's standing instruction for this mission).
+
+**Residual — narrowed, not closed.** The traceless class is now the *load/setup*
+failures rather than the refusals: unreadable `general.architecture`, a failed
+capability probe, `failed to load model`, `failed to create context`, the
+`--inspect-model` errors, and the exit-2 usage errors (`--handoff-partial` bounds, the
+layer-major TG cap). None is a byte-arithmetic refusal — they have no
+`bytes_needed`/`bytes_allowed` to report — so covering them is a setup-failure-trace
+feature, not an extension of this one. [EXTENDED 2026-09-14 (PRE-TIMED ABORT): this
+residual did not name the abort family, which the audit then measured on real arms —
+the `--graph-budget-mib` abort left a trace `--check-telemetry` REJECTED, and a failed
+`ls.init` wrote nothing. Both are refusals now; see the latest entry.]
+
+## 2026-09-14: Mission item 5 — the three opt-in TG modes measured at 4k and 50k; run `handoff` where it fits, `retention` K=4 where it cannot, `reactive` only if neither fits
+
+Owner-directed measurement (mission item 5). Six arms = three configurations x two
+lengths, run through the documented suite (`tools/run-tests.ps1 -Suite qa-smoke
+-SmokeMode <mode>`), everything except the mode held fixed: same model, same
+anchor, same flags, and the documented 50k prefill width (`-SmokeUbatch 512`, the
+recorded one-ubatch ceiling workaround). At 4k the recorded one-ubatch shape is
+kept. Modes: `reactive` (`--no-handoff --residency-tg`), `retention` (`--no-handoff
+--residency-tg --residency-tg-retain`; the bare flag resolves to the K=4 default),
+`handoff` (`--handoff`). No default, gate verdict or implementation was changed.
+
+PP is mode-independent, as its bytes prove: staged `bytes_transferred` is
+18,327,011,328 B on all three 4k arms and 1,796,047,110,144 B on both 50k arms, with
+the same 39 / 3,919 evictions and the same 3,840 `rowset_fetch` events. The mode is
+a TG policy, so only the TG leg moves.
+
+| length | mode | PP wall (tok/s) | TG wall | TG tok/s | `peak_vram_bytes` | `row_cache` | answer gate |
+|---|---|---|---|---|---|---|---|
+| 4k | reactive | 6,262,501 us (654.05) | 8,115,958 us | 11.829 | 5,311,627,264 B (5065.6 MiB) | 0 | PASS |
+| 4k | retention K=4 | 6,287,938 us (651.41) | 5,109,286 us | 18.789 | 5,311,627,264 B (5065.6 MiB) | 2,291,531,776 B | PASS |
+| 4k | handoff | 6,180,092 us (662.77) | 1,392,102 us | **68.960** | **4,781,047,808 B (4559.6 MiB)** | 0 | PASS |
+| 50k | reactive | 207,233,976 us (241.27) | 7,917,790 us | 12.125 | 5,204,672,512 B (4963.6 MiB) | 0 | PASS |
+| 50k | retention K=4 | 207,219,795 us (241.29) | 4,568,054 us | **21.016** | 5,204,672,512 B (4963.6 MiB) | 2,291,531,776 B | PASS |
+| 50k | handoff | REFUSED (no PP, no trace) | — | — | — | 0 | n/a |
+
+4k ctx 4352 / 1 PP ubatch; 50k ctx 50176 / 98 PP ubatches; 96 TG tokens every arm.
+All five completed arms PASS the answer gate with the negative control failing as
+designed; re-graded directly from the five `--tg-text` files
+(`check-answer.py check --tg-text ...` -> `aggregate=PASS`, `--negative` ->
+`aggregate=FAIL`) rather than trusted from the suite log.
+
+**Recommendation (measured, not argued).** The mode choice is a TG-leg choice, and
+the three are not variants of one another:
+1. Run `handoff` wherever it fits. It is 5.83x reactive TG at 4k and it costs
+   *less* reported VRAM (4559.6 vs 5065.6 MiB), because the post-PP peak-order rule
+   releases the slot buffers and packs the banks. It cannot serve long contexts on
+   this card (arm 6).
+2. Run `retention` K=4 where handoff does not fit. 1.588x reactive TG at 4k and
+   1.733x at 50k, for exactly 2,291,531,776 B (2185.4 MiB) of device residency, and
+   its TG edge is *larger* at the long context where it is the only option.
+3. `reactive` only when neither fits: the lowest-residency and slowest TG path, and
+   the one that carries no cache lifetime questions at all.
+PP latency is the same in all three (see the byte identity above), so nothing in this
+ranking trades prefill against decode.
+
+These magnitudes belong to THIS vehicle (qa-smoke, 96 TG tokens, 1 slot) and are not
+interchangeable with T-GPLR-19's own A/B, which measured reactive 11.953 -> K=1
+14.021 tok/s on the 4-slot batch-major probe vehicle with 256 TG tokens. Same
+mechanism, different shape, different absolute gain; neither reading is a correction
+of the other.
+
+**Arm 6 — `handoff` at 50k refuses by design, and the ceiling is now arithmetic.**
+Exit 1 at the T-GPLR-10 handoff capacity preflight, before the timed PP:
+`weights+KV+state 21,989,106,176 B (KV 545,914,880 B, state 65,863,680 B) + act slabs
+0 B + reserve 536,870,912 B = 22,525,977,088 B exceeds observed free VRAM
+22,226,665,472 B`, shortfall 299,311,616 B (285.4 MiB). This refusal precedes
+`ls.init`, so **no telemetry sink exists and no JSONL is written at all** — the
+residual the T-GPLR-22 entry left open, hit on a real arm (`run_refused` cannot cover
+it). Log `build/llama-cuda/gplr24-modes-50000-handoff.log`; the suite's
+`gplr07-qa-50000-handoff.jsonl` is absent, not empty. [AMENDED 2026-09-14 (T-GPLR-22
+PRE-SINK): the finding stands and this pass's artifacts are untouched, but the
+"cannot cover it" clause is now false — the pre-sink gates write a one-line
+`run_refused` through a standalone emitter. Re-running THIS arm's flags writes
+`gplr22-presink/qa-50000-handoff.jsonl` (reason `handoff_preflight`, 22,525,977,088 /
+22,226,665,472 B) and `--check-telemetry` reads it as a REFUSAL TRACE. The absence
+described above is that pass's artifact, not current behaviour.] From the gate's own terms the
+boundary is ~22,665 ctx tokens today: weights 21,377,327,616 B + state 65,863,680 B +
+reserve 536,870,912 B leave 246,603,264 B of KV at the measured 10,880 B/token (q8,
+ctx 50176 -> 545,914,880 B). This is derived arithmetic, not a run — no rung
+straddles the boundary.
+
+**VRAM finding: `peak_vram_bytes` cannot see the row cache, and the polled pair
+shows the real cost.** The two 4k arms that differ only by the retention flag report
+the *same* `peak_vram_bytes` (5,311,627,264 B; likewise 5,204,672,512 B at 50k)
+despite one holding a 2,291,531,776 B cache. Reason: `peak_vram_bytes` is
+`total - min(free_after, free_start)` sampled **once** at main.cpp:4662-4663, and
+`ls.end_row_set()` at main.cpp:4557 (which calls `end_row_cache()`,
+llama-layer-streaming.cpp:3653) releases the cache before that reading — so the
+figure is a free-VRAM endpoint delta, never a running peak. With `tools/gpu-mem-poll.ps1`
+attached to the same 4k pair, per-process dedicated peaks are 3,978.8 MiB (reactive)
+vs 6,242.8 MiB (retention), +2,264.0 MiB, consistent with the exact 2,185.4 MiB
+cache plus ~79 MiB of KV/compute growth. Attribution verified by absolute time, not
+assumed: each poll file spans 200 s (writers closed 18:38:47 / 18:39:57), so the
+reactive arm is the process seen only in the first file (t=45.3-63.1 = 18:36:12-18:36:30)
+and the retention arm is the one whose window appears in both (t=114.8-127.8 in file 1
+and t=44.0-58.5 in file 2, both resolving to 18:37:22-18:37:36); the files overlap by
+construction, since the loop starts the next 200 s poller 4 s after the previous arm
+ends. Read against bottleneck section 3.1: for reactive the JSONL figure *exceeds* the
+polled one by 1,086.8 MiB (5,065.6 vs 3,978.8) — the fixed ~1.09 GB class — while for
+retention it falls 1,177.3 MiB *below* its polled figure (5,065.6 vs 6,242.8), i.e. the
+cache is missing; the two JSONL figures are identical to the byte. This is a second and
+different instance of the H6 accounting class (a *lifetime* blind spot, not a counter
+blind spot), recorded in that section. Caveat: one run per arm at 500 ms sampling, so
+2,264.0 MiB is a sampled figure; 2,291,531,776 B is exact from `byte_account` and
+identical at both lengths.
+
+Artifacts (gitignored `build/`): `gplr07-qa-{4096,50000}-{reactive,retention,handoff}.{jsonl,txt}`,
+the 50000-handoff log, `gplr24-4k-{reactive,retention}-poll.csv` and the launchers
+`run-mode-50000-handoff.ps1` / `run-4k-poll.ps1`. **Nothing committed** (owner's
+standing instruction for this mission). All five completed arms also carry a strict
+`--check-telemetry` OK (the suite enforces it before grading). The suite gained one
+new parameter, `-SmokeMode`, and its default is verified not to disturb the recorded
+gate: `tools/run-tests.ps1 -Suite qa-smoke` with no mode argument re-ran the 512 rung
+after this measurement -- `mode=streaming`, artifacts at the recorded
+`gplr07-qa-512.{jsonl,txt,log}` paths (no `-streaming` suffixed files were created),
+the same 23,326-event trace, answer PASS and negative control FAILs as designed.
+
+## 2026-09-14: T-GPLR-22 — a pre-work refusal is now a structured, recoverable record (`run_refused`) instead of a partial trace that reads like a crash
+
+Owner-directed close of mission item 3. One event type, one checker rule,
+fixtures; no default changed, no gate verdict touched, nothing committed.
+
+**The defect.** A refusal raised after `ls.init` opened the telemetry sink (the
+row-cache fit gates, the cache allocation, the fit/allocation divergence check,
+the prefetch-probe configure) exited 1 with its arithmetic on stderr and left
+**40 `pkg_member` records and no `run_start`** — which `--check-telemetry`
+rejected with 3 invariant violations, i.e. indistinguishable from a crashed
+partial trace. Recorded as a residual three times.
+
+**The event.** `run_refused` — `{event, run_id, reason, detail, exit_status,
+bytes_needed, bytes_allowed, cap_source, phase, t_us}`. Emitted **before**
+`run_start` and **terminal**: it is the last event in the trace and closes the
+sink (it replaces the one bare `run_end` that used to be written at the
+prefetch gate, which was the same confusing shape). `detail` is JSON-escaped by
+the producer, so a free-text message can never break the line. The `reason`
+enum and its validator live once in the runner (`kRunRefusalReasons` /
+`ls_run_refusal_reason_ok`), used by both the emit sites and the checkers, so areason cannot be emitted without being checkable. Six reasons:
+`row_cache_derive`, `row_cache_fit`, `row_cache_depth`, `row_cache_alloc`,
+`row_cache_divergence`, `prefetch_configure`. [Later additions, same list and same
+owning claim: `capacity_preflight` and `handoff_preflight` (PRE-SINK), then
+`init_failed`, `prebuild_failed` and `graph_budget` (PRE-TIMED ABORT) — eleven total
+as of 2026-09-14.]
+
+**The rule, one owner.** `ls_refusal_trace_errors()` is called by BOTH
+`--check-telemetry` and `--validate-telemetry`: a trace carrying `run_refused`
+must have no `run_start`, no `phase_summary` and no `run_end`, and its `reason`
+must be in the enum. The three "missing run_start / phase_summary / run_end"
+rules describe a run that started, so they are suppressed for a refusal trace.
+With no `run_refused` present every input is false and the rule is a no-op.
+[AMENDED 2026-09-14 (PRE-TIMED ABORT): the "no `run_start`" clause was RELAXED
+for the ABORTED-RUN shape — `run_start` is admissible and neither required nor
+forbidden — so the rule now rejects only a `phase_summary` and a `run_end`. In
+this entry's own terms a refusal trace no longer needs to be pre-work; the
+one-owner claim and the suppression of the three "missing" rules both stand.
+See the latest entry.]
+`--validate-telemetry` returns before building a report (a refusal has no
+phases), so no `.summary.json` is written for one.
+
+**Non-breaking, and falsifiable that way.** Nothing that used to pass is
+rejected; the only new acceptance is the new shape. The pre-event refusal shape
+is deliberately still REJECTED, and there is a fixture that proves it, so the
+claim is tested rather than asserted. No recorded trace or fixture was
+rewritten to make anything pass.
+
+**Real runs, one GPU session (both reasons), MoE probe model.**
+
+| arm | flags | outcome |
+| --- | --- | --- |
+| R1 | bare `--residency-tg-retain` + `--residency-budget-mib 4700` | exit 1; `run_refused` reason **`row_cache_fit`**, 2,291,531,776 / 210,310,656 B, `cap_source` budget |
+| R2 | `--residency-tg-retain 4` + `--residency-budget-mib 6000` | exit 1; `run_refused` reason **`row_cache_depth`**, 2,291,531,776 / 1,573,459,456 B, "the largest depth that fits is K=2" |
+| — | *(a first R1 attempt that accidentally omitted the retain flag)* | retention OFF, so no fit ran and nothing refused: a normal 21,020-event run, checker OK; `rowset_init.retain_k` 0, `row_cache` 0, `residency_cap` 4,928,307,200 B. Evidence the event is not emitted on any non-refusal path |
+
+Both refusal traces are 41 records (40 `pkg_member` + 1 `run_refused`), carry no
+`run_start`, and `--check-telemetry` now reports them as
+`OK (REFUSAL TRACE: 41 events, reason=<r>, exit_status=1, <needed>/<allowed> B,
+cap_source=budget)` with the detail line — so the refusal is recoverable from
+the JSONL alone. R1's allowance (210,310,656 B) and R2's (1,573,459,456 B)
+reproduce the recorded budget-cap arms C3/C4 exactly.
+
+**Also observed and worth stating:** the first attempt at R1 omitted the bare
+`--residency-tg-retain` flag, so retention was OFF and the run completed
+normally (21,020 events, `rowset_init.retain_k` 0, `row_cache` 0,
+`residency_cap` 4,928,307,200 B). That is a correct run of a different
+configuration, not a failure of the rule, and it doubles as evidence that the
+new event is not emitted on any non-refusal path.
+
+**Fixtures (5, host-only, no GPU).** Generated by the tracked
+`gen-lm40-fixtures.py` (which re-emits every existing fixture byte-identically,
+verified): `run-refused-positive` (the real shape -> PASS) and four WILL_FAIL
+negatives — `run-refused-badreason` (reason outside the enum),
+`run-refused-noreason` (no reason field), `run-refused-with-run-start`
+(contradicted by `run_start` + `phase_summary`), and `run-refused-legacy` (the
+pre-event shape, which must stay rejected). Wired into CMakeLists and into the
+host suite's `Include` regex.
+
+**Validation.** Build clean. Host suite **33/33** (was 28; +5). The 5 new
+fixtures: 1 passes, 4 rejected, as designed. ctest `layer-streaming-pinned-1024`
+**2/2**, `qwen38-layer-boundary` **1/1**, `layer-slot-lifecycle` **1/1**. QA
+smoke 512 **PASS** (check-telemetry OK, answer PASS, negative control FAILS as
+designed). Real refusal traces for both reasons, checker-clean.
+
+**Residual.** A refusal raised BEFORE the sink exists (the T-GPLR-04 capacity
+preflight, argument validation) still writes no trace at all — the new event
+covers the refusals that produced a partial trace, which is the class the
+residual named. That absence is unambiguous (no file), unlike the old partial
+trace, but a harness still sees only a nonzero exit for it. Covering it would
+mean opening the sink before the preflight, which is a bigger change than this
+item's declared size. [RESOLVED 2026-09-14 (PRE-SINK) for the refusal half, and
+NOT by opening the sink early: a static one-shot emitter writes the same terminal
+record before `ls.init` exists, so the preflight gates now leave a one-line
+`run_refused` and the checker rule is unchanged. The load/setup failures and the
+exit-2 usage errors stay traceless — they are not byte-arithmetic refusals. See
+the PRE-SINK entry at the top.] The two probe runners are untracked one-offs under the
+gitignored `build/` root. **Not committed** — the owner did not ask this turn.
+
+## 2026-09-14: the non-echoing re-probe RAN — K=4 does NOT clear gate 9 on it (0.5355 vs 0.6284 echoed); the first clearing depth is K=6
+
+Owner-directed closing measurement for the mission's first item: the
+non-echoing 256-token re-probe plus the offline statistic (b). One GPU session
+(~0.6 min incl. the 885-token PP), no library change, no default change, no gate
+verdict changed, nothing committed.
+
+**First, a provenance correction that decides what was measured.** The intact
+artifacts from the earlier aborted attempt
+(`build/llama-cuda/gplr20-guess-early/probe-tg256-repro.{jsonl,txt}`,
+2026-09-14 17:27) are NOT the re-probe. They are a **bit-for-bit reproduction
+of the recorded echoing probe**: the same 10,240-event `rowset_fetch` route
+stream, the same greedy token IDs, the same text sha256
+`f690bfa4df173b7c...`, the same analyzer report (only the filename line
+differs), and the same readings 0.3088 / 0.4343 / 0.6284 / 0.7169 / 0.7775 with
+oracle 0.9385. Its prompt is the echoing needle document, and its 256 generated
+tokens contain 25 distinct values inside a ~34-token near-repeat loop. So that
+trace belongs to the **"guess early" expert-repetition item** (its runner's own
+framing), not to the re-probe — reading it again returns the same biased number
+the re-probe exists to escape, and it cannot decide K=4. Its repetition
+statistics, now recorded for that item: T5 token-level window-equality **0.0019**
+(n_pairs 10,200); T7 reappearance distance 1:25,202 / 2:7,564 / 3:4,270 /
+4:5,350 windows; rows seen once 739/5,342; cumulative coverage at retention
+1/2/4/8 = 0.3291 / 0.4279 / 0.5535 / 0.7025.
+
+**The re-probe, and its declared rule (authored 2026-09-14 — it does NOT
+predate the original measurement).** The recorded probe invocation with exactly
+ONE change, the prompt BODY: `build/calc-prompt.txt` (the natural-language code
+prompt already recorded for the gplr06 code-prompt runs, 885 tokens) instead of
+the echoing needle document; `--pp-tokens 885` to take it whole; everything else
+held at the recorded values (`--residency moe-expert-bank --residency-tg
+--pp-schedule batch-major --ubatch 512 --tg-tokens 256 --layer-slots 4
+--kv-cache q8 --greedy --no-mtp --pp-no-logits --allow-full-residency`).
+*Reading*: statistic (b) as SDD section 10 / gate 9 defines it (tracked analyzer,
+row-capacity-lru, W=1, next window in the denominator) at the declared depth,
+plus T8/T5/T7 for context. *Decision rule, fixed before the run*: K=4 survives
+only if (b) at K=4 >= 0.6 on the non-echoing stream; the pre-registered
+direction is that a non-echoing (b) is <= the echoed (b) at every K, because
+repetition can only raise temporal reuse.
+
+**Non-echoing check — PARTIAL, and the defect is in the declaration.** Declared
+conjunction: `distinct 16-gram ratio >= 0.90` AND `zlib(id sequence) ratio >=
+0.50`, calibrated beforehand on the known-echoing stream. Result: 16-gram ratio
+**1.0000** (echoed 0.3734; all 241 spans distinct) but zlib ratio **0.4238**
+(echoed 0.1152). zlib compresses structured HTML/CSS tokens well with no
+repetition at all, so that criterion measured the entropy of a code stream
+rather than repetition and was mis-chosen when declared. The stream is
+non-echoing on the criterion that actually measures repetition and on the
+generated text (a single-pass calculator document, no loop; distinct-token
+ratio 0.4102 vs 0.0977); the certification is recorded as partial rather than
+repaired after the fact.
+
+**Result (256 TG windows, W=1, 10,200 pairs).**
+
+| K | echoed (recorded probe) | non-echoing (re-probe) | delta | VRAM / 40 layers |
+| --- | --- | --- | --- | --- |
+| 1 | 0.3088 | 0.2468 | -0.0620 | 566.2 MB |
+| 2 | 0.4343 | 0.3778 | -0.0565 | 1132.5 MB |
+| 3 | 0.5330 | 0.4704 | -0.0626 | 1698.7 MB |
+| 4 | 0.6284 | **0.5355** | **-0.0929** | 2264.9 MB |
+| 5 | 0.6803 | 0.5982 | -0.0821 | 2831.2 MB |
+| 6 | 0.7169 | 0.6487 | -0.0682 | 3397.4 MB |
+| 7 | 0.7483 | 0.6926 | -0.0557 | 3963.6 MB |
+| 8 | 0.7775 | 0.7283 | -0.0492 | 4529.8 MB |
+| T8 oracle | 0.9385 | 0.9143 | -0.0242 | unbounded |
+
+Every K falls, so the pre-registered direction holds. **Verdict: the K=4
+default does not survive as a gate reading.** Its non-echoing (b) is 0.5355,
+below the 0.6 threshold; the recorded 0.6284 is confirmed echo-inflated by
+0.0929. The 0.6 crossing moves from ~K=3.6 (echo, ~2.26 GB) to ~K=5.1 on this
+stream, so the shallowest depth clearing the gate is **K=6 (0.6487, ~3.40 GB)**.
+T4 consecutive-window containment 0.3088 -> 0.2468; T5 window-equality 0.0019 ->
+0.0004 (exact window identity was never the discriminator); rows seen once
+739/5,342 -> 1,039/7,311; cumulative coverage at retention 1/2/4/8 =
+0.2699 / 0.3832 / 0.5160 / 0.6498.
+
+**One correction to how the echo caveat has been quoted.** The re-probe's
+ceiling (0.9143) is nowhere near the 0.4000-0.4266 range recorded for the four
+preserved ladder rungs. Those are 3-window streams, so their ceiling is
+structurally capped at two prior windows and is monotone in stream length: that
+range is a STREAM-LENGTH artifact, not the non-echoing expectation. The only
+like-for-like comparison is 256 windows vs 256 windows, 0.9385 -> 0.9143.
+
+**Nothing moved.** No default, no gate verdict, no implementation: K=4 stays
+the mechanism's provisional operating default, and a K=4 gate PASS remains
+UNAVAILABLE — now on measured evidence instead of a caveat. The gate stays
+informational per the SDD scope amendment, which now carries this validation
+note; the plan's "outstanding re-probe" entries are annotated RESOLVED.
+
+**Artifacts and validation.**
+`build/llama-cuda/gplr15-nononchoing/probe-tg256-nononchoing.jsonl` — run exit
+0, `--check-telemetry` OK (21,260 events), `rowset_init` 1, `rowset_fetch`
+10,240, `rowset_round` 256, `rowset_refused` 0; PP 885 tokens at 111.7 tok/s
+(transfer 30.1 s), TG 256 tokens at 12.070 tok/s, peak VRAM 5,731.56 MiB. The
+analyzer report sits beside it; the launching one-off
+(`build/llama-cuda/gplr15-nononchoing/run-reprobe.ps1`) and the trace are
+untracked under the gitignored `build/` root, so a clean checkout needs a fresh
+run to re-derive these numbers. **Not committed** — the owner did not ask, so
+the four doc records are on disk only.
+
+**Residual.** The non-echoing certification is partial (see above), and this is
+ONE prompt on ONE model: a second non-echoing stream would test whether the
+~0.06-0.09 shift is stable or prompt-specific, and the re-probe prompt choice
+was the agent's, not a recorded owner decision.
+
+## 2026-09-14: F3/H8 implemented — TG row-set `layer_compute` carries real per-part timings, so the transfer term now splits into submit / copy / compute
+
+Owner-directed implementation of follow-up F3 (H8). Host + one GPU run; library
+change only (`third_party/llama.cpp/src/llama-layer-streaming.cpp` and `.h`), no
+runner flag, no routing or placement change, no new dependency.
+
+**Defect closed.** The row-set TG executor ran a two-part graph per layer but
+emitted `tel_layer_compute(il, 0.0, 0.0, ...)` — section 3.6's 120 zero-valued
+TG events per run, which made the TG decomposition unable to separate
+FFN/attention compute from scheduler overhead.
+
+**Change.** `run_graph_plain` now returns the same split the other executors
+record (`setup_us` = sched reset + alloc, `compute_us` = launch + execute +
+sync); the per-layer loop times part A (attn+residual+post-norm+router) and
+part B (FFN + shared experts) around the router read and `load_row_set`; new
+`tel_layer_compute_parts` emits ONE `layer_compute` per layer/window with
+`compute_us`/`setup_us` unchanged in meaning (the A+B sums) plus
+`attn_compute_us`/`attn_setup_us`/`ffn_compute_us`/`ffn_setup_us`. Resolves
+schema-draft open decision 3: part A does NOT emit its own event, so event
+cardinality and every existing consumer of `compute_us` are untouched.
+
+**Measured (MoE probe model, GPU mutex held, one session).**
+
+| trace | shape | result |
+| --- | --- | --- |
+| `build/llama-cuda/gplr21-f3-parts/rowset-pp64-tg3-parts.jsonl` | the recorded probe flags unchanged (fresh path; the 2026-09-13 trace is preserved) | 120 TG `layer_compute`, `compute_us` 0 -> **66,822**, `setup_us` 0 -> **4,788**; attn 43,000 (setup 2,737) / ffn 23,822 (setup 2,051) us |
+| `build/llama-cuda/gplr21-f3-parts/rowset-512-tg256-retain4.jsonl` | 512 PP / 256 TG batch-major, `--residency-tg-retain 4` | 10,240 TG `layer_compute`, **0/10,240 zero-valued in either part**; 93.5% of TG wall accounted |
+
+Per TG token on the 256-token stream (wall 48,225 us/token, 20.736 tok/s):
+submit **23,574.9 us** (48.9%), copy completion **7,959.9 us** (16.5%), attn
+compute **8,019.6 us** (16.6%), FFN compute **4,224.2 us** (8.8%), graph setup
+**1,297.6 us** (2.7%) = 45,076.1 us accounted (**93.5%**); **3,148.9 us
+(6.5%) not yet instrumented** (router's blocking device-to-host probs read,
+sampling, round boundaries — NOT attributed by this fix and not claimed to be).
+So `transfer` = submit + copy completion = 65.4% of the token and
+compute+setup = 28.1%. Both `compute_us == attn+ffn` and `setup_us ==
+attn+ffn` hold on all 10,240 events.
+
+**No behavior change, proven against recorded evidence.** On the 256-token
+stream the 10,240-event `rowset_fetch` stream (layer, chunk, union hash,
+fetched/retained counts, staged bytes), the 256 `rowset_round` byte accounts,
+`byte_account` on every original field, and the greedy text sha256
+`f690bfa4df173b7c...` are **identical to the recorded K=4 arm-B1**. On the
+probe trace, 569/569 records match the 2026-09-13 trace once all timing fields
+and run identity are excluded; the only structural differences are fields
+added by intervening tasks (`n_rows_retained`/`n_rows_retired`/`retain_k`) and
+the wall-derived `tokens_per_s`. The F3 change is additive on timing only.
+
+**Validation.** Build clean (no new warnings). Host suite **28/28**. ctest
+`layer-streaming-pinned-1024` **2/2**, `qwen38-layer-boundary` **1/1**,
+`layer-slot-lifecycle` **1/1** (the last three need `Q38LS_MODEL_PATH` exported;
+they fail loudly as "missing or empty model environment variable" without it).
+QA smoke 512 **PASS** (check-telemetry OK, answer PASS, negative control FAILs
+as designed). Route-overlap analyzer self-test **PASS (55 checks)**. Both new
+traces exit 0 with `--check-telemetry` OK (569 and 21,020 events).
+
+**Residuals.** (1) The ~6.5% unattributed TG share above. (2) `phase_summary`'s
+TG line still reports `compute 0.0 / layers 0` for row-set runs, because the
+row-set path does not call `add_layer_stats`; the per-layer `layer_compute`
+events are the record, and reconciling the summary is a separate change. (3)
+The two probe runners are untracked one-offs under the gitignored `build/`
+root, so the traces are not reproducible from a clean checkout without a fresh
+run.
+
+**Not committed.** The owner did not ask for a commit this turn; the two
+vendored files and the four doc records (`docs/currentstate.md`,
+`docs/gplr13-bottlenecks-hypotheses.md`,
+`docs/rowset-fetch-telemetry-schema-draft.md`, the plan) are on disk and the
+Commit field is still to be filled when the owner authorizes the commit.
+
+## 2026-09-14: T-GPLR-07 ladder rungs 4k and 50k PASS (owner-invoked, one at a time) — and the 50k rung exposed a HARNESS limit, not a mechanism one
 
 Owner-invoked acceptance runs on the semantic-QA ladder, one length at a time
 under the GPU mutex, on the MoE probe model in the reactive streaming-TG shape
@@ -153,7 +1115,9 @@ pre-field trace (immunity); all three arms exit 0 with `--check-telemetry` OK.
 
 **Residual / open.** (1) A pre-work refusal still writes no `byte_account`
 (partial trace without `run_start`, rejected by the checker) — unchanged by this
-pass. (2) The record proves the configuration at bring-up; a later foreign
+pass. [CLOSED 2026-09-14 by T-GPLR-22: a pre-work refusal now writes a
+structured terminal `run_refused` event and the checker reads it as a refusal
+trace instead of rejecting it. See the entry at the top of this file.] (2) The record proves the configuration at bring-up; a later foreign
 allocation can still make the cache itself fail loudly. (3) Activation slabs
 remain outside the cap in the checker too, matching the recorded decision that
 they are a free-VRAM-gated runtime class. (4) The rule is enforced only on
@@ -253,7 +1217,10 @@ event: the run exits 1 with the byte arithmetic on stderr and leaves a partial
 trace (40 `pkg_member` records, no `run_start`), which `--check-telemetry`
 rejects with 3 invariant violations. That is unchanged by this pass and was
 already true of F5 — but the earlier record of F5 as "no trace written" was
-inaccurate and is corrected in place above. (2) Activation slabs stay outside
+inaccurate and is corrected in place above. [CLOSED 2026-09-14 by T-GPLR-22: the
+refusal now emits `run_refused` (reason enum + the byte arithmetic + exit
+status, terminal) and both checkers read the trace as a REFUSAL TRACE, exit 0,
+printing the reason. See the entry at the top of this file.] (2) Activation slabs stay outside
 the cap by design: they are a measured runtime class gated against observed free
 VRAM (preflight condition 3), not a residency this mechanism manages; if the
 owner wants `--residency-budget-mib` to cover them too, that is a further,
@@ -2208,6 +3175,15 @@ Owner question: can streaming layer-major PP be combined with stock llama.cpp TG
   remains proven at small ctx (T-GPLR-10: 2048-token run, TG 64.63 tok/s, parity PASS).
 - Artifacts: `build/llama-cuda/gplr-hybrid-50k-handoff.{jsonl(empty),log}`; the .jsonl
   holds no timed events (refusal precedes PP). No commit.
+- [AMENDED 2026-09-14: the "at ANY length" / "50K is below the floor too" claims held
+  for THAT day's shape, which carried non-zero activation slabs (419,430,400 B) and 4
+  slots. In the qa-smoke handoff shape used 2026-09-14 (act slabs 0 B, 1 slot) the
+  gate PASSES at 4k ctx -- run, exit 0, TG 68.960 tok/s, peak 4,559.6 MiB -- and
+  refuses at 50k with a 299,311,616 B shortfall (22,525,977,088 vs 22,226,665,472 B).
+  The gate's own terms put today's boundary at ~22,665 ctx tokens of KV capacity, so
+  the ceiling is length-dependent and now derived rather than assumed; no run
+  straddles it. See the 2026-09-14 mode-measurement entry above. No dated claim
+  above is retracted -- the 2026-09-10 shape still fits at no length.]
 
 ## 2026-09-10: Streaming-TG slowness profiled against stock baselines (host-only analysis, no GPU run)
 

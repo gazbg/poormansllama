@@ -75,7 +75,29 @@ and none of them was validated on a non-echoing stream. The non-echoing
 re-probe recorded as the precondition for any retention above the reference
 band therefore becomes the outstanding VALIDATION of this default and
 the first requirement of any task that claims a K=4 gate PASS — it is no longer
-a precondition for provisioning the depth. The mechanism itself remains opt-in
+a precondition for provisioning the depth.
+
+[VALIDATION RUN 2026-09-14 — the outstanding re-probe has now been executed and
+it does NOT clear the threshold at K=4. On a non-echoing stream (the recorded
+probe invocation with only the prompt body changed: the natural-language code
+prompt `build/calc-prompt.txt` instead of the echoing needle document; 256 TG
+windows, W=1, all other flags held), statistic (b) at the SDD's declared K=4 is
+**0.5355**, below the 0.6 threshold — a drop of 0.0929 from the echoed 0.6284.
+Every measured K falls, in the pre-registered direction (repetition can only
+raise (b)): K=1 0.3088->0.2468, K=2 0.4343->0.3778, K=4 0.6284->0.5355, K=6
+0.7169->0.6487, K=8 0.7775->0.7283; T8 oracle 0.9385->0.9143. The first depth
+clearing 0.6 on the non-echoing stream is therefore **K=6** (~3.40 GB over 40
+layers), not K=4 (~2.26 GB); the echo stream's crossing was ~K=3.6. So the K=4
+gate PASS this amendment names as unavailable remains unavailable on measured
+evidence, the recorded 0.6284 is confirmed as echo-inflated, and the K=4
+PROVISIONAL OPERATING DEFAULT above is unchanged by this measurement — no
+default, no gate verdict and no implementation moves. Residual: the stream's
+non-echoing certification is PARTIAL — the declared conjunction (distinct
+16-gram ratio >= 0.90 AND zlib(id sequence) ratio >= 0.50) was met on the
+16-gram criterion (1.0000, against 0.3734 echoed) but not on the compression
+criterion (0.4238), which measures the entropy of structured code output rather
+than repetition and was mis-chosen when declared. Full table, the declared
+decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.] The mechanism itself remains opt-in
 and default-off: disabling the experimental option changes no default placement
 and no non-experimental behaviour, and the depth applies only when an operator
 selects the cache. `--residency-tg-retain` with no value selects K=4 where the
@@ -454,6 +476,16 @@ The experimental path fails loudly for a forced unsupported architecture or poli
 invalid package membership, insufficient capacity, stale generation, source
 read or copy failure, failed CUDA event, missing graph variant, or graph launch
 failure.
+
+A pre-work refusal is a structured terminal record and not only an stderr line: it
+emits `run_refused` (reason enum, the byte arithmetic that decided, exit status) and
+is recoverable from the JSONL alone — whether it is raised after the telemetry sink
+opens or before that sink exists (the capacity and handoff preflights), or after the
+run began writing but before any timed phase completed (the pre-timed aborts: a
+failed bring-up, a failed graph prebuild, or the `--graph-budget-mib` ceiling). A
+refusal is terminal in every one of those shapes: it is the trace's last record and
+no timed phase may precede it. The record shape and the checker rule are owned by
+`docs/rowset-fetch-telemetry-schema-draft.md` sections 2 and 4.
 
 For `moe-row-set` it additionally fails loudly for a staged row set that does
 not cover the router's exact selected IDs for the window (under-coverage), a

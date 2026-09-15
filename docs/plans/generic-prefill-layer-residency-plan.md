@@ -38,7 +38,14 @@ spread; table and verdicts in currentstate 2026-09-13). Its deferred `K > 1`
 rungs were then RUN the same day at K=2/4/6/8 and all PASS, with the runtime's
 retained-row count equal to the offline statistic EXACTLY at every depth — a
 result recorded as internal consistency only, because that stream echoes its
-own anchor and the non-echoing re-probe remains the gate. The measured
+own anchor and the non-echoing re-probe remains the gate.
+[RE-PROBE RUN 2026-09-14: the non-echoing re-probe has been executed and K=4
+DOES NOT clear the gate on it — (b) at K=4 is 0.5355 against the echoed 0.6284,
+below 0.6; the first clearing depth is K=6 (0.6487, ~3.40 GB). This is the
+recorded RULING on the default's gate standing, not a default change: the
+mechanism's provisional operating default stays K=4 and the gate stays
+informational. See the SDD scope amendment's 2026-09-14 validation note and
+`docs/currentstate.md`.] The measured
 byte-to-time conversion DEGRADES with depth (14.29 -> 10.23 GB/s, K=1 -> 8),
 which corrects view 2 of the published artifact. Its Commit field now
 records both hashes: the vendored-fork commit convention was decided
@@ -2007,7 +2014,19 @@ falsifier. (2) F2 per-layer row caches — reuse realization and the
 T-GPLR-15 0.6 gate measurement; SDD residency treatment WRITTEN 2026-09-13
 (SDD section 4 "moe-row-cache package", sections 6-12 amended), so a Phase B
 or F2 task contract can now be drafted against a defined class. (3) F3/H8 zero TG per-part compute timings remain a telemetry
-debt. (4) H2 (200k staging-bandwidth decline) and H7 (~5 GB commit residual)
+debt.
+**[CLOSED 2026-09-14]** F3/H8 implemented: the row-set TG executor times both
+graph parts around `load_row_set` and `layer_compute` now carries
+`attn_compute_us`/`attn_setup_us`/`ffn_compute_us`/`ffn_setup_us` beside the
+unchanged `compute_us`/`setup_us` (one event per layer/window, additive fields
+only). Measured: 0/10,240 zero-valued events on the 512/256-token K=4 stream,
+93.5% of TG wall accounted (submit 48.9%, copy completion 16.5%, attn compute
+16.6%, FFN compute 8.8%, setup 2.7%); routing/bytes/greedy text identical to
+the recorded K=4 arm. Evidence in
+`docs/gplr13-bottlenecks-hypotheses.md` (3.6 amendment, H8, 6.3). No standalone
+task block was added: this is the bounded telemetry fix the owner directed,
+not new scope. Residual: the ~6.5% unattributed share (router read, sampling,
+round boundaries) is still un-instrumented. (4) H2 (200k staging-bandwidth decline) and H7 (~5 GB commit residual)
 remain explained-to-first-order only. (5) T-GPLR-15's 0.6 hit-rate gate is
 still unverified over a real stream (pilot containment 0.358-0.389 is a
 negative pilot signal, not a verdict). (6) Performance claims remain
@@ -2977,6 +2996,10 @@ reproduces the offline-vs-runtime invariant at a third depth (runtime retained
 43,495 == offline `hits_total`, (b) = 0.533027). No gate verdict is created or
 changed: K=4 remains a provisional operating default whose crossing is still
 echo-biased, and the non-echoing re-probe remains its outstanding validation.
+[OUTSTANDING -> RESOLVED 2026-09-14: the re-probe RAN; the crossing was echo-biased as
+predicted, and the non-echoing (b) at K=4 is 0.5355 — BELOW 0.6 — so the K=4
+default is provisioned but carries no gate standing, and the non-echoing first
+clearing depth is K=6 at ~3.40 GB. No default and no gate verdict changed.]
 Commit: vendored half `third_party/llama.cpp` **cc7cacc60**; outer half (the
 three docs, the driver note and the gitlink bump) in the `Record ...` commit
 carrying this entry: **9564ca5** (hash recorded in the follow-up commit, per the
@@ -3067,6 +3090,10 @@ designed); all seven completed arms exit 0 with `--check-telemetry` OK. Residual
 a pre-work refusal still writes no structured telemetry event, only a partial
 trace (40 `pkg_member` records, no `run_start`, which `--check-telemetry`
 rejects) plus stderr — unchanged by this pass and true of F5 before it.
+[CLOSED 2026-09-14 by T-GPLR-22: the refusal now emits a terminal
+`run_refused` (reason enum, the byte arithmetic, exit status) and both checkers
+read the trace as a REFUSAL TRACE with exit 0 instead of rejecting it. See
+`docs/currentstate.md` 2026-09-14.]
 Commit: vendored half `third_party/llama.cpp` **ad565487a**; outer half (these
 docs, this entry and the gitlink bump) in the `Record ...` commit carrying this
 entry: **05bbdd5** (hash recorded in the follow-up commit, per the
@@ -3137,7 +3164,14 @@ warnings), host suite 28/28, ctest `layer-streaming-pinned-1024` 2/2 /
 arms exit 0 with the checker OK. Residual: a pre-work refusal still writes no
 `byte_account`; the record proves bring-up, so a later foreign allocation can
 still make the cache fail loudly; activation slabs stay outside the cap, as
-recorded. Commit: vendored half `third_party/llama.cpp` **3f70b64d7**
+recorded. [CLOSED 2026-09-14 by T-GPLR-22 for the refusal half: a refused run
+now carries a structured `run_refused` and no longer reads as a crashed partial
+trace. And CLOSED 2026-09-14 (PRE-SINK) for the class that had no sink at all: the
+capacity/handoff preflights now write a one-line `run_refused` through a standalone
+emitter, with the checker rule unchanged. And CLOSED 2026-09-14 (PRE-TIMED ABORT) for
+the abort family the audit then measured: the `--graph-budget-mib` abort's own trace
+was rejected by the checker and a failed `ls.init` wrote nothing; both are refusals
+now, through the same rule. The other two residuals stand.] Commit: vendored half `third_party/llama.cpp` **3f70b64d7**
 (record + emission + validator + fixtures + ctest); outer half (these docs,
 `tools/run-tests.ps1` and the gitlink bump) in the `Record ...` commit for this
 pass: **e18188a** (recorded in this follow-up commit, per the convention's
@@ -3515,3 +3549,174 @@ and it will sit in the dirty vendored tree exactly as T-GPLR-18's
 `load_row_set` change does until the owner decides the vendored-fork
 convention — so the K=1 arm is still not reproducible from the tracked tree
 alone, and that question stays open in the Escalate list above.
+[CORRECTED 2026-09-15: the vendored-fork convention was decided (see
+"Vendored-Tree Commit Convention") and the T-GPLR-19 mechanism is committed
+(`cc7cacc60`..`3f70b64d7`, completed by `8e9757169`), so the K=1 arm IS
+reproducible from the tracked trees; the sentence above records the
+pre-convention state.]
+
+---
+
+## MEASURED 2026-09-14 (mission item 5): which TG mode to run, and the handoff
+## ceiling that bounds it — no task created, no default, gate verdict or
+## implementation changed
+
+Six arms (three modes x 4k/50k) through `tools/run-tests.ps1 -Suite qa-smoke
+-SmokeMode <mode>`: `reactive` (`--no-handoff --residency-tg`), `retention`
+(`--no-handoff --residency-tg --residency-tg-retain`, the K=4 default), `handoff`
+(`--handoff`). Full table, artifacts and caveats in `docs/currentstate.md`
+(2026-09-14). Summary, and its consequence for task selection:
+
+- **PP is mode-independent and this is proven by bytes, not asserted:** staged
+  `bytes_transferred` 18,327,011,328 B on all three 4k arms and
+  1,796,047,110,144 B on both 50k arms, same evictions (39 / 3,919), same 3,840
+  `rowset_fetch` events. These modes are TG policies only, so no mode ranking
+  trades prefill against decode.
+- **TG:** 4k 11.829 (reactive) / 18.789 (retention K=4) / 68.960 (handoff) tok/s;
+  50k 12.125 (reactive) / 21.016 (retention K=4) tok/s. All five completed arms
+  PASS the answer gate with the negative control failing as designed.
+- **Ranking:** `handoff` first where it fits (5.83x reactive at 4k, and 4,559.6
+  MiB reported peak vs 5,065.6); `retention` K=4 second, and it is the only
+  option at long context (1.733x reactive at 50k) at an exact 2,291,531,776 B of
+  device cost; `reactive` only when neither fits.
+- **T-GPLR-10 ceiling, corrected by measurement:** `handoff` REFUSES at 50k
+  (22,525,977,088 B needed vs 22,226,665,472 B free, shortfall 299,311,616 B) and
+  RUNS at 4k. The gate's own terms put the boundary at ~22,665 ctx tokens on
+  today's baseline (10,880 B/token of q8 KV). The "cannot fit at ANY length"
+  claim recorded in currentstate 2026-09-10 describes that day's shape (act
+  slabs present, 4 slots), not this one; the ceiling is length-dependent and is
+  now derived from the gate's own terms rather than assumed.
+- **Reporting defect, not a speed finding:** `peak_vram_bytes` is a single
+  post-run free-VRAM delta, so the T-GPLR-19 row cache — freed by
+  `end_row_set()` before the sample — is invisible to it (two 4k arms with and
+  without it report identical peaks). The polled pair reads +2,264.0 MiB, and
+  the gap is now recorded under H6 in `docs/gplr13-bottlenecks-hypotheses.md`.
+  Any future task that claims a VRAM figure for the retention path must not
+  quote `peak_vram_bytes` as the cache's cost.
+- **Consequence for task order:** no task is created or displaced. T-GPLR-16's
+  MIN_BATCH=1 revert stays the outstanding authorized item, and the non-echoing
+  re-probe stays the validation the K=4 default still owes. If a later task
+  needs a mode as a vehicle, `handoff` is the wrong vehicle above ~22.6k ctx
+  for a hardware reason, and `retention` K=4 is the correct one.
+
+---
+
+## CLOSED 2026-09-14 (T-GPLR-22 PRE-SINK): a refusal raised before `ls.init` now
+## leaves a recoverable `run_refused` trace — no task created, no rule added, no
+## default changed
+
+Closes the one refusal class the T-GPLR-22 item left open. The T-GPLR-04 capacity
+preflight and the T-GPLR-10 / T-GPLR-16 handoff fit gates run BEFORE the telemetry
+sink exists, so their refusals wrote no JSONL at all; the 2026-09-14 50k `--handoff`
+arm is the real instance.
+
+- **The rule did not change.** A trace whose only content is `run_refused` already
+  satisfied `ls_refusal_trace_errors()` (proven pre-edit: `OK (REFUSAL TRACE: 1
+  events, ...)`), so this adds a producer, never a second rule.
+- **The producer** is a STATIC one-shot emitter (`tel_run_refused_oneshot`), used
+  because no instance exists at those sites and mirroring the existing `tel_off_run`
+  precedent. The runner reaches it through `refuse_before_sink()` at the seven
+  pre-sink gates, and the shared enum gains `capacity_preflight` and
+  `handoff_preflight` (`detail` = the exact gate, `cap_source` = the limiting term).
+- **Measured on real arms:** the 50k `--handoff` flags verbatim -> one-line trace,
+  reason `handoff_preflight`, 22,525,977,088 / 22,226,665,472 B; a 512
+  `--residency-budget-mib 64` run -> reason `capacity_preflight`, 3,151,424,000 /
+  67,108,864 B. Both read as a REFUSAL TRACE at exit 0 under `--check-telemetry` and
+  pass strict `--validate-telemetry`; both reproduce the stderr arithmetic exactly.
+- **Non-breaking:** the five pre-existing refusal fixtures keep their verdicts,
+  host suite 35/35 (was 33), ctest `run-refused` 7/7, and the recorded 512 qa-smoke
+  gate re-run PASSES with the same 23,326 events (field-by-field, the only
+  differences are wall-clock values and the timing-derived `ready_at_consumption`
+  boolean). 0 `run_refused` on a successful run.
+- **Residual (narrowed):** the traceless class is now the *load/setup* failures and
+  the exit-2 usage errors, none of which is a byte-arithmetic refusal. Full record
+  in `docs/currentstate.md` (2026-09-14 PRE-SINK entry). [EXTENDED 2026-09-14: this
+  residual did not name the ABORT family, which the audit then measured on real arms
+  — see the PRE-TIMED ABORT section below.]
+
+---
+
+## CLOSED 2026-09-14 (T-GPLR-22 PRE-TIMED ABORT): every pre-timed abort in that family
+## now leaves a trace the checker reads as a refusal — the rule extended in place, no
+## second rule, no default or gate change
+
+Closes the class the audit measured on two real aborts: the `--graph-budget-mib` abort
+left `run_start` + `graph_footprint` + `run_end(exit_status=1)`, which
+`--check-telemetry` REJECTED with two invariant violations, and a failed `ls.init` wrote
+no trace at all.
+
+- **The rule kept its one owner.** `ls_refusal_trace_errors()` gained no sibling and no
+  call site: what changed is that a present `run_start` is no longer a contradiction on
+  its own. A refusal trace is now rejected for exactly two things — a `phase_summary`
+  (a completed phase means a failed run, not a refusal) and a `run_end`. The old
+  blanket `run_start` rejection is replaced by that narrower clause.
+- **The producer** now carries the deciding check from the abort site to the terminal
+  write (`abort_refusal_reason` / `_detail` / `_needed` / `_allowed` / `_cap`), so the
+  terminal write emits `run_refused` in place of the old `run_end(exit_status=1,
+  failed)`. The enum gains `init_failed`, `prebuild_failed`, `graph_budget`, and the
+  single `tel_error` call site was removed (both checkers reject an `error` event).
+- **Measured on a real arm:** 512 `--graph-budget-mib 1` -> 44 events, terminal
+  `reason=graph_budget`, 201,326,592 / 1,048,576 B, `cap_source=budget`;
+  `--check-telemetry` exit 0 reported as **ABORTED RUN - run_start was written, no
+  timed phase completed, no run_end**; strict `--validate-telemetry` exit 0. The abort's
+  arithmetic and `graph_footprint` are byte-identical to the pre-change run.
+- **Non-breaking:** 9 refusal fixtures covering every branch of the rule (4 accept /
+  5 reject), every pre-existing verdict kept (the `run_start`-carrying negative now
+  rejected via the no-`phase_summary` clause, which is narrower); host suite **37/37**,
+  ctest `run-refused` **9/9**; the recorded 512 qa-smoke gate re-ran PASS with the same
+  23,326 events and zero non-volatile field differences, answer gate PASS and negative
+  control FAIL as designed.
+- **Deletion pass:** the duplicated refusal emitter, the duplicated `layer_compute`
+  writer and the two checkers' duplicated refusal parse/report were each collapsed to one
+  owner, and two fixtures that duplicated existing branch coverage were removed. Verified
+  against the RECORDED traces rather than re-reasoned: 11,640 real `layer_compute` records
+  re-render byte-for-byte. Full record, including the defect found while pruning, in
+  `docs/currentstate.md` (2026-09-14 PRE-TIMED ABORT entry).
+- **Known limit:** a pre-timed abort reached through `init_failed` is emitted but cannot
+  be persisted when the telemetry path itself is unopenable (the one-shot emitter shares
+  the same `fopen`).
+
+---
+
+## DECISION PENDING (owner, item 6): which second architecture is the first to face the
+## generic gates? — brief drafted, no task created, no code/default/gate change
+
+A decision before it is a task, so no task block exists yet and none should be drafted until
+the owner rules. **The brief owns the content** — targets, which gates carry over, adapter
+cost, and the unknowns — and is in `docs/currentstate.md` (2026-09-14 DECISION BRIEF (item 6)).
+Recorded here only so task order can see that the slot is occupied:
+
+- recommended target is `arch=gemma4` (Gemma-4 12B, on disk), which needs an adapter, a split
+  layer-major graph seam in `src/models/gemma4.cpp`, and a non-Qwen-specific
+  `llama_ls_model_inventory` before it can be gated;
+- the small `qwen35`/`qwen35moe` models on disk are the reference architectures and route
+  through the existing adapters, so they exercise geometry and cannot close this gate;
+- the gate for any candidate is SDD section 11, unamended by the brief.
+
+---
+
+## DECISION PENDING (owner, item 4): does gate eligibility BIND provisioning, or stay
+## ADVISORY? — brief drafted, no task created, no code/default/gate change
+
+A decision before it is a task, so no task block exists yet and none should be drafted
+until the owner rules. Full brief in `docs/currentstate.md` (2026-09-14 DECISION BRIEF,
+the latest entry): the measured basis, where the K=4 default came from, what the runner
+knows at provisioning time, the two options with costs, and the recommendation.
+
+- **Measured basis:** non-echoing (b) is 0.2468 at K=1 rising to 0.7283 at K=8, so the
+  0.6 crossing moves from ~K=3.6 (echoed, ~2.26 GB) to **~K=5.1**, and the shallowest
+  depth that clears it is **K=6 (0.6487, ~3.40 GB)**. The per-K shift from one prompt
+  change is 0.0492-0.0929. Conversion degrades with depth (14.29 -> 10.23 GB/s,
+  marginal 7.69-9.55), but every measured depth still GAINS in tok/s.
+- **Where K=4 came from:** owner direction ("set K=4 as default for now"), resting on
+  the ECHOED crossing (0.6284, the first reading >= 0.6); it is a provisional operating
+  default, not a gate verdict, and the adaptive fit downscales only the bare flag.
+- **What binding needs and does not have:** (b) is a property of a routing stream, so
+  at bring-up it is not computable. Binding would require a tracked (b)-vs-K oracle (or
+  a pre-run probe, or a validated proxy); none exists, and the only available curve is
+  the biased one.
+- **Recommendation: stay advisory**, with binding deferred until an oracle exists. If
+  the owner chooses binding, the prerequisite is the oracle task above, not this one.
+- **Not started and not decided here:** item 6 (its model choice is a separate owner
+  call), any code or default change, and any gate verdict. The SDD scope amendment
+  still owns the informational-gate decision.
