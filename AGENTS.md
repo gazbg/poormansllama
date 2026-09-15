@@ -26,6 +26,14 @@ Do not silently redesign either active document while implementing a task.
 - The current implementation supports dense Qwen3.8 through Qwen-specific
 	package lists and graph construction. Generic support is not complete until
 	another architecture passes the active plan's acceptance gates.
+- Active development currently targets the Qwen MoE vehicle
+	(Qwen3.6-35B-A3B routed-expert banks), because it is the only on-disk model
+	whose expert banks do not fit in VRAM, making residency actually measurable.
+	This focus is a measurement choice, not an architecture boundary: it does
+	not exclude other models. Testing any other architecture is legitimate
+	work whenever the owner asks for it (see the plan's second-architecture
+	draft, T-GPLR-27), and owner-requested model tests are never treated as
+	scope creep.
 - For dense models, a pageable package contains the complete immutable decoder
 	layer. For MoE prefill, the first policy pages the complete routed-expert
 	bank for one layer; router, attention, shared-expert, embedding, output, KV,
@@ -187,6 +195,45 @@ semantic-QA ladder in addition to the checks above:
 	contract in `docs/plans/generic-prefill-layer-residency-plan.md`; record
 	results in `docs/currentstate.md`.
 
+## Gate Policy: All Gates Are Soft
+
+Every gate in this repository -- semantic-QA ladder, trace checker, CTest
+families, capacity preflight and refusal path, performance and hit-rate
+measurements -- is advisory evidence, not release authorization. A gate PASS
+proves only what that gate's contract defines (for example, answer stability
+or trace integrity); it never certifies that the code is fit for use.
+
+- Final acceptance is always the owner's decision, made from the summary
+	required below, never from gate output alone.
+- Report gate results honestly, including their limits: noise floors,
+	stream biases, unmeasured expectations, and withdrawn confounded
+	comparisons. Never present a gate PASS as "ready" or "approved".
+- Soft gates concern acceptance, not diligence: the required validation of a
+	task must still run and pass before its evidence is reported. A hard
+	failure (loud refusal, checker rejection, violated invariant) still blocks
+	reporting a task complete.
+
+## Owner Summary Requirement
+
+Because all gates are soft, every completed task and every significant
+experiment must end with a summary the owner can use to decide whether the
+code is acceptable for use. The summary must be self-contained and structured:
+
+1. Original task / goal / idea explored -- what was asked, the hypothesis or
+	idea behind it, and why it mattered.
+2. How it works in simple terms -- the mechanism in plain language a
+	non-specialist can follow.
+3. Glossary -- every term and abbreviation used in the summary is defined or
+	explained at first use (e.g. PP, TG, af, slots, hit rate). Do not assume
+	the glossary from prior turns; restate it in the summary itself.
+4. Pros and cons -- benefits, costs, risks, and limitations of the solution,
+	with every claim labeled measured / expected / unproven and pointed at its
+	evidence (telemetry path or docs section).
+5. Recommendation -- a clear bottom line: adopt, keep experimenting, or
+	discard, plus what the owner should validate or decide next.
+
+A task is not reported complete while any of these parts is missing.
+
 ## Shared GPU Coordination
 
 This machine shares one GPU across multiple projects. Before any command that initializes CUDA or uses the GPU, acquire the Windows named mutex `Global\AI-GPU-EXCLUSIVE-v1`.
@@ -210,3 +257,9 @@ A task is done only when its acceptance criteria and required validation are dem
 Do not stage, commit, push, create branches, or create pull requests unless the owner explicitly asks. If authorized to commit, stage only task-owned files, verify the staged diff and `git diff --check`, and record the resulting hash in the task plan.
 
 After a task finishes, continue with the next eligible `ready` task only when the owner has authorized continuing implementation. Otherwise report the completed evidence and any blockers.
+
+
+## Tools
+- Prefer using lean-ctx MCP instead of default tools , fall back to default if it does not work for a particular call, read the lean-ctx skill to know how
+- Prefer using context7 MCP for library information on how it works or what it offers for a give case. to be used if the library has no source locally , example CUDA . This can also search for functionality instead of implementign all by yourself
+- For web search ,research and other web related context prefer using mcp wigolo, also when you hit similar  problem more than 1 time , do a web research on it to help yourself out 

@@ -1,5 +1,349 @@
 # Current State
 
+## 2026-09-15: AGENTS.md governance updated — MoE-Qwen focus is a measurement choice (other models on owner request), all gates declared soft, owner summary required
+
+AGENTS.md gained three sections/notes, binding every future session:
+
+1. **MoE-Qwen focus, not a boundary (Scope and Boundaries).** Active
+   development targets the Qwen MoE vehicle (Qwen3.6-35B-A3B routed-expert
+   banks) because it is the only on-disk model whose expert banks do not fit
+   in VRAM, making residency actually measurable. The note states explicitly:
+   this focus is a measurement choice, not an architecture boundary; testing
+   any other architecture is legitimate work whenever the owner asks for it
+   (entry point: the second-architecture draft T-GPLR-27), and
+   owner-requested model tests are never treated as scope creep.
+2. **"Gate Policy: All Gates Are Soft" (new section).** Every gate —
+   semantic-QA ladder, trace checker, CTest families, capacity preflight and
+   refusal path, performance and hit-rate measurements — is advisory
+   evidence, not release authorization. A PASS proves only what that gate's
+   contract defines. Final acceptance is always the owner's decision from the
+   required summary, never from gate output. Honest reporting of limits
+   (noise floors, stream biases, unmeasured expectations, withdrawn
+   confounded comparisons) is required. Diligence is unchanged: required
+   validation must still run and pass, and hard failures still block a task
+   being reported complete.
+3. **"Owner Summary Requirement" (new section).** Because gates are soft,
+   every completed task and significant experiment ends with a
+   self-contained, structured summary the owner can decide from: (1) original
+   task/goal/idea explored; (2) how it works in simple terms; (3) glossary
+   defining every term and abbreviation at first use (PP, TG, af, slots, hit
+   rate, ...), restated in the summary itself rather than assumed from prior
+   turns; (4) pros and cons with every claim labeled measured / expected /
+   unproven and pointed at its evidence; (5) a recommendation (adopt, keep
+   experimenting, or discard) plus what the owner should validate or decide
+   next. A task is not reported complete while any part is missing.
+
+No code, plan, or SDD content changed. This entry records the governance
+change only; the summaries already produced this session (slot ladder,
+async-feed A/B, refusal-path test, residue fix, proof ledger) follow the
+now-required structure. [Committed 2026-09-15 as d91fd1e together with this
+entry.]
+
+## 2026-09-15: Pending owner decisions (item 4 gate-eligibility, item 6 second-architecture) recorded as plan task drafts T-GPLR-26 / T-GPLR-27
+
+Per the owner's standing instruction, the two 2026-09-14 decision briefs are
+now represented in docs/plans/generic-prefill-layer-residency-plan.md as
+drafts — no pick made, no code, no gate verdict, status DRAFT — pending
+owner:
+
+- **T-GPLR-26 (item 4, gate-eligibility binding vs advisory):** written as
+  two explicit branches — A (BIND: the oracle + verdict-rule + refusal-
+  reason prerequisite chain first, since the brief establishes no admissible
+  input exists at bring-up) and B (ADVISORY, the brief's recommendation:
+  docs-only SDD scope note + K=4 non-echoing caveat). Executing the branch
+  the owner picks IS the task.
+- **T-GPLR-27 (item 6, second architecture):** written against the brief's
+  recommended target (Gemma-4 12B, dense, on-disk checkpoint) with the
+  brief's scope table and its five unknowns carried over verbatim; the
+  explicit non-goals state the capacity-claim limit up front (green proves
+  lifecycle/parity, not capacity). Re-scopes if the owner picks otherwise.
+
+Activation: both drafts stay dormant until the owner picks; T-GPLR-27's
+green-block condition (Qwen reference gates standing) is named in its
+Depends-on.
+
+## 2026-09-15: T-GPLR-25 residue FIXED — async_feed_submit wired to the worker (batch-major + layer-major), async_feed_ready gated to worker-fed copies; a false-positive protocol hazard removed
+
+The 2026-09-15 prototype residue ("async_feed_submit never fires; dead
+telemetry") was investigated and turned out to be a mis-wiring plus a latent
+protocol hazard, not a dead event. Decision: WIRE, not delete (the event was
+already emitted from the worker's copy body — the worker simply was never
+fed).
+
+**Root causes found (all in the untested worker paths):**
+1. Both af enqueue sites lived in the LAYER-MAJOR controller; every recorded
+   af1 arm ran batch-major, so the worker was constructed but never fed. The
+   apparent overlap evidence (3,880 async_feed_ready) was the
+   consumption-side event firing unconditionally whenever af existed — a
+   false positive that misattributed the main-thread lookahead's work to the
+   worker.
+2. af_submit_copy skipped the slot-reuse invariant's consumer wait:
+   record_consumer_done frees the slot BEFORE ev_consumer_done completes, so
+   the worker could overwrite a slot whose prior generation's graph was still
+   running.
+3. The worker's entry gate re-staged an unconsumed resident generation
+   ("slot already holds il" was treated as stage-again; the layer-major seed
+   enqueue hits exactly this).
+4. Main-thread staging never claimed the slot (free_slot stayed stale-true),
+   so a worker request could double-stage over an unconsumed main-thread
+   copy.
+
+**The fix (single-writer copy protocol, opt-in af path only, default behavior
+byte-identical):**
+- Batch-major lookahead (and the layer-major post-consumer_done refill) now
+  ENQUEUE the next slot's refill on the worker when af is on; the
+  consumption-time load_layer remains the on-demand fallback. af=0 paths are
+  untouched (else branch identical to the old code).
+- af_submit_copy mirrors load_layer's eviction block exactly: consumer-done
+  event wait OUTSIDE af->mtx (re-validating after the wait for the main
+  thread's same-layer race, returning no-op success if it staged first),
+  eviction bookkeeping + tel_slot_evict under the lock, claim-on-stage
+  (free_slot=0) by whoever stages, af_submitted flag on the slot consumed by
+  wait_slot_ready.
+- tel_async_feed_ready fires ONLY for worker-submitted copies (af_fed gate);
+  T-GPLR-08 page-prefetch hint parity added to the worker copy body
+  (pf has its own mutex; no lock-order risk).
+
+**Validation:** build green; host suite pass; the previously env-var-skipped
+cTest families (lm511-run/checker, tail513-{lm,bm}-run/checker) 6/6 PASS with
+Q38LS_MODEL_PATH set (the earlier 'Failed' rows were the missing env var, not
+the change). Focused real-model arm under the GPU mutex
+(`gplr25-af1-residuefix-512.jsonl`, 2 slots, af=1, batch-major, 512 anchor):
+async_feed_submit 3,686 events (was 0 in every recorded arm),
+async_feed_ready 3,686, and the two (layer,generation) sets are an exact
+bijection (0 ready-without-submit, 0 submit-without-ready); evictions 38 (no
+double count); checker OK (30,698 events); answer gate PASS. PP wall 12.69 s
+is a single cold-branch arm and carries NO performance claim. Consequence
+for the A/B history: the recorded af0/af1 pairs measured af1 with an IDLE
+worker (it was never fed under batch-major), so the "no gate-able af wall
+delta at 512/4k" null verdict does not speak for the now-live prototype —
+re-running the paired A/B on the fixed binary is the honest next step for
+the performance question.
+
+## 2026-09-15: T-GPLR-25 COMPLETED: 4k pair run — af delta +3.0% is AT the noise floor, no performance claim; batch-major 4k re-staging discovered (8.09x bank bytes); budget-refusal path verified (run_refused, cap_source=budget)
+
+**Owner-decision refusal path VERIFIED under the GPU mutex**
+(`gplr25-budget-refusal-2048.jsonl`, launcher `build/run-budget-refusal-test.ps1`,
+chained into `build/run-refusal-and-af1-chain.ps1`). Tight explicit budget
+`--residency-budget-mib 2048` (no `--layer-slots`; default ladder resolves the
+count; `--allow-full-residency` keeps the out-of-core gate out of the way):
+- The ladder resolved 3 slots on free VRAM, then preflight check #2 refused:
+  runner exit 1 (the expected outcome), `run_refused` trace with
+  `reason=capacity_preflight`, `detail`="bounded 3-slot window 4,195,805,696 B
+  exceeds the residency budget 2,147,483,648 B", `bytes_needed=4195805696`,
+  `bytes_allowed=2147483648`, `cap_source=budget`, `exit_status=1` — and NO
+  run_end / phase_summary (the T-GPLR-22 refusal-trace rule).
+- `--check-telemetry` accepts the refusal shape (OK, REFUSAL TRACE). No silent
+  downgrade to 2 or 1 slots: the budget refusal names the resolved slot count.
+  Note the ladder itself reads free VRAM only; the explicit budget is enforced
+  by check #2 AFTER the ladder — this is the designed layering.
+
+**4k paired A/B complete (af=0 vs af=1, fixed --layer-slots 2, back-to-back
+under ONE mutex hold; only flag delta):**
+- af0 `gplr25-ab-4096-af0.jsonl`: PP wall 30,034 ms, PP tok/s 135.2, transfer
+  sum 56.4 s, compute sum 3.35 s, effective staging 4.88 GB/s.
+- af1 `gplr25-ab-4096-af1.jsonl`: PP wall 29,123 ms (+3.0%, +911 ms), PP tok/s
+  139.3, transfer 54.7 s, compute 3.21 s, effective staging 5.03 GB/s. Checker
+  OK (29,166 events, 2 slots), answer gate PASS.
+- **Verdict: NOT a performance result.** The TG leg (which the flag provably
+  does not touch) differs by +2.3% between the same two arms (191.5 s vs
+  196.0 s) — a direct single-replicate noise-floor estimate. The +3.0% PP
+  delta sits at that floor. The 512 rung showed -0.3% (noise). The prototype
+  MECHANISM evidence stands (worker engages, overlap real); a gate-able wall
+  claim would need replicated pairs. Direction is positive and
+  mechanism-consistent; magnitude unproven.
+
+**New structural discovery (af0 4k trace, supersedes the 40-copy mental
+model for batch-major PP):** at 4k/ubatch-512 batch-major, PP runs 320
+copies, not 40 — mean 458.2 MB/copy, 146.62 GB total = 8.09x the one-pass
+bank total (318 evictions). Every layer's bank is re-staged once per chunk
+sweep (8 sweeps at 4096/512); slot 0 and slot 1 carry 160 copies each.
+next-copy-submitted-at-compute-start is only 12% (vs 98% at 512): the
+schedule is eviction-dominated. host_submit sum 26.9 s against a 30.0 s wall
+— the main-thread feed chain remains the critical path; compute (3.35 s) is
+already largely hidden by the eviction stream itself (transfer sum 56.4 s >
+wall). Effective staging at 2 slots is 4.88-5.03 GB/s, i.e. the recorded
+3.34 GB/s H-D number was the 1-slot serialization artifact, and the REAL 4k
+cost driver is the 8.09x re-staging of the batch-major sweep order, not copy
+bandwidth. A layer-major PP schedule (40 copies, one pass) is the obvious
+next lever and is explicitly in scope per the SDD's primary-workload note.
+
+Artifacts: `gplr25-budget-refusal-2048.jsonl`,
+`gplr25-ab-4096-{af0,af1}.{jsonl,tgtext}`, `build/analyze_gplr25_pair.py`,
+`build/run-refusal-and-af1-chain.ps1`, `build/run-budget-refusal-test.ps1`.
+
+## 2026-09-15: T-GPLR-25 paired A/B, 512 rung COMPLETE: NO af delta at 1 chunk/layer; earlier prototype wall comparison confounded (superseded); 4k pair pending GPU mutex
+
+**Design (per the amended T-GPLR-25 contract):** paired arms run back-to-back
+under ONE mutex hold, `--layer-slots 2` fixed, af the only flag delta —
+controls the file-cache state that confounded the prototype reading.
+Analyzer: `build/analyze_gplr25_pair.py` (PP window, busy coverage, feed
+serial chain, effective staging).
+
+**512 rung result (anchor-512, both arms PASS check-telemetry + answer gate,
+exit 0, n_slots=2):**
+- af0 `gplr25-ab-512-af0.jsonl`: PP wall 11,958 ms, busy 11,976 ms, idle
+  -19 ms (-0.2%), feed serial chain 11,933 ms, effective staging 1.53 GB/s
+  (cold first-touch: chain = wall means the copy chain IS the wall).
+- af1 `gplr25-ab-512-af1.jsonl`: PP wall 11,989 ms (+31 ms, -0.3% delta —
+  noise), identical structure; worker ENGAGED (async_feed_init depth=1,
+  3,880 async_feed_ready events, 0 in af0).
+- Read: at 1 chunk/layer (512-token prompt, batch-major) compute is only
+  0.74 s of a ~12 s wall; the ~306 ms/layer feed chain is the critical path
+  and BOTH arms already submit the next copy at compute start (controller
+  lookahead, 39/40) — the worker had no headroom left to exploit. The 0.74 s
+  compute sum is the theoretical af ceiling at this rung and it is inside
+  run-to-run noise.
+
+**Supersedes (confound identified, claim removed):** the 2026-09-15
+prototype reading "PP wall 12.29 s (af1, 2 slots) vs 17.6 s (same-session
+3-slot ladder arm) -> tok/s 41.7 vs 29.1" compared DIFFERENT slot shapes
+(2 vs 3) across DIFFERENT file-cache states (the 17.6 s arm was the cold
+first rung; the 12.3 s arm ran warm). The paired af0@2-slot wall (11.96 s)
+matches the af1 arm (11.99 s), so the earlier af-vs-no-af attribution of
+the 5.3 s gap was wrong — the gap was cache state + shape, not the worker.
+Prototype mechanism evidence (overlap proven, worker live) STANDS; the
+wall/tok-s numbers from the unpaired reading are WITHDRAWN.
+
+**Pending (superseded 2026-09-15, see the newer section above):** the 4k
+rung pair has since run — verdict there supersedes this paragraph's
+expectation setting.
+
+Artifacts: `gplr25-ab-512-{af0,af1}.{jsonl,tgtext}`,
+`build/analyze_gplr25_pair.py`, `build/run-gplr25-4k-pair.ps1`.
+
+## 2026-09-15: OWNER DECISION IMPLEMENTED — default --layer-slots 2, auto-3 on fit, loud refusal below 2; T-GPLR-25 async-feed prototype proven live; latent checker defect fixed
+
+**Owner decision (2026-09-15, this session):** "we should really use 2, and 3
+if the budget allows. Make the default 2, note it also where the budgets are
+set or managed. Keep it transparent. If we need a lower vram residency there
+should be a warning or denial with the text why we cannot get it."
+Implemented as stated, with the budget point documented here:
+
+**Where the budget is set/managed (the transparency note the owner asked for).**
+The slot count is decided in the runner's T-GPLR-04 CAPACITY PREFLIGHT
+(`tools/layer-streaming/main.cpp`, the block introduced by this decision,
+inside the preflight between the inventory parse and
+`ls_bounded_window_for_policy`'s adoption of the window). Its arithmetic is
+the preflight's own bounded window — the SAME
+static + per-layer-resident + slot-window + KV + recurrent-state + reserve
+terms `byte_account` emits, re-derived per rung through the same
+`ls_bounded_window_for_policy` helper (no second arithmetic path). The three
+budget INPUTS an operator can set: `--residency-budget-mib` (explicit total
+residency cap; the bounded window must fit under it), `--reserve-mib
+(default 512)` (headroom left between the bounded config and free VRAM), and
+`--ctx-size`/`--kv-cache` (the KV term). The ladder consumes free VRAM
+(`vram.free_start`, the observed post-CUDA-context reading).
+
+**The decision ladder (default path only; an explicit --layer-slots is a
+contract used verbatim, never altered):**
+1. 3 slots when the 3-slot bounded need (bounded + act slabs + reserve)
+   <= observed free — stderr line `layer-slots: default 2 -> 3 (T-GPLR-25
+   owner ladder: budget admits it; ... +1 slot = 522190848 B for copy/compute
+   overlap)`.
+2. else 2 slots when only the 2-slot need fits — stderr line naming the 3-slot
+   shortfall and the 2-slot spare.
+3. else LOUD REFUSAL (exit 1, pre-sink `run_refused` reason
+   `capacity_preflight`) whose text states the need/free/shortfall bytes AND
+   why 1 slot is not taken silently (the slot-reuse invariant forbids
+   copy/compute overlap at 1 slot — the serialized PP shape H-D measured) and
+   that `--layer-slots 1` remains available as an explicit deliberate choice.
+No silent fallback at any rung.
+
+**Proof on the real gate (GPU mutex):** qa-smoke 512 now resolves 3 slots
+(`run_start n_slots:3`, ladder line in the log, bounded 3-slot need
+4,732,676,608 B <= free 22,226,665,472 B) and PASSES — check-telemetry OK
+(23,324 events, 3 slots), answer 5/5, negative control FAILs as designed
+(`gplr07-qa-512.{jsonl,tgtext}`). Host suite 37/37 on the changed binary.
+Cold-cache caveat per AGENTS.md: PP wall/tok-s in this rung's summary are the
+cold branch and are not comparable to the warm recorded arms; the claims are
+the ladder decision, the event count, and the gate verdict.
+
+**Latent checker defect fixed (exposed by the first 3-slot rung).** The
+`slot_evict` rule computed `per_slot = n_layer / n_slots`, correct only when
+n_slots divides n_layer (1, 2, 4 — every previously recorded shape); at 3
+slots over 40 layers (slot 0 owns 14, slots 1-2 own 13) it drifted after the
+first wrap and rejected 1,253 CORRECT `slot_evict` records. The rule now uses
+the same uneven-aware formula as the `copy_submit` rule
+(`(n_layer - 1 - slot) / n_slots + 1`) — one owner per fact. All previously
+recorded shapes are unaffected (the two formulas are equal when n_slots
+divides n_layer): the recorded 512 trace re-checks OK and the host suite is
+green.
+
+**T-GPLR-25 async-feed prototype (`--pp-async-feed 1`, default 0 =
+byte-identical) — implemented and PROVEN LIVE on a real arm, prototype
+results only, no performance claim.** Worker thread (T-GPLR-08 worker shape:
+1-deep queue, stats under mutex, thread-safe telemetry) submits the NEXT
+layer's H2D package copy into a free slot while the main thread computes;
+same copy body as `load_layer` (same events, same ordering); slot-reuse
+invariant untouched (worker fills only slots the main thread released via
+`record_consumer_done`; graph still consumes only after `ev_copy_ready`).
+Requires `--layer-slots >= 2` (refused at parse otherwise). Arm
+`gplr25-asyncfeed-af1-s2` (2 slots, worker on, batch-major, 512 anchor):
+- Overlap PROVEN from the trace: for every layer L, copy_submit(L+1)
+  timestamps sit between L's compute start and end, and copy_complete(L+1)
+  lands ~260-280 ms into L's 7,500-9,000 ms compute window — the copy is
+  fully hidden under compute, vs 0% at the 1-slot recorded shape.
+- The 11.5 s host_submit sum moved OFF the wall: PP wall 12.29 s against
+  feed 11.54 s + compute 0.74 s (overlap ratio 1.0 of feed) vs the recorded
+  1-slot shape's wall ~ feed + compute. PP tok/s 41.7 vs the same-shape
+  3-slot ladder arm's 29.1 in the SAME session/cache state (12.3 s vs 17.6 s).
+- Checker OK (27,206 events incl. 3,880 async_feed_ready), TG answer gate
+  unchanged (structural; the TG leg is untouched by the flag).
+- Caveats recorded: one run, cold-cache branch, batch-major vehicle — the
+  magnitudes are prototype evidence, NOT a performance result; a gate claim
+  needs the paired same-shape A/B (af=0 vs af=1 at equal slots) under held
+  cache state. The `async_feed_submit` event never fires (0 of them) — the
+  ready-side event carries the evidence; the submit-side event is dead
+  telemetry, recorded as a prototype residue, not repaired in this pass.
+
+**Where things stand for H-D:** the serialization mechanism is confirmed and
+the fix class is real on this vehicle. The falsifiable next step (per the
+T-GPLR-25 contract, amended in the plan) is the paired af=0/af=1 A/B at fixed
+2-slot shape plus the 4k/50k rungs, before any tok/s claim leaves prototype
+status.
+
+Artifacts (gitignored build/): `gplr25-asyncfeed-af1-s2.{jsonl,tgtext}`,
+`build/analyze_pp_overlap.py`, `build/analyze_pp_copy_gaps.py`,
+`build/analyze_evict_rule.py`, `build/run-asyncfeed-arm.ps1`. Vendored diff
+(uncommitted, per standing instruction): `src/llama-layer-streaming.{h,cpp}`
+(worker + flag), `tools/layer-streaming/main.cpp` (ladder + flag + checker
+rule + refusal text).
+
+## 2026-09-15: documented online research pass on H-C/H-D (no GPU runs, no code changes)
+
+Per AGENTS.md "Problems and Online Help", the CUDA-platform mechanisms behind
+the two open hypotheses were researched from authoritative sources (CUDA
+Handbook ch. 6.3, NVIDIA forum threads on pageable-memcpy sync behavior and
+the WDDM software queue, upstream llama.cpp CUDA-graph precedent), and every
+claim was verified against the vendored tree before being recorded. Findings,
+full source list, source-vs-tree verification, and the falsifiable probes are
+in the new `docs/gplr13-research-hcd-online.md` (section 8). Headlines:
+
+- **H-C narrowed, mechanism revised.** The ~198 us hit-path ready-latency is
+  most consistent with WDDM software-queue flush on an EMPTY submission (the
+  hit path enqueues no copies before its synchronize; the miss path batches
+  behind its copy burst), not retained-set bookkeeping. Sync mode is already
+  spin (the vendored `cudaDeviceScheduleSpin` call covers only cc 12.1 iGPUs),
+  so blocking-sync mode is NOT the cause and `cudaEventBlockingSync` would
+  likely hurt. Cheapest disambiguation, no code change: a K=1 vs K=8 A/B on
+  the same stream -- bookkeeping scales with K, WDDM flush does not.
+- **H-D refined; a zero-code probe exists.** The row-set fetch source is the
+  mmap'd (pageable) weight buffer, so every `set_async` is a hidden staged
+  copy (driver pins, copies, DMAs) and PP's 3.34 GB/s is the "synchronous
+  variant" shape from the CUDA Handbook's pageable-memcpy analysis. The
+  vendored CUDA backend exposes `ggml_backend_cuda_register_host_buffer` under
+  env `GGML_CUDA_REGISTER_HOST`, but NOTHING in `src/` or the runner calls it
+  (tree-wide grep), so the mmap window is never pinned today. Probe order:
+  (1) set `GGML_CUDA_REGISTER_HOST=1` and re-run the 4k arm, watching
+  `host_submit_us` per fetch -- if unchanged, the env route is dead code on
+  this build; (2) a minimal read-only `cudaHostRegister` of the mmap window
+  at runner bring-up; (3) only then the two-buffer ping-pong / prefetch-ahead
+  A/B. Caveats recorded: `cudaHostRegister` on an 18 GB region may fail or
+  inflate commit, and WDDM batch depth on driver 610.74 is unverified.
+
+No default, no gate verdict, no implementation changed. Nothing committed.
+
 ## 2026-09-15 (latest): H-A fixed and proven — row-set TG phase_summary carries transfer/wait/bytes; first real F3 part fields
 
 Continuation of the sweep's H-A hypothesis (vendored change, no default or
@@ -28,6 +372,10 @@ reading at 4k: attention 30.3 ms vs staged FFN 1.1 ms per layer-window —
 TG compute is ~27x attention-dominated at 4k context; expert staging is
 the transfer story, not the compute story. This sharpens H-C: the wait
 term to optimize next sits in attention, not expert copy.
+[CORRECTED 2026-09-15: the ~27x was a single-event artifact — see the
+bottlenecks doc's correction. Distributions give attention:FFN ~2.2x (4k)
+and ~2.4x (50k) on means; expert staging remains the largest single TG
+term at width.]
 
 **Records:** hypothesis annotations in `docs/gplr13-bottlenecks-hypotheses.md`
 (discord item 2 and the F3-prediction line); schema note in
@@ -54,6 +402,18 @@ whole window (1,800 s lock timeout; the recorded reactive trace is
 untouched). Host suite green after the H-B edit. [Committed 2026-09-15
 in `third_party/llama.cpp` **8e9757169** together with the deletion-first
 pass, the T-GPLR-22 refusal traces and the 200k spill fix.]
+
+**Follow-on: F3 width test at 50k (2026-09-15, same session).**
+50k retention arm under the GPU mutex (`-SmokeMode retention
+-SmokeUbatch 512`, fresh trace `gplr07-qa-50000-retention.jsonl`; the
+recorded Sep-14 rung archived to `gplr24-f3-50k/qa-50000-retention-PRIOR.jsonl`):
+qa-smoke gate PASS (check-telemetry OK, answer 5/5, control FAILs), TG
+7.21 s / 13.3 tok/s / 17.93 GB staged / peak 7.56 GB. The F3 distributions
+correct the 4k first-event reading: attention:FFN ratio of means 2.4x
+(4k: 2.2x), all 40 layers' attention means < 2 ms, and all three TG
+terms comparable at 50k (transfer 3.63 s, wait 1.04 s, compute 2.63 s).
+Answer-gate outcome recorded; no default, no gate verdict, no
+implementation change. Uncommitted.
 
 ---
 
