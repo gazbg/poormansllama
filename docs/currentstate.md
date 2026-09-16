@@ -1,5 +1,9 @@
 # Current State
 
+## 2026-09-16: T-GPLR-35 RECON RUN — the coupling is NOT the staging/compute stream topology. Falsifier class reached: NONE. Both arms ran under the GPU mutex with `--pp-recon 1` (trace build/llama-cuda/gplr35-recon-{ov0,ov1}.jsonl, log/gplr35-recon-wrapper.log, tools/run-gplr35-recon.ps1, analyzer tools/analyze-gplr35-recon.py), 4k anchor, ubatch 512, 2 slots, layer-major default, kv q8, --pp-repeat 2 (pass 1 cold, pass 2 warm), pinned, af=1; both strict checkers OK. **Identity (measured, not assumed):** `recon_identity` records the actual handles — ov0 compute_s0=2562101218336 vs copy_s0=2571110727088 (same_ctx_stream=0: the copy backend really is a separate stream); ov1 overlap=1 with compute_s1=2571110691440 (the aux stream exists). **Attribution (76 samples/arm, 40 layers x 2 passes):** copy windows are PURE in both arms — median 31.47 ms (ov0) / 31.44 ms (ov1) = **1.00x the 31.37 ms pure 453 MB pinned ceiling**; lag (copy_start - compute-stream reference) is median +34.59 ms (ov0) / +34.15 ms (ov1) with **0/76 negative samples in either arm** — no bank's DMA ever started while the compute backlog was still draining. **ov1 (aux stream inside the compute context) is measurably identical to ov0:** warm walls 3089.0 vs 3088.4 ms, 1326 tok/s both, same window, same lag, same overlap 0%; host hop moved 1559 -> 1279 ms but ready latency rose 2429 -> 2694 ms and engine queue wait 1191 -> 1456 ms, net zero. The stream-topology lever is FALSIFIED as a wall lever for this shape. **Warm-pass ledger (wall 3089 ms, 40 banks; summary-authoritative totals):** compute 1350 ms + transfer-window 3988 ms with consumer wait 747 ms; the 3988 ms transfer window decomposes into **host hop (pinned mirror + submit) 1559 ms + ready latency 2429 ms**, and of that ready latency only **1238 ms is actual DMA engine time** (median 31.4 ms/bank) — the other **1191 ms is queue wait** (submitted but not started). So per bank the wall carries ~39 ms of CPU hop, ~31 ms of pure DMA, ~30 ms of engine queue wait and ~34 ms of compute, at one bank of pipeline depth; wall - (compute + pure DMA) = **+501 ms** is the non-engine residual. **The old "74 ms chained window" reading was a host-window artifact**: the host-observed per-bank window (~100 ms) = host hop + queue wait + DMA, and only the last ~31 ms is the engine. **Defect found and fixed during recon:** `backend_compute` was published ONLY inside `layer_streaming_compute` (llama-layer-streaming.cpp:2426), which layer-major PP never calls — it executes graphs directly via `ggml_backend_sched_graph_compute_async` (:3274) — so on the PRIMARY workload that pointer was null for the whole run. Consequences: the ov1 arm aborted loudly at the first staging ("refusing to fall back to the copy-stream staging path", message later overwritten by the caller's package/bundle diagnostic), i.e. the T-GPLR-35 V1 mechanism could not engage at all, and the recon's own `backend_compute == nullptr` guard silently emitted nothing (a bad instrument, now fixed). Fix: publish `backend_compute` in `layer_major_pp` right where the scheduler's CUDA backend is discovered, with the same loud aux-stream refusal; the recon now emits `recon_unavailable` instead of a silent no-op. Build clean after both fixes (0 errors), host validation unchanged. **Consequence for the goal charter:** at 2 slots the PP wall is ~68% host-pipeline + engine-queue, not engine-bound and not stream-bound; the levers that remain are host-hop removal (direct mmap staging instead of the pinned mirror) and pipeline depth (more than one bank in flight, i.e. slot lookahead), not CUDA stream topology. Nothing committed; recon scripts + probe code uncommitted in the worktree.
+
+## 2026-09-16: T-GPLR-35 V1 IMPLEMENTED + BUILT (A/B armed, NOT yet run) — staging DMAs can now run on an auxiliary stream (No. 1) of the COMPUTE backend's CUDA context behind `--pp-copy-overlap 0|1` (default 0 = the pre-T-GPLR-35 copy-backend path, byte-identical). New experimental extension surface (ggml/include/ggml-cuda.h + ggml/src/ggml-cuda/ggml-cuda.cu): `ggml_backend_cuda_aux_stream_ok` / `memcpy_1d_aux` / `event_record_aux` / `event_wait_aux` / `aux_synchronize`; every staging submission and every staging-side ordering call in llama-layer-streaming.cpp routes through one plumbing layer (`ls_stage_aux` / `ls_stage_record` / `ls_stage_wait` / `ls_stage_drain`) so the mode switch is atomic — an event can never be recorded on a stream that carries no copy work, and a wait always targets the stream that does. Drains are conservative (both streams) so no site can be missed; the handoff-migration and TG row-cache paths keep the copy backend and their own consistent topology. A run whose flag is on but whose compute context has no aux stream fails LOUDLY where the scheduler's CUDA backend resolves (never a silent fallback to the serialized path). Host validation (no GPU): build clean (0 errors; CUDA backend + llama core + runner all recompiled), usage line present, `--pp-copy-overlap 2` refused with the contract message, `--pp-copy-overlap 1` parses through to prompt validation. A/B armed and NOT yet run: `tools/run-gplr35.ps1` -> `tools/run-gplr35-arms.ps1` (arms overlap0/overlap1, 4k anchor, ubatch 512, 2 slots, default schedule, kv q8, --pp-repeat 3, --copy-source pinned, af=1, strict check-telemetry per arm) + `tools/analyze-gplr35.py`. Pre-registered: warm 4k 2.75-2.8 s -> ~2.0-2.1 s (ceiling ~1.5-1.6 s); FALSIFIER warm wall >= ~2.6 s with the copy window unchanged. Recon limitation stated: stream/context identity is not logged, so the attribution rests on the A/B's wall/window/pass-transfer evidence.
+
 ## 2026-09-16: T-GPLR-34 MID-KERNEL PROBE — WDDM cross-engine serialization FALSIFIED (a second stream overlaps the compute and can even overtake it); the runner-side cause was first written up as shared-stream, which is CORRECTED in the same entry below (drafted as T-GPLR-35). The standalone probe (tools/gplr34-midkernel-probe.cu, rev 4, -arch=native; runner tools/run-gplr34-probe.ps1; log build/llama-cuda/gplr34-midkernel-probe.log; run under the GPU mutex; re-run 2026-09-16 from the committed script reproduces every number below): [1] pure 453 MB pinned copy 31.37 ms min (14.44 GB/s — pure-rate ceiling re-confirmed); [5] single-stream kernel+copy mid-kernel enqueue 62.12/62.77 ms = 30.74 kernel + 31.37 copy additive — guaranteed by stream ordering on every platform, so only a reference; **[6] TWO-STREAM discriminator: copy START -31.6/-28.4 ms relative to kernel start (the copy OVERTOOK the kernel — launched later but ran earlier), copy-done -0.15 ms min (finished before the kernel began), copy window pure 31.38 ms, kernel window unaffected 30.36 ms. WDDM cross-engine serialization is FALSIFIED: the copy engine runs at full rate around SM compute on this box when the copy is on a second stream, and event completion is not deferred either.** Instrument notes: rev 1 was invalid (burn kernel measured 0.00 ms — launches never error-checked); rev 2+ add loud launch checks, verified calibration (33.94 ms), and the FATAL guard; first rev-2 run also surfaced a Blackwell toolchain fact — the default nvcc target gave "provided PTX was compiled with an unsupported toolchain" at kernel launch on sm_120, fixed with -arch=native. CORRECTION (same day, before any fix was attempted): the "shared stream" causal reading was WRONG for the runner. `ggml_backend_cuda_set_tensor_async` does submit on `cuda_ctx->stream()` (ggml-cuda.cu:2428-2434), but the backend it is handed here is `backend_copy` — a DEDICATED CUDA backend (llama-layer-streaming.cpp:1305 `ggml_backend_cuda_init` -> a fresh `ggml_backend_cuda_context`; `streams[device][...]` is a per-context member, common.cuh:1420/1494) — while the compute side is the SCHEDULER's CUDA backend (`backend_compute`, resolved at llama-layer-streaming.cpp:2274): two contexts, two streams. Stream identity therefore does NOT explain the runner's chained 34 + 31.5 ms windows. What matches instead is the runner's own CROSS-CONTEXT ordering gate: `ev_consumer_done` is created on the copy device (:1324), recorded on `backend_compute` (:2105) and waited on the copy stream (:602 worker, :1900 main) — a shape the T-GPLR-34 probe never tested (its two streams shared ONE context, where overlap is proven). The GPU is still not the limiter and the wall conclusion is unchanged (~2.75-2.8 s is not an engine-bound floor; target ~2.0-2.1 s), but the lever's mechanism is UNRESOLVED and is exactly what T-GPLR-35's recon step must attribute (cross-context wait vs slot-reuse gate vs enqueue position vs graph-launch semantics) before any fix is written. Probe commit: fc13543 (2026-09-16, tools/gplr34-midkernel-probe.cu + tools/run-gplr34-probe.ps1 + this verdict; the T-GPLR-35 draft lands with the next doc update).
 ## 2026-09-16: SUBMIT_BATCH GAP CLOSED — the field now reports the ACTUALLY-TAKEN branch threaded from stage_members (0 = per-member, 1 = single span, 2 = mixed), not the flag state; verification A/B under the mutex: batch0 {0:120}, batch1 {1:120} — and this retroactively confirms the falsified A/B's implementation-side premise by direct branch telemetry (the span path really ran on every bank there)
 
@@ -143,7 +147,7 @@ or accepting the ~2.75-2.8 s warm wall as the pinned-af optimum on this box.
 
 ## 2026-09-16: WDDM DMA-INFLATION RESEARCH PASS — asyncEngineCount=5 measured on this 5090 Laptop; NVIDIA's engine model (same-direction copies sharing one engine stretch; batching restores full rate while kernels still overlap) predicts our 2.2x stretch is LINK/QUEUE CONTENTION, fixable by one-in-flight serialization; T-GPLR-32 experiment drafted
 
-Local measurement (build/gplr32-enginecount.cu/.exe, CUDA 13.2): RTX 5090
+Local measurement (tools/gplr32-enginecount.cu/.exe, CUDA 13.2): RTX 5090
 Laptop GPU reports asyncEngineCount=5 (multiple copy engines exist) — yet
 our traces show 28 concurrent two-copy pairs stretching effective windows
 2.2x (69.6 ms avg vs 31.45 ms pure) and ~237 ms at 3 slots. Conclusion: the
@@ -296,7 +300,7 @@ not certify the promotion's performance claims, which remain the T-GPLR-25/
 
 ## 2026-09-16: T-GPLR-31 DONE — locked-RAM probe: the driver grants 44.72 GiB of pinned memory incrementally (106 x 432 MiB, fails with cudaErrorMemoryAllocation with ~10 GiB still free), single-shot 20 GiB OK, and cudaHostRegister on ANONYMOUS pages SUCCEEDS — the T-GPLR-29 OOM was file-backed-view-specific, not a general registration limit
 
-Standalone probe (build/gplr31-pinpool-probe.cu, CUDA 13.2 nvcc, GPU-mutex
+Standalone probe (tools/gplr31-pinpool-probe.cu, CUDA 13.2 nvcc, GPU-mutex
 run, log build/llama-cuda/gplr31-pinpool-probe.log): incremental
 `cudaHostAlloc` ladder granted 44.72 GiB pinned before failing
 (cudaErrorMemoryAllocation) with GlobalMemoryStatusEx showing 10.11 GiB
@@ -369,7 +373,7 @@ inflation (outside current scope). Residual uses for the pool: long-lived
 process starting with hot OS file cache (populate ~0.75 s, unproven), or
 af=0 serial staging where the 0.75 s/pass hop exposure is real (unmeasured).
 Files: build/llama-cuda/gplr30-{lru4,fixed4,fixed10,fixed20,fixed40}.{jsonl,log},
-analyzer build/analyze_gplr30_pool.py, arms build/run-gplr30{,-poolcurve}.ps1.
+analyzer tools/analyze-gplr30-pool.py, arms build/run-gplr30{,-poolcurve}.ps1.
 No default-path change; nothing committed.
 
 ## 2026-09-16: WAIT SIGNATURE IDENTIFIED — it is the per-layer deficit max(0, effective_DMA_window − compute_window), quantized at the DMA window itself (31.45 ms); af=1+pinned wall without it = 1.85–1.92 s (empirical) / ~1.5–1.8 s (engine-bound floor); 3-slot prescription TESTED AND FALSIFIED (warm 4.14–4.83 s, worse — copy engine saturates at 2 slots)
@@ -457,11 +461,11 @@ Consequence: the interaction (af=1 AND pinned) is the configured optimum
 measured on this box; next lever remains first-touch (process longevity /
 pinned pool population already amortize it within a process).
 Files: build/llama-cuda/gplr29-afab-{af0,af1,af1direct}.{jsonl,log},
-scripts build/run-gplr29-afab*.ps1, build/run-gplr29-af1direct.ps1.
+scripts build/run-gplr29-afab*.ps1, tools/run-gplr29-af1direct.ps1.
 
 ## 2026-09-16: T-GPLR-29 DONE — pinned-pool probe + end-to-end pinned arm: DMA ceiling 14.4 GB/s is ~90% of the real link (Gen4 x8 LAPTOP 5090, not Gen5); pinned buys nothing serial (chain 9.0 GB/s < direct 10.0 GB/s) and no PP-wall change end-to-end; first-touch stays the dominant cost
 
-Standalone probe `build/gplr29-pinprobe.cu` (nvcc 13.2, outside the vendored
+Standalone probe `tools/gplr29-pinprobe.cu` (nvcc 13.2, outside the vendored
 tree) over a 453 MB region of the real MoE GGUF (3-member bank shape
 confirmed), run twice under the GPU mutex (reproducible to <2%):
 
@@ -638,7 +642,7 @@ The T-GPLR-12 layer-major 4k prediction ("~3.5-4x PP-wall gain at 4k, 40 copies
 instead of 320") was tested with a three-arm adjacent trio on the MoE vehicle
 (Qwen3.6-35B-A3B, anchor-4096 prompt, ubatch 512, `--layer-slots 2`, af=0,
 `--allow-full-residency`, kv q8), all under ONE GPU-mutex hold for cache
-adjacency, executed by `build/run-lm4k-arms.ps1` via `build/run-lm4k-trio.ps1`:
+adjacency, executed by `tools/run-lm4k-arms.ps1` via `tools/run-lm4k-trio.ps1`:
 
 | arm | schedule | handoff | PP wall | PP tok/s | PP bytes | PP copies | PP evictions | checker |
 |---|---|---|---|---|---|---|---|---|
@@ -909,7 +913,7 @@ bandwidth. A layer-major PP schedule (40 copies, one pass) is the obvious
 next lever and is explicitly in scope per the SDD's primary-workload note.
 
 Artifacts: `gplr25-budget-refusal-2048.jsonl`,
-`gplr25-ab-4096-{af0,af1}.{jsonl,tgtext}`, `build/analyze_gplr25_pair.py`,
+`gplr25-ab-4096-{af0,af1}.{jsonl,tgtext}`, `tools/analyze-gplr25-pair.py`,
 `build/run-refusal-and-af1-chain.ps1`, `build/run-budget-refusal-test.ps1`.
 
 ## 2026-09-15: T-GPLR-25 paired A/B, 512 rung COMPLETE: NO af delta at 1 chunk/layer; earlier prototype wall comparison confounded (superseded); 4k pair pending GPU mutex
@@ -917,7 +921,7 @@ Artifacts: `gplr25-budget-refusal-2048.jsonl`,
 **Design (per the amended T-GPLR-25 contract):** paired arms run back-to-back
 under ONE mutex hold, `--layer-slots 2` fixed, af the only flag delta —
 controls the file-cache state that confounded the prototype reading.
-Analyzer: `build/analyze_gplr25_pair.py` (PP window, busy coverage, feed
+Analyzer: `tools/analyze-gplr25-pair.py` (PP window, busy coverage, feed
 serial chain, effective staging).
 
 **512 rung result (anchor-512, both arms PASS check-telemetry + answer gate,
@@ -950,7 +954,7 @@ rung pair has since run — verdict there supersedes this paragraph's
 expectation setting.
 
 Artifacts: `gplr25-ab-512-{af0,af1}.{jsonl,tgtext}`,
-`build/analyze_gplr25_pair.py`, `build/run-gplr25-4k-pair.ps1`.
+`tools/analyze-gplr25-pair.py`, `tools/run-gplr25-4k-pair.ps1`.
 
 ## 2026-09-15: OWNER DECISION IMPLEMENTED — default --layer-slots 2, auto-3 on fit, loud refusal below 2; T-GPLR-25 async-feed prototype proven live; latent checker defect fixed
 
@@ -1044,7 +1048,7 @@ T-GPLR-25 contract, amended in the plan) is the paired af=0/af=1 A/B at fixed
 status.
 
 Artifacts (gitignored build/): `gplr25-asyncfeed-af1-s2.{jsonl,tgtext}`,
-`build/analyze_pp_overlap.py`, `build/analyze_pp_copy_gaps.py`,
+`tools/analyze-pp-overlap.py`, `tools/analyze-pp-copy-gaps.py`,
 `build/analyze_evict_rule.py`, `build/run-asyncfeed-arm.ps1`. Vendored diff
 (uncommitted, per standing instruction): `src/llama-layer-streaming.{h,cpp}`
 (worker + flag), `tools/layer-streaming/main.cpp` (ladder + flag + checker

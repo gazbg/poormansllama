@@ -35,7 +35,7 @@ Commit: third_party/llama.cpp 68cd1726d (2026-09-16: af rewire + residue fix por
 
 Goal
 : Close the H-D hypothesis with a measured prototype. The 2026-09-15 trace
-  analysis (build/analyze_pp_copy_gaps.py, build/analyze_pp_overlap.py over
+  analysis (tools/analyze-pp-copy-gaps.py, tools/analyze-pp-overlap.py over
   the RECORDED arms, no new GPU runs) established the serialization structure:
 
   - direct-200k (`rung-200000-fix.jsonl`): 15,640 PP copy_submit events,
@@ -132,7 +132,7 @@ Focused validation
   4k layer-major direct arms K=0/K=1/K=3 (`--pp-schedule layer-major
   --pp-tokens 4096 --ubatch 512 --pp-lookahead {0,1,3} --copy-source direct`)
   with `--check-telemetry` on every trace; qa-smoke 512 for the parity gate.
-  Analysis: build/analyze_pp_overlap.py + build/analyze_pp_copy_gaps.py on
+  Analysis: tools/analyze-pp-overlap.py + tools/analyze-pp-copy-gaps.py on
   the new traces.
 
 State update
@@ -315,7 +315,7 @@ Goal
   Windows data point).
 
 Scope
-: Standalone throwaway microbenchmark (build/gplr29-pinprobe.cu, nvcc,
+: Standalone throwaway microbenchmark (tools/gplr29-pinprobe.cu, nvcc,
   outside the vendored tree), one bank-sized (453 MB) transfer mapped from the
   real MoE GGUF so the pageable case IS our copy source. No changes to the
   runner, lib, SDD, or default paths. GPU-mutex run.
@@ -731,9 +731,34 @@ Escalation condition
 
 ### T-GPLR-35: PP staging overlap — bank DMAs on a second stream inside the compute context (warm 4k ~2.75-2.8 -> ~2.0-2.1 s)
 
-Status: in-progress (2026-09-16) — V1 implemented and built clean (0 errors;
-host validation: usage line present, value 2 refused, value 1 parses), A/B
-armed but NOT yet run (no GPU time spent). Staging DMAs now
+Status: in-progress (2026-09-16) — RECON RUN DONE, FALSIFIER CLASS REACHED
+(NONE). V1 implemented, built clean, and measured: with the aux stream (ov1)
+the warm 4k wall is 3088.4 ms vs the copy-backend baseline's 3089.0 ms —
+measurably identical — and in BOTH arms the copy windows are already pure
+(median 31.4 ms = 1.00x the 31.37 ms pure-rate ceiling) with lag >= 0 on
+76/76 samples (no DMA ever starts while the compute backlog drains). The 2.75
+-> 2.0-2.1 s prediction therefore FAILS and its falsifier fires: the coupling
+is not stream/context-level. The warm-pass ledger names what it IS instead:
+of the 3089 ms wall, compute is 1350 ms and the pure DMA is 1238 ms, while the
+host transfer window (3988 ms) splits into a **1559 ms host hop (pinned mirror
++ submit)** and **2429 ms ready latency, of which only 1238 ms is engine time
+and 1191 ms is queue wait** — i.e. the wall is dominated by host-side pipeline
+and one-bank-deep ordering, not by the engine and not by stream topology. The
+old "74 ms chained window" was a host-window artifact: the host-observed
+window (~100 ms/bank) is hop + queue + DMA. A real V1 defect was found and
+fixed by the recon: `backend_compute` was published ONLY inside
+`layer_streaming_compute`, which layer-major PP never calls (it executes graphs
+directly at :3274), so on the primary workload the aux mechanism could not
+engage at all (ov1 aborted loudly) and the recon silently emitted nothing;
+it is now published in `layer_major_pp` with the loud aux-stream refusal, and
+the recon emits `recon_unavailable` rather than a silent no-op. Remaining
+levers per the goal charter: host-hop removal (direct mmap staging) and
+pipeline depth (more than one bank in flight), NOT CUDA stream topology.
+Evidence: build/llama-cuda/gplr35-recon-{ov0,ov1}.jsonl (both checkers OK),
+tools/run-gplr35-recon.ps1, tools/analyze-gplr35-recon.py, wrapper log
+build/llama-cuda/gplr35-recon-wrapper.log; full numbers in docs/currentstate.md.
+NOT a performance result: no wall moved, so no default changes are proposed
+here. Staging DMAs now
 run on the auxiliary stream (No. 1) of the COMPUTE backend's CUDA context
 behind `--pp-copy-overlap 0|1` (default 0 = the pre-T-GPLR-35 copy-backend
 path, byte-identical). New experimental surface (ggml/include/ggml-cuda.h +
@@ -755,7 +780,9 @@ Depends on: T-GPLR-33 (done — closed the submission-shaping family), T-GPLR-34
 one-stream work is additive by CUDA semantics), T-GPLR-32 (done — the af gate
 is wall-neutral), T-GPLR-29/30 (pinned staging + pool defaults), T-GPLR-13/25
 (the trace arms this A/B stays comparable with)
-Commit: (fill on completion)
+Commit: nested 69799064a (V1 aux-stream staging + `--pp-recon` instrumentation +
+  the layer-major `backend_compute` publication fix); outer (docs, recon scripts,
+  analyzer, gitlink bump) recorded below on completion
 
 Goal
 : Recover copy/compute overlap in the runner so the warm 4k layer-major pass
@@ -832,6 +859,11 @@ Design/failure contract
 
 Implementation steps
 : 1. Recon instrumentation (contract 1) plus one short GPU run to read it.
+  DONE 2026-09-16: `--pp-recon 0|1` + `recon_identity` / `recon_attr` /
+  `recon_unavailable` events (timing-enabled events on the actual staging and
+  compute streams), `tools/run-gplr35-recon.ps1` under the mutex, analyzer
+  `tools/analyze-gplr35-recon.py` (distribution + warm-pass ledger). Verdict:
+  NONE — see the Status block.
   2. Add the experimental CUDA accessor for the compute context's second
   stream and the per-bank copy helper in the isolated path; wire
   `stage_members` and the slot event creation/recording to it behind the flag.
@@ -898,7 +930,7 @@ Goal
   general registration limit.
 
 Scope
-: Standalone throwaway probe (build/gplr31-pinpool-probe.cu, nvcc, outside
+: Standalone throwaway probe (tools/gplr31-pinpool-probe.cu, nvcc, outside
   the vendored tree), no runner/lib changes, GPU-mutex run, telemetry-free.
   Four measurements: (A) incremental ladder — allocate 432 MiB pinned blocks
   one at a time up to failure, record the largest successful total and the
@@ -938,7 +970,7 @@ Escalation
 
 Results (2026-09-16)
 : All acceptance criteria met; ALL THREE PREDICTIONS FALSIFIED, each in the
-  direction that EXPANDS feasibility. Probe build/gplr31-pinpool-probe.cu,
+  direction that EXPANDS feasibility. Probe tools/gplr31-pinpool-probe.cu,
   run build/llama-cuda/gplr31-pinpool-probe.log (GPU mutex, CUDA 13.2
   toolkit; the 12.3 toolkit on PATH rejects the Blackwell host compiler —
   same quirk the T-GPLR-29 probe already worked around).
