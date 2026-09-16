@@ -21,6 +21,21 @@ Do not silently redesign either active document while implementing a task.
 
 `docs/Idea/` is historical research material. It is not the governing workflow.
 
+## Goal Charter (owner decision, 2026-09-16)
+
+The program's objective, in priority order:
+
+1. **Maximize PP (prompt-processing/prefill) speed first.**
+2. **Minimize VRAM usage second** — the slot-window budget, not model
+   placement, is the design instrument.
+3. **PP speed must hold when VRAM is crowded** — long-context KV (e.g.
+   262k), or a lower-end GPU (16 GB-class) where the expert banks cannot fit
+   even without KV. The mechanism must never depend on the model fitting in
+   VRAM; that case is not the target condition.
+
+Tasks are prioritized and judged against this charter; results that only
+improve the uncrowded case are secondary.
+
 ## Scope and Boundaries
 
 - The current implementation supports dense Qwen3.8 through Qwen-specific

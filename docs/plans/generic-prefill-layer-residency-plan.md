@@ -31,7 +31,7 @@ n_layer/n_slots) was fixed in the same pass.
 Depends on: T-GPLR-13 (bottleneck evidence), T-GPLR-08 (falsified HOST-side
 PrefetchVirtualMemory probe — this task is the DEVICE-side analogue and shares
 no mechanism with it)
-Commit: (fill on completion)
+Commit: third_party/llama.cpp 68cd1726d (2026-09-16: af rewire + residue fix portion)
 
 Goal
 : Close the H-D hypothesis with a measured prototype. The 2026-09-15 trace
@@ -303,7 +303,7 @@ Depends on: T-GPLR-28 verdict (first-touch = pay-once-per-process page state),
 the 2026-09-16 research pass in docs/currentstate.md (pageable cudaMemcpy
 bounce-buffer behavior; cudaHostRegister-on-mmap invalid; PrefetchVirtualMemory
 not added to the working set).
-Commit: (fill on completion)
+Commit: third_party/llama.cpp 68cd1726d (2026-09-16: --copy-source pinned default + probe tooling gates)
 
 Goal
 : Measure on this box (RTX 5090, WDDM, Gen5 x16, CUDA 13.2) the actual
@@ -485,6 +485,198 @@ concurrency inflation (outside current scope). The wait telemetry is
 trustworthy: it reads as chain exposure, matches the deficit model to 0.2 ms
 across two slot geometries.
 
+### T-GPLR-32: WDDM DMA-inflation serialization — one H2D in flight at a time (af worker DMA gate)
+
+Status: done (2026-09-16) — verdict: DISCARD the serialization default; the
+wall falsifier FIRED. A/B ran under the GPU mutex (tools/run-gplr32.ps1;
+ser0 vs ser1, 4k 3-pass 2-slot pinned shape; both traces check-telemetry OK,
+20,577 events each, no deadlock). RESULTS: warm passes ser0 2777.8/2768.9 ms
+(wait 959.3/958.6 ms) vs ser1 2782.9/2751.8 ms (wait 958.8/958.5 ms) —
+identical within noise; the predicted wait collapse and 1.9-2.3 s wall did
+NOT materialize. Gate verified operating: af_inflight field present (ser1 max
+2 = submitted-but-unconsumed worker DMAs), stream gate enqueued, 120/120
+copies per arm. MECHANISM RESOLUTION (sharper than the pre-registered
+readings): with worker DMAs serialized, ~114/120 windows remain stretched
+(>45 ms; mean 82.6 vs 82.3 ms) while the only possible concurrent partner is
+a main-thread copy (preload, ~3-6 per pass) — far too few to stretch 114
+windows. The stretch is therefore INTRINSIC per-copy cost under WDDM
+(submission/window overhead), not DMA-pair contention: the original
+"2.2x inflation from concurrent copies" interpretation is falsified, and
+with it the entire DMA-concurrency lever family (3-slot falsification,
+T-GPLR-32 falsification). Analyzer caveat: windows are submit->consumption
+spans (host-observed; the trace carries no GPU-side timestamps), but the
+wall and wait verdicts are independent of that limitation.
+--pp-af-serialize stays as opt-in diagnostic tooling (harmless: identical
+walls, checkers OK). Remaining PP lever family: shrink the per-copy window
+itself (member batching / GPU-direct storage) — new task territory.
+Commit: nested 3bc3aff71 (2026-09-16, gate + af_inflight telemetry);
+outer commit fills with this doc commit (scripts tools/run-gplr32{,-arms}.ps1,
+analyzer tools/analyze-gplr32.py)
+Depends on: T-GPLR-29 addendum 3 (warm wall engine-bound floor ~1.5-1.8 s;
+pinned A/B methodology), T-GPLR-13/25 trace arms (the 2.2x window-stretch
+evidence), 2026-09-16 research pass in docs/currentstate.md (NVIDIA engine-
+model + WDDM batching sources; asyncEngineCount=5 local measurement).
+Commit: (fill on completion)
+
+Goal
+: The traces show concurrent two-copy stretches inflating effective DMA
+  windows 2.2x (69.6 ms vs 31.45 ms pure; ~237 ms at 3 slots) while the
+  device reports asyncEngineCount=5. Hypothesis (from the NVIDIA engine
+  model: same-direction copies sharing one engine/link stretch each other;
+  batching restores the full rate): limiting the af worker to ONE DMA in
+  flight removes the stretch; compute overlap is untouched because copies
+  and kernels run in different engines.
+
+Scope
+: Gate ONLY the af worker's H2D enqueue on the previous copy_complete
+  event. The CPU memcpy hop into the pinned staging buffer must stay fully
+  overlapped (do not gate the hop). Keep 2 slots, pinned source, layer-
+  major default schedule, 4k 3-pass shape for comparability with the
+  T-GPLR-25/29 recorded arms.
+
+Non-goals
+: No change to batch-major behavior, no multi-stream copy fan-out, no
+  VRAM/land layout changes, no upstream-facing material.
+
+Design/failure contract
+: If windows return to ~31-36 ms and per-pass wait collapses toward zero
+  with wall dropping toward ~1.9-2.3 s, the contention hypothesis is
+  CONFIRMED and serialization is a default candidate (gated behind the
+  existing af flag family, loud telemetry). If wall is unchanged AND
+  windows remain stretched, the stretch is per-copy WDDM submission
+  overhead outside the DMA window — record that and DISCARD. If windows
+  are pure-rate but wait persists, the wait accounting itself is the next
+  suspect. All outcomes are recorded verdicts, not failures.
+
+Implementation steps
+: 1. In the af worker (llama-layer-streaming.cpp), add a one-in-flight gate:
+  before cudaMemcpyAsync H2D enqueue, cudaStreamWaitEvent(copy_stream,
+  last_copy_complete); after enqueue, record last_copy_complete from
+  copy_stream. (Events, not host sync — no CPU stall.)
+  2. Add telemetry: an af_inflight field on copy_submit, 0/1, so the
+  analyzer can verify the invariant (never two concurrent worker DMAs).
+  3. Flag-gate: reuse the existing af mechanism; add
+  --pp-af-serialize 0|1 (default 0) so the A/B is one flag.
+  4. Build, run A/B (serialize 0 vs 1) under the GPU mutex, 4k 3-pass.
+  5. Analyze with the existing per-copy window analyzer + wait accounting.
+
+Acceptance criteria
+: - A/B traces both checker OK; af_inflight invariant holds (max 1) in the
+    serialized arm.
+  - Verdict recorded against the three outcome classes above with numbers
+    (window ms, wait ms/pass, warm wall, tok/s).
+  - docs/currentstate.md updated; plan status set with the verdict.
+
+Validation commands
+: powershell -NoProfile -ExecutionPolicy Bypass -File tools/with-gpu-lock.ps1
+  -TimeoutSeconds 420 -Command "<runner> --pp-af-serialize 1 ..." (exact
+  command recorded in docs/currentstate.md at run time); trace checker per
+  T-GPLR-07 smoke rules; window analyzer over both jsonl traces.
+
+State/document updates
+: docs/currentstate.md (run + verdict), this task (status + verdict),
+  T-GPLR-29 addendum 3 cross-reference if the floor is revised.
+
+Escalation condition
+: If the serialized arm regresses beyond noise (>10% wall) or the gate
+  deadlocks (wait never fires), stop, capture the trace, and escalate to
+  the owner before touching the enqueue path again.
+
+### T-GPLR-31: Locked-RAM probe — does the driver grant a full-pool-size pinned allocation on this box?
+
+Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB pool grantable with large headroom
+Depends on: T-GPLR-29 (probe methodology; cudaHostRegister OOM precedent;
+Gen4 x8 laptop link), T-GPLR-30 (the fixed40 arm already held 17,478 MiB of
+pinned pool buffers successfully — the direct motivation for this probe).
+Commit: (fill on completion)
+
+Goal
+: Answer, before any persistent-pool design work, the question T-GPLR-30
+  flagged as the first thing to check: does the CUDA driver grant ~18 GiB of
+  `cudaHostAlloc` pinned memory on this box, at what N does it stop, what
+  does refusal look like, and is the earlier `cudaHostRegister`
+  `cudaErrorOutOfMemory` (T-GPLR-29 case D) a file-backed-pages issue or a
+  general registration limit.
+
+Scope
+: Standalone throwaway probe (build/gplr31-pinpool-probe.cu, nvcc, outside
+  the vendored tree), no runner/lib changes, GPU-mutex run, telemetry-free.
+  Four measurements: (A) incremental ladder — allocate 432 MiB pinned blocks
+  one at a time up to failure, record the largest successful total and the
+  exact cudaError; (B) single-shot ladder — allocate one block of the stated
+  size (1, 4, 8, 12, 16, 17, 17.5, 18, 20 GiB) with cudaError propagation,
+  to detect a large-allocation path or driver-imposed single-block cap;
+  (C) register-on-malloc isolation — cudaHostRegister on ordinary malloc'd
+  anonymous memory, separating the T-GPLR-29 failure from file-backed pages;
+  (D) before/after GlobalMemoryStatusEx so OS-level commit (vs driver quota)
+  can be identified as the binding constraint.
+
+Falsifiable predictions
+: (P1) the incremental ladder reaches >= 17 GiB (T-GPLR-30's fixed40 already
+  granted 17.07 GiB in-process) but FAILS well before the physical 61.7 GiB
+  — the WDDM locked-page quota is far below physical RAM; (P2) single-shot
+  large allocations fail EARLIER than the incremental total (fragmentation
+  or a per-allocation cap in the WDDM path); (P3) cudaHostRegister on
+  anonymous malloc memory ALSO fails (the T-GPLR-29 OOM is quota on
+  registration generally, not file-backed-page-specific).
+
+Acceptance criteria
+: Probe compiles clean; all four cases print per-step status with exact
+  cudaError names; the ladder's failure point and error are recorded;
+  GlobalMemoryStatusEx before/after shows the OS-visible effect of the
+  pinned pool; results + verdict recorded in docs/currentstate.md and this
+  task's status note; no vendored-tree changes; no changes to default
+  execution paths.
+
+Focused validation
+: nvcc compile; GPU-mutex run of the probe binary; cross-check the ladder's
+  successful total against T-GPLR-30 fixed40's 17,478 MiB grant.
+
+Escalation
+: if the ladder's ceiling lands BELOW what T-GPLR-30 already granted
+  (17,478 MiB), the probe methodology itself is wrong and must be fixed
+  before any conclusion is drawn from it.
+
+Results (2026-09-16)
+: All acceptance criteria met; ALL THREE PREDICTIONS FALSIFIED, each in the
+  direction that EXPANDS feasibility. Probe build/gplr31-pinpool-probe.cu,
+  run build/llama-cuda/gplr31-pinpool-probe.log (GPU mutex, CUDA 13.2
+  toolkit; the 12.3 toolkit on PATH rejects the Blackwell host compiler —
+  same quirk the T-GPLR-29 probe already worked around).
+
+  (A) INCREMENTAL LADDER: 106 x 432 MiB = 44.72 GiB of cudaHostAlloc pinned
+  memory granted and touched before cudaErrorMemoryAllocation ("out of
+  memory"). P1 FALSIFIED — there is no small WDDM locked-page quota; the
+  driver grants to near-physical exhaustion. At the failure point
+  GlobalMemoryStatusEx showed 10.11 GiB still available (83% load), so the
+  binding constraint sits ~10 GiB above the granted total — either a
+  locked-memory cap around ~45 GiB or an OS floor that refuses to give up
+  the last ~10 GiB; distinguishing those two is unproven and irrelevant at
+  pool scale. Clean accounting: physLoad 10% -> 83% -> 10% across
+  allocate/free.
+
+  (B) SINGLE-SHOT LADDER: every size up to 20 GiB allocated AND touched OK
+  (1/4/8/12/16/17/17.5/18/20). P2 FALSIFIED — no per-allocation cap, no
+  large-block fragmentation penalty; a one-shot 20 GiB pool is grantable.
+
+  (C) REGISTER ISOLATION: cudaHostRegister on ANONYMOUS malloc pages
+  SUCCEEDS at 64 MiB and 432 MiB. P3 FALSIFIED, and this REVISES the
+  T-GPLR-29 case-D interpretation: registration itself is viable under WDDM
+  on this driver; the earlier cudaErrorOutOfMemory was specific to the
+  FILE-BACKED mmap view (section-object pages), not to registration
+  generally. Consequence beyond the pool: pinning a large anonymous staging
+  area is a legal design option here (the "registration is not viable"
+  shorthand recorded earlier must not be read broader than file-backed
+  views).
+
+  VERDICT: allocation is NOT the blocker for the persistent pool — 18 GiB
+  (and far beyond) is grantable, confirming and extending T-GPLR-30
+  fixed40's 17,478 MiB in-process grant. The pool's remaining obstacles are
+  exactly the T-GPLR-30 findings (warm-wall flat under af=1; populate at
+  the cold ~162 ms/bank rate), both of which are design/measurement
+  problems, not driver refusals. The two residual pool uses (hot-cache
+  populate, af=0 serial staging) lose their feasibility contingency.
+
 ### T-GPLR-30: Partial persistent pinned pool — warm-wall savings curve vs RAM cost
 
 Status: done (2026-09-16) — verdict: DISCARD for warm-wall purposes; retained as opt-in tooling
@@ -493,7 +685,7 @@ T-GPLR-28 (first-touch pay-once-per-process), T-GPLR-29 addenda 2-3 (the
 ~635 ms/pass wait = the chain's 18.7 ms/bank CPU hop; af=1+pinned warm wall
 2.80-2.87 s at 2 slots; 3 slots harmful; 61.7 GiB RAM, 432 MiB/bank exactly,
 40 banks = 18.1 GB full-pool commitment).
-Commit: (fill on completion)
+Commit: third_party/llama.cpp 68cd1726d (2026-09-16: --pp-pool acquire/release protocol)
 
 Goal
 : Prototype the persistent pinned pool at PARTIAL sizes and measure the
@@ -609,7 +801,7 @@ trio verdict in docs/currentstate.md (layer-major 4k wall 13.30 s vs
 predicted 7-8 s; every copy first-touch at ~570 ms vs ~103 ms warm; the
 second batch-major arm's sweep 1 still cold after layer-major had touched
 every bank, ruling out pure file-cache contents as the carrier).
-Commit: (fill on completion)
+Commit: third_party/llama.cpp 68cd1726d (2026-09-16: --pp-repeat + per-pass batch lifetime)
 
 Goal
 : Decide WHICH first-touch mechanism the 5.5x per-copy penalty is by

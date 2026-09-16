@@ -1,5 +1,226 @@
 # Current State
 
+## 2026-09-16: T-GPLR-32 DONE (A/B RUN) — serialize-the-worker-DMAs FALSIFIED as a wall lever: warm walls identical (2751.8-2782.9 ms ser1 vs 2768.9-2777.8 ms ser0, wait ~959 ms both); with worker DMAs serialized, 114/120 windows STILL stretch >45 ms while the only possible concurrent partner is a main-thread preload copy — the stretch is INTRINSIC per-copy cost under WDDM, and the DMA-concurrency lever family is CLOSED
+
+The A/B ran under the GPU mutex (detached wrapper survived the session;
+deepseek_v4.exe held the mutex first — the run fired on its release, exactly
+as designed). Both arms: check-telemetry OK (20,577 events, 2 slots),
+no deadlock, 120/120 nonzero phase-0 copies per arm.
+
+Config: 4k anchor, ubatch 512, --layer-slots 2, --pp-repeat 3, --copy-source
+pinned, --pp-async-feed 1; only --pp-af-serialize differs (0 vs 1).
+
+Results (trace gplr32-ser{0,1}.jsonl; logs UTF-16):
+- ser0 warm passes: 2777.8 / 2768.9 ms (wait 959.3 / 958.6 ms) — matches the
+  recorded af=1+pinned optimum (2.80-2.87 s), so the arm shape is comparable.
+- ser1 warm passes: 2782.9 / 2751.8 ms (wait 958.8 / 958.5 ms) — identical
+  within noise. The pre-registered falsifier (wall unchanged) FIRED.
+- Gate verified operating: af_inflight present on copy_submit (ser1 max 2 =
+  submitted-but-unconsumed worker DMAs; 0 when the gate is off), stream gate
+  enqueued before every worker copy, ser1 cold pass also ~equal (6205 vs
+  6474 ms — inside arm-to-arm variance).
+- Mechanism resolution: analyzer tools/analyze-gplr32.py (submit->consumption
+  span per (layer,generation); host-observed — the trace has no GPU-side
+  timestamps): with worker DMAs serialized one-in-flight, ~114/120 windows
+  remain >45 ms (mean 82.6 ms ser1 vs 82.3 ms ser0; p90 142.6). The only
+  DMAs that can overlap a serialized worker copy are the main-thread preload
+  copies (~3-6 per pass, they supply layers 0/1 while the worker takes over)
+  — far too few to stretch 114 windows. CONCLUSION: the effective window is
+  dominated by an intrinsic per-copy cost under WDDM (submission/window
+  overhead), NOT by contention between concurrent copies. The original
+  "2.2x inflation from DMA pairs" interpretation (2026-09-16 research pass)
+  is falsified; with it the whole DMA-concurrency lever family closes
+  (3-slot falsification was the first signal, this is the second).
+- Analyzer caveat recorded: "effective window" is the host-side
+  submit->consumption span, so it embeds WDDM submission latency by
+  construction; that limitation does not affect the wall/wait verdicts,
+  which are direct measurements.
+
+Status of --pp-af-serialize: kept as opt-in diagnostic tooling (default 0;
+harmless — identical walls, checkers OK, ~zero risk since it only orders
+worker DMAs on the copy stream). NOT a default.
+
+Remaining PP lever family (next territory): shrink the per-copy window
+itself — member batching for large-member banks, GPU-direct storage paths,
+or accepting the ~2.75-2.8 s warm wall as the pinned-af optimum on this box.
+
+## 2026-09-16: WDDM DMA-INFLATION RESEARCH PASS — asyncEngineCount=5 measured on this 5090 Laptop; NVIDIA's engine model (same-direction copies sharing one engine stretch; batching restores full rate while kernels still overlap) predicts our 2.2x stretch is LINK/QUEUE CONTENTION, fixable by one-in-flight serialization; T-GPLR-32 experiment drafted
+
+Local measurement (build/gplr32-enginecount.cu/.exe, CUDA 13.2): RTX 5090
+Laptop GPU reports asyncEngineCount=5 (multiple copy engines exist) — yet
+our traces show 28 concurrent two-copy pairs stretching effective windows
+2.2x (69.6 ms avg vs 31.45 ms pure) and ~237 ms at 3 slots. Conclusion: the
+inflation is contention for the shared physical Gen4 x8 link and/or WDDM
+timeslicing of engine queues, NOT a single-engine limit.
+
+Primary sources consulted (2026-09-16 online pass; searches were mostly
+degenerate, so I read documents directly):
+- NVIDIA Technical Blog "How to Overlap Data Transfers in CUDA C/C++":
+  engines execute their queues strictly in issue order; ops in DIFFERENT
+  engines run concurrently (so copy/compute overlap never depends on copy
+  serialization); same-direction copies sharing one engine stretch each
+  other (their C1060 case: per-stream interleaving gave ZERO gain; batching
+  all H2D first restored the full per-copy rate — 12.9 -> 8.8 ms — while
+  kernels still overlapped). This is our exact pattern.
+- Microsoft DirectX Developer Blog "Hardware Accelerated GPU Scheduling":
+  WDDM's scheduler coordinates/prioritizes/batches GPU submission from a
+  high-priority CPU thread (HAGS moves high-frequency scheduling onto the
+  GPU); submission/batching overhead is a first-class WDDM cost — consistent
+  with per-copy window inflation when copies are issued over each other.
+  (No applicable learn.microsoft.com DMA-buffer page was reachable; the
+  blog is the governing Microsoft source I could fetch.)
+
+T-GPLR-32 EXPERIMENT DRAFT (GPU-mutex, af=1+pinned, 2 slots, 4k 3-pass
+shape): serialize the per-pass H2D DMAs to ONE IN FLIGHT at a time (gate
+the af worker's enqueue on the previous copy_complete, keeping the CPU hop
+overlapped as today). PREDICTION: effective windows 69.6 -> ~31-36 ms,
+per-pass wait ~930 -> near 0, warm wall 2.80-2.87 -> ~1.9-2.3 s (floor
+~1.5-1.8 s engine-bound from T-GPLR-29 addendum 3). FALSIFIER: wall
+unchanged or windows still stretched -> the stretch is per-copy WDDM
+submission overhead outside the DMA window itself, which serialization
+does not fix; the wait telemetry will discriminate (wait would then persist
+while windows stay pure-rate). Note the warning case: if the af worker
+waits for copy-complete BEFORE its next CPU hop, the hop (~18.7 ms) re-
+serializes; the gate must cover only the DMA, not the memcpy.
+Status: not run yet (GPU busy with the external deepseek_v4 baseline).
+
+## 2026-09-16: BASELINE COMPARISON (docs/llamacpp-baseline.log, 2026-09-10 llamacppCUDA fork llama-server, same model) — same placement philosophy (banks CPU-side), our PP streaming 1.9x cold / ~4.3x warm by implied rate, TG 2.4x (76.9 greedy vs 32.4 with MTP), VRAM same class; no long-context PP datapoint exists in the baseline log
+
+Facts from the baseline log (a recorded run, NOT the live colibri
+deepseek_v4.exe process): llama-server, same Qwen3.6-35B-A3B GGUF, 262k ctx,
+Q8 KV, ubatch 512, MTP draft on. Placement: 34/42 layers offloaded, CUDA0
+model buffer 2,089 MiB, CPU-mapped 19,980 MiB (the routed-expert banks),
+CUDA0 KV 2,176 MiB (10 attn layers, q8_0, 262k) + 544 MiB CPU recurrent
+state + 512 MiB MTP-draft KV. Self VRAM 5,795 MiB; 16,257 MiB left free.
+Its measured workload: one 372-token chat request — prompt eval 9,421 ms
+(39.5 tok/s, 25.33 ms/token), eval 32.4 tok/s over 1,724 tokens with draft
+acceptance 0.546 (mean 3.73).
+
+| metric | baseline (llamacppCUDA server) | current optimum (ours) |
+|---|---|---|
+| PP, short prompt (372 tok) | 9.42 s / 39.5 tok/s | ~6.3-7.0 s cold at 4,096 tok (590-650 tok/s); ~2.85 s warm-class |
+| PP implied streaming rate | ~1.4-1.6 GB/s (≈all 512 experts touched at top-8 x 372 tok ≈ 13.6-15 GB rows / 9.4 s; assumption flagged) | cold 2.6-2.9 GB/s (18.33 GB / 6.3-7.0 s); warm 6.4-6.5 GB/s (18.33 GB / 2.80-2.87 s) |
+| PP, long context | NOT IN THE LOG | 1,363 tok/s at 200k F16 (wall 146.7 s, 91% compute, wait 0.8%) |
+| TG | 32.4 tok/s WITH MTP (acc 0.546) | 76.9 tok/s greedy, no MTP, 4k ctx handoff (2.4x) |
+| VRAM self | 5,795 MiB (2,089 model + 2,477 ctx + 1,228 compute) | slots 996 + slabs 1,563 MiB sampled; KV ≈ 3.3 GiB derived (10 attn layers, 200k F16); same class, banks out in both |
+| Server features | prompt cache, MTP, chat template, 262k server ctx | research runner (CLI, one-shot prefill) |
+
+Honest caveats: the baseline's only PP datapoint is a 372-token request
+(overhead-dominated; its marginal long-context PP rate is not recorded);
+the expert-coverage rate estimate assumes ~full expert coverage; our TG
+figure has no MTP while the baseline's does (ours would be the slower
+comparison if MTP were added to the runner); our 200k arm ran while
+deepseek_v4.exe was resident (started 17:13; run_start showed 21,197 MiB
+free, so its VRAM impact was small, and wait 0.8% suggests little compute
+interference — but the arm predates that check and is not certified
+exclusive). Comparison is documents-vs-documents; no new GPU work while
+deepseek_v4.exe holds the machine. Where to beat the baseline next is
+unchanged: cold-start first-touch and the WDDM DMA inflation.
+
+## 2026-09-16: CROWDED-VRAM CHARTER RUNG MEASURED — 200k-token PP, F16 KV, the af=1+pinned 2-slot optimum: 1,363 tok/s (146.7 s wall), slot window only 996 MiB — the streamed mechanism delivers its speed with the banks OUT of VRAM; 5.13x the recorded Q8 af=0 262k reference (262.6 tok/s)
+
+The charter's crowding condition (KV takes the VRAM so banks must stream)
+ran end-to-end at the new optimum: 200,000-token prefill (anchor-200000
+prompt, the longest on-disk rung), F16 KV (the widest standard cache),
+layer-major + af=1 + pinned + 2 slots + bf16 slabs (the T-Q38PW-02-approved
+long-ctx shape). Checker OK (4,302 events). Trace
+build/llama-cuda/gplr31-262k-f16-af1pinned.{jsonl,log}.
+
+Results: PP 1,363.2 tok/s, wall 146.7 s; transfer 137.7 s; wait 1.18 s
+(0.8% of wall); compute 133.0 s; bytes 18.33 GB (exactly one pass, 40
+copies, 38 evictions); VRAM at run_start: 21,197 MiB free of 24,463
+(3,266 MiB used total = slots 996 + activations 1,562.5 + KV head), i.e.
+the 18.33 GB of banks stayed OUT of VRAM by design. Per-copy windows mean
+3.44 s (min 0.26, max 9.69 s) — first-touch cost spread across the pass,
+overlapped by the af worker (wait only 0.8%).
+
+Comparison to the recorded long-ctx reference (T-Q38PW-02, 262k, Q8 KV,
+af=0, 4 slots): 262.6 tok/s. This run: 5.13x at a shorter but same-order
+rung with HALF the KV bytes and 2 fewer slots. Honest caveats: (1) rung
+lengths differ (200k vs 262k; tok/s at this shape is length-dependent —
+the 100k reference was 506 tok/s af=0, so the like-for-like gain vs 100k
+af=0 is ~2.7x, still decisive); (2) F16 KV at 262k was NOT run (only 200k
+with F16) — the charter asks for it and it is the next recorded gap; (3)
+peak-VRAM telemetry shows usage at run_start, not a sampled maximum; the
+budget model bounded it. Verdict: the crowded-VRAM charter condition is
+DELIVERED at the new optimum — minimal VRAM (996 MiB slot window) and high
+PP speed simultaneously; no default-path change yet (promotion task
+pending its qa-smoke gate).
+
+## 2026-09-16: GOAL CHARTER RECORDED (owner decision) — PP speed first, VRAM second, speed must hold under crowded VRAM (262k KV, 16 GB-class GPUs); model-fits-in-VRAM is NOT the target condition; next levers: 262k F16 at the new optimum, then default promotion
+
+Owner confirmed the charter: maximize PP (prefill) speed first, minimize
+VRAM second, and the PP speed must hold when VRAM is crowded — long-context
+KV (e.g. 262k) or a 16 GB-class GPU where the 18.33 GB expert banks cannot
+fit even alone. The mechanism must never depend on the model fitting in
+VRAM. Recorded in AGENTS.md (Goal Charter section); future tasks are
+prioritized and judged against it. Grounding facts: 262k KV costs ~2.7 GiB
+at Q8 / ~5.3 GiB at F16 on this model; 2 slot windows cost ~0.9 GiB; on a
+16 GB GPU streaming is mandatory regardless of KV width. Owner-selected next
+levers: (1) validate 262k F16 KV at the new optimum (layer-major + af=1 +
+pinned, 2 slots), then (2) promote that config to the runner default
+(default profile v3) gated by the qa-smoke semantic regression.
+
+## 2026-09-16: DEFAULT PROFILE v3 GATED — af=1 + pinned defaults passed the qa-smoke semantic gate (512 rung); default promotion COMPLETE
+
+The 2026-09-16 default promotion (af=1 + --copy-source pinned as runner
+defaults) was built earlier today but its semantic gate was pending on GPU
+availability. With the external baseline finished, ran the canonical gate
+under the GPU mutex (tools/run-tests.ps1 -Suite qa-smoke, 512-token anchor,
+streaming-TG shape, --no-handoff, batch-major PP per the recorded rung
+shape; fresh exe rebuild that includes the default changes):
+
+- Prompt calibration: target=512 achieved=512, items=N1,N2,N3,N4,K1.
+- Runner: exit 0; strict --check-telemetry OK (30,503 events, 3 slots —
+  note: the 512 rung's one-ubatch shape triggers the auto slot ladder, 3
+  slots here; answer content unaffected).
+- Answer gate: aggregate=PASS 5/5 (QX-7741 TR-2918 MK-5501 LD-8834 Paris).
+- Negative control: FAILs as designed (aggregate=FAIL, exit != 0).
+- Suite verdict: SUCCESS. Artifacts regenerated:
+  build/llama-cuda/gplr07-qa-512.{jsonl,txt,log}.
+
+Telemetry sanity (gate is an answer-stability gate, not a perf gate, but
+recorded): PP 512 tok wall 5.34 s (96 tok/s) cold process incl. first-touch;
+TG 96 tok wall 178 s — TG is the known slow shape for this 512-rung config
+(streaming TG, no handoff, no row-set; unchanged from all prior 512-rung
+runs) and carries the bulk of trace time; peak VRAM 3,266 MiB. This matches
+the recorded 512-rung behavior of prior profiles; the af=1+pinned defaults
+change the PP path (measured separately: warm 4k 2.80-2.87 s) and did not
+perturb answer stability here.
+
+Also fixed: stale usage line still advertising "direct (default)" for
+--copy-source (now "pinned (default since profile v3) or direct").
+
+Status: the new defaults (pp_async_feed=1, copy_source=pinned, layer_slots=2,
+layer-major PP, bf16 slabs) are now gate-cleared. Remaining honest caveat:
+qa-smoke proves answer stability only (soft gate, per AGENTS.md); it does
+not certify the promotion's performance claims, which remain the T-GPLR-25/
+29 measurements.
+
+## 2026-09-16: T-GPLR-31 DONE — locked-RAM probe: the driver grants 44.72 GiB of pinned memory incrementally (106 x 432 MiB, fails with cudaErrorMemoryAllocation with ~10 GiB still free), single-shot 20 GiB OK, and cudaHostRegister on ANONYMOUS pages SUCCEEDS — the T-GPLR-29 OOM was file-backed-view-specific, not a general registration limit
+
+Standalone probe (build/gplr31-pinpool-probe.cu, CUDA 13.2 nvcc, GPU-mutex
+run, log build/llama-cuda/gplr31-pinpool-probe.log): incremental
+`cudaHostAlloc` ladder granted 44.72 GiB pinned before failing
+(cudaErrorMemoryAllocation) with GlobalMemoryStatusEx showing 10.11 GiB
+still available — the binding constraint is a ~45 GiB-class cap or an OS
+floor, NOT a small WDDM locked-page quota; clean 10%→83%→10% physLoad
+accounting across allocate/free. Single-shot allocations up to 20 GiB
+allocate and touch OK (no per-allocation cap). `cudaHostRegister` on
+anonymous malloc pages SUCCEEDS (64 MiB and 432 MiB) — revising T-GPLR-29
+case D: the earlier cudaErrorOutOfMemory was specific to the FILE-BACKED
+mmap view; registration generally is viable under WDDM on this driver.
+
+Consequence for the persistent pool: allocation is NOT the blocker — the
+18 GiB full-pool size is grantable with large headroom (extends T-GPLR-30
+fixed40's 17,478 MiB in-process grant). The pool's remaining obstacles are
+the T-GPLR-30 findings themselves (flat warm wall under af=1; populate at
+the cold 162 ms/bank rate), not driver refusals; the two residual uses
+(hot-cache populate, af=0 serial staging) lose their feasibility
+contingency. Also recorded: the CUDA 12.3 toolkit on PATH rejects the
+Blackwell host compiler; probes must compile with the v13.2 toolkit.
+Nothing committed; no vendored-tree changes.
+
 ## 2026-09-16: T-GPLR-30 DONE — partial persistent pinned pool (--pp-pool N[,fixed|lru]): hit mechanics perfect, warm savings curve FLAT AT ZERO at every N — DISCARD for warm-wall purposes; af=1 wall is now proven DMA-window-bound by two independent falsifications
 
 Implementation (vendored tree, opt-in): `--pp-pool N[,policy]` allocates N
