@@ -588,7 +588,8 @@ Status: done (2026-09-16) — verdict: DISCARD as a wall lever; the
 falsifier FIRED. A/B under the GPU mutex (tools/run-gplr33{,-arms}.ps1,
 analyzer tools/analyze-gplr33.py): V1 verified live (submit_batch=1 on
 120/120 banks — contiguity check tiled exactly, single span submission
-everywhere) and windows did NOT move: median 76.1 ms (batch1) vs 75.1
+everywhere; CONFIRMED by direct branch telemetry after the flag-vs-branch
+fix, see below) and windows did NOT move: median 76.1 ms (batch1) vs 75.1
 (batch0), warm walls 3483.2/3055.4 vs 3418.7/2949.0 ms (batch1 marginally
 worse, within variance). The per-submission-overhead model is DEAD; with
 T-GPLR-32, the whole submission-shaping family (serialization, submission
@@ -598,7 +599,13 @@ compute on WDDM (or completion signaling defers to the compute boundary).
 Discriminating next step pre-registered in docs/currentstate.md: a
 standalone mid-kernel H2D probe (event ~65 ms => true serialization;
 ~31.5 ms => concurrent DMA with deferred completion). --pp-submit-batch
-stays as opt-in diagnostic tooling (default 0). Commit: nested fe6fce575
+stays as opt-in diagnostic tooling (default 0). GAP CLOSED (later the same
+day): submit_batch now reports the ACTUALLY-TAKEN branch threaded from
+stage_members (0 = per-member, 1 = single span, 2 = mixed) instead of the
+flag state; verification A/B: batch0 {0:120}, batch1 {1:120} — the span
+path demonstrably ran on every bank of the falsified A/B. Telemetry-fix
+commit: nested a03fe510e (2026-09-16, branch-true submit_batch). V1
+code commit: nested fe6fce575
 (2026-09-16, V1 code); outer 96ad669 (2026-09-16, verdict + why-analysis
 + scripts tools/run-gplr33{,-arms}.ps1, analyzer tools/analyze-gplr33.py,
 gitlink bump)

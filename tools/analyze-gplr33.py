@@ -3,7 +3,9 @@
 
 Reads the two A/B traces (gplr33-batch0/batch1.jsonl) and reports, per arm:
 - submit_batch path distribution from copy_submit (0 = legacy per-member,
-  1 = single-span V1 copy) — verifies which path actually ran;
+  1 = single-span V1 copy, 2 = mixed span+per-member degradation) — since
+  the flag-vs-branch fix this reports the ACTUALLY-TAKEN branch, so the
+  path distribution is self-verifying evidence, not flag echo;
 - matched submit->consumption spans per (layer, generation) — the effective
   window as observed by the host (embeds WDDM submission latency);
 - how many windows exceed the 45 ms "stretched" threshold;
