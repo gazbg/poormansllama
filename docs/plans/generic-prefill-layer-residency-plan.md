@@ -781,8 +781,8 @@ one-stream work is additive by CUDA semantics), T-GPLR-32 (done — the af gate
 is wall-neutral), T-GPLR-29/30 (pinned staging + pool defaults), T-GPLR-13/25
 (the trace arms this A/B stays comparable with)
 Commit: nested 69799064a (V1 aux-stream staging + `--pp-recon` instrumentation +
-  the layer-major `backend_compute` publication fix); outer (docs, recon scripts,
-  analyzer, gitlink bump) recorded below on completion
+  the layer-major `backend_compute` publication fix); outer ed2dd39 (docs,
+  recon scripts, analyzer, gitlink bump)
 
 Goal
 : Recover copy/compute overlap in the runner so the warm 4k layer-major pass
