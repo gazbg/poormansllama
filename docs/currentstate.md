@@ -1,5 +1,427 @@
 # Current State
 
+## 2026-09-16: T-GPLR-30 DONE — partial persistent pinned pool (--pp-pool N[,fixed|lru]): hit mechanics perfect, warm savings curve FLAT AT ZERO at every N — DISCARD for warm-wall purposes; af=1 wall is now proven DMA-window-bound by two independent falsifications
+
+Implementation (vendored tree, opt-in): `--pp-pool N[,policy]` allocates N
+bank-sized pinned buffers at init (fixed: banks 0..N-1 populated once,
+157-162 ms/bank at the COLD ~2.8 GB/s first-touch rate; lru: N-entry LRU
+filled on first touch). Both stage sites (af worker + load_layer) serve pooled
+banks straight from the pool — no mmap→pinned hop; DMA unchanged. Safe against
+in-flight async DMAs: acquire/release protocol, eviction drains the copy
+stream before rewriting a possibly-inflight entry (no torn weights, ever);
+`pool_init` + per-bank `pool_event` telemetry; checker unaffected (unknown
+events ignored). Default off; requires `--copy-source pinned`; refusals loud
+(parse errors host-side, allocation failure surfaces the driver locked-page
+quota).
+
+Measured (five arms, one mutex hold, checker OK, gplr28/29 3-pass 4k shape,
+2 slots, af=1, pinned; RAM = pool_init bytes):
+
+| arm | RAM | cold pass 1 | warm 2/3 | hits per warm pass |
+|---|---|---|---|---|
+| baseline (no pool) | 0 | 6.26 s | 2.80/2.87 s | — |
+| lru4 | 1992 MiB | 7.47 s | 4.17/3.64 s | 0 |
+| fixed4 | 1728 MiB | 6.49 s | 3.20/2.91 s | 4 |
+| fixed10 | 4320 MiB | 5.94 s | 3.10/2.83 s | 10 |
+| fixed20 | 8640 MiB | 4.97 s | 3.07/2.86 s | 20 |
+| fixed40 | 17478 MiB | 3.24 s | 2.93/3.02 s | 40 |
+
+Verdicts: (P1) LRU cliff VALIDATED — under layer-major's cyclic order an
+N-entry LRU below the 40-bank working set hits nothing (0 hits, ~112 misses
+over 3 passes) and its fills ADD work: lru4 warm walls +27-45% vs baseline.
+The naive persistent-cache idea is structurally dead in this schedule.
+(P2) SAVINGS CURVE FALSIFIED — hits are perfect at every N (exactly N per
+warm pass, zero misses) yet warm walls stay in the baseline band (all within
+~6% of 2.80-2.87 s). The predicted ~0.5-0.6 s warm saving (the "~2.3-2.5 s
+ceiling") does not exist: the wall is set by the concurrency-inflated DMA
+window chain (addendum 3's mechanism — wait ends at own-DMA-end), and the
+pool leaves the DMA untouched. At af=1 the 18.7 ms hop was ALREADY fully
+hidden. (P3) Cold pass 1 collapses with N (fixed40 3.24 s, -48%) but populate
+pays the same cost serially at init (6.48 s at 40 banks), so the whole
+3-pass process is a net LOSS (15.67 s vs 11.93 s). Populate at 157-162
+ms/bank is the cold first-touch rate, not the 24 GB/s warm-page rate — init
+overlaps nothing; a hot-OS-cache start would populate at ~19 ms/bank
+(unproven, cache-state lottery per T-GPLR-28).
+
+Owner-facing implication: under af=1+pinned, the warm wall (~2.8-2.9 s) is
+DMA-window-bound — proven now by TWO independent falsifications (3-slot
+geometry; pool hop removal). No RAM size buys warm-wall time. Remaining
+levers: shrink DMA bytes (row-set TG class), or beat WDDM concurrency
+inflation (outside current scope). Residual uses for the pool: long-lived
+process starting with hot OS file cache (populate ~0.75 s, unproven), or
+af=0 serial staging where the 0.75 s/pass hop exposure is real (unmeasured).
+Files: build/llama-cuda/gplr30-{lru4,fixed4,fixed10,fixed20,fixed40}.{jsonl,log},
+analyzer build/analyze_gplr30_pool.py, arms build/run-gplr30{,-poolcurve}.ps1.
+No default-path change; nothing committed.
+
+## 2026-09-16: WAIT SIGNATURE IDENTIFIED — it is the per-layer deficit max(0, effective_DMA_window − compute_window), quantized at the DMA window itself (31.45 ms); af=1+pinned wall without it = 1.85–1.92 s (empirical) / ~1.5–1.8 s (engine-bound floor); 3-slot prescription TESTED AND FALSIFIED (warm 4.14–4.83 s, worse — copy engine saturates at 2 slots)
+
+Event-level analysis of the af1 trace (pass 3, fully warm): every
+layer_ready_wait ends EXACTLY at that layer's own copy_complete (delta 0.0 ms
+everywhere), quantized at 31.45 ms — the pure pinned DMA time from the probe.
+~10 of 40 layers wait 0. So the wait is neither worker lag nor an accounting
+artifact: it is the summed deficit between what the copy engine delivers per
+bank (69.6 ms average effective window at 2 slots — inflated 2.2x from the
+31.4 ms pure rate when two DMAs overlap on the WDDM engine, 28 concurrent
+pairs) and what the consumer computes per layer (~34 ms). Deficit model: ~23
+ms × ~30 layers ≈ 927–958 ms at 2 slots. MODEL VALIDATED cross-geometry: the
+same arithmetic predicted 363 ms at 3 slots; two independent 3-slot runs
+measured 363.0/363.2 ms.
+
+Counterfactual: empirical wall-without-wait = wall − wait = 1.85–1.92 s;
+engine-bound floor = 40 × 31.4 ms pure DMA = 1.26 s overlapped with ~0.55 s
+sampled compute ≈ 1.5–1.8 s. The gap to 2.80–2.87 s is concurrency inflation
+on the copy engine — outside current scope to remove.
+
+Prescription test (the obvious "add a slot" fix): af=1 + pinned + 3 slots,
+reproduced twice (checker OK both, TG=3 legal shape because handoff auto
+declines at 3 slots): warm walls 4.14–4.83 s (worse than 2-slot 2.80–2.87 s),
+transfer ~9.2–9.5 s vs 3.69–3.73 s (windows inflate to ~237 ms avg), wait
+halves to 363 ms only because compute inflates too, cold pass 23.2–43.9 s
+(vs ~7 s at 2 slots). VERDICT: the copy engine is already saturated at 2
+slots under pinned+af; a third slot adds contention, not runway. Owner-facing
+implication: under af=1+pinned, 2 slots is the measured optimum; 3 is
+actively harmful. Wait telemetry is trustworthy and reads as chain exposure.
+Files: build/llama-cuda/gplr29-af1-pinned-3slot.{jsonl,log} (×2 runs),
+analysis inline in the plan addendum 3. No code changes.
+
+## 2026-09-16: PASS-2 ANOMALY REPLICATED AND RESOLVED — two separate observations, opposite verdicts: the 4.10 s wall spike was environmental (not replicated); the ~635 ms wait is SYSTEMATIC pinned-path behavior (4 warm passes in 2 independent runs: 635.1/635.3/635.3/635.9 ms, 0.13% spread; absent in direct arms) — mechanism closed by arithmetic (hop 748 ms vs DMA saving 564 ms per pass)
+
+No new GPU runs: the three pinned traces on disk (gplr29-repeat-3pass-pinned,
+gplr29-afab-af0, gplr29-afab-af1) contain four warm passes across two
+independent executions. Per-pass wait totals: 635.1 / 635.3 / 635.3 / 635.9 ms
+— the signature replicates to 0.8 ms (0.13%). Direct arms show 0.4–7 ms.
+Distribution: ~120 layer_ready_wait events per 3-pass trace, 59 > 1 ms, max
+36.4 ms — distributed per-layer (~16 ms/layer avg), not one spike; layer 39
+largest (~109 ms/pass), most layers ~95 ms.
+
+Verdicts: (1) the original 4.10 s pass-2 WALL spike is an environmental one-off
+(not replicated; its residual sat in a compute figure that also did not
+reproduce — shared-GPU interference window during that mutex hold). (2) The
+wait is a REAL, deterministic pinned-path property. Mechanism: the chain's CPU
+hop (18.7 ms × 40 banks = 748 ms/pass) minus the DMA saving (14 ms × 40 =
+564 ms/pass) = ~184 ms net serial cost, matching the measured af0-pinned
+vs-direct wall delta (+70–170 ms); at af=1 the worker hides most of the hop
+and walls drop 0.45–0.53 s below direct, but worker service time
+(~50 ms/bank vs ~34 ms/layer compute) becomes the pipeline bottleneck —
+which is why the wait ACCOUNT grows (927–958 ms) while the wall SHRINKS. Wait
+is accounting-visible chain exposure, not wall cost.
+
+Ceiling (expected, unproven): eliminating the per-pass hop (persistent
+pre-populated pinned pool across passes) is worth up to ~0.5–0.6 s/pass;
+af=1+pinned warm could approach ~2.3–2.5 s. Open: exact wait-accounting
+semantics under af (instrumentation question, separate from this verdict).
+No code changes; no new GPU time.
+
+## 2026-09-16: T-GPLR-29 ADDENDUM — af overlap A/B with pinned: overlap converts ONLY with pinned staging (warm 4k PP 2.80–2.87 s vs 3.33–3.43 s, ~14–15%); af=1 + direct shows NO gain; first measured configuration to beat the warm steady state
+
+The pinned-probe task left one open question: does OVERLAP (async-feed,
+T-GPLR-25) convert the pinned chain's +44% DMA headroom into wall time, given
+the serial chain loses to direct? Three arms under/adjacent to one mutex hold
+(4k anchor, 2 slots, layer-major default, handoff auto, --pp-repeat 3, kv q8):
+
+| warm passes 2+3 (wall) | af=0 | af=1 |
+|---|---|---|
+| pinned copy-source | 3.43 / 3.33 s | **2.80 / 2.87 s** |
+| direct copy-source | 3.26 / 3.23 s (gplr28) | 3.41 / 3.35 s (new control) |
+
+Cold pass 1: af1-pinned 6.26 s vs af0-pinned 6.96 s. All four traces checker
+OK; TG unchanged (~76–77 tok/s, 0 evictions).
+
+**Verdict:** the pinned gain is REAL but only under overlap — af=1 + direct
+shows no wall gain, so the improvement is attributable to the worker consuming
+the pinned chain's DMA headroom, not to overlap alone. Measured: ~0.5 s per
+warm 4k prefill (13.8–15.5%, above the ~6% noise floor and ~1.1% drift).
+Caveats: one pair per cell; the wait-telemetry figure grows under af (768–958
+ms) and needs a dedicated interpretation pass before being read as
+slot-starvation; af=1 stays an opt-in prototype per the T-GPLR-25 contract.
+Consequence: the interaction (af=1 AND pinned) is the configured optimum
+measured on this box; next lever remains first-touch (process longevity /
+pinned pool population already amortize it within a process).
+Files: build/llama-cuda/gplr29-afab-{af0,af1,af1direct}.{jsonl,log},
+scripts build/run-gplr29-afab*.ps1, build/run-gplr29-af1direct.ps1.
+
+## 2026-09-16: T-GPLR-29 DONE — pinned-pool probe + end-to-end pinned arm: DMA ceiling 14.4 GB/s is ~90% of the real link (Gen4 x8 LAPTOP 5090, not Gen5); pinned buys nothing serial (chain 9.0 GB/s < direct 10.0 GB/s) and no PP-wall change end-to-end; first-touch stays the dominant cost
+
+Standalone probe `build/gplr29-pinprobe.cu` (nvcc 13.2, outside the vendored
+tree) over a 453 MB region of the real MoE GGUF (3-member bank shape
+confirmed), run twice under the GPU mutex (reproducible to <2%):
+
+| case | rate |
+|---|---|
+| A pinned cudaHostAlloc → VRAM | **14.4 GB/s** (best 31.4 ms) |
+| B direct mmap → VRAM warm | 10.0 GB/s (45 ms) |
+| B0 direct cold first-touch | 0.83 GB/s (548 ms) first probe; 3.25 GB/s (139.5 ms) second probe minutes later |
+| C1 CPU memcpy mmap → pinned | 24.2–24.5 GB/s |
+| C T-GPLR-18 chain (C1+A, serial) | **9.0 GB/s — slower than direct** |
+| D cudaHostRegister on the mapped view | FAILED (WDDM, cudaErrorOutOfMemory — locked-page quota; same practical verdict as Linux InvalidValue) |
+
+**New hardware fact (nvidia-smi under load):** the 5090 is the LAPTOP SKU and
+the PCIe link negotiates **Gen4 x8 (~16 GB/s theoretical)**; width max x16,
+gen max 4. All prior Gen5/63 GB/s bandwidth framings are void for this box.
+Pinned DMA at 14.4 GB/s is already ~90% of the physical ceiling.
+
+End-to-end check (existing `--copy-source pinned`, T-GPLR-18 machinery, the
+gplr28 3-pass shape, checker OK 20,348 events):
+pass 1 wall 7.12 s (direct: 7.15 s) — no change; pass 2 4.10 s vs 3.26 s —
+anomalous (wait 635 ms vs 0.4 ms, compute +~380 ms; unexplained, does not
+count as a pinned penalty without replication); pass 3 3.26 s vs 3.23 s —
+no change; transfer −7% (4.60 vs 4.96 s); TG unchanged (76.4 tok/s, 0
+evictions).
+
+**Verdict:** three predictions falsified. (1) The 4.4 GB/s "pageable
+bounce-buffer" figure from the research pass is revised — the pure pageable
+copy runs 10 GB/s here (penalty only ~1.44x vs pinned); the recorded 4.4 GB/s
+per-copy effective rate in production traces is pipeline overhead + stream
+gaps, and first-touch (3–12x, T-GPLR-28) remains the dominant cost. (2) The
+pinned two-hop chain loses serially (9.0 < 10.0 GB/s): its only justification
+is OVERLAP (af=1, T-GPLR-25), where +44% DMA headroom could hide the chain —
+unmeasured. (3) No end-to-end PP-wall win from pinned at serial direct
+copy-source. Consequence ranking: keep banks warm in-process (done, T-GPLR-28)
+> hide the chain behind compute via async-feed (measure af=1 with pinned) >
+pinned headroom as an overlap enabler only. The mlock/working-set privilege
+path stays parked pending an owner-side Local Security Policy change.
+Files: build/gplr29-pinprobe.{cu,exe}, build/run-gplr29-*.ps1,
+build/llama-cuda/gplr29-pinprobe.log (+ second-run console),
+build/llama-cuda/gplr29-repeat-3pass-pinned.{jsonl,log}. No vendored-tree
+changes. Not committed.
+
+## 2026-09-16: ONLINE RESEARCH PASS — first-touch + staging cost layers identified from primary sources (pageable-memcpy bounce buffer, PrefetchVirtualMemory-vs-working-set, pinned-register legality, ik_llama slot-pool precedent)
+
+Owner asked for formulated research questions + an online pass on the T-GPLR-28
+first-touch findings. Questions and answers (all claims verified against the
+cited primary sources; local facts from docs/AGENT_ENVIRONMENT.md outrank any
+page):
+
+**Q1 Why is warm staging only ~4.4 GB/s when the bus is ~63 GB/s?**
+NVIDIA staff (Robert Crovella, developer forums thread 68153, confirmed 2021):
+cudaMemcpy/cudaMemcpyAsync from PAGEABLE host memory silently degrades to a
+synchronous copy that first bounces through a driver-maintained page-locked
+buffer, then DMAs. Our `copy_source: direct` path IS this path — the warm
+ceiling is bounce-buffer + copy-engine overhead, not the PCIe Gen5 x16 link
+(~63 GB/s raw; we use ~7% of it). The pinned staging pool (T-GPLR-18) removes
+the bounce hop; externally expected to multiple-x the warm rate (exact 5090
+pinned number not found in public benchmarks — unmeasured, falsifiable).
+
+**Q2 Can we pin the mmap itself (cudaHostRegister on the mapped file)?**
+Same thread: cudaHostRegister over file-backed mmap pages returns
+cudaErrorInvalidValue; it only works once pages are locked (mlock/MAP_LOCKED)
+or after copying to anonymous memory. No Windows-specific counterexample found,
+but no positive Windows case either — registering our mapped GGUF view is NOT
+viable as-designed; the pinned pool must be cudaHostAlloc'd anonymous memory +
+one-time population. Size-dependent pin failures exist in the wild
+(nvidia-container-toolkit #226) — a probe on this box is the falsifiable check.
+
+**Q3 Why did the T-GPLR-08 PrefetchVirtualMemory probe fail?**
+Official MS docs (PrefetchVirtualMemory function page): "The prefetched memory
+is not added to the target process' working set; it is cached in physical
+memory. When the prefetched address ranges are accessed by the target process,
+they will be added to the working set." Prefetch fills the STANDBY cache only;
+every bank page still soft-faults into the working set on first access.
+Arithmetic check: 453 MB / 4 KiB = ~116k pages/bank; 570 ms / 116k ≈ 4.9 µs
+per soft fault — matches the cold per-copy cost. This also explains the
+fresh-process re-pay (bm2 sweep 1 cold: pages in standby, not in the new
+process's WS) AND the T-GPLR-28 in-process stability (pages stay in the WS for
+the process lifetime once faulted in). Mechanism now consistent across all
+three observations.
+
+**Q4 Can we defend the working set without privileges?**
+No. Raising a process working set (SetProcessWorkingSetSizeEx, incl. the
+QUOTA_LIMITS_HARDWS_MIN_ENABLE "hard minimum" mode) requires
+SeIncreaseWorkingSetPrivilege, which docs/AGENT_ENVIRONMENT.md records as
+present-but-DISABLED on this machine (whoami /priv, 2026-09-09) — same blocker
+as VirtualLock (no SeLockMemoryPrivilege). The privilege-free paths that remain:
+process longevity (server-style residency) and pinned (driver-locked) memory.
+An owner-side Local Security Policy change would unlock the WS/mlock path.
+
+**Q5 Does anyone else do this (MoE slot pools)?**
+ik_llama.cpp RFC+PoC #1833 (cross-post of ggml-org/llama.cpp#23324, 2026-05):
+expert slot pool with LRU + pread from GGUF + event-signaled GPU wait — the
+same architecture as ours, independently. Their measured cautions: even the
+no-eviction case (n_slots=all) pays ~19% throughput tax from the interceptor
+sync alone; knee at ~half the experts; synchronous cold misses collapsed PP to
+~4.8 tok/s. Implications: validates the design; flags that OUR af=1 vs af=0
+overhead should be re-checked against that 19% figure; our async staging
+(308-1,270 tok/s PP at 4k) is the differentiator their PoC lacks.
+
+**Q6 DirectStorage/GDS as a bypass?**
+NVIDIA GPUDirect Storage (NVMe→VRAM DMA, Windows via DirectStorage) exists and
+could bypass the whole mmap/fault path; no public llama.cpp integration found.
+Would need an owner-approved dependency + GPU-attached NVMe verification —
+recorded as a possible future lever only, behind the dependency gate.
+
+Consulted: developer.nvidia.com forums #68153 (pinned/pageable/register
+semantics), learn.microsoft.com PrefetchVirtualMemory + Working Set pages,
+SetProcessWorkingSetSizeEx docs, ik_llama.cpp discussion #1833, gamersnexus
+Gen5 x16 figures, nvidia-container-toolkit #226. Wigolo MCP engine pool was
+degraded (Bing-only, junk results); searches completed via fallback web search.
+Changed: this entry only — no code, no plan edits. Next cheap probes implied:
+(1) cudaHostAlloc pin-probe + pinned-vs-direct per-copy A/B on the MoE vehicle;
+(2) owner decision on the Local Security Policy right if the mlock-class path
+is ever wanted; (3) af-overhead cross-check vs ik's 19%.
+
+## 2026-09-16: T-GPLR-28 DONE — in-process --pp-repeat 3 proves first-touch is pay-once-per-process (warm state stable in-process: 7.15 s cold pass → 3.26/3.23 s warm passes, per-copy ~309 ms → ~124-125 ms); in-process trimmer/invalidator branch FALSIFIED
+
+The 2026-09-15 trio left the first-touch mechanism open: batch-major's warm
+sweeps ran ~103 ms/copy while layer-major's every copy was first-touch
+(~570 ms), and the decisive bm2 observation (fresh process re-pays sweep 1
+even seconds after layer-major touched every bank) proved the state does not
+survive process death — but could not distinguish an active in-process
+trimmer from process-lifetime page state. T-GPLR-28 added an opt-in runner
+flag `--pp-repeat N` (default 1, no behavior change; passes 2..N clear KV,
+reset per-layer stats, emit a `pp_pass` telemetry marker, keep the slot
+window; TG runs once; refusals: outside 1..16, and repeat>1 with --mtp) and
+ran the falsifiable 3-pass arm on the MoE vehicle (anchor-4096, ubatch 512,
+`--layer-slots 2`, default schedule = layer-major, handoff auto-on, kv q8,
+af=0) under the GPU mutex:
+
+| pass | PP wall | PP transfer | per-copy avg | evictions |
+|---|---|---|---|---|
+| 1 (cold) | 7154 ms | 12 359 ms | ~309 ms | 38 |
+| 2 (warm) | 3262 ms | 4992 ms | ~125 ms | 40 |
+| 3 (warm) | 3226 ms | 4956 ms | ~124 ms | 40 |
+
+TG (96 tokens, handoff auto): 76.9 tok/s, 0 evictions, transfer 82 ms.
+Trace `build/llama-cuda/gplr28-repeat-3pass.jsonl` (20,348 events),
+check-telemetry OK after a generic multi-pass extension of the checker
+(`pp_pass` resets per-layer ascending-chunk state; final-chunk, stride-1 and
+act-bind rules made pass-count aware; all 14 lm40/tail/byte-account checker
+fixtures still pass — the only failing CTests remain the pre-existing
+environment-gated `-run` companions requiring Q38LS_MODEL_PATH + GPU).
+Pass 1 reproduced the trio shape (40 copies, 38 evictions) at a better wall
+(7.15 s vs 13.30 s; the trio's lm arm was a fresh process under different
+cache conditions — cross-process inheritance of page state is real but
+partial and time-varying, recorded as uncontrolled Windows file-cache/
+working-set behavior).
+
+**Verdict on the falsifiable prediction: the in-process trimmer/invalidator
+branch is FALSIFIED.** Passes 2 and 3 are identical within 1.1% and run at
+~4.4x the cold per-copy rate, so once established, the warm state persists
+for the process lifetime with no decay. The first-touch cost is paid once
+per bank per process. The warm steady state of layer-major 4k PP is
+**~3.2 s (~1,260-1,270 tok/s)** — the 7-8 s prediction floor is met or
+beaten in steady state. The exact carrier (disk-in vs page-fault work vs
+working-set trim on teardown) remains partially open; what is settled is
+that it lives and dies with the process. Expected (unproven) consequence:
+long-lived server processes hold the warm rate; levers are pinned staging
+(`--copy-source pinned`, T-GPLR-18) or a resident server-style process —
+both unmeasured.
+
+Implementation: `--pp-repeat` in
+`third_party/llama.cpp/tools/layer-streaming/main.cpp` (flag, parse,
+validation, per-pass loop around the existing PP block, `llama_memory_clear`
+between passes, per-pass phase_summaries sharing the prebuild builds0
+baseline) + `tel_pp_pass` emitter in `llama-layer-streaming.cpp` + checker
+multi-pass rules. Not committed.
+
+## 2026-09-15: 4k LAYER-MAJOR PP MEASURED — 2.3x PP-wall gain vs fresh adjacent batch-major baseline (prediction of 3.5-4x FALSIFIED as stated; the 8.0x staging-volume cut CONFIRMED; residual cost identified as per-process first-touch PCIe stalls)
+
+The T-GPLR-12 layer-major 4k prediction ("~3.5-4x PP-wall gain at 4k, 40 copies
+instead of 320") was tested with a three-arm adjacent trio on the MoE vehicle
+(Qwen3.6-35B-A3B, anchor-4096 prompt, ubatch 512, `--layer-slots 2`, af=0,
+`--allow-full-residency`, kv q8), all under ONE GPU-mutex hold for cache
+adjacency, executed by `build/run-lm4k-arms.ps1` via `build/run-lm4k-trio.ps1`:
+
+| arm | schedule | handoff | PP wall | PP tok/s | PP bytes | PP copies | PP evictions | checker |
+|---|---|---|---|---|---|---|---|---|
+| `gplr25-lm4k-bm1.jsonl` | batch-major (pinned) | off | 30.41 s | 134.7 | 146.62 GB | 320 | 318 | OK (25005 ev) |
+| `gplr25-lm4k-lm.jsonl` | layer-major (default) | auto-on | **13.30 s** | **307.9** | **18.33 GB** | **40** | **38** | OK (19624 ev) |
+| `gplr25-lm4k-bm2.jsonl` | batch-major (drift control) | off | 28.73 s | 142.6 | 146.62 GB | 320 | 318 | OK (25005 ev) |
+
+**Verdict on the 3.5-4x prediction: FALSIFIED as stated.** Measured gain is
+**2.29x** (vs bm1 30.41 s) / **2.39x** (vs the adjacent bm2 28.73 s baseline).
+The prediction's floor logic assumed the batch-major warm per-copy cost
+(~176 ms/bank) would apply to layer-major's 40 copies (40 x 0.176 s ~ 7.1 s
+floor). It does not: per-copy DMA rate is copy-state-dependent, not
+schedule-inherent.
+
+**What IS confirmed (structural volume prediction):** 40 copies / 18.33 GB /
+38 evictions — exactly the one-pass shape; the 8.09x re-staging volume
+(320 copies / 146.62 GB) is gone. Compute parity holds: bm2 PP compute sum
+2.98 s vs layer-major 0.74 s over 80 `layer_compute` events (4-chunk
+activation slabs, same FLOPs at coarser granularity; 0.74 x 4 ~ 2.98).
+
+**Why the wall lands at 13.30 s, not ~7-8 s — the first-touch finding:**
+per-copy submit-to-complete spans sum to 12.93 s of the 13.30 s PP wall: the
+copy chain IS the layer-major wall (no scheduling gap to recover). But
+layer-major's 40 copies each run ~570-580 ms transfer (first touch of the
+bank's host pages in this process), while batch-major's sweeps 2-8 run
+~103 ms (~4.4 GB/s effective) after a ~680/596 ms cold sweep 1 (bm1/bm2).
+First-touch penalty is per-copy ~5.5x vs warm. Decisive negative control:
+**bm2's sweep 1 is still cold (596 ms) even though layer-major (lm arm) had
+copied every one of the 40 banks seconds earlier** — so the penalty is
+per-process, NOT file-cache contents; the Windows working-set/codeyness of
+mmap-backed staging buffers re-cold per process. (Mechanism unproven;
+recorded as an open question.)
+
+**Side result (larger than the PP win): TG-phase handoff effect.** With
+`--no-handoff`, batch-major's 96-token TG re-stages every bank per token:
+TG wall 192.6/284.2 s at 0.5/0.34 tok/s, 1,759 GB transferred, 3,840
+evictions. Layer-major's handoff auto-on kept the last bank resident: TG wall
+2.31 s at **41.5 tok/s**, 0 evictions, 0 bytes. For interactive 4k-prompt
+sessions the handoff is worth ~2 orders of magnitude in TG, independent of
+schedule choice.
+
+**Honest limits:** single trio per shape (no repeated legs; BM drift
+bm1->bm2 = -1.7 s bounds run-to-run noise at ~6%); both BM arms cold-started
+sweep 1 while the lm arm's whole run is first-touch — a warm-process
+layer-major run (second identical run in one process) is NOT yet measured and
+could land well below 13.30 s; the `--residency-budget-mib`/ladder gates were
+not involved (explicit `--layer-slots 2`). Analysis script:
+`build/analyze-lm4k-trio.py`.
+
+**Open next levers (unchanged order):** (1) measure in-process warm
+layer-major (re-run without reload) to separate first-touch from steady state;
+(2) pre-touch / persistent bank cache across processes to attack the 570 ms
+first-touch copy; (3) af=1 A/B re-run on the fixed binary (async-feed
+residue fix) whose payoff is now bounded by this wall decomposition (worker
+fed 40 copies ~ 12.9 s span work to hide under 0.74 s compute — af alone
+cannot hide first-touch PCIe; it needs the same warm-copy state).
+
+## 2026-09-15: DEFAULT PP SCHEDULE VERIFIED as layer-major (T-GPLR-12, no code flip needed); stale selector comment fixed; harness scripts pin batch-major deliberately
+
+Owner asked to make `--pp-schedule layer-major` the default. Code inspection
+showed it already is: `main.cpp` line 2464 initializes
+`pp_schedule = "layer-major"` (T-GPLR-12), and three independent paths agree
+(the pw-probe default note, the `--residency off` conflict table that refuses
+only an EXPLICIT layer-major request, the TG-cap gate that fires from the
+untouched default). The recorded batch-major arms were pinned by their
+measurement scripts (`build/run-gplr25-*.ps1`, `tools/run-gplr13-ladder.ps1`,
+`tools/run-tests.ps1:348` MoE rows), not by the binary.
+
+**Proof on the real vehicle (Qwen3.6-35B-A3B, 512 anchor, 2 slots, af=0):**
+- Default shape, `--tg-tokens 96 --no-handoff`: runner exits 2 with the
+  layer-major-only TG-cap refusal — a batch-major default cannot produce
+  this error; the cap gate is reached only when the schedule resolved to
+  layer-major.
+- Default shape, `--tg-tokens 3 --no-handoff`:
+  `gplr25-default-lm-tg3.jsonl` — run_start `"schedule":"layer-major"`,
+  run_end present, checker OK (1,047 events, 2 slots); PP wall 14,385.6 ms,
+  38 evictions (2 slots, matches the 1-slot-per-sweep layer-major shape at
+  512; the 320-copy batch-major shape is a 4k sweep effect).
+- Default shape, `--tg-tokens 96`, handoff AUTO:
+  `gplr25-default-lm-tg96-auto.jsonl` — run_start `"schedule":"layer-major"`
+  + `"handoff_mode":"auto-on"`, run_end present, checker OK (19,530 events);
+  TG 96 tokens at 43.377 tok/s with transfer 123.5 ms and 0 evictions (bank
+  stayed resident through TG — the T-GPLR-10 cap lift worked as designed).
+
+**Code change:** one stale comment fixed (the selector comment at ~2825
+claimed "batch-major is the normative default; layer-major is the opt-in
+experiment" — contradicted by T-GPLR-12's actual default and the gate
+structure). No behavior change; rebuilt green.
+
+**Why the harness scripts pin batch-major (deliberate, leave as-is):**
+`--no-handoff --tg-tokens 96` is only legal under batch-major (layer-major
+caps TG at 3 without an active handoff, T-GPLR-10); the A/B, ladder, and
+suite scripts measure the batch-major path on purpose. The 8.09x re-staging
+discovery (320 copies at 4k) is a batch-major-sweep property; the pending
+layer-major 4k measurement (predicted ~3.5-4x PP-wall gain, 40 copies) is
+the open falsifiable test, not a default question.
+
+Trace/artifact identity: `gplr25-default-schedule-512.*` (the exit-2 refusal
+arm), `gplr25-default-lm-tg3.*`, `gplr25-default-lm-tg96-auto.*` (completed
+proofs); all under `build/llama-cuda/`, gitignored per policy.
+
 ## 2026-09-15: AGENTS.md governance updated — MoE-Qwen focus is a measurement choice (other models on owner request), all gates declared soft, owner summary required
 
 AGENTS.md gained three sections/notes, binding every future session:
