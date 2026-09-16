@@ -598,20 +598,28 @@ count) is closed on this box. Surviving arithmetic: warm wall = 40 x
 compute on WDDM (or completion signaling defers to the compute boundary).
 Discriminating next step pre-registered in docs/currentstate.md: a
 standalone mid-kernel H2D probe (event ~65 ms => true serialization;
-~31.5 ms => concurrent DMA with deferred completion). PROBE-RUN-PENDING-SEPARATE-TASK
+~31.5 ms => concurrent DMA with deferred completion). PROBE RUN
 (T-GPLR-34, 2026-09-16, see docs/currentstate.md): neither arm of the
 pre-registered dichotomy — the third mechanism won. Two-stream arm [6]
 shows the copy OVERTAKING the kernel (copy start -31.6 ms rel. kernel
 start; copy window pure 31.38 ms; kernel window unaffected 30.36 ms):
 WDDM cross-engine serialization and deferred signaling are both
 falsified. Single-stream arm [5] reproduces the chained 62 ms additive
-(k+copy) — and code inspection locates the coupling in our stack:
-compute (cudaGraphLaunch) and staging (set_tensor_async) share the same
-cuda_ctx->stream(), where submission order IS execution order. NEXT
-LEVER (new): a dedicated copy stream for staging DMAs (the context
-already supports curr_stream_no 0/1 via stream()) so layer compute and
-next-bank transfer overlap; predicted warm 4k ~2.75-2.8 -> ~2.0-2.1 s
-(bounded by max(compute, transfer) per layer). --pp-submit-batch
+(k+copy) as the CUDA stream-ordering reference. CORRECTION (same day,
+before any fix was attempted): the runner does NOT stage on the compute
+stream — `backend_copy` is a dedicated CUDA backend with its own context
+and stream (llama-layer-streaming.cpp:1305, common.cuh:1420/1494), and the
+compute side is the SCHEDULER's CUDA backend (`backend_compute`, resolved
+at :2274), a different context again. The chaining is therefore NOT stream
+identity but the runner's own CROSS-CONTEXT ordering gate
+(ev_consumer_done: created on the copy device :1324, recorded on
+backend_compute :2105, waited on the copy stream :602/:1900) — a shape the
+probe (two streams inside ONE context) never tested. NEXT LEVER: DRAFTED
+AS T-GPLR-35 (the task block lands with the next doc update) — issue the
+bank staging DMAs on a SECOND STREAM INSIDE THE COMPUTE CONTEXT so every
+staging wait is intra-context; predicted warm
+4k ~2.75-2.8 -> ~2.0-2.1 s (bounded by max(compute, transfer) per layer),
+with the falsifier pre-registered in the task. --pp-submit-batch
 stays as opt-in diagnostic tooling (default 0). GAP CLOSED (later the same
 day): submit_batch now reports the ACTUALLY-TAKEN branch threaded from
 stage_members (0 = per-member, 1 = single span, 2 = mixed) instead of the
