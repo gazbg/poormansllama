@@ -510,8 +510,8 @@ wall and wait verdicts are independent of that limitation.
 walls, checkers OK). Remaining PP lever family: shrink the per-copy window
 itself (member batching / GPU-direct storage) — new task territory.
 Commit: nested 3bc3aff71 (2026-09-16, gate + af_inflight telemetry);
-outer commit fills with this doc commit (scripts tools/run-gplr32{,-arms}.ps1,
-analyzer tools/analyze-gplr32.py)
+outer 7b83828 (2026-09-16, verdicts + scripts tools/run-gplr32{,-arms}.ps1,
+analyzer tools/analyze-gplr32.py, charter)
 Depends on: T-GPLR-29 addendum 3 (warm wall engine-bound floor ~1.5-1.8 s;
 pinned A/B methodology), T-GPLR-13/25 trace arms (the 2.2x window-stretch
 evidence), 2026-09-16 research pass in docs/currentstate.md (NVIDIA engine-
