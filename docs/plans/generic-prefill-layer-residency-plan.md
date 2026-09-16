@@ -599,7 +599,9 @@ Discriminating next step pre-registered in docs/currentstate.md: a
 standalone mid-kernel H2D probe (event ~65 ms => true serialization;
 ~31.5 ms => concurrent DMA with deferred completion). --pp-submit-batch
 stays as opt-in diagnostic tooling (default 0). Commit: nested fe6fce575
-(2026-09-16, V1 code); outer commit records the verdict + scripts
+(2026-09-16, V1 code); outer 96ad669 (2026-09-16, verdict + why-analysis
++ scripts tools/run-gplr33{,-arms}.ps1, analyzer tools/analyze-gplr33.py,
+gitlink bump)
 Depends on: T-GPLR-32 (done — its falsification LOCATED the cost), the
 2026-09-16 follow-up research pass (docs/currentstate.md: warm ready
 latency 69.7 ms = 3 x (10.5 pure + ~12.7 per-submission); banks are
