@@ -598,13 +598,27 @@ count) is closed on this box. Surviving arithmetic: warm wall = 40 x
 compute on WDDM (or completion signaling defers to the compute boundary).
 Discriminating next step pre-registered in docs/currentstate.md: a
 standalone mid-kernel H2D probe (event ~65 ms => true serialization;
-~31.5 ms => concurrent DMA with deferred completion). --pp-submit-batch
+~31.5 ms => concurrent DMA with deferred completion). PROBE-RUN-PENDING-SEPARATE-TASK
+(T-GPLR-34, 2026-09-16, see docs/currentstate.md): neither arm of the
+pre-registered dichotomy — the third mechanism won. Two-stream arm [6]
+shows the copy OVERTAKING the kernel (copy start -31.6 ms rel. kernel
+start; copy window pure 31.38 ms; kernel window unaffected 30.36 ms):
+WDDM cross-engine serialization and deferred signaling are both
+falsified. Single-stream arm [5] reproduces the chained 62 ms additive
+(k+copy) — and code inspection locates the coupling in our stack:
+compute (cudaGraphLaunch) and staging (set_tensor_async) share the same
+cuda_ctx->stream(), where submission order IS execution order. NEXT
+LEVER (new): a dedicated copy stream for staging DMAs (the context
+already supports curr_stream_no 0/1 via stream()) so layer compute and
+next-bank transfer overlap; predicted warm 4k ~2.75-2.8 -> ~2.0-2.1 s
+(bounded by max(compute, transfer) per layer). --pp-submit-batch
 stays as opt-in diagnostic tooling (default 0). GAP CLOSED (later the same
 day): submit_batch now reports the ACTUALLY-TAKEN branch threaded from
 stage_members (0 = per-member, 1 = single span, 2 = mixed) instead of the
 flag state; verification A/B: batch0 {0:120}, batch1 {1:120} — the span
 path demonstrably ran on every bank of the falsified A/B. Telemetry-fix
-commit: nested a03fe510e (2026-09-16, branch-true submit_batch). V1
+commits: nested a03fe510e, outer 15615a9 (2026-09-16, branch-true
+submit_batch, analyzer docstring, gitlink bump). V1
 code commit: nested fe6fce575
 (2026-09-16, V1 code); outer 96ad669 (2026-09-16, verdict + why-analysis
 + scripts tools/run-gplr33{,-arms}.ps1, analyzer tools/analyze-gplr33.py,
