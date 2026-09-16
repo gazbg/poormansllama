@@ -1,5 +1,46 @@
 # Current State
 
+## 2026-09-16: T-GPLR-33 WHY-ANALYSIS — the decisive pair: warm GPU-side ready_latency 74.1 ms (3 submissions) vs 74.2 ms (1 submission) — a real per-submission toll of ~12.7 ms would have dropped batch1 by ~25 ms; it dropped 0.0 ms. The theory was flawed by MODEL ALIASING: the 69.7 = 3 x (10.5 + 12.7) fit mistook "remaining layer-compute time at staging" for "per-submission overhead" — both predict the same warm mean, only the submission-count A/B separates them, and it separated. The chaining model (DMA parked during compute, then drains at pure rate) predicts 34 + 31.5 + flush ~ 74 ms for BOTH arms: matches. Implementation ruled out: contiguity arithmetic (144 MiB members, alignment divides exactly, bundle from offset 0) + pinned-staging source contiguity make the span path near-certain to have run; one honest gap disclosed: submit_batch reports the FLAG, not the taken branch, so the null result's implementation-side certainty rests on that arithmetic, not telemetry.
+
+## 2026-09-16: T-GPLR-33 DONE (A/B RUN) — one-submission-per-bank FALSIFIED: windows identical with 1 vs 3 submissions (median 76.1 vs 75.1 ms; walls 3483/3055 vs 3419/2949 ms, batch1 marginally worse within variance); per-submission-overhead model is DEAD — and the surviving arithmetic points at the real mechanism: warm wall = 40 x (compute ~34 ms + DMA ~31.5 ms) chained, i.e. the H2D DMA does NOT overlap layer compute on this WDDM box (or its completion is deferred to the compute boundary)
+
+A/B ran under the GPU mutex (tools/run-gplr33.ps1, detached wrapper;
+~2 min per arm — the "no load" observation mid-run was the run already
+finishing). Both checkers OK (20,577 events, 2 slots). V1 verified live:
+submit_batch=1 on 120/120 banks (the slot-build contiguity check tiled the
+members exactly — the single span copy ran everywhere; the 453 MB span
+submission is one cudaMemcpyAsync via the backend API).
+
+Results (traces gplr33-batch{0,1}.jsonl):
+- batch0 (legacy 3-submission): warm passes 3418.7 / 2949.0 ms (wait 698.7 /
+  927.6 ms); windows mean 78.5 / median 75.1 / p90 159.3; 93/120 stretched.
+- batch1 (single span submission): warm passes 3483.2 / 3055.4 ms (wait
+  734.5 / 927.7 ms); windows mean 87.5 / median 76.1 / p90 160.6; 107/120
+  stretched. NOT faster; slightly worse within arm variance.
+- The pre-registered prediction (window 91 -> ~44-58 ms, warm wall ->
+  ~1.8-2.0 s) FAILED; the falsifier (window >= ~80 ms) FIRED.
+
+What this closes and what it opens:
+- CLOSED: the per-submission-overhead model (submission count does not
+  move the window). With it, the whole submission-shaping lever family is
+  dead on this box: serialization (T-GPLR-32), submission count (this).
+- OPEN (surviving arithmetic): warm wall ~2.75 s = 40 layers x (~34 ms
+  compute + ~31.5 ms DMA) chained — exactly the wall, per-layer. The H2D
+  DMA is not executing concurrently with layer compute (or its completion
+  signal is deferred to the compute boundary) despite the copy/compute
+  engine model. This also explains why af=1's gain is bounded and why the
+  engine-bound floor (~1.5-1.8 s) was never reached.
+- DISCRIMINATING NEXT STEP (cheap, pre-registration): a standalone probe
+  that launches a ~34 ms compute kernel, enqueues a 453 MB pinned H2D mid-
+  kernel, and times the copy event: event ~= 65 ms => true DMA-after-
+  compute serialization; event ~= 31.5 ms => concurrent DMA with deferred
+  completion signaling. The fix differs (HAGS/scheduling vs engine
+  concurrency), so this probe decides the next lever. GPU-direct storage
+  (M3) remains the heavy alternative in both worlds.
+
+Status of --pp-submit-batch: kept as opt-in diagnostic tooling (default 0;
+measureably harmless-to-neutral; byte-safe by construction). NOT a default.
+
 ## 2026-09-16: T-GPLR-32 FOLLOW-UP RESEARCH — the ~82 ms window decomposes as 3 members x (10.5 ms pure transfer + ~12.7 ms PER-SUBMISSION overhead); the "intrinsic per-copy cost" is actually PER-SUBMISSION cost x3, and CUDA 13.2's cudaMemcpyBatchAsync (in the installed SDK) is the direct fix — predicted bank window 91 -> ~44-58 ms, warm wall ~2.77 -> ~1.8-2.0 s
 
 Sharper decomposition of the T-GPLR-32 traces (build/llama-cuda/

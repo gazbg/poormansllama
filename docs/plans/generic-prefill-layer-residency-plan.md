@@ -584,16 +584,22 @@ Escalation condition
 
 ### T-GPLR-33: Member-batched submission — one submission per bank (91 -> ~44-58 ms window)
 
-Status: in-progress (2026-09-16) — V1 IMPLEMENTED and built. Contiguity
-check runs at slot build (dense tiling of [base, base+total) verified per
-layer; on success a 1-D I8 span tensor aliases the member region); both
-copy sites route through a shared stage_members helper that issues ONE
-set_tensor_async over the span when the sources stay contiguous (mid-bank
-discontinuity degrades to the legacy path loudly via the new submit_batch
-copy_submit field: 0=legacy, 1=single-span). Flag --pp-submit-batch 0|1
-(default 0), usage line, configure call, host validation (bad values
-refused) all done; A/B scripts tools/run-gplr33{,-arms}.ps1 + analyzer
-tools/analyze-gplr33.py armed. PENDING: the GPU-mutex A/B run.
+Status: done (2026-09-16) — verdict: DISCARD as a wall lever; the
+falsifier FIRED. A/B under the GPU mutex (tools/run-gplr33{,-arms}.ps1,
+analyzer tools/analyze-gplr33.py): V1 verified live (submit_batch=1 on
+120/120 banks — contiguity check tiled exactly, single span submission
+everywhere) and windows did NOT move: median 76.1 ms (batch1) vs 75.1
+(batch0), warm walls 3483.2/3055.4 vs 3418.7/2949.0 ms (batch1 marginally
+worse, within variance). The per-submission-overhead model is DEAD; with
+T-GPLR-32, the whole submission-shaping family (serialization, submission
+count) is closed on this box. Surviving arithmetic: warm wall = 40 x
+(~34 ms compute + ~31.5 ms DMA) chained — the DMA does not overlap layer
+compute on WDDM (or completion signaling defers to the compute boundary).
+Discriminating next step pre-registered in docs/currentstate.md: a
+standalone mid-kernel H2D probe (event ~65 ms => true serialization;
+~31.5 ms => concurrent DMA with deferred completion). --pp-submit-batch
+stays as opt-in diagnostic tooling (default 0). Commit: nested fe6fce575
+(2026-09-16, V1 code); outer commit records the verdict + scripts
 Depends on: T-GPLR-32 (done — its falsification LOCATED the cost), the
 2026-09-16 follow-up research pass (docs/currentstate.md: warm ready
 latency 69.7 ms = 3 x (10.5 pure + ~12.7 per-submission); banks are
