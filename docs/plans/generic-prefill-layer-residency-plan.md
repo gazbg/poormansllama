@@ -729,6 +729,158 @@ Escalation condition
   batch API returns unexpected errors on this driver, stop and escalate
   to the owner before any further submission-path changes.
 
+### T-GPLR-35: PP staging overlap — bank DMAs on a second stream inside the compute context (warm 4k ~2.75-2.8 -> ~2.0-2.1 s)
+
+Status: in-progress (2026-09-16) — V1 implemented and built clean (0 errors;
+host validation: usage line present, value 2 refused, value 1 parses), A/B
+armed but NOT yet run (no GPU time spent). Staging DMAs now
+run on the auxiliary stream (No. 1) of the COMPUTE backend's CUDA context
+behind `--pp-copy-overlap 0|1` (default 0 = the pre-T-GPLR-35 copy-backend
+path, byte-identical). New experimental surface (ggml/include/ggml-cuda.h +
+ggml-cuda.cu): ggml_backend_cuda_aux_stream_ok / memcpy_1d_aux /
+event_record_aux / event_wait_aux / aux_synchronize. Every staging submission
+and every staging-side ordering call in llama-layer-streaming.cpp now routes
+through one plumbing layer (ls_stage_aux/record/wait/drain), so the mode
+switch is atomic — an event can never be recorded on a stream that carries no
+copy work; drains are conservative (both streams) so no site can be missed;
+the handoff-migration and TG row-cache paths keep the copy backend and their
+own consistent topology; a missing compute backend with the flag on fails
+loudly instead of falling back silently. A/B armed: tools/run-gplr35.ps1 +
+tools/run-gplr35-arms.ps1 (overlap0 vs overlap1, gplr32/33 shape) +
+tools/analyze-gplr35.py. NOT YET RUN (no GPU time spent). Recon limitation
+stated, not hidden: stream/context identity is not logged, so the attribution
+rests on the A/B's wall, window and pass-transfer evidence.
+Depends on: T-GPLR-33 (done — closed the submission-shaping family), T-GPLR-34
+(the standalone two-stream probe: cross-engine overlap is proven in hardware;
+one-stream work is additive by CUDA semantics), T-GPLR-32 (done — the af gate
+is wall-neutral), T-GPLR-29/30 (pinned staging + pool defaults), T-GPLR-13/25
+(the trace arms this A/B stays comparable with)
+Commit: (fill on completion)
+
+Goal
+: Recover copy/compute overlap in the runner so the warm 4k layer-major pass
+  stops paying compute AND transfer serially (~68.7 ms per layer = ~34 ms
+  compute + ~31.5 ms copy). T-GPLR-34 arm [6] proved the hardware can do it:
+  with the bank copy on a second stream inside the SAME context the copy
+  window stayed pure (31.38 ms min) and the kernel window was unaffected
+  (30.36 ms), the copy even overtaking the kernel; arm [5] gives the
+  one-stream additive reference (62.12 = 30.74 + 31.37). Target: warm 4k
+  ~2.0-2.1 s (PP tok/s ~1,480 -> ~1,900-2,050).
+
+Known evidence and a correction to the T-GPLR-34 write-up
+: The runner does NOT stage on the compute stream. `backend_copy` is a
+  dedicated CUDA backend (llama-layer-streaming.cpp:1305
+  `ggml_backend_cuda_init`) whose `ggml_backend_cuda_context` owns its own
+  `streams[device][...]` array (common.cuh:1420, `stream()` = :1494), while
+  the compute side is the scheduler's CUDA backend (`backend_compute`,
+  resolved at :2274) — two contexts, two streams. The "shared stream
+  identity" causal sentence recorded during T-GPLR-34 is SUPERSEDED. The
+  recon step below must attribute the chaining among the remaining
+  candidates: (i) CROSS-context event waits — `ev_consumer_done` is created
+  on the copy device (:1324), recorded on `backend_compute` (:2105) and
+  waited on the copy stream (:602 worker, :1900 main); the probe used two
+  streams in ONE context, so cross-context wait behavior under WDDM is
+  untested; (ii) the slot-reuse gate itself (`consumer_pending` ->
+  ev_consumer_done wait; with 2 slots the target slot's consumer is two
+  layers back, so this should not chain, but the event's recorded position
+  must be verified); (iii) the worker's H2D enqueue position relative to the
+  compute graph (the 21.5 ms host hop is already overlapped for af=1,
+  T-GPLR-29); (iv) graph-launch semantics (`cudaGraphLaunch`,
+  ggml-cuda.cu:4222, plus the `ev_copy_ready` dependency).
+
+Scope
+: The staging DMA path only: `stage_members` (both call sites, worker and
+  main), the slot events that order copies against consumers, and the flag +
+  telemetry around them. Keep 2 slots, pinned staging/pool source, one H2D per
+  bank (span path when the contiguity check passes), the layer-major default
+  schedule, and the 4k 3-pass shape for comparability with the T-GPLR-29/32/33
+  arms.
+
+Non-goals
+: No change to staging bytes, member order, or member count; no routing/KV/
+  session-state change; no TG-side work; no multi-GPU; no new dependency; no
+  default flips without an owner decision; no upstream-facing material.
+
+Design/failure contract
+: 1. RECON FIRST (cheap; decides the variant from evidence, not assumption):
+  log the stream/context identity of the compute and copy paths at init and
+  per-bank copy/compute GPU timestamps, so the analyzer can say whether the
+  copy STARTS during the layer's compute interval and what the copy's own GPU
+  window is. If the copy already starts mid-compute with a pure window while
+  the wall stays chained, the coupling is on the consumption side and this
+  task STOPS with that verdict.
+  2. V1 (the mechanism implemented here): issue the staging DMAs on a SECOND
+  STREAM INSIDE THE COMPUTE CONTEXT (`ggml_backend_cuda_context::
+  stream(device, 1)`, lazily created by the existing accessor) and move every
+  staging ordering event into that context so ALL waits are intra-context —
+  the configuration T-GPLR-34 proved overlaps. Reached through the existing
+  experimental ggml-cuda surface (precedent: `#include "ggml-cuda.h"` at
+  llama-layer-streaming.cpp:30 and `ggml_backend_cuda_host_buffer_type()` at
+  :936). One H2D per bank, bytes and order unchanged; the slot-reuse
+  invariant (no overwrite before the prior consumer completes) is preserved
+  by keeping the consumer-done dependency, expressed as an intra-context wait.
+  3. V2 (only if recon exonerates (i)): relax the gate ordering — e.g. record
+  the slot's consumer-done at the consumer's enqueue bound rather than graph
+  completion, or stage one layer earlier. Must be justified by the recon
+  telemetry; no speculative reordering.
+  4. Loud failure: with the flag on, if the second stream cannot be created or
+  any staging wait would remain cross-context, abort with structured
+  telemetry (never silently fall back to the serialized path, which would
+  manufacture a false null).
+  5. Flag `--pp-copy-overlap 0|1` (default 0) so the A/B is one flag; value 2
+  is refused with the contract message.
+
+Implementation steps
+: 1. Recon instrumentation (contract 1) plus one short GPU run to read it.
+  2. Add the experimental CUDA accessor for the compute context's second
+  stream and the per-bank copy helper in the isolated path; wire
+  `stage_members` and the slot event creation/recording to it behind the flag.
+  3. Telemetry: per-bank copy GPU timestamps plus a compute-window field so
+  the analyzer can report the overlap fraction; one init line carrying the
+  stream/context identity.
+  4. Build; host validation (flag parse/usage, refusal on 2, non-CUDA builds
+  unaffected, event protocol still ordered).
+  5. A/B under the GPU mutex: `tools/run-gplr35.ps1` (T-GPLR-32/33 script
+  shape: arms overlap0/overlap1, strict check-telemetry per arm, one mutex
+  hold) on the 4k anchor, 3-pass, 2 slots, af=1, pinned.
+  6. Analyze with `tools/analyze-gplr35.py`: per-bank copy start vs compute
+  interval, copy window, wait, phase walls, total PP wall and tok/s.
+  7. Record the verdict and the attributed mechanism; update this task's
+  status and Commit fields.
+
+Acceptance criteria (falsifiable)
+: - Warm 4k per-pass wall falls from the recorded 2.75-2.8 s into ~2.0-2.1 s
+  (ideal ceiling ~1.5-1.6 s if the overlap is perfect); PP tok/s ~1,480 ->
+  ~1,900-2,050; the transfer phase does not increase.
+  - Mechanism evidence: in the overlap=1 arm the copy STARTS during the
+  layer's compute interval for a majority of banks, the copy's own GPU window
+  stays ~31.5 ms, and the per-pass wait collapses.
+  - FALSIFIER: warm wall >= ~2.6 s with the copy still starting at/after
+  compute end (or the copy window unchanged) -> the coupling is not
+  stream/context-level; record it, close the stream-family lever, and
+  escalate (remaining territory: GPU-direct storage, platform settings).
+  - Both arms check-telemetry OK, no deadlock, refusal path exercised.
+  - No qa-smoke required (staging-path only, cannot alter generated output)
+  unless a run shows any output difference; if it does, stop and escalate.
+
+Validation
+: `powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-gplr35.ps1`
+  (wraps `tools/with-gpu-lock.ps1`; ~20 min) then
+  `python tools/analyze-gplr35.py overlap0 overlap1`. Expected: the
+  acceptance numbers above, with the falsifier reported explicitly either way.
+
+State/document updates
+: docs/currentstate.md (recon finding, run, verdict, mechanism attribution),
+  this task (status + Commit), and the T-GPLR-33/34 notes (their superseded
+  causal wording corrected). If V1 wins and becomes a default candidate that
+  is an owner decision — recorded, not applied here.
+
+Escalation condition
+: Stop and escalate if the recon cannot attribute the coupling after ~30 min
+  of GPU time; if V1 requires changes outside the isolated experimental path
+  (public ggml/llama API, allocator, non-CUDA builds); or if the flag-on path
+  cannot guarantee the slot-reuse invariant.
+
 ### T-GPLR-31: Locked-RAM probe — does the driver grant a full-pool-size pinned allocation on this box?
 
 Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB pool grantable with large headroom
