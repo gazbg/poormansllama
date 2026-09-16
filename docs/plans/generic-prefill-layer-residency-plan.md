@@ -582,6 +582,116 @@ Escalation condition
   deadlocks (wait never fires), stop, capture the trace, and escalate to
   the owner before touching the enqueue path again.
 
+### T-GPLR-33: Member-batched submission — one submission per bank (91 -> ~44-58 ms window)
+
+Status: in-progress (2026-09-16) — V1 IMPLEMENTED and built. Contiguity
+check runs at slot build (dense tiling of [base, base+total) verified per
+layer; on success a 1-D I8 span tensor aliases the member region); both
+copy sites route through a shared stage_members helper that issues ONE
+set_tensor_async over the span when the sources stay contiguous (mid-bank
+discontinuity degrades to the legacy path loudly via the new submit_batch
+copy_submit field: 0=legacy, 1=single-span). Flag --pp-submit-batch 0|1
+(default 0), usage line, configure call, host validation (bad values
+refused) all done; A/B scripts tools/run-gplr33{,-arms}.ps1 + analyzer
+tools/analyze-gplr33.py armed. PENDING: the GPU-mutex A/B run.
+Depends on: T-GPLR-32 (done — its falsification LOCATED the cost), the
+2026-09-16 follow-up research pass (docs/currentstate.md: warm ready
+latency 69.7 ms = 3 x (10.5 pure + ~12.7 per-submission); banks are
+exactly 3 members x 144 MiB; cudaMemcpyBatchAsync present in the
+installed CUDA 13.2 SDK), T-GPLR-29/30 (pinned staging + pool: sources
+already contiguous in member order).
+Commit: (fill on completion)
+
+Goal
+: Convert the per-bank staging from 3 sequential cudaMemcpyAsync calls to
+  ONE submission, removing the measured ~12.7 ms per-submission driver
+  overhead from two of the three member copies. This is the direct attack
+  on the last standing warm-wall cost after T-GPLR-32 closed the
+  DMA-concurrency family: warm 4k wall ~2.77 s -> ~1.8-2.0 s (the
+  engine-bound floor band from T-GPLR-29 addendum 3).
+
+Scope
+: Two implementation variants, decided by a cheap runtime check at slot
+  build time:
+  - V1 (preferred, zero new API): if the slot bundle's member tensors are
+    verified back-to-back in the destination buffer (dst offset of member
+    k+1 == dst offset of member k + nbytes(member k), checked for every
+    slot at init and asserted per run) AND the staging source (pool mirror
+    or slot.buf_staging) holds the bank contiguously in the same member
+    order (it already does by construction), issue ONE cudaMemcpyAsync of
+    the full bank bytes instead of 3.
+  - V2 (fallback if V1's offset check fails): one cudaMemcpyBatchAsync
+    (CUDA 13.2, count=3, srcAccessOrder=cudaMemcpySrcAccessOrderAny,
+    optionally the cudaMemcpyFlagPreferOverlapWithCompute hint as a
+    sub-variant arm M2).
+  Behind an explicit flag (--pp-submit-batch 0|1, default 0) so the A/B
+  is one flag; the CPU memcpy hop loop and the pool protocol are
+  untouched; telemetry keeps per-bank copy_submit/copy_complete shape
+  (one event pair per bank, bytes = full bank).
+
+Non-goals
+: No change to the af worker's gating/queueing, the eviction protocol, or
+  the main-thread preload path beyond reusing the same helper; no
+  GPU-direct storage work (M3) in this task; no batch-major changes.
+
+Design/failure contract
+: PREDICTION (falsifiable): mean effective window 91 -> ~44-58 ms
+  (host-observed span, per the analyzer caveat), transfer phase per warm
+  pass 3.65 -> ~2.4 s, warm wall 2.77 -> ~1.8-2.0 s, PP tok/s ~1,480 ->
+  ~2,100-2,300. FALSIFIER: window unchanged (>= ~80 ms) — the ~12.7 ms
+  toll lives inside the DMA engine per OPERATION-BYTES rather than per
+  SUBMISSION, closing this lever family too and confirming ~2.75-2.8 s as
+  the pinned-af optimum on this box. V1 legality: the offset check must
+  gate EVERY stage (not just init) — a failed check must fall back to the
+  3-call path loudly (telemetry field submit_batch=0 on that bank), never
+  copy wrong addresses.
+
+Implementation steps
+: 1. At slot build: compute and cache per-slot member offsets; verify
+  contiguity (V1) or mark the slot V2-eligible.
+  2. Add the --pp-submit-batch flag (parse, usage, module setter with
+  loud refusal if the runtime lacks the batch API).
+  3. In both staging sites (af_submit_copy, load_layer), replace the
+  member loop's tensor_set_async calls with the single-submission helper
+  when the flag is on and the slot check passed: V1 one cudaMemcpyAsync
+  over (staging_src_base, dst_base, bank_bytes); V2 cudaMemcpyBatchAsync
+  with per-member arrays built once per slot.
+  4. Telemetry: copy_submit gains submit_batch (0=legacy 3-call, 1=V1
+  single, 2=V2 batch API) so the analyzer can verify which path ran.
+  5. Build; host-validate (flag parse, refusal path); run the A/B
+  (batch 0 vs 1) with the T-GPLR-32 script shape (4k 3-pass 2-slot
+  pinned af=1) under the GPU mutex; strict check-telemetry both arms.
+  6. Analyze with the T-GPLR-32 analyzer extended for submit_batch; the
+  qa-smoke 512 gate is NOT required (staging path only, no code that can
+  alter generated output — but run it if any doubt arises).
+
+Acceptance criteria
+: - Both arms check-telemetry OK; submit_batch field proves the intended
+    path ran on >= 118/120 banks per arm (preload/main-thread copies may
+    differ).
+  - Verdict recorded against the prediction/falsifier with numbers
+    (window ms, wait, warm wall, tok/s) in docs/currentstate.md and this
+    task; no silent fallback unaccounted for.
+  - If adopted as default: a loud note in the usage line and the plan
+    status updated with the promotion decision left to the owner.
+
+Validation commands
+: powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-gplr33.ps1
+  (mutex wrapper, same shape as tools/run-gplr32.ps1, arms batch0/batch1);
+  python tools/analyze-gplr33.py batch0 batch1; strict --check-telemetry
+  per arm inside the wrapper.
+
+State/document updates
+: docs/currentstate.md (run + verdict + mechanism resolution), this task
+  (status + Commit field), T-GPLR-32 cross-reference (its "intrinsic
+  per-copy cost" wording is superseded by per-submission cost on adoption).
+
+Escalation condition
+: If the contiguity check fails on the real model (V1 unavailable), record
+  it and continue with V2; if the V2 arm REGRESSES (>10% wall) or the
+  batch API returns unexpected errors on this driver, stop and escalate
+  to the owner before any further submission-path changes.
+
 ### T-GPLR-31: Locked-RAM probe — does the driver grant a full-pool-size pinned allocation on this box?
 
 Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB pool grantable with large headroom

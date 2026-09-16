@@ -1,5 +1,58 @@
 # Current State
 
+## 2026-09-16: T-GPLR-32 FOLLOW-UP RESEARCH — the ~82 ms window decomposes as 3 members x (10.5 ms pure transfer + ~12.7 ms PER-SUBMISSION overhead); the "intrinsic per-copy cost" is actually PER-SUBMISSION cost x3, and CUDA 13.2's cudaMemcpyBatchAsync (in the installed SDK) is the direct fix — predicted bank window 91 -> ~44-58 ms, warm wall ~2.77 -> ~1.8-2.0 s
+
+Sharper decomposition of the T-GPLR-32 traces (build/llama-cuda/
+gplr32-ser{0,1}.jsonl, warm passes; per-pass phase_summary cross-check):
+- Local fact (inspect JSON): each MoE bank package = exactly 3 members of
+  452,984,832/3 = 150,994,944 B (144 MiB) each — per-member submission
+  overhead CANNOT be hidden by member size; there are 3 submissions per
+  bank and each member is only ~10.5 ms of pure transfer at the measured
+  14.4 GB/s link.
+- Warm per-bank telemetry: transfer_us 91.1-91.2 ms = host_submit 21.4-21.5
+  (the CPU memcpy hop, PROVEN wall-neutral by T-GPLR-30/31 — it overlaps
+  compute) + ready_latency 69.7 ms (GPU-side). 69.7 = 3 x (10.5 + ~12.7):
+  the cost tracks the NUMBER OF SUBMISSIONS, not the bytes. This resolves
+  T-GPLR-32's "intrinsic per-copy cost" wording into per-submission cost.
+- Primary sources (search tooling degraded again — pivoted to the
+  authoritative local source, the installed CUDA 13.2 SDK):
+  - cuda_runtime_api.h (CUDA 13.2): cudaMemcpyBatchAsync(dsts[], srcs[],
+    sizes[], count, attrs, attrsIdxs, numAttrs, stream) — "performs a batch
+    of memory copies asynchronously. The batch as a whole executes in
+    stream order but copies within a batch are not guaranteed to execute in
+    any specific order." Pointer-to-pointer only; attrs include
+    srcAccessOrder (cudaMemcpySrcAccessOrderAny fits our pinned pool/
+    staging sources) and the cudaMemcpyFlagPreferOverlapWithCompute hint
+    ("associated copies should preferably overlap with any compute work").
+    Also present: cudaMemcpy3DBatchAsync, cudaMemPrefetchBatchAsync.
+  - NVIDIA streams guidance (fetched 2026-09-16, earlier pass): same-
+    direction copies sharing an engine serialize; batching restores the
+    per-copy rate — consistent with the per-submission overhead model.
+  - Microsoft HAGS devblog (fetched 2026-09-16, earlier pass): WDDM
+    batching/submission overhead is first-class; HAGS moves high-frequency
+    scheduling onto the GPU (platform knob, owner-level, noted not pursued).
+
+Mechanisms to shrink the window (in attack order):
+- M1 MEMBER-BATCHED SUBMISSION (next task, T-GPLR-33 draft): one
+  cudaMemcpyBatchAsync(count=3) per bank instead of 3 cudaMemcpyAsync
+  calls. Stronger variant with zero new-API risk: the slot bundle allocates
+  all members in ONE buffer and each member is exactly 144 MiB (already
+  512-byte aligned), and the pinned staging/pool buffers already hold the
+  bank CONTIGUOUSLY in member order by construction — so if a runtime
+  offset check confirms dst members are back-to-back in the slot buffer,
+  ONE plain cudaMemcpyAsync of the full 453 MB suffices. Expected: the
+  ~12.7 ms overhead paid once per bank instead of 3x — bank window 91 ->
+  ~44-58 ms (host-observed), transfer phase 3.65 -> ~2.4 s, warm wall
+  ~2.77 -> ~1.8-2.0 s (the earlier engine-bound floor). Falsifiable: if
+  the window does not shrink, the overhead is inside the DMA engine itself,
+  not the submission path — that would close this family too.
+- M2 Overlap hint: set cudaMemcpyFlagPreferOverlapWithCompute on the
+  batch attributes; near-zero cost, try as an M1 variant arm.
+- M3 GPU-direct storage (bypass the CPU hop and possibly WDDM entirely):
+  large effort, separate future task; M1's verdict decides if needed.
+- M4 HAGS platform knob: owner-level Windows setting, not code; recorded
+  for completeness.
+
 ## 2026-09-16: T-GPLR-32 DONE (A/B RUN) — serialize-the-worker-DMAs FALSIFIED as a wall lever: warm walls identical (2751.8-2782.9 ms ser1 vs 2768.9-2777.8 ms ser0, wait ~959 ms both); with worker DMAs serialized, 114/120 windows STILL stretch >45 ms while the only possible concurrent partner is a main-thread preload copy — the stretch is INTRINSIC per-copy cost under WDDM, and the DMA-concurrency lever family is CLOSED
 
 The A/B ran under the GPU mutex (detached wrapper survived the session;
