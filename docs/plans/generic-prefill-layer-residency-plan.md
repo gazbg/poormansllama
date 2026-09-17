@@ -782,7 +782,8 @@ is wall-neutral), T-GPLR-29/30 (pinned staging + pool defaults), T-GPLR-13/25
 (the trace arms this A/B stays comparable with)
 Commit: nested 69799064a (V1 aux-stream staging + `--pp-recon` instrumentation +
   the layer-major `backend_compute` publication fix); outer ed2dd39 (docs,
-  recon scripts, analyzer, gitlink bump)
+  recon scripts, analyzer, gitlink bump); outer b7cd387 (pipeline regression
+  gate + its runner wiring + the slot-depth addenda 1/2 verdicts)
 
 Goal
 : Recover copy/compute overlap in the runner so the warm 4k layer-major pass
