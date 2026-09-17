@@ -1140,7 +1140,11 @@ Depends on: T-GPLR-29/30/31 (pinned staging + pool), T-GPLR-33 (shared
 `stage_members` submission helper), T-GPLR-35 (the recon that measured the hop),
 T-GPLR-36 (the ledger that showed no host bucket contains the hop, because it
 runs on the async-feed worker)
-Commit: (fill on completion)
+Commit: nested 7bcbd7a75 (cudaHostRegister host-range API) + 8e14abd36
+(register-once staging + ledger sub-buckets) + 1e72d62c7 (runner wiring); outer
+4b13ac3 (evidence/tooling, gitlink bump)
+
+
 
 Goal
 : Remove the CPU hop from bank staging without giving up pinned transfer speed.
@@ -1373,7 +1377,8 @@ chunk-independent (a ~0.7 s/pass prize at u2048), drafted as T-GPLR-39.
 Depends on: T-GPLR-37 addendum 2 (ron = the current best 4k mode; the falsified
 churn arm stays reproducible), T-GPLR-36 (the host ledger that named the
 per-launch overhead), T-GPLR-35 (the pipeline gate and recon)
-Commit: (fill on completion)
+Commit: nested 8e14abd36 (ledger sub-buckets); outer 4b13ac3 (sweep evidence +
+tooling + gitlink bump)
 
 Goal
 : The 200k ledger attributed the long-context residual to per-launch host cost
