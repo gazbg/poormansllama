@@ -1484,6 +1484,101 @@ Non-goals
 Recon result (measured, 2026-09-17)
 : * Arm: `tools/run-gplr39-recon.ps1`, u2048 / 3 slots / ron / 4k anchor /
   `--pp-repeat 2`; checker OK; trace `build/llama-cuda/gplr39-u2048-recon.jsonl`.
+
+#### T-GPLR-40 (bisect, 2026-09-17): the 144k pass-2 crash — tail chunk vs long-context+repeat
+
+The 144k A/B (T-GPLR-38 addendum) crashed deterministically in pass 2 of
+`--pp-repeat 2` at the same position in both arms (layer 3, slot 0, generation
+16; ~37% into the pass). Both shapes shared one new property: a 640-token TAIL
+chunk (144000 = 140x1024 + 640 = 70x2048 + 640); every earlier `--pp-repeat`
+run divided the prompt exactly. Bisect:
+: * Arm B1 `nobreak`: `--pp-tokens 143360` = 140x1024 EXACTLY (no tail), u1024,
+  3 slots, ron mode, `--pp-repeat 2`.
+  * Arm C1 `tail`: `--pp-tokens 144000` (141 chunks, 640-token tail), identical
+  otherwise — re-run for adjacency.
+  * Outcome table (pre-registered): B1 survives + C1 crashes -> the TAIL CHUNK
+  is the trigger (fix belongs in the tail-chunk graph/slab binding or the reset
+  path); B1 crashes + C1 crashes -> tail exonerated, long-context+repeat is the
+  trigger (KV clear / act-slab rebind at this ctx); B1 survives + C1 survives ->
+  the original crash was order/environment dependent, re-run the u2048 arm.
+  No performance claims: this is a failure-isolation run.
+
+Bisect result (measured, 2026-09-17): TAIL EXONERATED — trigger is q8 KV + long ctx + pass 2
+: * B1 no-tail 143360 / q8 KV: CRASH in pass 2 at chunk 130, layer 3, slot 0,
+  gen 16 — byte-identical signature to the tail-bearing arms.
+  * C1 tail 144000 / q8 KV: same crash, same position (adjacency re-run).
+  * D1 no-tail 143360 / **f16 KV**: SURVIVES both passes (generation reached 28
+  = full pass 2; warm 140,810.8 ms / 1022.7 tok/s — the first clean warm 144k
+  reference). Traces `build/llama-cuda/gplr40-*.jsonl`.
+  * Conclusion: the trigger is the **quantized (q8) KV cache combined with long
+  context and the pass-2 KV clear/reuse path** — not the tail chunk, not the
+  ubatch size, not the copy-source mode. Consistent with all prior evidence:
+  4k repeat runs (q8, tiny ctx) survived; 200k repeat runs (f16 KV) survived.
+  * Defect ownership: the crash is in the q8 KV clear/rebind path under
+  `--pp-repeat`, NOT in the layer-residency staging path (f16 staging identical).
+  Next step (owner decision): reproduce with stock llama.cpp q8 KV + KV-clear
+  at long ctx to decide whether it is upstream or residency-owned before any
+  fix is attempted.
+  * Process note: two aborted attempts (ctx smaller than the 144,001-token
+  file; the generator overshoot again) — the runner now carries the working
+  flags; the file-length requirement is ctx >= prompt file tokens regardless
+  of --pp-tokens.
+
+#### T-GPLR-40 addendum (2026-09-17): ownership test — stock libllama, no residency path
+
+Design
+: A standalone probe (no layer-streaming, no residency module — plain
+  llama_model + llama_context from the vendored tree) that reproduces the crash
+  shape with the public API only: fill a q8 KV cache with ~143k tokens in
+  1024-token batches (llama_decode), then `llama_memory_clear(mem, true)` and
+  fill it AGAIN — mirroring exactly what `--pp-repeat 2` does across the pass
+  boundary. Arms: q8 (`--cache-type-k q8_0 --cache-type-v q8_0` equivalent via
+  `cache_type_k/v`), f16, and a no-clear control (decode once). u1024, ctx
+  144128, CUDA0 only, same model.
+
+Pre-registered interpretation
+: * Stock probe CRASHES on the second fill with q8 (and survives f16) -> the
+  defect is UPSTREAM (stock KV q8 clear/reuse at long ctx); file an upstream-
+  facing issue, do not fix in the vendored tree beyond a workaround, and the
+  residency path is exonerated.
+  * Stock probe SURVIVES both fills -> the crash is RESIDENCY-OWNED (something
+  in the layer-residency pass-boundary reset or its q8 KV interaction); fix
+  belongs in src/llama-layer-streaming.cpp / the runner's reset sequence.
+  * Stock probe survives q8 but with a WARNING/defrag difference -> treat as
+  residency-owned but look at the ubatch/defrag interaction.
+  * Failure-isolation run: no performance claims from any arm.
+
+RESULT (2026-09-17, same day)
+: Stock probe SURVIVES both fills in both arms -- q8_0 and f16 each completed
+  fill 1 (144,001 tokens, u1024, ctx 144128) + `llama_memory_clear(mem, true)`
+  + fill 2, exit 0 both (`gplr40-stock-wrapper.log`: `ARM kv=q8_0 EXIT: 0`,
+  `ARM kv=f16 EXIT: 0`). -> By the pre-registered matrix the defect is
+  **RESIDENCY-OWNED**: it lives in the layer-residency pass-boundary reset or
+  its q8-KV interaction (src/llama-layer-streaming.cpp / runner reset
+  sequence), NOT in stock q8 KV clear/reuse.
+  Placement equivalence verified against the owner's validity challenge: the
+  crashing residency runs' own logs show `llama_kv_cache: CUDA0 KV buffer size
+  = 1495.47 MiB` (q8 arms) — KV was fully VRAM-resident on CUDA0 there, the
+  same placement the probe used (stock defaults; 22.3 GiB total VRAM incl.
+  expert banks + q8 KV + compute). The control matches the failing
+  configuration on the axis that matters for a KV clear/reuse bug.
+  Disclosed differences (what the probe does NOT reproduce): the layer-major
+  controller, slot/staging machinery, per-chunk memory contexts held across
+  the pass, and the runner's reset sequence — which is exactly where the
+  attribution now points. Candidate mechanism for the fix (hypothesis, not
+  evidence): the controller keeps `chunk_mctx` alive for the whole pass while
+  the runner clears memory between passes; stale q8 cell references in
+  pass-2 graph inputs are consistent with the async illegal access at a fixed
+  slot generation early in pass 2.
+  Deviation from the design: the no-clear control arm was dropped (both
+  residency crashes occur after the clear; the f16-vs-q8 pair already
+  isolates the axis).
+  Build notes: VS 18 BuildTools vcvars (the 2022 install's vswhere dependency
+  is broken on this box); probe links `src/Release/llama.lib`, loads DLLs
+  from `bin/Release`. Evidence: `tools/gplr40-stock-probe.cpp`,
+  `tools/run-gplr40-stock.ps1`, `build/llama-cuda/gplr40-stock-wrapper.log`.
+  Next step (owner decision): fix the residency pass-boundary reset, then
+  re-run the B1/C1/D1 matrix as the regression.
   * Warm ledger: `other` 1152.8 ms = **route 1161.5 (100.8%)** + tel 1.0 + loop
   −9.7 ms (closure exact by construction; small negative loop = timer jitter).
   80 route events/pass confirmed in the trace.
@@ -1495,6 +1590,239 @@ Recon result (measured, 2026-09-17)
   checker then rejects the trace (`auto-on but no handoff events`). The 200k
   addendum-3 arms escaped only because their fit gate measured auto-OFF. Recon
   arms must either pass `--tg-tokens > 0` or force `--handoff-mode off`.
+
+#### T-GPLR-41 (recon, 2026-09-17): pass-boundary memory-lifecycle telemetry — prove or refute the stale-reference hypothesis
+
+Status: done (falsifier fired — P2 recorded; escalated per plan)
+Depends on: T-GPLR-40 addendum (stock probe => RESIDENCY-OWNED verdict)
+Commit: (fill on completion)
+
+Goal
+: Before fixing the q8-KV 144k pass-2 crash, prove its mechanism with
+  telemetry. Working hypothesis from the stock-probe attribution: a
+  stale-reference between the prebuilt per-chunk graph sets and pass 2's
+  cleared-and-refilled memory (baked KV-view shapes ne[2] = build-time n_kv,
+  and/or baked KV storage pointers, diverging from pass 2's live layout).
+
+Instrument (implemented, behind --pp-mctx-recon 1)
+: In the layer-major mctx loop, AFTER each chunk's apply and BEFORE the sweep:
+  (a) one `mctx` event per chunk: pass index, live n_kv (public
+  llama_kv_cache_context::get_n_kv()), recurrent rs_z, and the selected set's
+  (chunk_id, rs_z, n_outputs); (b) one `mctx_kvview` event per exec layer per
+  chunk: the set's baked cache_k_l*/cache_v_l* view shapes (ne[2]) and the KV
+  storage device addresses the views point at. Both passes emit; pass-2 events
+  all precede the sweep, so the crashing run leaves a complete picture.
+  Diagnostics only: host-only reads, no execution-order change, unknown event
+  types ignored by both checkers. Refused under --mtp (different controller).
+
+Pre-registered interpretation (falsifiable)
+: P1 CONFIRM (stale-reference family): pass-2 vs pass-1 divergence in any
+  emitted fact — live_n_kv trajectory differs at the same chunk, set
+  selection differs (rs_z or n_out), baked k_ne2/v_ne2 != the pass's live
+  n_kv at some chunk, or KV storage addresses differ between passes. Fix
+  then targets the diverging fact; regression = B1/C1 re-run surviving.
+: P2 REFUTE (falsifier): every emitted fact byte-identical between pass 1
+  and pass 2 AND pass 2 still crashes => the stale-reference family as
+  instrumented is NOT the mechanism; escalate to the un-instrumented
+  suspects one at a time (recurrent zero-view state, scheduler alloc-graph
+  reuse across the clear, async-feed/copy-stream interaction with cleared
+  cells).
+: P3 TIMING: pass 2 completes under the recon (crash not reproduced) =>
+  the crash is timing-dependent (the instrument's host work perturbs it);
+  re-run without the flag to confirm reproduction before any conclusion.
+
+Non-goals
+: No fix in this task. No performance claims. No behavior change when the
+  flag is off.
+
+Validation
+: Run the exact crashing shape (B1: --pp-tokens 143360, u1024, 3 slots,
+  mmap-registered, --pp-repeat 2, q8) with --pp-mctx-recon 1, plus the f16
+  control (D1 shape). Expected: q8 crashes in pass 2 with complete pass-2
+  mctx streams in the trace; f16 completes and passes --check-telemetry
+  (new event types ignored). Analyzer: tools/analyze-gplr41.py.
+
+Escalation condition
+: P2 (falsifier fires) or P3 (repro lost) — stop, record, return to the
+  owner with the discriminating facts before any code fix.
+
+RESULT (2026-09-17, same day — P2: FALSIFIER FIRED)
+: The crash REPRODUCED under instrumentation (q8 arm, exit -1073740791,
+  illegal access in pass 2, detected at layer 3 / slot 0 / chunk 130 — the
+  exact recorded signature; f16 arm completed both passes, checker OK,
+  14878 events, new event types ignored). Pass-2 lifecycle facts were
+  emitted for ALL 141 chunks BEFORE the sweep, so the crashing run has a
+  complete pass-2 picture. Measured: mctx=282 (141 chunks x 2 passes),
+  kvview=11280 (141 x 40 x 2) per arm. **Every emitted fact is identical
+  between pass 1 and pass 2:** live_n_kv trajectory (chunk 130 = 144128
+  padded in both), rs_z (-1 continuing in both), set selection (chunk_id=1,
+  n_out=0 in both), baked cache_k/cache_v view shapes ne[2] (all chunk x
+  layer sites), and KV storage + view device pointers (identical — no
+  reallocation, no cell relocation, no defrag across the clear).
+  => The stale-reference family AS DEFINED (stale shapes, stale pointers,
+  changed set selection, changed live n_kv) is NOT the mechanism. The
+  crash cannot be explained by anything this instrument reaches; per the
+  pre-registered matrix the task stops here and escalates.
+  Notes: (a) the instrument is expensive on this shape (~40% wall overhead
+  from 11.3k per-layer graph walks per run; f16 walls 149.5/142.0 s vs the
+  D1 references 134.5/140.8 s) but preserved the crash — gross timing
+  sensitivity is excluded at the applied perturbation level; (b) pass 1's
+  KV buffer starts as fresh cudaMalloc garbage while pass 2's starts
+  memset-zeroed — a data-dependent mechanism would predict pass 1 to be
+  the fragile pass, the opposite of what happens; (c) remaining suspects
+  (un-instrumented, for the owner to prioritize): recurrent-side state
+  across the boundary (GDN cells/s_copy bindings the hybrid clear resets
+  vs what the prebuilt zero-views assume), scheduler CUDA-graph
+  capture/exec-update state persisting across alloc_graph after the clear,
+  and async-feed/copy-stream interaction with the cleared cells; a cheap
+  discriminator is --kv-cache q4 (crash => quantized-KV path generally,
+  survive => q8-specific). Evidence: gplr41-q8-mctx.jsonl/.log,
+  gplr41-f16-mctx.jsonl/.log, tools/analyze-gplr41.py,
+  tools/run-gplr41-mctx-arms.ps1.
+
+#### T-GPLR-42 (discriminator, 2026-09-17): q4-KV at the 144k pass-2 shape — quantized-KV-general vs q8-specific
+
+Status: done (row 1 — QUANTIZED-KV-GENERAL)
+Depends on: T-GPLR-41 (mctx recon REFUTED the stale-reference family; this is
+its cheapest listed discriminator)
+Commit: (fill on completion)
+
+Goal
+: Decide whether the pass-2 crash needs q8 specifically or any quantized KV.
+  Arms (B1 shape, u1024, 3 slots, mmap-registered, af=1, --pp-repeat 2, NO
+  mctx recon): `q4` (the discriminator) + an adjacent `q8` confirm arm in the
+  SAME mutex hold, so a q4 survival cannot be blamed on environment drift.
+
+Pre-registered interpretation (falsifiable)
+: q4 CRASHES in pass 2 (with q8 also crashing) => the trigger is the
+  quantized-KV path generally; q8-specific hypotheses (block-scale handling)
+  drop out; suspicion shifts to shared quantized-KV machinery across the
+  clear (view/buffer handling, quantized attention path).
+: q4 SURVIVES both passes (with q8 crashing adjacently) => the mechanism is
+  Q8-SPECIFIC: inside vendored q8-KV code engaged by the layer-major pass
+  across the boundary (Q8_0 32-wide block handling, scale layout,
+  dequant-kernel interaction). Fix targets the q8 path.
+: q4 survives AND q8 fails to crash => environment changed; re-establish
+  the q8 repro before any conclusion (discriminator aborted).
+: Failure isolation only; no performance claims from any arm.
+
+Validation
+: tools/run-gplr42-q4disc-arms.ps1 under the GPU mutex; analyzer
+  tools/analyze-gplr40.py for pass/crash positions; checker on surviving
+  traces.
+
+Escalation condition
+: Third row of the matrix (q8 repro lost) — stop and report.
+
+RESULT (2026-09-17, same day — row 1: q4 CRASHES, trigger is QUANTIZED-KV-GENERAL)
+: Both arms ran under one mutex hold on the free GPU. q4 arm: pass 1
+  complete (143,013.2 ms, 1006.9 tok/s), pass 2 CRASHED — illegal memory
+  access at chunk 130, layer 3, slot 0, generation 16 (analyzer line: `pp
+  summaries: 1 (crashed/incomplete) | last launch: chunk 130 layer 3 slot 0
+  gen 16`); q8 confirm arm: identical crash at the identical position
+  (144,543.2 ms pass 1). Byte-identical signatures; KV placement CUDA0
+  (791.72 MiB q4 / 1495.47 MiB q8).
+  => By the pre-registered matrix the trigger is the QUANTIZED-KV path
+  generally, NOT q8-specific block handling. Suspects narrow to machinery
+  shared by Q4_0 and Q8_0 KV but absent for f16, engaged across the pass
+  boundary in the layer-major residency pass: (a) quantized-KV buffer/view
+  handling across clear+refill (e.g. the [TAG_V_CACHE_VARIABLE] transposed-V
+  path differs between quantized and f16 caches), (b) the quantized
+  attention/dequant kernel path interacting with pass-2 graph reuse, (c)
+  buffer-clear semantics on quantized KV buffers. The f16-vs-quantized axis
+  is now the sharpest known fact about this defect.
+  Next discriminator (owner decision): rebuild the per-chunk graph sets
+  between passes (bypasses graph reuse entirely; distinguishes
+  graph-reuse-across-clear from memory-state mechanisms) or bisect the
+  position (why layer 3 / gen 16 / ~37% into pass 2 at every ubatch and
+  every quantization). Evidence: gplr42-q4-disc.{jsonl,log},
+  gplr42-q8-confirm.{jsonl,log}, tools/run-gplr42-q4disc-arms.ps1.
+
+#### T-GPLR-43 (probe, 2026-09-17): graph-rebuild between passes — graph-reuse-across-clear vs memory-state
+
+Status: done (row 1: graph-reuse-across-clear CONFIRMED as the mechanism)
+Depends on: T-GPLR-42 (quantized-KV-general), T-GPLR-41 (lifecycle facts
+identical across passes)
+Commit: (fill on completion)
+
+Goal
+: Decide the last open split: does pass 2 crash because the layer-major pass
+  REUSES prebuilt graph sets across the clear (graph-reuse-across-clear), or
+  because of memory-state the rebuild cannot see (recurrent/GDN cells,
+  scheduler internals)? Mechanism probe: re-run the full prebuild between
+  passes so pass 2 executes against COMPLETELY FRESH graphs (new cgraphs,
+  rebuilt KV views against the post-clear memory), then run the B1 q8 shape.
+
+Implementation (behind --pp-prebuild-per-pass 1, runner flag)
+: In the --pp-repeat pass loop, after the pass-2 memory clear + reset_stats +
+  tel_pp_pass, re-invoke llama_layer_streaming_prebuild(ctx, batch,
+  tg_tokens, st). begin_set's existing rebuild path (find_set match ->
+  res->reset + graph lists cleared + rebuild into the same ctx/slab offsets)
+  makes this safe; no act_bind re-emission occurs on rebuild (bind-count rule
+  preserved); builds0 is advanced to the new build_generation so per-pass
+  phase summaries keep graph_builds = 0 (checker-clean). Refused under --mtp.
+
+Pre-registered interpretation (falsifiable)
+: REBUILT-ON SURVIVES both passes (adjacent rebuilt-off q8 crashes) =>
+  graph-reuse-across-clear IS the mechanism: something the rebuilt graphs
+  re-derive (KV views/copy nodes bound to the live cache) fixes pass 2. FIX:
+  rebuild (or equivalent safe rebind) between passes in the residency path;
+  regression = B1 + C1 with the fix surviving with checker OK, f16 control
+  unchanged; performance cost of the rebuild measured and reported.
+: REBUILT-ON STILL CRASHES at the same position => memory-state mechanism
+  (the rebuild cannot see it); escalate to recurrent-side instrumentation
+  (T-GPLR-41 suspect 2); no fix attempted.
+: Rebuild itself fails loudly (prebuild error) => record and stop.
+
+Validation
+: tools/run-gplr43-rebuild-arms.ps1 (rebuilt-on + rebuilt-off q8, B1 shape,
+  one mutex hold); analyzer tools/analyze-gplr40.py; checker on any
+  surviving trace.
+
+Escalation condition
+: Second row (rebuild cannot fix) — stop and report before any fix.
+
+RESULT (2026-09-17, same day — row 1: REBUILT-ON SURVIVES, mechanism CONFIRMED)
+: One mutex hold, adjacent arms, B1 q8 shape. **q8-rebuild (pass 2 against
+  FRESH graphs): SURVIVED both passes** (gen 28 = complete pass 2; pass 1
+  78,531.3 ms / 1833.7 tok/s, pass 2 111,790.7 ms / 1288.1 tok/s; rebuild
+  cost 7.4 ms, build_generation 3 -> 6). **q8-norebuild control: CRASHED at
+  the byte-identical signature** (chunk 130, layer 3, slot 0, gen 16).
+  => By the pre-registered matrix, graph-reuse-across-clear IS the
+  mechanism: pass 2 fails only while executing graphs whose executed state
+  was derived at prebuild time against the PRE-clear cache. Combined with
+  T-GPLR-41 (view shapes, storage pointers, set selection, live n_kv all
+  identical across passes), the stale element is something the rebuild
+  re-derives that metadata does not capture (executed/captured graph state
+  bound to the pre-clear cache) — on quantized KV only (f16 survives
+  reuse). The 7.4 ms rebuild is timing-negligible, and T-GPLR-41 already
+  excluded gross-timing effects at ~40% overhead.
+  Probe artifact (fix prerequisite): the rebuilt arm exited 1 — its trace
+  was rejected by --check-telemetry with 564 act_bind violations: the
+  rebuild re-emitted every act_bind (282 pairs x 2). The binds describe
+  the slab layout, unchanged by a rebuild; re-emission is redundant.
+  FIX (T-GPLR-43 fix, next block): (1) emit act_bind only when a set is
+  newly created (rebuild is silent); (2) make the per-pass rebuild the
+  DEFAULT for --pp-repeat > 1 (explicit --pp-prebuild-per-pass 0 restores
+  the single-prebuild behavior for evidence reproducibility).
+
+  FIX RESULT (2026-09-17): the 564-violation artifact persisted through the
+  first fix build; forensics traced it to a SECOND emitter — the pw-mode
+  act_bind block in llama-context.cpp (T-Q38PW-00), which fires on every
+  prebuild and pw_probe is ON by default in layer-major (main.cpp), so
+  begin_set's own guard was inert in these runs and the "per-pass double
+  emission" was the pw emitter re-emitting all chunk binds on the pass-2
+  prebuild (141 chunks x 2 slabs x 2 passes = 564; the 4k diag showed
+  8 x 2 x 2 = 32). Fix applied: the pw emitter now fires once per process
+  (pw_bind_emitted latch); the diag [ls-set] stderr probe was removed as
+  residue. REGRESSION (one mutex hold, B1 q8 / C1 q8-tail / D1 f16, default
+  per-pass rebuild): ALL THREE SURVIVE both passes (last launch chunk 140,
+  layer 39, gen 28 in each) with strict checker OK and zero act_bind
+  violations. B1 walls 78,102.6 ms / 1843.7 tok/s (pass 1), 111,000.5 ms /
+  1297.3 tok/s (pass 2). The q8 pass-2 crash is FIXED; f16 behavior is
+  unchanged. The known checker rule "handoff_mode auto-on but no handoff
+  events" fires only in TG-less probe shapes (--tg-tokens 0), documented in
+  T-GPLR-39; all regression arms ran with TG so it does not apply.
 
 #### T-GPLR-38 addendum (2026-09-17): ubatch A/B at the middle shape — 100k tokens, u1024 vs u2048
 
