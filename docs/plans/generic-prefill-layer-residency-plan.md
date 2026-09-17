@@ -1487,6 +1487,8 @@ Recon result (measured, 2026-09-17)
 
 #### T-GPLR-40 (bisect, 2026-09-17): the 144k pass-2 crash — tail chunk vs long-context+repeat
 
+Commit: outer 0a6e54b (bisect scripts + stock-probe attribution + docs)
+
 The 144k A/B (T-GPLR-38 addendum) crashed deterministically in pass 2 of
 `--pp-repeat 2` at the same position in both arms (layer 3, slot 0, generation
 16; ~37% into the pass). Both shapes shared one new property: a 640-token TAIL
@@ -1525,6 +1527,8 @@ Bisect result (measured, 2026-09-17): TAIL EXONERATED — trigger is q8 KV + lon
   of --pp-tokens.
 
 #### T-GPLR-40 addendum (2026-09-17): ownership test — stock libllama, no residency path
+
+Commit: outer 0a6e54b (tools/gplr40-stock-probe.cpp + build/run scripts)
 
 Design
 : A standalone probe (no layer-streaming, no residency module — plain
@@ -1595,7 +1599,7 @@ RESULT (2026-09-17, same day)
 
 Status: done (falsifier fired — P2 recorded; escalated per plan)
 Depends on: T-GPLR-40 addendum (stock probe => RESIDENCY-OWNED verdict)
-Commit: (fill on completion)
+Commit: outer 0a6e54b (instrument + analyzer + scripts)
 
 Goal
 : Before fixing the q8-KV 144k pass-2 crash, prove its mechanism with
@@ -1685,7 +1689,7 @@ RESULT (2026-09-17, same day — P2: FALSIFIER FIRED)
 Status: done (row 1 — QUANTIZED-KV-GENERAL)
 Depends on: T-GPLR-41 (mctx recon REFUTED the stale-reference family; this is
 its cheapest listed discriminator)
-Commit: (fill on completion)
+Commit: outer 0a6e54b (scripts)
 
 Goal
 : Decide whether the pass-2 crash needs q8 specifically or any quantized KV.
@@ -1743,7 +1747,7 @@ RESULT (2026-09-17, same day — row 1: q4 CRASHES, trigger is QUANTIZED-KV-GENE
 Status: done (row 1: graph-reuse-across-clear CONFIRMED as the mechanism)
 Depends on: T-GPLR-42 (quantized-KV-general), T-GPLR-41 (lifecycle facts
 identical across passes)
-Commit: (fill on completion)
+Commit: nested 0ffd0ab14, outer 0a6e54b
 
 Goal
 : Decide the last open split: does pass 2 crash because the layer-major pass
