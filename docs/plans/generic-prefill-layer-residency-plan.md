@@ -986,6 +986,563 @@ still pay at the crowded-VRAM shape? RUN; depth does NOT pay there.
   (optimum stays in the 2-3 slot range) and the remaining lever is the compute
   side, which is 92% of that wall.
 
+### T-GPLR-36: Long-context PP residual — what is the ~10 s that is neither compute nor engine time?
+
+Status: in-progress (2026-09-17) — RUN; PREDICTION FALSIFIED IN ITS DETAIL. The
+per-graph-setup hypothesis is answered NO (278.6 ms per pass = 0.017 ms/launch =
+3.0% of the residual), and the residual is per-launch HOST work outside the
+graph window: other 4,516 ms (48.3%, unnamed yet), patch 3,402 ms (36.4%,
+redundant per-launch chunk patching), slot 1,065 ms (11.4%), setup 3.0%,
+graph_call 0.2%. Ledger closure exact (0.00%).
+Depends on: T-GPLR-35 (the recon + slot-depth arms whose traces carry the
+residual), T-GPLR-25 (async feed), T-GPLR-29 (pinned staging)
+Commit: (fill on completion)
+
+Goal
+: Name the warm 200k-token PP residual. At 3 slots the recorded pass is
+  wall 146,030 ms, compute 134,592 ms (92.2%), consumer wait 36.5 ms — and
+  wall - compute - pure DMA = 10,183 ms (0.65 ms/launch over 15,640 launches)
+  that no recorded instrument attributes. The owner's question: is it
+  per-graph setup repeated across those 15,640 launches?
+
+Known evidence (measured from the existing traces, no GPU time)
+: * Per-graph setup is ALREADY FALSIFIED as the explanation: `setup_us`
+  (sched reset + `ggml_backend_sched_alloc_graph`, the exact quantity the
+  question names) is median 13-18 us/launch, summing to ~0.35 s per pass
+  (3.4% of the 10,183 ms residual). `graph_builds` is 0 in every pp summary:
+  the graphs are prebuilt once and never rebuilt.
+* `prepare_chunk` (input-snapshot memcpy + FA causal/KV-bound patching) IS
+  timed already, via `total_patch_us`: 7,108.8 ms for the whole 200k run
+  (~3.55 s per pass = ~35% of the residual), and only ~0.24 s for the whole 4k
+  run. It is called once per launch (15,640 times per pass) even though its
+  inputs are per-chunk, not per-layer.
+* The sweep window (first layer compute -> last layer compute end) is
+  145,010 of the 146,030 ms wall, so the embed / preload / output phases
+  together are ~1.0-1.4 s: the residual lives INSIDE the layer sweep.
+* The pass is bimodal: the 30 non-attention layers are flat ~3.5 ms/launch at
+  every context position, while the 10 full-attention layers (every 4th) ramp
+  3.9 -> 40.6 ms/launch as the KV grows. Those 10 layers are ~69% of the
+  134.6 s compute: the long-context wall is attention-bound.
+* The executor synchronises after every launched graph
+  (`ggml_backend_sched_graph_compute_async` + `sched_synchronize`), so any host
+  work between launches is exposed on the wall by construction.
+
+Prediction (pre-registered before the ledger run)
+: The ledger closes on `sweep_us`: patch + setup + compute + graph_call + slot
+  + other = sweep within ~1%. `graph_call_us` — the currently UNTIMED part of
+  `run_graph` (the per-launch src-pointer snapshot save/restore, O(n_nodes x
+  GGML_MAX_SRC), plus call overhead) — is the largest unattributed host bucket
+  and accounts for at least half of the remaining ~6.3 s. `other_us` (loop +
+  telemetry) stays under ~1 s per pass.
+  FALSIFIER: if `graph_call_us` and `other_us` are both under ~1 s per pass
+  while closure holds, then the residual is NOT host bookkeeping at all — the
+  remaining witness would be GPU idle inside the compute window's own sync
+  wait, and the next lever is a deep-submit schedule, not host-work removal.
+
+Result (measured, 2026-09-17; trace build/llama-cuda/gplr36-ledger-200k.jsonl,
+checker OK, pipeline gate EXIT 0, one mutex hold)
+: Warm pass: wall 141,847.9 ms (1,409.96 tok/s) vs the recorded 146,030 ms
+  reference (a ~2.9% session-to-session spread); wait 36.5 ms. Ledger closes
+  exactly (0.00%): sweep 140,807.7 = compute 131,523.3 + other 4,516.3 +
+  patch 3,402.3 + slot 1,065.1 + setup 278.6 + graph_call 22.1 ms. Per launch
+  (16,422 launches): compute 8.009, other 0.275, patch 0.207, slot 0.065,
+  setup 0.017, graph_call 0.0013 ms. Per-graph setup is 3.0% of the 9,343.8 ms
+  residual -> the hypothesis the owner asked to test is FALSIFIED; graph_call
+  (src-pointer snapshot) 0.2% -> the pre-registered prediction was wrong about
+  both graph_call (predicted largest, measured 0.022 s) and other (predicted
+  < 1 s, measured 4.52 s). The falsifier did not fire: the residual IS host
+  bookkeeping, but its largest piece (`other`) is still unnamed.
+  Side finding: the ledger's compute bucket exceeds the summary's
+  total_compute_us by 274 ms because the embed and output loops execute graphs
+  that no layer stat accumulates — that 0.27 s of 'residual' is real compute.
+  Consequence for the wave the owner saw in the GPU chart: the per-launch sync
+  exposes 0.564 ms of host prep per launch (duty 93.4%), beating with the
+  bimodal layer cost; pre-staging the next layer cannot fix it (staging is
+  already hidden: wait 36.5 ms, slot block 11.4% of the residual).
+  Next levers, in measured order: (1) name and cut `other` (4.5 s);
+  (2) make `prepare_chunk` per-chunk instead of per-launch (3.4 s, ~97%
+  redundant); (3) deep-submit chunk graphs (remove the per-launch sync) so host
+  work overlaps compute — together worth up to ~9.3 s of a 141.8 s pass (-6.5%)
+  at this shape, with no extra VRAM.
+
+Scope
+: Instrumentation + one measurement arm + documentation. The buckets are host
+  `ggml_time_us()` reads on an existing loop; no execution order, routing,
+  arithmetic, quantization, or default path changes.
+
+Non-goals
+: No optimization in this task (no removal of the redundant per-launch
+  patching, no deep-submit scheduler, no default change). Those are separate
+  tasks, each needing its own pre-registration and A/B.
+
+Implementation steps
+: 1. Add the ledger to `llama_context::layer_major_pp`: timers around
+  `prepare_chunk`, the `run_graph` call (minus its own setup/compute), the
+  per-layer slot block, and the four phase loops; accumulate `compute`,
+  `setup`, `patch`, `graph_call`, `slot`, `launches`.
+  2. Emit one `host_ledger` JSON line per pass, gated on `--pp-recon` (unknown
+  events are ignored by the checker, so existing traces and rules are
+  untouched).
+  3. Build; host-validate (usage + refusal paths unchanged).
+  4. Run one arm at the charter shape (200k tokens, 262k F16 KV, 3 slots,
+  layer-major, ubatch 512, af=1, pinned, `--pp-repeat 2`, `--pp-recon 1`) under
+  the GPU mutex with the strict checker, then read the ledger.
+
+Acceptance criteria
+: * `host_ledger` appears once per pp pass with `launches == ubatches x
+  layers_run`.
+* Closure holds: |patch + setup + compute + graph_call + slot + other -
+  sweep| <= 1% of sweep.
+* The buckets are reported per pass, and the verdict on the per-graph-setup
+  hypothesis (already falsified from `setup_us`) is restated with the ledger's
+  independent numbers.
+* Both strict checkers (telemetry) pass, and the 200k wall is within the
+  expected session-to-session spread of the recorded 146,030 ms.
+
+Validation commands
+: * `tools/run-gplr36-ledger-locked.ps1` (one mutex hold; ~10 min: one 200k
+  arm, 2 passes at ~146 s each, plus load).
+* `python tools/analyze-gplr36-ledger.py build/llama-cuda/gplr36-ledger-200k.jsonl`
+* `llama-layer-streaming.exe --check-telemetry <trace>` (already inside the
+  runner).
+
+State/document updates
+: `docs/currentstate.md` entry with the measured bucket table, the verdict on
+  the per-graph-setup question, and the falsifier status; this block's status
+  and Commit field.
+
+Escalation condition
+: If the ledger fails to close (buckets do not sum to the sweep within 1%),
+  stop and record the discrepancy rather than publishing a decomposition.
+
+### T-GPLR-37: direct mmap-sourced staging — remove the CPU hop from bank staging
+
+Status: in-progress (2026-09-17) — PROBE FEASIBLE; V1 (per-bank churn)
+**FALSIFIED AT 4k** (warm regression -15.4% at 2 slots, -23.8% at 3); V2
+(churn-free, register once at init — see addendum 2 below) **CONFIRMS the churn
+mechanism and WINS at 4k at both depths** (warm -23.3% at 2 slots, -15.4% at 3,
+paired against adjacent pinned controls), at a measured cost of 17.23 GiB of
+pinned file pages. Not promoted to default; owner decision.
+
+V1 detail (kept as the falsified half of the family) The hop was removed from the accounting (host submit 1587.8 ->
+1222.3 ms/pass at 2 slots; `slot` bucket 1315.6 -> 1153.3) but per-launch host
+windows grew more (`setup` 11.2 -> 227.8 ms at 2 slots; `compute` 1329.5 ->
+1845.1 / 1581.4 -> 2441.7 ms), with bank DMA windows unchanged (31.48 ms pure)
+and no starvation (3-slot wait 36.5 ms). Indicated mechanism: per-bank
+register/unregister churn over ~111k pages x 80 registrations (34.46 GiB
+cumulative). Cold passes look 17-23% better but are CONFOUNDED by arm order
+(file cache warmed by the earlier arms) and are not claimed as a result. Next
+and last test of the family: register ONCE at init (whole mapping / all exec
+spans, ~17 GiB pinned, T-GPLR-31 proved 18 GiB grantable) so there is no churn;
+falsifier = the `setup` inflation persists without churn, which closes the
+family.
+Depends on: T-GPLR-29/30/31 (pinned staging + pool), T-GPLR-33 (shared
+`stage_members` submission helper), T-GPLR-35 (the recon that measured the hop),
+T-GPLR-36 (the ledger that showed no host bucket contains the hop, because it
+runs on the async-feed worker)
+Commit: (fill on completion)
+
+Goal
+: Remove the CPU hop from bank staging without giving up pinned transfer speed.
+  Today every member is `memcpy`'d into a pinned staging buffer and the DMA reads
+  that copy; `--copy-source direct` skips the copy but DMAs from pageable memory
+  at 9.59 GB/s. The third option does not exist yet: page-lock the model's own
+  mapped source pages and DMA straight from the mapping.
+
+Probe evidence (measured, tools/gplr37-mmapreg-probe.cu, one mutex hold, 452.5
+MiB window of the real MoE GGUF at offset 1 GiB; every arm verified byte-for-byte
+against the file window)
+: * A pageable mmap DMA (= `--copy-source direct`): 49.47 ms, 9.59 GB/s
+  * B registered mmap DMA (`cudaHostRegister` on the FILE-BACKED mapping):
+    **32.86 ms, 14.44 GB/s = the pinned ceiling**, registration cost 0.16 ms
+  * C the current path: CPU hop 20.22 ms + DMA 32.86 ms = 53.08 ms per bank
+  So the hop is 20.22 ms/bank (~809 ms per 40-bank pass) and a registered source
+  both deletes it and lowers the transfer below the pageable path.
+
+Prediction (pre-registered before the A/B)
+: Mechanism: `copy_complete.host_submit_us` per bank collapses from ~39 ms to
+  ~0.2 ms, one `mmap_register` event fires per bank fill (~452 MB each), and the
+  bank DMA windows stay pure (~31.4 ms). Wall at **3 slots: no change beyond
+  noise (+-3%)** — the recorded 3-slot account already closes as wall 2843 ms ~
+  compute 1611 + pure DMA 1255 with consumer wait 225 ms, i.e. the hop is hidden
+  behind compute at that depth. Wall at 2 slots: staging (hop+DMA) exceeded the
+  per-bank compute there (consumer wait 734 ms), so the candidate may win up to
+  ~5%.
+  FALSIFIER: a >= 0.3 s (>=10%) warm-wall drop at 3 slots means the hop was on
+  the critical path after all and the "already hidden" reading is wrong; a >= 5%
+  REGRESSION at either depth means register/unregister churn per bank costs more
+  than the hop it removes.
+
+Scope
+: An experimental copy-source mode and its measurement. `--copy-source
+  mmap-registered` registers the page-aligned span covering a package's member
+  sources, caches it on the slot, unregisters it before that slot stages a
+  different package (safe: a slot is only re-staged after the previous
+  generation's consumer completed), and unregisters at slot teardown. The mode
+  allocates no staging buffers at all and is mutually exclusive with `--pp-pool`
+  (which requires the pinned path and refuses loudly).
+
+Non-goals
+: No default change; no removal of the pinned path; no change to routing,
+  arithmetic, quantization or KV handling; no attempt to keep whole-run
+  registrations alive (that would pin the full ~18 GB bank set permanently —
+  measured as grantable by T-GPLR-31 but a much larger RAM trade).
+
+Acceptance criteria
+: * Every arm's strict checker passes and the mmap-registered traces carry one
+  `mmap_register` event per bank fill with the expected bytes.
+* The hop collapses in the accounting (per-bank host submit window ~0.2 ms vs
+  ~39 ms) with bank DMA windows unchanged.
+* The warm-wall verdict at 2 and 3 slots is recorded against the pre-registered
+  prediction and falsifier, with the VRAM/RAM price stated (no staging buffers
+  in this mode; pinned file pages held instead, bounded by n_slots x ~452 MB).
+
+Validation commands
+: * `tools/run-gplr37-probe-locked.ps1` (stage-1 feasibility, ~10 s of GPU work)
+* `tools/run-gplr37.ps1` (four 4k arms, one mutex hold, ~12 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37-{pin,reg}-s{2,3}.jsonl`
+
+State/document updates
+: `docs/currentstate.md` entry with the probe table, the A/B verdict against the
+  prediction, and the RAM/RAM trade; this block's status and Commit field.
+
+Escalation condition
+: If registration fails on the real model (file-backed mapping refused, or the
+  span spans far-apart members and pinning explodes the footprint), record the
+  failure and stop — the pinned path stays the answer and the mode is withdrawn.
+
+#### T-GPLR-37 addendum 2 RESULT (2026-09-17): churn-free variant — mechanism CONFOUNDS CONFIRMED, large warm win, prediction wrong
+
+Measured verdict (four adjacent arms, one mutex hold, 4k anchor, ubatch 512,
+layer-major, kv q8, af=1, `--pp-repeat 2`; all four strict checkers OK; traces
+`build/llama-cuda/gplr37b-*.jsonl`; analyzer `tools/analyze-gplr37.py`)
+: * Warm pass: **pin-s2 3490.2 ms / 1173.6 tok/s -> ron-s2 2676.9 ms / 1530.1
+  tok/s (-813.3 ms, -23.3%, +30.4% tok/s)**; **pin-s3 2706.0 ms / 1513.7 ->
+  ron-s3 2290.6 ms / 1788.2 tok/s (-415.5 ms, -15.4%, +18.1%)**.
+  * FALSIFIER DID NOT FIRE: `setup` returned to the clean band (13.0 -> 8.2 ms at
+  2 slots, 12.1 -> 7.9 at 3, vs the churn arms' 227.8 / 134.7), `mmap_register`
+  fired 40x with `mode="init-once"` and **40/40 before the first
+  `layer_compute`** (churn: 80 events, 34.46 GiB, 2/80 before), and one
+  `mmap_register_init` reports 18,500,517,888 B (17.23 GiB) pinned in 1.6 ms
+  pre-timed. Churn was the whole cause of the V1 regression.
+  * Mechanism: PP hop median 45.24 -> 0.06 ms/bank (s2) and 23.43 -> 0.11 (s3);
+  `slot` bucket 1620.7 -> 991.2 ms (s2) and 582.3 -> 69.4 (s3); bank DMA windows
+  pure (31.38-31.48 ms = 1.00x); compute ~unchanged (1363.6 -> 1297.2 at s2); TG
+  unaffected (76.6 vs 76.75 tok/s). Greedy 96-token `--tg-text` byte-identical
+  between pinned and mmap-registered at both depths (identity sanity check only,
+  NOT the semantic-QA gate).
+  * **Prediction WRONG:** I pre-registered "within +-3%, gain <=5% at 2 slots";
+  measured -23.3% / -15.4%. The pre-registered reading that the hop is "already
+  hidden behind compute at 3 slots" was false at this shape.
+  * Headline vs history: ron-s3 2290.6 ms is the fastest warm 4k layer-major pass
+  recorded (previous best 2706 / 2811.9 / 2843.2), and **ron-s2 2676.9 ms matches
+  pin-s3 2706.0 ms with one slot fewer (-498 MiB VRAM)** — depth-3 pinning is not
+  needed for this shape under this mode.
+  * Price: 17.23 GiB of pinned file pages for the run (vs 0.9-1.4 GiB of pinned
+  staging buffers for the pinned path); no staging buffers allocated. The side RAM
+  monitor's window missed the arms (started before the ~26 min mutex wait, stopped
+  after ~74 s) — its CSV is NOT cited as evidence; the 17.23 GiB is the runner's
+  own pre-timed measurement.
+  * Cold-pass numbers remain CONFOUNDED in the candidates' favour (they page in
+  the whole model before the timed pass) and are not claimed.
+  * Gate change: `tools/check-gplr35-pipeline.py` paired mode was depth-only and
+  its absolute wait/wall fraction false-FAILed the faster arm; it now accepts a
+  same-depth pair with a different copy source, anchors wait (ms, <= control x
+  1.25 + 50) and exposure (<= control + 350) to the control, keeps the pure-DMA
+  window check, and FAILs an identical-configuration pair. Re-validated on six
+  controls (depth pair PASS 1.188x; reversed FAIL 0.842x; churn arms FAIL 0.846x;
+  ron pairs PASS 1.304x / 1.181x; identical FAIL).
+  * Not a default change and not a fitness claim: the owner decides whether a
+  17.23 GiB pinned-RAM trade for -23% warm 4k PP is acceptable, and whether the
+  next step is the crowded-VRAM (262k KV) shape where the charter's decisive case
+  lives.
+
+#### T-GPLR-37 addendum 2 (2026-09-17): churn-free variant — register every span ONCE at init
+
+Motivation (from the falsified V1)
+: V1's regression had exactly one measured candidate cause: 80 register/unregister
+  cycles over ~111k pages each (34.46 GiB of churn per run) landing inside the
+  per-launch host windows (`setup` 11.2 -> 227.8 ms at 2 slots; `compute` +0.5 to
+  +0.9 s). `mmap-registered` therefore becomes the churn-FREE mode: one
+  `register_all_pkg_sources` call runs after the prebuild and BEFORE the timed PP
+  (pre-timed, so its cost is setup and cannot pollute the pass wall), registering
+  the page-aligned source span of every executed layer once; staging then reads
+  the cached per-layer span and never touches page tables during the pass. The
+  falsified per-bank churn stays reproducible as `--copy-source
+  mmap-registered-churn` so the V1 evidence remains re-runnable.
+
+Pre-registered prediction (written before the run)
+: * Mechanism: 40 `mmap_register` events with `mode="init-once"`, ALL before the
+  first `layer_compute` of pass 1, plus one `mmap_register_init` carrying the
+  total bytes and the pre-timed cost; no registration inside a pass.
+  * Ledger: `setup` returns to the pinned control's band (~11-12 ms) and
+  `compute` returns to the control's band (1329 ms at 2 slots / 1581 at 3), with
+  bank DMA windows still pure (~31.4 ms).
+  * Wall: within +-3% of the pinned control at BOTH depths; a gain is expected
+  only at 2 slots (<= 5%), where the hop was partly exposed rather than hidden.
+  * FALSIFIER: if `setup` still reads 100-230 ms without churn, the cost is
+  inherent to file-backed registered pages rather than to churn, and the
+  mmap-registered family closes. A >= 5% warm regression at either depth
+  rejects the variant regardless of mechanism.
+  * Price to report: the pre-timed registration phase and the pinned footprint
+  (expected ~17 GiB of file pages held for the run — the RAM cost of removing
+  churn, and the reason this mode is opt-in).
+
+Known confound, stated up front
+: The candidate arms pin (and therefore page in) the whole model before their
+  timed pass, so any COLD-pass advantage is confounded in the candidate's favour
+  (V1 measured cold 17-23% better and that was not claimed either). The WARM
+  comparison in adjacent pin/ron pairs is the verdict target.
+
+Validation commands (addendum 2)
+: * `tools/run-gplr37b.ps1` (four adjacent arms + strict checkers + analyzer +
+  pipeline gate, one mutex hold, ~15-20 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37b-{pin,ron}-s{2,3}.jsonl`
+* `python tools/check-gplr35-pipeline.py <ron trace> --baseline <pin trace>`
+
+#### T-GPLR-37 addendum 3 RESULT (2026-09-17): crowded shape measured — prediction CONFIRMED, win does not transfer
+
+Measured verdict (four adjacent arms, one mutex hold, all strict checkers OK;
+traces `build/llama-cuda/gplr37c-*.jsonl`; analyzer `tools/analyze-gplr37.py`;
+pipeline gate s2/s3 both PASS paired)
+: * Warm pass: **pin-s2 142,165.5 ms / 1406.8 tok/s -> ron-s2 141,853.7 /
+  1409.9 (-311.8 ms, -0.22%)**; **pin-s3 141,666.6 / 1411.8 -> ron-s3 141,134.4 /
+  1417.1 (-532.2 ms, -0.38%)**. Both within the pre-registered <= ~1% noise band;
+  neither falsifier branch fired.
+  * Mechanism confirmed where it can be seen: per-bank hop 44.01 -> 0.08 ms (s2)
+  and 44.47 -> 0.13 ms (s3); `slot` bucket 1759.0 -> 1280.6 (s2) and
+  **637.3 -> 70.3 ms (s3)**; bank DMA windows pure (31.5-31.6 ms = 1.00x);
+  compute/patch/other/setup unchanged. The hop is deleted; the wall is 92.5%
+  compute and does not care.
+  * RAM (measured by the fixed monitor, whole-run window): min free system RAM
+  **19,447 MiB** of 61.7 GiB with 17.23 GiB pinned + ~5 GiB spilled KV; max
+  process WS 23,458 MiB. No pressure event; no eviction/trim observed.
+  * Consequence: the churn-free mmap-registered mode is a SHORT/AMORTIZED-CONTEXT
+  lever (staging on the critical path), not a long-context one; at 200k it costs
+  17.23 GiB pinned for ~0.3% wall. Default posture unchanged (pinned + depth for
+  long context; mmap-registered opt-in); a shape-aware mode switch is a possible
+  later owner decision, not made here.
+
+#### T-GPLR-37 addendum 3 (2026-09-17): the crowded-VRAM shape — 200k tokens on 262k F16 KV, pinned vs mmap-registered
+
+Motivation
+: The charter's decisive case is PP under VRAM/RAM crowding. Addendum 2 measured
+  the churn-free win at the 4k shape (-23.3% warm at 2 slots, -15.4% at 3) for
+  17.23 GiB of pinned file pages. This addendum tests whether that win survives
+  where staging is amortized differently: at 200k tokens each bank serves ~391
+  chunks, the 4k-measured depth effect had already collapsed to <=1% (T-GPLR-35
+  addendum 2), and the host-spilled KV (5.0 GiB f16, 10 full-attention layers at
+  262144 ctx) plus the 17.23 GiB pinning meet on the host for the first time
+  (61.7 GiB total system RAM).
+
+Shape (identical to the recorded 200k references, unchanged)
+: `--pp-tokens 262144`, `--ubatch 512`, `--kv-cache f16`, `--act-slab-dtype
+  bf16`, layer-major, af=1, `--pp-repeat 2`, `--tg-tokens 0`; control = pinned,
+  candidate = mmap-registered (churn-free), at 2 and 3 slots; four adjacent arms
+  in one mutex hold; ~10 min/pass x 2 passes x 4 arms ~ 80 min budget.
+
+Pre-registered prediction (written before the run)
+: * Mechanism: at this shape the wall is compute-dominated (91%+ measured;
+  T-GPLR-35 addendum 2: slots 2->3->4 moved the wall +0.8% total, wait 36.5 ms).
+  The hop that ron deletes is ~0.9-1.6 s per pass (T-GPLR-37 V1 ledger), i.e. ~1%
+  of the ~147 s wall, and af=1 already hides it behind compute. Expected: warm
+  walls within noise (<= ~1%) at BOTH depths; ron's advantage concentrated in
+  the `slot` ledger bucket and the per-bank host submit, not the wall.
+  * RAM: ron arms pin 17.23 GiB of file pages ON TOP of the ~5.0 GiB spilled KV
+  residency; pinned arms hold only n_slots x 452 MiB of staging buffers. Both
+  fit 61.7 GiB; the monitor's sys_free column records the actual floor.
+  * FALSIFIER: if ron still cuts the 200k warm wall by > 3% at either depth, the
+  "staging is already hidden at long context" reading is wrong and the mode is
+  a long-context win too. A warm-wall REGRESSION > 3% would instead indicate the
+  pinning interacts badly with the spilled-KV working set (page-cache pressure).
+
+Validation commands (addendum 3)
+: * `tools/run-gplr37c.ps1` (four adjacent 200k arms + strict checkers + analyzer
+  + paired gates, one mutex hold, ~80 min budget)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37c-{pin,ron}-s{2,3}.jsonl`
+* RAM monitor `tools/monitor-mem-gplr36.ps1` (fixed: process-anchored window +
+  sys_free column) writes `build/llama-cuda/gplr37c-mem-monitor.csv`
+
+### T-GPLR-38: ubatch sweep on the 4k anchor — does fewer, fatter launches buy wall time under the current best mode?
+
+Status: run (2026-09-17) — prediction INVERTED at u2048; sweet spot u1024
+(−4.0% warm wall); the falsifier fired informatively: the `other` ledger bucket
+scales with UBITSIZE, not launch count. Verdict recorded in
+docs/currentstate.md; follow-up lever = make the other-bucket work
+chunk-independent (a ~0.7 s/pass prize at u2048), drafted as T-GPLR-39.
+Depends on: T-GPLR-37 addendum 2 (ron = the current best 4k mode; the falsified
+churn arm stays reproducible), T-GPLR-36 (the host ledger that named the
+per-launch overhead), T-GPLR-35 (the pipeline gate and recon)
+Commit: (fill on completion)
+
+Goal
+: The 200k ledger attributed the long-context residual to per-launch host cost
+  (~0.564 ms/launch across patch+other+slot+setup, x15,640 launches) and the 4k
+  warm ron-s3 pass has 336 launches. Fewer, fatter ubatches cut that overhead
+  proportionally AND let each bank serve fewer, longer consumers — but coarsen
+  pipelining granularity (a 1-chunk bank at ubatch 4096 gives the af worker one
+  ~33 ms DMA to hide behind a ~46 ms compute instead of eight). Sweep
+  `--ubatch 512/1024/2048/4096` at 3 slots, ron mode, 4k anchor, and measure
+  where the wall, consumer wait, and peak VRAM actually move.
+
+Scope
+: Measurement only. No default change (`--ubatch` already accepts any value > 0;
+  `--mtp` requires `pp_tokens %% ubatch == 0` and stays out of these arms). Each
+  arm is `--pp-repeat 2` (cold+warm); the warm pass is the verdict target.
+
+Memory expectation (derived from code + measured traces, stated up front)
+: ubatch-dependent VRAM is small: `buf_act` = 24/48/96/192 MiB at
+  512/1024/2048/4096, plus the transient ggml compute workspace (unmeasured
+  term, scales with ubatch). Everything dominant is ubatch-independent: 3 slots
+  x 498 MiB, the 32 MiB bf16 act slabs (sized by pp_tokens, not ubatch), KV.
+  Baseline peak VRAM 3265.56 MiB; expected sweep range roughly 3.3-4.5 GiB —
+  the capacity preflight refuses loudly with exact numbers if a budget cannot
+  hold it.
+
+Pre-registered prediction (written before the run)
+: * Wall: improves monotonically with ubatch but SUB-LINEARLY — host overhead
+  removed is only ~0.19 -> ~0.02 s of a 2.29 s pass, while larger ubatches risk
+  worse pipelining (at ubatch 4096 there is ONE chunk per bank; if its DMA is
+  not hidden, consumer wait grows). Predicted: warm wall 2290 -> ~2050-2200 ms
+  at ubatch 2048; ubatch 4096 flat or worse than 2048 (coarse granularity).
+  * Consumer wait: rises with ubatch (fewer, longer chunks to hide staging
+  behind), most visibly at 4096.
+  * Peak VRAM: rises modestly and monotonically (buf_act + workspace), never
+  near a refusal on this card.
+  * FALSIFIER: if the wall IMPROVES at 4096 vs 2048, the granularity concern is
+  wrong and bigger is strictly better here; if the wall WORSENS at 1024+, the
+  per-launch overhead model is wrong (something else grows faster than the
+  overhead shrinks).
+
+Validation commands
+: * `tools/run-gplr38-ubatch.ps1` (four adjacent ron-s3 arms + 512 control re-run,
+  one mutex hold, ~6 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr38-u{512,1024,2048,4096}.jsonl`
+* paired gates vs the fresh u512 control
+
+State/document updates
+: `docs/currentstate.md` entry with the wall/wait/VRAM table against the
+  pre-registered prediction; this block's status and Commit field.
+
+Escalation condition
+: If an arm refuses on VRAM or the checker rejects a trace, record the shape and
+  stop the sweep at the last clean point.
+
+### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent — the residue that grows with ubatch size
+
+Status: in-progress (2026-09-17) — RECON RUN: attribution complete.
+**`route_us` = 1161.5 of 1152.8 ms `other` (100.8%, closure exact) at u2048**;
+tel 1.0 ms; loop −9.7 ms. The prediction ("route dominates, ubatch-scaled") is
+CONFIRMED; the falsifier did not fire. The growth is route TELEMETRY (device
+readback + host sort inside `tel_route`, 80 events/pass), not the launch loop.
+Remaining: owner decision on the fix class — (a) sample route heads / F16
+readback (diagnostic cost cut ~32-64x), (b) GPU-side sort / drop hash, or (c)
+accept the cost as the price of the exact-routing evidence. Note: u1024 stays
+the measured sweet spot; the u2048 "regression" is largely the telemetry
+measuring itself.
+Depends on: T-GPLR-38 (the sweep that measured `other` 237.9 -> 959.0 ms as
+ubatch 512 -> 4096 at fixed launch count), T-GPLR-36 (the ledger that names the
+bucket)
+Commit: (fill on completion)
+
+Goal
+: T-GPLR-38 measured that the host loop's `other` bucket (loop body + sampled
+telemetry + route lookup per the T-GPLR-36 attribution) GROWS with ubatch size
+while the launch count FALLS: 237.9 ms (u512) -> 484.5 (u1024) -> 962.1 (u2048)
+-> 959.0 (u4096) per warm 4k pass. If that work is made chunk-size-independent
+(precompute once per chunk instead of per (layer, chunk) launch, or hoist out of
+the layer loop entirely where inputs are per-chunk), the u2048 wall could drop
+by up to ~0.7 s toward the ~1.8 s compute floor.
+
+Pre-registered prediction (recon stage, written before the run)
+: * Instrument: the ledger emits `route_us` (tel_route: device->host probs
+  readback + host sort/hash, fires 2 chunks x 40 layers per pass), `tel_us`
+  (remaining sampled telemetry writes, per-launch), and `loop_us` (residue).
+  Closure: other == route + tel + loop.
+  * Prediction: `route_us` dominates the growth and scales with ubatch — each
+  call reads n_expert x n_tok f32 (512 x 2048 = 4 MiB at u2048 vs 1 MiB at
+  u512) and stable-sorts 512 experts x n_tok rows, 80 calls per pass; predicted
+  route_us ~ 500-800 ms at u2048 (vs < 100 ms at u512). `tel_us` and `loop_us`
+  predicted flat (per-launch, launch count fell).
+  * If confirmed: the fix is sampling/decimation of route telemetry (stride is
+  already 10; the cost is the READBACK + SORT, so reduce n_tok per route event
+  or drop the host sort), predicted warm u2048 wall 2510.6 -> ~1850-1950 ms.
+  * FALSIFIER: if `loop_us` (not route) carries the growth, the residue is the
+  per-launch loop body itself and the family closes; if route is large but FLAT
+  across ubatch, the readback is latency- not size-bound and a different fix
+  applies.
+
+Non-goals
+: No change to the staging path, no new copy-source mode, no ubatch default
+  change (1024 stays opt-in until this lands), no TG-path changes.
+
+Recon result (measured, 2026-09-17)
+: * Arm: `tools/run-gplr39-recon.ps1`, u2048 / 3 slots / ron / 4k anchor /
+  `--pp-repeat 2`; checker OK; trace `build/llama-cuda/gplr39-u2048-recon.jsonl`.
+  * Warm ledger: `other` 1152.8 ms = **route 1161.5 (100.8%)** + tel 1.0 + loop
+  −9.7 ms (closure exact by construction; small negative loop = timer jitter).
+  80 route events/pass confirmed in the trace.
+  * Cross-check: u512's `other` was 237.9 ms with the same 80 events but 4x
+  smaller readbacks (1 MiB vs 4 MiB per event, 512 experts x n_tok f32) — the
+  per-event cost scales with n_tok (~14.5 ms/event at u2048).
+  * Flag-combination trap found and documented: `--tg-tokens 0` skips the
+  handoff block entirely while the fit gate can still declare `auto-on`, and the
+  checker then rejects the trace (`auto-on but no handoff events`). The 200k
+  addendum-3 arms escaped only because their fit gate measured auto-OFF. Recon
+  arms must either pass `--tg-tokens > 0` or force `--handoff-mode off`.
+
+#### T-GPLR-38 addendum (2026-09-17): ubatch A/B at the middle shape — 100k tokens, u1024 vs u2048
+
+Motivation
+: The 4k sweep (T-GPLR-38) found u1024 best and u2048 worse, but the u2048 loss
+  was largely the route telemetry measuring itself (T-GPLR-39 recon: 1161.5 ms
+  of 1152.8 ms `other`). At 100k the per-bank chunk count (~24-25) sits BETWEEN
+  the two regimes already measured (8 at 4k, ~391 at 200k), so this shape tests
+  where the crossover actually sits — and doubles as a route-cost scaling data
+  point (same 2-chunk-stride x 40 layers = 80 events/pass, each now n_tok x 512).
+
+Shape
+: `--pp-tokens 100000` (anchor-100000.txt, generated by the semantic-QA needle
+  generator), ubatch 1024 vs 2048, 3 slots, ron (churn-free) mode, kv q8,
+  layer-major, af=1, `--pp-repeat 2`, `--tg-tokens 96` (keeps the handoff path
+  alive; see the T-GPLR-39 trap note).
+
+Pre-registered prediction (written before the run)
+: * 100k is compute-dominated but less extremely than 200k: per-bank compute
+  ~24 chunks x ~8 ms = ~192 ms vs a 31.4 ms staging window — staging ~hidden.
+  Predicted warm walls within ~2% of each other (u1024 ~ 72-75 s, u2048 ~
+  72-76 s); the route telemetry overhead (~1.16 s/pass at u2048, ~0.29 s at
+  u1024, from the same 80 events with 4x-different readbacks) is ~1.6% and
+  ~0.4% of the wall respectively — the same absolute pattern as 4k, diluted.
+  * FALSIFIER: if u2048 beats u1024 by > 2%, the 4k ranking was telemetry-only
+  and fat ubatches genuinely win from 100k up; if u2048 loses by > 4%, the
+  host-side residue still grows super-linearly with ubatch beyond the route
+  term and T-GPLR-39's `loop` bucket needs a second look at this shape.
+
+Validation commands
+: * `tools/run-gplr38-100k.ps1` (two adjacent arms, one mutex hold, ~10 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr38-100k-u{1024,2048}.jsonl`
+
+Run result (2026-09-17): INCOMPLETE — deterministic pass-2 crash in BOTH arms.
+: * The generated anchor tokenized to 144,001 tokens (generator overshoot);
+  arms ran `--pp-tokens 144000` (ctx 144256, KV q8 1.46 GiB, act slabs 0.75 GiB).
+  * Pass 1 completed cold in both arms (u1024 80,631.8 ms / 1785.9 tok/s;
+  u2048 76,972.0 / 1870.8) but the delta is arm-order-confounded and NOT a
+  verdict. Pass 2 crashed identically in both: CUDA illegal memory access at
+  chunk 130/141 (u1024) and 60/71 (u2048), layer 3, slot 0, generation 16 —
+  ubatch-independent and deterministic.
+  * Both shapes end in a 640-token TAIL CHUNK (144000 = 140x1024 + 640 =
+  70x2048 + 640); every earlier `--pp-repeat` run divided the prompt exactly.
+  Candidate cause: pass-boundary reset vs tail-chunk graph/act-slab binding.
+  * Flag traps hit and documented: the needle generator's token target is
+  unverified (overshoot); at this KV size the handoff fit gate is auto-OFF so
+  `--tg-tokens 96` refused (arms used `--tg-tokens 0`); strict checkers reject
+  the crash traces (no warm pass) — correct behavior.
+  * Follow-up (new candidate task): bisect exact-multiple `--pp-tokens
+  143360` (140x1024, no tail) vs 144000 to separate tail-chunk from long-ctx
+  + repeat, then fix the reset path. Route telemetry measured 4.39 s/4.31 s
+  per pass (~3%), extending the T-GPLR-39 scaling line.
+
 ### T-GPLR-31: Locked-RAM probe — does the driver grant a full-pool-size pinned allocation on this box?
 
 Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB pool grantable with large headroom

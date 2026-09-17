@@ -49,6 +49,11 @@ import sys
 
 PURE_MS = 31.37  # measured pure 453 MB pinned H2D window (T-GPLR-34 probe)
 
+# Paired-mode margins (see the docstring note on why wait is compared in ms):
+PAIRED_WAIT_RATIO        = 1.25
+PAIRED_WAIT_SLACK_MS     = 50.0
+PAIRED_EXPOSURE_SLACK_MS = 350.0
+
 # per-slot-count absolute alarms, anchored to the measured references above
 PROFILES = {
     'slots2': {'min_tok_s': 1100.0, 'max_wait_fraction': 0.36, 'max_exposure_ms': 900.0},
@@ -110,6 +115,7 @@ def measure(path):
     m = {
         'path': path,
         'n_slots': run.get('n_slots'),
+        'copy_source': run.get('copy_source'),
         'pp_tokens': run.get('pp_tokens'),
         'slot_vram_bytes': run.get('slot_vram_bytes'),
         'wall_ms': wall_ms,
@@ -130,6 +136,16 @@ def measure(path):
 
 
 def evaluate(m, prof_name, profile, baseline, min_ratio, notes, force_absolute=False):
+    # Paired mode REPLACES the absolute floors when a control is supplied (unless
+    # --force-absolute): the absolute fractions are anchored to one shape/session
+    # and invert when the wall shrinks -- a FASTER candidate can show a larger
+    # wait FRACTION while waiting less in absolute terms. Measured 2026-09-17 on
+    # the T-GPLR-37b ron-s2 arm: 2677 ms wall / 990 ms wait (37.0%) vs its pinned
+    # control's 3490 ms / 829 ms (23.8%) -- the absolute ceiling false-FAILed a
+    # run that is 30% faster. Against a same-session control, the control's own
+    # numbers are the anchor; the pure-DMA window check always applies.
+    if baseline and not force_absolute:
+        profile = None
     fails = []
     print(f'--- {m["path"]}')
     print(f'    slots={m["n_slots"]}  warm wall={m["wall_ms"]:.1f} ms  {m["tok_s"]:.1f} tok/s  '
@@ -165,13 +181,44 @@ def evaluate(m, prof_name, profile, baseline, min_ratio, notes, force_absolute=F
         if m['exposure_ms'] > profile['max_exposure_ms']:
             fails.append(f'exposure {m["exposure_ms"]:+.0f} ms > ceiling '
                          f'{profile["max_exposure_ms"]:.0f} ms [{prof_name}]')
+    elif baseline and not force_absolute:
+        wf = (m['wait_ms'] / m['wall_ms']) if m['wall_ms'] else 0.0
+        print(f'    INFO absolute floors skipped in PAIRED mode: wait fraction {100*wf:.1f}% of '
+              f'wall is normalized to the candidate wall and is not comparable across '
+              f'walls; the paired wait/exposure below and the pure-DMA window are the gates')
     if m['median_window_ms'] is not None and m['median_window_ms'] > MAX_PURE_INFLATION * PURE_MS:
         fails.append(f'bank DMA window {m["median_window_ms"]:.2f} ms inflated past '
                      f'{MAX_PURE_INFLATION:.2f}x pure ({MAX_PURE_INFLATION*PURE_MS:.2f} ms)')
     if baseline:
-        if m['n_slots'] == baseline['n_slots']:
-            fails.append(f'candidate and baseline both ran {m["n_slots"]} slots: a depth '
-                         f'comparison needs different configurations')
+        same_depth  = m['n_slots'] == baseline['n_slots']
+        same_source = m.get('copy_source') == baseline.get('copy_source')
+        if same_depth and same_source:
+            fails.append(f'candidate and baseline are the SAME configuration '
+                         f'({m["n_slots"]} slots, copy-source {m.get("copy_source")}): a '
+                         f'comparison needs a different depth or copy source')
+        elif same_depth:
+            print(f'    INFO pair is an ARM comparison at the same depth (copy-source '
+                  f'{baseline.get("copy_source")} -> {m.get("copy_source")}), not a depth '
+                  f'comparison; verdicts come from the paired criteria below')
+        # Paired criteria: the control's own numbers are the anchor (same session,
+        # file cache, driver and clocks). Wait is compared in MILLISECONDS, not as a
+        # fraction of wall, for the reason in the docstring note above.
+        dw = m['wait_ms'] - baseline['wait_ms']
+        if m['wait_ms'] > baseline['wait_ms'] * PAIRED_WAIT_RATIO + PAIRED_WAIT_SLACK_MS:
+            fails.append(f'paired consumer wait {m["wait_ms"]:.0f} ms > control '
+                         f'{baseline["wait_ms"]:.0f} ms x {PAIRED_WAIT_RATIO} + '
+                         f'{PAIRED_WAIT_SLACK_MS:.0f} ms (starvation grew vs the control)')
+        else:
+            print(f'    paired wait: {m["wait_ms"]:.0f} ms vs control {baseline["wait_ms"]:.0f} ms '
+                  f'({dw:+.0f} ms), ceiling {baseline["wait_ms"]*PAIRED_WAIT_RATIO + PAIRED_WAIT_SLACK_MS:.0f} ms')
+        exp_ctrl = max(baseline['exposure_ms'], 0.0)
+        if m['exposure_ms'] > exp_ctrl + PAIRED_EXPOSURE_SLACK_MS:
+            fails.append(f'paired exposure {m["exposure_ms"]:+.0f} ms > control '
+                         f'{baseline["exposure_ms"]:+.0f} ms + '
+                         f'{PAIRED_EXPOSURE_SLACK_MS:.0f} ms (unexplained overhead grew)')
+        else:
+            print(f'    paired exposure: {m["exposure_ms"]:+.0f} ms vs control '
+                  f'{baseline["exposure_ms"]:+.0f} ms, ceiling {exp_ctrl + PAIRED_EXPOSURE_SLACK_MS:.0f} ms')
         ratio = (m['tok_s'] / baseline['tok_s']) if baseline['tok_s'] else 0.0
         floor = 1.0 - min_ratio
         print(f'    paired vs {baseline["path"]}: {ratio:.3f}x throughput '
@@ -228,6 +275,10 @@ def main():
                                      force_absolute=args.force_absolute)
     if profile_applied:
         scope = f' (absolute profile {prof_name} + baseline)' if baseline else f' (profile {prof_name})'
+        if baseline:
+            scope = f' (paired arm comparison + forced absolute profile {prof_name})' if \
+                m.get('copy_source') != baseline.get('copy_source') and m['n_slots'] == baseline['n_slots'] \
+                else scope
     elif baseline:
         scope = ' (paired only)'
     else:
