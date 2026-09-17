@@ -913,6 +913,78 @@ Escalation condition
   (public ggml/llama API, allocator, non-CUDA builds); or if the flag-on path
   cannot guarantee the slot-reuse invariant.
 
+Addendum 1 (2026-09-16) — slot-depth probe: does a third slot convert the
+recon's queue wait into wall time? RUN, mechanism answered, prediction band
+NOT reached.
+: Question and pre-registration: the recon measured a 3089 ms warm wall with
+  1191 ms of engine queue wait and 747 ms of consumer wait at one bank of
+  pipeline depth; the prediction was that 3 slots shrink both and bring the
+  warm wall to ~2.2-2.6 s, with the falsifier being a wall >= ~2.9 s at
+  unchanged waits. A/B: tools/run-gplr35-slots.ps1 under the mutex, adjacent
+  arms in one hold (2-slot control re-run in-session), 4k anchor, ubatch 512,
+  layer-major, kv q8, af=1, pinned, --pp-repeat 2, --pp-recon 1, strict checker
+  per arm; traces build/llama-cuda/gplr35-slot{2,3}.jsonl.
+  Result (measured): warm 3377.8 -> 2843.2 ms (-534.6 ms, -15.8%), PP 1212.6 ->
+  1440.6 tok/s (+18.8%), cold 6364 -> 5697 ms. The MECHANISM is not the
+  predicted one: engine queue wait GREW (1155 -> 2667 ms) while consumer wait
+  COLLAPSED (734.4 -> 225.3 ms) and the residual `wall - (compute + pure DMA)`
+  fell 770 -> 100 ms. Deeper lookahead does not remove queueing; it takes the
+  queueing off the critical path, which is why the wall gain (-534.6 ms) is
+  essentially the consumer-wait drop (-509 ms). Per-bank DMA windows stay pure
+  at both depths (median 31.4 ms = 1.00x ceiling) and lag is never negative
+  (0/76, 0/66), so this is still not a rate or stream-ordering effect.
+  Cost: +522,194,944 B (498 MiB) of slot VRAM per extra slot (run_start:
+  1,044,389,888 -> 1,566,584,832 B) for the 15.8% wall gain.
+  Open, unattributed: the per-pass compute total rose 1369 -> 1611 ms (+18%)
+  with identical bytes and arithmetic — unexplained, not a claimed result.
+  Prediction band 2.2-2.6 s not reached (2843 ms); the falsifier did not fire.
+  Default unchanged: the slot count remains an owner decision (default 2, the
+  ladder may take a third slot when the budget allows). Next lever per the
+  ledger: the 1607 ms host hop (direct mmap-sourced staging).
+  Regression gate added (tools/check-gplr35-pipeline.py, wired into the runner
+  after the strict checkers): gates warm PP throughput, consumer wait share,
+  exposure = wall - compute - pure DMA, and the bank DMA window vs the pure
+  ceiling, per depth, with a same-session `--baseline` pair as the trustworthy
+  form and exit 2 when no criterion applies. It deliberately does NOT gate the
+  recon's lag signal: that signal is 0%-negative at BOTH depths, so gating it
+  would be vacuous. Validated on the four existing traces (all PASS), two
+  negative controls (both FAIL correctly), and the two error paths (exit 2).
+
+Addendum 2 (2026-09-16) — long-context depth probe: do 3/4 slots still fit and
+still pay at the crowded-VRAM shape? RUN; depth does NOT pay there.
+: Question and pre-registration: the 4k shape rewards depth (-15.8% at 3 slots),
+  but at 200k tokens each bank is consumed across ~391 chunks, so staging should
+  already be hidden and depth should buy little; predicted <= ~5% wall change,
+  falsified only if a slot jump cut the 200k wall by > 10%. A/B (one mutex
+  hold, tools/run-gplr35-slots262k.ps1): arms slots3 / slots4 / slots4-tight,
+  200,000-token prefill on the 262,144-token F16 KV configuration, layer-major,
+  ubatch 512, af=1, pinned, bf16 slabs, --pp-repeat 2, --pp-recon 1, strict
+  checker per arm.
+  Result (measured): warm 2 slots 1363.2 -> 3 slots 1369.6 -> 4 slots 1374.7
+  tok/s (walls 146,713 -> 146,030 -> 145,487 ms): +0.5% then +0.4%, +0.8%
+  total. Prediction confirmed, falsifier did not fire. Consumer wait 1,182.5 ->
+  36.5 -> 36.5 ms while the wall stays compute-dominated (92%); summed host
+  transfer windows grow 137.7 -> 269.5 -> 400.3 s with no wall change, i.e. the
+  queueing at this shape is already fully overlapped. Bank windows stay pure
+  (1.00x/1.01x) and lag stays 0% negative.
+  Fit and refusal: the 4-slot run completes under the derived budget (preflight
+  window arithmetic: 8,809,572,864 B for 4 slots vs ~20.7 GiB free); with
+  --residency-budget-mib 1500 the same config refuses LOUDLY at capacity
+  preflight with both the bounded window and the budget in the message.
+  Instrument defect reported: the `peak VRAM` telemetry line reads 3265.56 MiB
+  identically at 2/3/4 slots at this shape, so it cannot judge slot residency
+  here; use the preflight window arithmetic. No independent VRAM sample (the
+  sampling pass was interrupted) — recorded as a gap.
+  Gate follow-up: the 4k-anchored absolute floors false-FAILED the legitimate
+  3-slot 200k arm, so the gate now skips absolute floors on a shape mismatch
+  (labelled `no gate applied` / `paired only`; `--force-absolute` overrides),
+  with the negative controls and the four 4k traces re-validated after the
+  change. Absolute floors do not transfer across prompt shapes; paired
+  comparisons do.
+  Charter consequence: at long context the extra slot is not worth its VRAM
+  (optimum stays in the 2-3 slot range) and the remaining lever is the compute
+  side, which is 92% of that wall.
+
 ### T-GPLR-31: Locked-RAM probe — does the driver grant a full-pool-size pinned allocation on this box?
 
 Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB pool grantable with large headroom
