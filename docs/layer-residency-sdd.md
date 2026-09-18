@@ -133,6 +133,17 @@ two reactive baselines are not comparable in time (11.019/11.145 honest vs
 11.873/11.879 echoed); each rung's A-vs-B gain is a within-prompt difference and
 is unaffected. Evidence: `tools/run-gplr19-rowcache-ab-honest.ps1`,
 `build/llama-cuda/gplr19-honest-*`, `docs/currentstate.md` 2026-09-18.
+
+**Vehicle rule (added 2026-09-18, same day):** the NON-ECHOING prompt is the
+DEFAULT vehicle for row-cache rungs (`tools/run-gplr19-rowcache-ab.ps1`,
+`-Vehicle honest` is the default; prompt `build/calc-prompt.txt`, 885 prefill
+tokens, baseline and offline (b) taken from the same stream). The echoed prompt
+is opt-in reproduction only (`-Vehicle echoed`), is labelled as such in its own
+driver log, and is not admissible as the sole evidence behind a depth decision.
+Every run logs the other vehicle's gain at the same K, so a rung cannot be a
+single reading, and criterion 1 requires the reactive arms to reproduce the
+recorded baseline run's route digest AND greedy ids, not merely its byte
+counts.
 Second, the row cache is a TG-phase residency class, so no depth changes
 prefill — this lever does not touch this SDD's primary PP objective, and every
 MiB it takes is a MiB the slot window cannot hold.

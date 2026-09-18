@@ -259,7 +259,18 @@ uncompressed. The pre-registered honest (b) prediction was reproduced within
 (52,930 / 59,432) and reuse on 40/40 layers. Full table, the length confound
 (honest and echoed also differ in PP length, 885 vs 512), the artifact-path
 defect and the evidence paths: `docs/currentstate.md` 2026-09-18 "ROW-CACHE A/B
-ON THE HONEST STREAM"; driver `tools/run-gplr19-rowcache-ab-honest.ps1`; (2) the row cache is a
+ON THE HONEST STREAM"; driver `tools/run-gplr19-rowcache-ab-honest.ps1`;
+
+**Vehicle rule, from the same day:** the non-echoing prompt is now the DEFAULT
+vehicle for row-cache rungs (`tools/run-gplr19-rowcache-ab.ps1`,
+`-Vehicle honest`), and the echoed prompt is opt-in reproduction that labels
+itself as the optimistic pairing in its own log. A depth decision made on an
+echoed rung alone is no longer an acceptable reading: every run logs the other
+vehicle's gain at the same K, and criterion 1 now checks the reactive arms
+against the recorded baseline's route digest and greedy ids rather than only its
+byte counts. Note this is a DEFAULT plus a labelled opt-out, not a gate: nothing
+mechanically blocks someone from citing an echoed rung. The rule is recorded
+here and in SDD section 4 so that citing one is a visible choice. (2) the row cache is a
 TG-phase residency class, so NO depth changes prefill — this pick does not move
 the program's primary PP objective; (3) K=8 holds 4370.1 MiB of the row-cache
 allowance and its marginal K6->K8 step converts at 7.69 GB/s, the worst step in

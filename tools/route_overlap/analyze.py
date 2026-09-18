@@ -284,6 +284,17 @@ def load_trace(path: str):
                 "graph_footprint",
                 "byte_account",
                 "meta",
+                # T-GPLR-25 async-feed PP telemetry (engine: tel_async_feed_init /
+                # _submit / _ready). Added 2026-09-18: these are emitted on every
+                # PP run of the current build, so their absence here made EVERY
+                # modern trace unreadable ("unsupported event type:
+                # 'async_feed_init'") and disabled the offline-vs-runtime
+                # cross-check in tools/run-gplr19-rowcache-ab.ps1. They carry no
+                # routing information and are ignored, as are the other non-route
+                # events above; check-telemetry validates them.
+                "async_feed_init",
+                "async_feed_submit",
+                "async_feed_ready",
                 "prefetch_submit",
                 "prefetch_complete",
                 "prefetch_init",
