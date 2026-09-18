@@ -28,6 +28,52 @@ slow_command_threshold_ms = 10000
 # absolute paths (`git -C <repo> ...`, `ctx_*` `path=...`). See addendum E in the
 # same doc.
 
+# --- Shell allowlist (project-scoped additions) -------------------------------
+# Measured 2026-09-18 with direct ctx_shell probes: the gate matches the
+# command's binary name EXACTLY. So `powershell.exe` being allowed globally does
+# NOT allow `powershell`, and the built-in list's `cmake`/`git`/`python` do not
+# imply `ctest`. Needed on this project: `powershell` launches the mutex-held
+# arm wrappers (tools/run-*-locked.ps1), `ctest` runs the focused test targets.
+#
+# Use shell_allowlist_extra, never shell_allowlist: the latter REPLACES the
+# built-in ~226-entry list instead of extending it. `powershell.exe` is repeated
+# here so this file is still self-sufficient if a project override ever replaces
+# the global extras (`rg`, `-n`, `-C`) instead of merging with them.
+#
+# Caveat 1, measured: a project override of the shell allowlist is
+# security-sensitive, so lean-ctx WITHHOLDS it until the workspace is trusted
+# (`lean-ctx trust`), and trust is pinned to this file's CONTENTS -- editing
+# this file again invalidates it and needs a re-trust.
+#
+# Caveat 2, measured -- this is the one that surprises people: a project
+# allowlist does NOT reach the MCP tools. ctx_shell resolves its workspace to
+# $HOME (see addendum E: its detected project root is $HOME and an explicit repo
+# cwd is refused), and $HOME has no .lean-ctx.toml, so the MCP-side gate reads
+# only the GLOBAL config. Effect measured 2026-09-18: after editing and trusting
+# this file, `lean-ctx -c "ctest --version"` and `lean-ctx -c "powershell ..."`
+# run from the repo cwd (exit 0, project list honoured) while the same commands
+# through ctx_shell stay BLOCKED. So this block serves the CLI/hook path; for
+# ctx_shell the names must be in ~/.config/lean-ctx/config.toml, either via
+# `lean-ctx allow powershell ctest ctest.exe` (additive, global) or by invoking
+# `powershell.exe`, which is already permitted globally.
+#
+# Disabling the gate outright (shell_allowlist = [], or shell_security = "off")
+# is NOT done here: both give up the gate for every ctx_shell call and need a
+# deliberate, owner-approved change.
+#
+# Verification recipe (host-only, no GPU, no mutex):
+#   lean-ctx trust status                        -> withheld vs honoured
+#   lean-ctx allow --list                        -> effective count + config path
+#   lean-ctx -c "ctest --version"  (from repo)   -> CLI path: runs after trust
+#   ctx_shell: ctest --version                   -> MCP path: needs the global list
+#   ctx_shell: powershell.exe -NoProfile -Command "echo ok"  -> already permitted
+shell_allowlist_extra = [
+    "powershell",
+    "powershell.exe",
+    "ctest",
+    "ctest.exe",
+]
+
 # --- Project-appropriate defaults --------------------------------------------
 compression_level = "standard"
 memory_profile = "performance"

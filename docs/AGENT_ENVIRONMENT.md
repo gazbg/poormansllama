@@ -557,16 +557,72 @@ declaration, now with a second consequence.
 Working route, no config change: pass it per call, e.g.
 `ctx_shell(command="cmake --build C:/.../build/llama-cuda --config Release --target <t>", env={"CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2", "CUDA_PATH_V13_2": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2"})`.
 The durable route is declaring `CUDA_PATH` in the lean-ctx `env` map, which costs
-a launch re-approval (Addendum C). For CTest, use the app's terminal tool: the
-allowlist refusal is permanent for the name, adding one is explicit and additive
-(`lean-ctx allow ctest`), and it was NOT done here because it edits
-`~/.config/lean-ctx/config.toml`, outside this repository.
+a launch re-approval (Addendum C). SUPERSEDED for CTest by Addendum G below:
+`ctest` and `powershell` are now permitted, owner-approved, and both run through
+`ctx_shell` in-tree.
 
 Long-running work through `ctx_shell` works well and is the right shape here:
 `run_in_background: true` returns a `job_id`; `background_action: "status"`
 returns accrued output (large output is firewalled out-of-band into an archive
 id with head/tail inline); `background_action: "cancel"` stops it. A detached job
 keeps running up to `timeout_ms` (max 3600000) after the ~110 s foreground cap.
+
+**Addendum G — the allowlist is name-exact, a project `.lean-ctx.toml` cannot
+reach `ctx_shell`, and trust is pinned to file contents (2026-09-18, measured).**
+Resolved the T-GPLR-36 arm-launch blocker properly, by direct probes:
+
+| Observation | Reading |
+| --- | --- |
+| `ctx_shell: powershell.exe -NoProfile -Command "echo ok"` | **permitted, ran** — `powershell.exe` was already in the global extra list |
+| `ctx_shell: powershell ...` (bare) | **BLOCKED** — `'powershell' is not in the shell allowlist` |
+| `ctx_shell: ctest --version` and `ctest.exe --version` | **both BLOCKED** |
+| `lean-ctx trust status` (from the repo) | `untrusted`, *withholding 2 security-sensitive override(s): shell_allowlist_extra, rules_scope* |
+| `lean-ctx trust --list` | this workspace WAS trusted 2026-09-15 — the `.lean-ctx.toml` edit in commit `6235003` invalidated it |
+
+**(1) Matching is name-exact.** The gate resolves the command's first token
+literally, so an allowlist entry for `powershell.exe` does NOT admit
+`powershell`, and `cmake`/`git`/`python` being built in does not imply `ctest`.
+Either spell the permitted name in the command (`powershell.exe -File ...`) or
+allowlist the name you actually invoke.
+
+**(2) A project allowlist reaches the CLI/hook path but NEVER the MCP tools.**
+This is the non-obvious one. The MCP server resolves its workspace to `$HOME`
+(Addendum E), `$HOME` has no `.lean-ctx.toml`, so the `ctx_shell` gate reads only
+`~/.config/lean-ctx/config.toml`. Measured after editing and trusting the
+project file: `lean-ctx -c "ctest --version"` run from the repo cwd **ran, exit
+0** (`ctest version 4.2.3`) and `lean-ctx -c "powershell ..."` ran, while the same
+commands through `ctx_shell` stayed BLOCKED. The two paths report different
+command counts from the same machine (`lean-ctx allow --list`: 229 from the repo
+vs 226 from `$HOME`). Consequence: for `ctx_shell`, allowlist the name in the
+GLOBAL config; keep the project file only for the CLI/hook path.
+
+**(3) `lean-ctx trust` is pinned to file CONTENTS, and a comment-only edit
+breaks it.** Adding a comment line to `.lean-ctx.toml` flipped the workspace
+back to `untrusted, withholding shell_allowlist_extra, rules_scope`; re-running
+`lean-ctx trust <path>` restored it. Treat every future edit of that file as
+requiring a re-trust, and remember a withheld key fails SILENTLY (the setting
+simply does not apply) — `lean-ctx trust status` is the check.
+
+**(4) Key semantics.** `shell_allowlist_extra` APPENDS; `shell_allowlist`
+REPLACES the built-in ~226-entry list; `lean-ctx allow <cmd>...` appends to the
+global extras. Disabling the gate (`shell_security = "off"`) gives up the gate
+for every call and is not done.
+
+**Applied, owner-approved:** `lean-ctx allow powershell ctest ctest.exe` (global,
+additive; config `C:\Users\<user>\.config\lean-ctx\config.toml`, extras now
+`powershell.exe, rg, -n, -C, powershell, ctest, ctest.exe`), plus the same key in
+this repo's now-trusted `.lean-ctx.toml` for the CLI path. It took effect with NO
+MCP/daemon restart, as its own output claimed. Verified end-to-end: `ctx_shell`
+`powershell -NoProfile -Command "echo ..."` and `ctest --version` both ran, and
+`ctest --test-dir C:/Development/AI/qwen38GZI/build/llama-cuda -C Release -R
+"route-topk|host-mem"` passed **2/2** (tests #49, #50) from inside `ctx_shell`.
+
+**Related, found by the same run:** this build tree uses a multi-config
+generator, so `ctest` without `-C Release` reports both tests **Not Run** with
+`Test not available without configuration. (Missing "-C <config>"?)` — exit 1,
+which is a usage error, not a test failure. Always pass `-C Release`; the same
+applies to `ctest -R "layer-streaming"`, whose model-backed `-run` targets also
+fail without `Q38LS_MODEL_PATH` set.
 
 ## Canonical Build Commands
 
