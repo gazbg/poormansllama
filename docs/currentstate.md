@@ -2598,7 +2598,9 @@ GPU-free parser checks on the new optional value, all as designed:
 value" (it takes the default), `--residency-tg-retain nonsense` reports
 `unknown argument: nonsense` rather than silently eating the token, and
 `--residency-tg-retain 0` still fails loudly with "expects 1..64 windows (got
-0)". Build clean; the `--help` text documents N defaults to 4.
+0)". Build clean; the `--help` text documents N defaults to 4 (accurate when written;
+the default depth is K=8 since the owner-directed change of 2026-09-18 recorded
+at the top of this file).
 
 **Residual risk carried forward.** The default is provably implemented but its
 GATE reading is not validated: K=4's 0.6284 comes from the self-echoing probe

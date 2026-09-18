@@ -108,7 +108,14 @@ non-echoing certification is PARTIAL — the declared conjunction (distinct
 16-gram criterion (1.0000, against 0.3734 echoed) but not on the compression
 criterion (0.4238), which measures the entropy of structured code output rather
 than repetition and was mis-chosen when declared. Full table, the declared
-decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.]Scope amendment 2026-09-18 (owner-directed, T-GPLR-26): the retention DEPTH is
+decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.]
+
+[SUPERSEDED BY A LATER DECISION, not by this measurement: on 2026-09-18 the owner
+raised the DEFAULT depth to K=8 (see that amendment below). The sentence "the K=4
+PROVISIONAL OPERATING DEFAULT above is unchanged" was true OF THIS MEASUREMENT and
+is retained as the record of it.]
+
+Scope amendment 2026-09-18 (owner-directed, T-GPLR-26): the retention DEPTH is
 an operator-named operating lever, not a gate outcome. `--residency-tg-retain N`
 names it (1..64 windows, 8 rows/layer per K step = 572,719,104 B per step across
 the 40 layers) and a named depth is never silently reduced; the bare flag's depth is a
