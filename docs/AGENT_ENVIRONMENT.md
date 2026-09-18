@@ -689,6 +689,19 @@ read should be trusted here:
    wrong `old_string` guess came back naming the CRLF endings and the nearest
    matching line.
 
+6. **`ctx_shell` is PowerShell, and its allowlist validates EACH
+   `;`-separated segment's first token.** Two failure modes, both measured:
+   `2>/dev/null` is parsed as a redirect to the path `/dev/null` (resolved as
+   `C:\dev\null`), so the command errors and prints **nothing at all** — an empty
+   result that reads exactly like "no matches found", which is how a stale
+   citation appeared not to exist in this repository until the same grep was
+   re-run without the redirect. And `ls -la` fails because `ls` is
+   `Get-ChildItem` with different flags. A one-liner dense with `$` variables and
+   backticks is also split into fragments whose first token is no longer a binary,
+   and the whole call is then hard-blocked (`<file>.md is not in the shell
+   allowlist`). **Keep `ctx_shell` commands single-purpose, and never treat an
+   empty result as evidence until the command is known to have run.**
+
 Working rule that follows: `ctx_search` for orientation across the tree,
 `ctx_shell` + `grep` for anything that might sit in a large file or span lines,
 `ctx_read mode="lines:N-M"` for a window, and `ctx_patch` for edits.
