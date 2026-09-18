@@ -230,7 +230,7 @@ waits for copy-complete BEFORE its next CPU hop, the hop (~18.7 ms) re-
 serializes; the gate must cover only the DMA, not the memcpy.
 Status: not run yet (GPU busy with the external deepseek_v4 baseline).
 
-## 2026-09-16: BASELINE COMPARISON (docs/llamacpp-baseline.log, 2026-09-10 llamacppCUDA fork llama-server, same model) — same placement philosophy (banks CPU-side), our PP streaming 1.9x cold / ~4.3x warm by implied rate, TG 2.4x (76.9 greedy vs 32.4 with MTP), VRAM same class; no long-context PP datapoint exists in the baseline log
+## 2026-09-16: BASELINE COMPARISON (out/llamacpp-baseline.log -- a local artifact under the gitignored out/ tree, not versioned; the 2026-09-10 llamacppCUDA fork llama-server, same model) — same placement philosophy (banks CPU-side), our PP streaming 1.9x cold / ~4.3x warm by implied rate, TG 2.4x (76.9 greedy vs 32.4 with MTP), VRAM same class; no long-context PP datapoint exists in the baseline log
 
 Facts from the baseline log (a recorded run, NOT the live colibri
 deepseek_v4.exe process): llama-server, same Qwen3.6-35B-A3B GGUF, 262k ctx,
