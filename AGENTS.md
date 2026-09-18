@@ -173,6 +173,11 @@ authoritative online sources before improvising:
 - A missing package, stale slot generation, failed CUDA event, or insufficient VRAM must fail loudly with structured telemetry. It must not silently run another layer's data.
 - PP-to-TG retains session state and live weight-slot assignments unless a task explicitly studies reset behavior.
 
+### Vendored-engine gotchas (measured, not documented upstream)
+
+- `llm_graph_context::build_inp_embd` always allocates BOTH `inp_tokens` and `inp_embd` (F32, ~4 MiB at ubatch 512), then `ggml_build_forward_select` prunes the embeddings branch in token mode — leaving a tensor that is INPUT-flagged, allocated, and consumed by NO graph. Any cache built by walking a graph ctx for INPUT tensors inherits it; attribute inputs by TRANSITIVE src walk (an input consumed through a view sits one hop past the node's direct src), never direct sources alone.
+- `--pp-schedule layer-major` refuses `--tg-tokens > 3` when handoff auto does not activate (exit 2). Long-id identity arms at the 50k shape are impossible without forcing handoff (which changes the execution mode); run them at 4k instead.
+
 ## Validation and Evidence
 
 Run the narrowest meaningful validation first:
@@ -184,6 +189,8 @@ Run the narrowest meaningful validation first:
 5. Run a larger real-model trace only when the task contract requires it.
 
 For CUDA/runtime work, use the project CMake build and CTest targets defined by the active plan. Do not substitute unrelated `make`, DeepSeek V4, or upstream CI commands. Run the Qwen reference regression before claiming that genericization preserved existing behavior.
+
+- An A/B control across a vendored-tree change is a DIFFERENT BINARY, and the streaming code lives in `llama.dll`: side-copy the exe AND all DLLs (e.g. `build/llama-cuda/bin/unscoped-bin/`) BEFORE rebuilding. Rebuilding destroys the control, and copying the exe alone leaves it silently loading the new dll.
 
 ### Semantic-QA answer gate (T-GPLR-07)
 
@@ -258,6 +265,7 @@ This machine shares one GPU across multiple projects. Before any command that in
 - CPU-only configuration, compilation, source inspection, and static checks do not require the mutex.
 - Do not use a sentinel file or delete another process's lock. Windows releases the named mutex if its owning process exits unexpectedly.
 - Other projects sharing this GPU must use the same mutex name and equivalent acquire-wait-release behavior.
+- Detached arm launches: the LAUNCHER must dot-source `tools/arm-verdict.ps1` and run `Clear-ArmVerdict` for the tag BEFORE `Start-Process`. The arm clears its own files only after the process starts, so an immediate `Wait-ArmStart`/`Wait-ArmVerdict` reads the PREVIOUS run's marker and verdict (measured 2026-09-18: stale pid and `started_utc`).
 
 Expensive model runs require a recorded command, model artifact identity, hardware, relevant flags, exit status, and telemetry path. Do not run them merely for confidence.
 
@@ -270,6 +278,8 @@ Update `docs/currentstate.md` after each completed task with observed behavior, 
 A task is done only when its acceptance criteria and required validation are demonstrated, its state/docs are updated, and no task-owned defect or unchecked criterion remains.
 
 Do not stage, commit, push, create branches, or create pull requests unless the owner explicitly asks. If authorized to commit, stage only task-owned files, verify the staged diff and `git diff --check`, and record the resulting hash in the task plan.
+
+When the owner authorizes a mid-task commit while validation is still pending (e.g. work parked behind a GPU-mutex wait), checkpoint the mechanism and tooling BEFORE any verdict exists (nested and outer commits separately), and leave the task's `Commit:` field unfilled until the verdict commit lands.
 
 After a task finishes, continue with the next eligible `ready` task only when the owner has authorized continuing implementation. Otherwise report the completed evidence and any blockers.
 
