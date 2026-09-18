@@ -15,11 +15,18 @@ shell_timeout_secs = 120
 shell_heavy_timeout_secs = 600
 slow_command_threshold_ms = 10000
 
-# --- MCP shell environment quirk ---------------------------------------------
-# ctx_shell cannot resolve extension-less command names here: PATHEXT is absent
-# from the MCP child environment (PowerShell reports only ".CPL") and COMSPEC is
-# empty. Pass the per-call env payload recorded in
-# docs/AGENT_ENVIRONMENT.md (section "lean-ctx MCP shell environment").
+# --- MCP shell environment ---------------------------------------------------
+# Fixed and verified 2026-09-18: the desktop app spawns MCP servers with a
+# 12-name inherited environment allowlist plus the server's own `env` map, so
+# declaring PATHEXT and COMSPEC in the lean-ctx entry of ~/.agents/mcp.json (now
+# approved) gives ctx_shell a full PATHEXT, a set COMSPEC and resolving
+# git/python/cmake with NO per-call payload. Do not reintroduce the per-call
+# payload; re-run the probe in docs/AGENT_ENVIRONMENT.md (addendum E) instead if
+# the environment changes.
+# Known remaining limit: lean-ctx's detected project root is $HOME, so ctx_shell
+# starts there and an explicit repo cwd is refused. Workaround, verified: pass
+# absolute paths (`git -C <repo> ...`, `ctx_*` `path=...`). See addendum E in the
+# same doc.
 
 # --- Project-appropriate defaults --------------------------------------------
 compression_level = "standard"
