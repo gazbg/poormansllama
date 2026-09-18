@@ -116,14 +116,87 @@ try {
     $w2 = Read-ArmVerdict -Dir $vdir -Tag 'w1'
     Check 'rerun flips the same tag to PASS 0' ($w2.status -eq 'PASS' -and $w2.exit_code -eq 0) ("$($w2.status) $($w2.exit_code)")
 
-    Write-Host '=== 7. defaults: derived tag, default directory ==='
+    Write-Host '=== 7. the start marker and the four run states ==='
+    # The point of the marker: with only a sentinel, a missing .done cannot tell
+    # "never started" (a bad path, a rejected launch) from "still running".
+    $mt = 'marker-case'
+    Clear-ArmVerdict -Dir $tmp -Tag $mt
+    $st = Get-ArmRunState -Dir $tmp -Tag $mt
+    Check 'no marker + no sentinel = never-started' ($st.state -eq 'never-started') $st.state
+    Check 'nothing to read in that state' ($null -eq $st.marker -and $null -eq $st.verdict)
+
+    Write-ArmStart -Dir $tmp -Tag $mt -Command 'demo' -LogPath 'demo.log' | Out-Null
+    $st = Get-ArmRunState -Dir $tmp -Tag $mt
+    Check 'marker alone = running' ($st.state -eq 'running') $st.state
+    Check 'marker records the live pid' ($null -ne $st.marker.pid) ("pid=$($st.marker.pid)")
+    Check 'marker pid is this process, so liveness reads true' ($st.alive -eq $true)
+    Check 'marker is readable on its own' ((Read-ArmStart -Dir $tmp -Tag $mt).schema -eq 'arm-start/1')
+
+    # The 'died' case: a marker whose pid is gone and no sentinel. Use a pid that
+    # cannot be alive, and pin the marker's host so the check is not skipped.
+    $deadMarker = Get-Content -LiteralPath (Join-Path $tmp ($mt + '.started')) -Raw | ConvertFrom-Json
+    $deadMarker.pid = 999998
+    [System.IO.File]::WriteAllText((Join-Path $tmp ($mt + '.started')), ($deadMarker | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($false)))
+    $st = Get-ArmRunState -Dir $tmp -Tag $mt
+    Check 'marker with a dead pid and no sentinel = died' ($st.state -eq 'died') $st.state
+    Check 'death is only claimed when liveness is known false' ($st.alive -eq $false)
+
+    Write-ArmVerdict -Dir $tmp -Tag $mt -ExitCode 0 | Out-Null
+    $st = Get-ArmRunState -Dir $tmp -Tag $mt
+    Check 'marker + sentinel = finished' ($st.state -eq 'finished') $st.state
+    Check 'the verdict is what finished means' ($st.verdict.status -eq 'PASS')
+    Check 'no anomaly when both are present' ($st.anomaly -eq '')
+
+    # Anomaly: a sentinel with no marker. Not reachable through the wrappers, so a
+    # reader must say so rather than silently trusting the verdict.
+    Remove-Item -LiteralPath (Join-Path $tmp ($mt + '.started')) -Force
+    $st = Get-ArmRunState -Dir $tmp -Tag $mt
+    Check 'sentinel without a marker is flagged as an anomaly' ($st.state -eq 'finished' -and $st.anomaly -ne '') $st.anomaly
+
+    Write-Host '=== 8. an old finished state cannot be read as a new run ==='
+    # Exactly the stale-state failure this convention exists to prevent.
+    Check 'before: the tag reads finished' ((Get-ArmRunState -Dir $tmp -Tag $mt).state -eq 'finished')
+    Clear-ArmVerdict -Dir $tmp -Tag $mt
+    Check 'after invalidation: never-started' ((Get-ArmRunState -Dir $tmp -Tag $mt).state -eq 'never-started')
+    Write-ArmStart -Dir $tmp -Tag $mt | Out-Null
+    Check 'a new run reads running, not finished' ((Get-ArmRunState -Dir $tmp -Tag $mt).state -eq 'running')
+
+    Write-Host '=== 9. Wait-ArmStart is bounded and conclusive ==='
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $w = Wait-ArmStart -Dir $tmp -Tag $mt -TimeoutSeconds 20 -PollSeconds 1
+    $sw.Stop()
+    Check 'wait returns the marker when it exists' ($null -ne $w)
+    Check 'wait does not sleep when the marker exists' ($sw.Elapsed.TotalSeconds -lt 2) ("{0:N2}s" -f $sw.Elapsed.TotalSeconds)
+    $sw.Restart()
+    $w = Wait-ArmStart -Dir $tmp -Tag 'launch-that-never-began' -TimeoutSeconds 3 -PollSeconds 1 -Quiet
+    $sw.Stop()
+    Check 'a launch that never began times out with $null' ($null -eq $w)
+    Check 'and the wait is bounded' ($sw.Elapsed.TotalSeconds -lt 8) ("{0:N2}s" -f $sw.Elapsed.TotalSeconds)
+    Clear-ArmVerdict -Dir $tmp -Tag $mt
+
+    Write-Host '=== 10. defaults: derived tag, default directory ==='
     $defDir = Join-Path $root 'build\llama-cuda\verdicts'
     Clear-ArmVerdict -Dir $defDir -Tag 'gpu-command'
     & $lock -TimeoutSeconds 60 -Command 'exit 0' | Out-Null
     $d = Read-ArmVerdict -Dir $defDir -Tag 'gpu-command'
     Check 'default dir + derived tag produce a verdict' ($null -ne $d -and $d.status -eq 'PASS')
+    Check 'and leave a marker beside it' ((Get-ArmRunState -Dir $defDir -Tag 'gpu-command').state -eq 'finished')
     Clear-ArmVerdict -Dir $defDir -Tag 'gpu-command'
     Check 'cleanup removed the default-location artifacts' (-not (Test-Path (Join-Path $defDir 'gpu-command.done')))
+    Check 'cleanup removed the marker too' (-not (Test-Path (Join-Path $defDir 'gpu-command.started')))
+    Check 'and the tag now reads never-started' ((Get-ArmRunState -Dir $defDir -Tag 'gpu-command').state -eq 'never-started')
+
+    Write-Host '=== 11. the marker exists BEFORE the command body runs ==='
+    # Ordering, proven rather than assumed: the command itself checks for its own
+    # marker and reports via its exit code, so no timing assumption is involved.
+    $vdir2 = Join-Path $tmp 'ordering'
+    Clear-ArmVerdict -Dir $vdir2 -Tag 'w2'
+    $probe = 'if exist "' + (Join-Path $vdir2 'w2.started') + '" (exit 0) else (exit 9)'
+    & $lock -TimeoutSeconds 60 -Command $probe -VerdictDir $vdir2 -VerdictTag 'w2' | Out-Null
+    $st = Get-ArmRunState -Dir $vdir2 -Tag 'w2'
+    Check 'marker present when the arm body started' ($st.verdict.exit_code -eq 0) ("exit=$($st.verdict.exit_code) (9 would mean the marker came too late)")
+    Check 'state is finished with both files' ($st.state -eq 'finished' -and $null -ne $st.marker)
 } finally {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction Continue }
 }

@@ -66,6 +66,12 @@ $verdictStart = (Get-Date).ToUniversalTime().ToString('o')
 $verdictFields = @{ wrapper = 'smoke-gpu-lock-ctxshell' }
 . (Join-Path $root 'tools\arm-verdict.ps1')
 Clear-ArmVerdict -Dir $verdictDir -Tag $verdictTag
+# START marker before anything else: this is the chain-level counterpart of the
+# job id, and it is what makes a launch that never began visible as such.
+Write-ArmStart -Dir $verdictDir -Tag $verdictTag -LogPath $log | Out-Null
+# Write-Host, not Log(): the logging function is defined further down, and this
+# line must not depend on anything defined after it.
+Write-Host ("START marker: {0}" -f (Join-Path $verdictDir ($verdictTag + '.started')))
 
 trap {
     $msg = "$($_.Exception.GetType().Name): $($_.Exception.Message)"

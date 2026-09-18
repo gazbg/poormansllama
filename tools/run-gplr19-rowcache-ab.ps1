@@ -141,6 +141,10 @@ $verdictStart  = (Get-Date).ToUniversalTime().ToString('o')
 $verdictFields = @{ vehicle = $Vehicle; retain_k = $RetainK; rung_root = $rungRoot }
 . (Join-Path $root 'tools\arm-verdict.ps1')
 Clear-ArmVerdict -Dir $verdictDir -Tag $verdictTag
+# START marker before any heavy work (the model loads after this), so a rung that
+# never got going is distinguishable from one still running.
+Write-ArmStart -Dir $verdictDir -Tag $verdictTag -MutexName 'Global\AI-GPU-EXCLUSIVE-v1' -LogPath $drvLog | Out-Null
+Write-Host ("START {0} -> {1}" -f $verdictTag, (Join-Path $verdictDir ($verdictTag + '.started')))
 
 # A run that dies unexpectedly still leaves a verdict. Without this, an
 # uncaught error (the 2026-09-18 cross-vehicle crash) produced no verdict line

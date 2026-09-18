@@ -37,6 +37,11 @@ if (-not $NoVerdict) {
         $vDir = if ($VerdictDir) { $VerdictDir } else { Join-Path $root 'build\llama-cuda\verdicts' }
         $vStarted = (Get-Date).ToUniversalTime().ToString('o')
         Clear-ArmVerdict -Dir $vDir -Tag $vTag
+        # Mark the run STARTED here -- before the mutex wait and before any model
+        # load -- so "never started" is distinguishable from "still working" for
+        # the whole duration of the run, not merely at the end.
+        Write-ArmStart -Dir $vDir -Tag $vTag -Command $Command -MutexName $MutexName | Out-Null
+        Write-Host ("Started: {0}" -f (Join-Path $vDir ($vTag + '.started')))
         $verdictReady = $true
     } else {
         Write-Warning "arm-verdict helper not found at $helper; no verdict file will be written."

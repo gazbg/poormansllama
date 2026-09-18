@@ -666,7 +666,7 @@ do not answer one with the other's evidence:
 
 | Question | Source | Notes |
 | --- | --- | --- |
-| *Did it start?* | the launch handshake — the `job_id` | The ONLY source that can distinguish "never started" from "still running": an absent sentinel looks identical in both cases (measured 2026-09-18 — the job that never started left exactly the same `ABSENT` as a running one). |
+| *Did it start?* | the launch handshake (`job_id`) **and** the `.started` marker | Two different halves, both wanted: the job id says whether the launch was ACCEPTED (and why not, when the tool rejects it); the marker says whether the SCRIPT BODY BEGAN. The marker is what closed the absence ambiguity below — `Get-ArmRunState` returns `never-started` when no marker appears, measured 2026-09-18 against a launch that died on a relative path. |
 | *Did it finish, and how?* | the `.done` sentinel beside its verdict | See the next section; one file check, no log tailing. |
 
 **Launch.** `ctx_shell` with `run_in_background: true` returns a job id —
@@ -738,22 +738,42 @@ nothing here makes a GPU run cheap: the wrapper above costs one mutex hold and
 seconds of CUDA, and the rule that expensive model runs need a recorded command
 and are not run merely for confidence is unchanged.
 
-## Arm verdicts and the `.done` sentinel (convention, 2026-09-18)
+## Arm verdicts, the start marker and the `.done` sentinel (convention, 2026-09-18)
 
-A GPU arm run does not have to be watched. Every arm leaves two files:
+A GPU arm run does not have to be watched. Every arm leaves up to three files:
 
 ```
+<dir>/<tag>.started        START MARKER, written at launch, before the heavy work
 <dir>/<tag>.verdict.json   machine-readable status, exit code, timings, fields
 <dir>/<tag>.done           sentinel, written LAST
 ```
 
-**The rule that makes the sentinel worth reading:** the verdict is written
-first, the `.done` second, so the presence of a `.done` implies a complete
-verdict beside it. And the `.done` is **deleted before** the run starts, so a
-PASS left by an earlier run at the same depth and vehicle can never be read as
-the current run's result. That stale-sentinel case is the failure mode that
-makes hand-rolled completion files untrustworthy, and it is what
-`tools/test-arm-verdict.ps1` exists to guard.
+**Which file exists IS the state.** One call — `Get-ArmRunState -Dir <dir> -Tag
+<tag>` — answers the whole question, with no polling and no log tailing:
+
+| Marker | Sentinel | State | Meaning |
+| --- | --- | --- | --- |
+| absent | absent | `never-started` | the launch never got as far as the script body |
+| present | absent | `running` | started, not finished (pid alive) |
+| present | absent | `died` | started, then vanished with no verdict — pid is GONE |
+| present | present | `finished` | read the verdict; this is the only state that reports an outcome |
+| absent | present | `finished` + `anomaly` | the marker was deleted mid-run; not reachable through the wrappers, so a reader says so rather than quietly trusting the verdict |
+
+**Why the marker exists:** without it, a missing `.done` conflates "never
+started" with "still running". Both were hit on 2026-09-18 — a detached job given
+a relative `-File` path died in under a second, and two unconditional `sleep 170`
+waits watched a run that never needed watching. The job id answers whether the
+LAUNCH was accepted; the marker answers whether the SCRIPT BODY BEGAN. Neither
+replaces the other, and the pair is the complete diagnosis.
+
+**The rules that make these files worth reading:** the marker is written at
+launch, the verdict on exit, and the `.done` LAST — so a `.done` implies a
+complete verdict beside it and a `.started` implies the work actually began. And
+**all three are deleted before** the run starts (`Clear-ArmVerdict`), so a state
+from an earlier run at the same depth and vehicle can never be read as the
+current run's. That stale-state case is the failure mode that makes hand-rolled
+completion files untrustworthy, and it is what `tools/test-arm-verdict.ps1`
+exists to guard.
 
 Where the files land, and the tag:
 
@@ -770,16 +790,26 @@ dies for an unexpected reason therefore cannot look like a run still in
 progress. `tools/run-gplr19-rowcache-ab.ps1` now also exits `2` when criteria 1
 or 2 do not pass; previously a NOT-PASSED rung exited `0`.
 
+All three writers (the table above) write the marker at launch with the same tag
+and directory as the verdict and sentinel, so ONE tag addresses the whole state.
+
 Host-side readers, in `tools/arm-verdict.ps1` (dot-source it):
-`Write-ArmVerdict`, `Read-ArmVerdict`, `Clear-ArmVerdict`, `Wait-ArmVerdict`
-(bounded wait that returns the moment the sentinel appears, or `$null` on
-timeout — never an unbounded sleep), `Get-ArmVerdictPaths`,
-`Get-ArmTagFromCommand`. One check answers the whole question:
+`Write-ArmStart`, `Read-ArmStart`, `Write-ArmVerdict`, `Read-ArmVerdict`,
+`Clear-ArmVerdict`, `Test-ArmMarkerAlive`, and the three bounded waits —
+`Wait-ArmStart` / `Wait-ArmVerdict` (each returns the moment its observable
+appears, or `$null` on timeout: never an unbounded sleep) — plus
+`Get-ArmVerdictPaths`, `Get-ArmTagFromCommand`, and `Get-ArmRunState`.
+`Get-ArmRunState` is the one call that answers the whole question:
 
 ```powershell
 . tools/arm-verdict.ps1
-$v = Read-ArmVerdict -Dir build/llama-cuda/verdicts -Tag run-gplr36-hostmem
-if ($v) { $v.status }   # $null = still running (or never started)
+$s = Get-ArmRunState -Dir build/llama-cuda/verdicts -Tag run-gplr36-hostmem
+switch ($s.state) {
+  'never-started' { 'the launch never began -- check the job id for why' }
+  'running'       { 'in flight; nothing to read yet' }
+  'died'          { 'started and vanished with no verdict -- killed or hard crash' }
+  'finished'      { "$($s.verdict.status) in $($s.verdict.duration_s)s" }
+}
 ```
 
 This changes **how a run is observed, never what it measures**: no arm's flags,
@@ -800,16 +830,31 @@ honest K=6 root left `rowcache-honest-k6.done` = `PASS 0` with `crit1/crit2`,
 refusal left `rowcache-honest-k4.done` = `ERROR 1` carrying the full refusal
 text in `error` and `[FATAL]` in `driver.log`.
 
-Two limits of the sentinel, stated so it is not over-read. **Absence is
-ambiguous**: a missing `.done` means "not finished" but cannot distinguish that
-from "never started" — only the launch handshake can, so keep the job id or the
-launcher's immediate output. Measured on the same day: a detached `ctx_shell`
-job that must be given an ABSOLUTE `-File` path, because `cwd` does not apply to
-a `run_in_background` job (a relative path resolved against `$HOME` and the job
-failed with exit 1 in under a second while the file check simply said ABSENT).
-And the verdict is written from a **termination handler**, not from a watchdog:
-a process killed outright (power loss, `taskkill /F`) writes nothing, which is
-correct — an absent sentinel must never be reported as a passing run.
+**The start marker closed the ambiguity that the sentinel alone could not.**
+Measured end to end on 2026-09-18, same tag, four real processes:
+
+| Situation | `Get-ArmRunState` |
+| --- | --- |
+| a detached `ctx_shell` job given a RELATIVE `-File` path (resolved against `$HOME`, no `cwd` for a background job) | **`never-started`** — and the job id independently reports `failed`, exit 1, with the reason |
+| the same command launched detached with an ABSOLUTE path, checked ~5 s in | **`running`**, `alive=True`, pid and start time in the marker, no sentinel yet |
+| the same run checked once at the end | **`finished`**, `PASS 0`, 17.5 s (the arm tag `PASS 0`, 10.8 s) |
+| a marker-holding process killed with `Stop-Process -Force` (no `finally`, no `trap`) | **`died`**, `alive=False`, no sentinel |
+
+That is the whole point: a launch that never began is now distinguishable from a
+run in progress **without** the job id, and the job id is still what says *why* a
+launch was rejected. `Wait-ArmStart -Dir <dir> -Tag <tag> -TimeoutSeconds N` gives
+the bounded version of the same question for a launcher that wants to confirm its
+job landed before walking away (returns in 0.00 s when the marker exists,
+`$null` on timeout).
+
+Two limits remain, stated so the marker is not over-read. **Liveness is
+best-effort**: `died` is claimed only when the recorded pid is known to be gone
+on the same host, so a pid that has been REUSED by an unrelated process can make
+a dead run read as `running` — the authoritative answer for a completed run is
+always the verdict, never the marker. And the verdict is still written from a
+**termination handler**, not a watchdog: a hard-killed process writes no verdict,
+which is why its state is `died` rather than `finished` — an absent sentinel must
+never be reported as a passing run.
 
 ## Canonical Build Commands
 
