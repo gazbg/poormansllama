@@ -157,7 +157,8 @@ The 2026-09-14 brief's "should gate eligibility BIND provisioning or stay
 ADVISORY?" is answered here; the decision material below is kept as the record
 of what was weighed, including the unbuilt branch-A prerequisite chain.
 Depends on: T-GPLR-22 (the PRE-SINK run_refused plumbing the brief names as
-the existing shape for a gate-ineligible provisioning refusal; the missing  part is the oracle, not the plumbing).
+the existing shape for a gate-ineligible provisioning refusal; the missing
+part is the oracle, not the plumbing).
 Commit: 4c1f339 (branch B, documents only — SDD sections 4/10 + this plan +
   currentstate; ZERO source changes, so no vendored-tree gitlink bump)
 
