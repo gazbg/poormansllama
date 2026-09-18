@@ -1,6 +1,8 @@
 # T-GPLR-13 Ladder Bottlenecks and Solution Hypotheses
 
-Status: active findings file (created 2026-09-13). Future runs of the
+Status: active findings file (created 2026-09-13). A documented online research
+pass on H-C/H-D landed 2026-09-15 (docs/gplr13-research-hcd-online.md section
+8); it changed no measurement and no verdict in sections 1-6. Future runs of the
 T-GPLR-13/T-GPLR-15 program append dated sections here; do not rewrite older
 sections. Unit convention: host commit/available figures in this file are
 decimal GB (Python /1e9); the PowerShell ladder driver's table reports the
@@ -835,6 +837,21 @@ cause and fix below); the retry is recorded in currentstate when it lands.
   staged FFN 1.1 ms per layer-window — TG compute is ~27x attention-dominated
   at 4k context, so expert staging is the transfer story but NOT the
   compute story.]
+  [CORRECTED 2026-09-15 by the 50k width test: the "~27x" was the FIRST
+  event (layer 0, window 0), which is the distribution MAX -- a first-window
+  warmup outlier -- not a representative reading. Full distributions:
+  4k attention mean 0.30 ms / median 0.19 / max 30.3; FFN mean 0.14 ms;
+  ratio of means 2.2x. 50k (`gplr07-qa-50000-retention.jsonl`, warm cache,
+  qa-smoke gate PASS): attention mean 0.48 ms / median 0.27 / max 26.8;
+  FFN mean 0.20 ms; ratio of means 2.4x; per-layer attention means are
+  < 2 ms on ALL 40 layers in both runs. So attention leads staged-FFN
+  compute by ~2-3x, not ~27x -- and at 50k all three TG terms are
+  comparable: transfer 3.63 s, wait 1.04 s, compute 2.63 s of the 7.21 s
+  TG wall. Expert staging remains the single largest TG term at width;
+  the earlier "compute story" framing was an artifact of reading one
+  event. Per-window attention does NOT grow across the TG (last-10-window
+  mean 0.77x of first-10) -- recorded as an unexplained flat reading,
+  not fitted to a story.]
 
 **Discrepancies found (three real, one environmental).**
 1. COLD CACHE (environmental; reported per AGENTS.md, not a defect): the
