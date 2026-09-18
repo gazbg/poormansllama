@@ -666,6 +666,28 @@ read should be trusted here:
    in the file, and passing `path` to that file directly does NOT lift it (still
    "0 matches in 0 files"). Workaround, verified: `ctx_shell` +
    `grep -n "<pattern>" <absolute path>`, which found the line immediately.
+   **CAUSE, ESTABLISHED 2026-09-18 — and it is NOT configurable:** the cap is
+   COMPILED INTO THE BINARY. There is no `LCTX_*` environment override for it: the
+   complete set the installed binary contains (`lean-ctx-bin/bin/lean-ctx.exe`, 104 MB,
+   Rust) is `LCTX_MAX_READ_BYTES` (ctx_read/ctx_edit, default 4 MB),
+   `LCTX_MAX_MULTI_READ_BYTES`, `LCTX_MAX_SHELL_BYTES`, `LCTX_CONTEXT_BUDGET`,
+   `LCTX_DEBUG`, `LCTX_MODEL`/`LCTX_MODEL_PRICING_JSON`, the rate limits, the delta
+   and degradation knobs, and `LEAN_CTX_ARCHIVE_MAX_FILES` (archive CAPACITY, not a
+   search size) — and the published configuration reference lists no search-size key
+   either. So "just raise the limit" is NOT available in this installation.
+   **The threshold VALUE cannot be read from the binary**: a compiled integer is
+   binary data, not an ASCII string, so grepping for `512000` returns 0 and proves
+   nothing. Web research reports 512,000 bytes, consistent with this repo's two data
+   points but not independently confirmed here.
+   **SECOND REPRODUCTION (same session):** `ctx_search "THREE TASKS CLOSED"` scoped to
+   `docs/` returned *0 matches in 24 files (1 large files skipped)* for a string added
+   to `docs/currentstate.md` minutes earlier.
+   **SCOPE — ONE FILE, NOT THE REPO (measured):** `docs/currentstate.md` is 557,144 B
+   (skipped), while the next largest tracked file,
+   `docs/plans/generic-prefill-layer-residency-plan.md`, is 174,707 B and searches
+   normally (1 hit for `T-GPLR-44`, reporting "scanned 9"). Everything else is smaller,
+   so exactly one document is affected and any plan to shrink it should aim WELL UNDER
+   the cap, not at it.
    **Consequence: a `ctx_search` zero is NOT evidence whenever the answer could
    live in `docs/currentstate.md`** — the canonical state file is exactly the
    place a stale claim hides. Cross-check with grep before concluding "nothing
@@ -702,9 +724,15 @@ read should be trusted here:
    allowlist`). **Keep `ctx_shell` commands single-purpose, and never treat an
    empty result as evidence until the command is known to have run.**
 
-Working rule that follows: `ctx_search` for orientation across the tree,
-`ctx_shell` + `grep` for anything that might sit in a large file or span lines,
-`ctx_read mode="lines:N-M"` for a window, and `ctx_patch` for edits.
+Working rule that follows: `ctx_search` for orientation across the tree, but treat
+its zero as provisional (fact 1); `rg` for anything that might sit in a large file or
+span lines; `ctx_read mode="lines:N-M"` for a window; and `ctx_patch` for edits.
+Measured 2026-09-18: the native `code_search` tool is WORKING AGAIN (its earlier
+`uv_spawn` ENOENT failure is gone — it found `T-GPLR-44` at plan line 2633), and
+`rg` 15.0.0 is on PATH at `~/.kimi-code/bin/rg` with `rg` already in the global
+ctx_shell allowlist extras. So `rg` is the COMPLETE, non-truncating search and
+`ctx_search` is the CONVENIENT, incomplete one — pick accordingly, and prefer `rg`
+whenever the answer could be in `docs/currentstate.md`.
 
 ## Detached runs and waiting (convention, 2026-09-18)
 
