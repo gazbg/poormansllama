@@ -148,11 +148,14 @@ Escalate before implementation if
 
 ### T-GPLR-26: Gate-eligibility decision recording — binding vs advisory (item 4 brief)
 
-Status: DRAFT — pending owner pick. Decision material is the 2026-09-14 brief
-in docs/currentstate.md ("should gate eligibility BIND provisioning or stay
-ADVISORY?"); this draft is the task that records the pick and executes its
-consequences. Nothing is implemented and no gate verdict is claimed by this
-draft.
+Status: CLOSED — branch B (ADVISORY) executed 2026-09-18. **Owner decision:
+ADVISORY — the (b)-versus-0.6 reading binds nothing, and the higher-throughput
+retention depth is NAMED PER RUN (K=8) instead of being defaulted.** Branch B
+is the documentation-only branch, so this closure changes no source and makes
+no gate verdict: no gate PASS exists at any depth, before or after this pick.
+The 2026-09-14 brief's "should gate eligibility BIND provisioning or stay
+ADVISORY?" is answered here; the decision material below is kept as the record
+of what was weighed, including the unbuilt branch-A prerequisite chain.
 Depends on: T-GPLR-22 (the PRE-SINK run_refused plumbing the brief names as
 the existing shape for a gate-ineligible provisioning refusal; the missing
 part is the oracle, not the plumbing).
@@ -215,6 +218,40 @@ Escalate before implementation if
   measurement (the brief shows that input is wrong-sized for a policy);
   the refusal-reason enum change collides with an in-flight task; branch B
   would contradict a newer SDD amendment.
+
+#### T-GPLR-26 RESULT (2026-09-18): branch B executed — ADVISORY, zero source changes
+
+Owner pick: **ADVISORY** (branch B), taken together with the depth decision —
+the owner names the retention depth per run to take the higher-throughput option
+(**K=8**, `--residency-tg-retain 8`, requires `--residency-tg`) rather than have
+a default chosen for them. Branch B's acceptance criteria, checked: the SDD
+scope note and the K=4 caveat exist and name the brief, `git diff` for this task
+shows ZERO source changes — the closure is documents only
+(`docs/layer-residency-sdd.md` header amendment + section 4 depth amendment +
+section 10 provisioning-status note; section 11 gate 9 wording unchanged) — and
+the host suite is unaffected because nothing executable changed.
+
+Why the depth pick makes the gate question moot at this operating point: on the
+non-echoing (honest) curve the 0.6 threshold is cleared by K=6 (0.6487) and K=8
+(0.7283) and missed by K=4 (0.5355). A binding rule would therefore refuse the
+DEPRECATED default, not the depth the owner now names — there is no refusal left
+to exercise at K=8, and branch A's prerequisite chain (tracked oracle, verdict
+rule, absent-depth behaviour, new refusal reason + trace fields) would buy
+nothing the `slot`/`other` ledger and `rows_reused` do not already show. That is
+the recorded reason the cheaper branch was chosen: not that binding was found
+wrong, but that it has no work to do at the chosen depth.
+
+Recorded WITH the pick so it cannot be read as an endorsement — three limits, all
+measured: (1) the +12.609 tok/s at K=8 is the OPTIMISTIC echo pairing of the
+T-GPLR-19 A/B (that table's `(b)off` column is the echoed series), so an honest
+stream compresses it by roughly the 0.06-0.09 (b) shift and the figure is an
+upper estimate, unvalidated on a non-echoing stream; (2) the row cache is a
+TG-phase residency class, so NO depth changes prefill — this pick does not move
+the program's primary PP objective; (3) K=8 holds 4370.1 MiB of the row-cache
+allowance and its marginal K6->K8 step converts at 7.69 GB/s, the worst step in
+the ladder, so it is the most tok/s and the least efficient per byte. A NAMED
+depth is a contract: if it does not fit the allowance the run refuses loudly
+(`row_cache_depth`) instead of silently reducing it.
 
 ### T-GPLR-27 (CLOSED — DEFERRED 2026-09-18 by owner decision): Second-architecture first pass — dense target (item 6 brief)
 

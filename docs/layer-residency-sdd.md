@@ -10,6 +10,14 @@ see sections 1, 4, 6, 7, 8, 9, 10, 11, 12.
 Amended 2026-09-13: gate 9 decision rule stated by owner direction (T-GPLR-15
 metric reconciliation), so the verdict statistic is single-owned here; see
 sections 10 and 11 (gate 9).
+Amended 2026-09-18: gate-eligibility provisioning resolved to ADVISORY by owner
+decision (T-GPLR-26) — the (b)-versus-0.6 reading binds no run, no depth and no
+provisioning, permanently until an admissible oracle exists, and the operator
+names the retention depth per run; see sections 4, 10 and 11 (gate 9).
+Amended 2026-09-18: the operator-named retention depth becomes the operating
+lever for TG row-cache throughput (T-GPLR-26 depth decision); the measured
+depth ladder and its byte-to-time conversion are recorded in
+`docs/currentstate.md`.
 
 Reference implementation: `third_party/llama.cpp/src/llama-layer-streaming.*`
 
@@ -97,8 +105,25 @@ non-echoing certification is PARTIAL — the declared conjunction (distinct
 16-gram criterion (1.0000, against 0.3734 echoed) but not on the compression
 criterion (0.4238), which measures the entropy of structured code output rather
 than repetition and was mis-chosen when declared. Full table, the declared
-decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.] The mechanism itself remains opt-in
-and default-off: disabling the experimental option changes no default placement
+decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.]Scope amendment 2026-09-18 (owner-directed, T-GPLR-26): the retention DEPTH is
+an operator-named operating lever, not a gate outcome. `--residency-tg-retain N`
+names it (1..64 windows, 8 rows/layer per K step = 572,719,104 B per step across
+the 40 layers) and a named depth is never silently reduced; the bare flag keeps
+K=4 as a device-fitted CEILING. Measured on the 512-anchor vehicle (256 TG
+tokens, `--layer-slots 4`, reactive baseline 11.863-11.967 tok/s held across
+five GPU sessions), the TG gain rises monotonically with depth — K=1 +2.068,
+K=2 +3.853, K=4 +7.865, K=6 +10.196, K=8 +12.609 tok/s — while the byte-to-time
+conversion DEGRADES (14.29 / 12.18 / 10.67 / 10.52 / 10.23 GB/s; marginal per
+step 8.93 / 8.35 / 9.55 / 7.69), so only the first retained window converts
+above the ~13.7 GB/s link ceiling and every deeper window converts near the
+measured 8.42 GB/s per-fetch rate. Two limits travel with those numbers: the
+A/B's `(b)off` column is the ECHOED series, so the gains are the optimistic
+pairing and an honest stream compresses them by roughly the 0.06-0.09 (b)
+shift; and the row cache is a TG-phase residency class, so no depth changes
+prefill — this lever does not touch this SDD's primary PP objective, and every
+MiB it takes is a MiB the slot window cannot hold.
+
+The mechanism itself remains opt-in and default-off: disabling the experimental option changes no default placement
 and no non-experimental behaviour, and the depth applies only when an operator
 selects the cache. `--residency-tg-retain` with no value selects K=4 where the
 device affords it and otherwise the largest depth that does, so K=4 is a depth
@@ -545,6 +570,27 @@ next window's required set). The cache the statistic assumes is the section 4
 `min(n_expert, K*W*top_k)` most recently routed rows per layer, which is
 exactly what the runtime implements — so (b) predicts the mechanism's measured
 staging reduction rather than bounding it from above. The 0.6 threshold in gate 9 is read against that statistic.
+
+Provisioning status of this reading (owner decision 2026-09-18, T-GPLR-26): the
+(b)-versus-0.6 reading is **ADVISORY ONLY and binds nothing**. No run, no depth
+and no provisioning is admitted, refused or reduced by it, and reading it
+establishes no gate PASS at any depth. It stays advisory permanently until an
+admissible oracle exists — a tracked (b)-vs-K surface for a DECLARED workload
+class with per-stream provenance, a pre-registered verdict rule fixing which
+stream length, W and retention rule count produce a verdict, and a stated
+behaviour for a depth the surface has no entry for. The only readings on hand
+come from two streams measured at the wrong size for policy-making, and (b) is
+monotone in stream length, so a binding rule could refuse a productive run
+after a single prompt change — while a genuinely unproductive depth still shows
+up visibly in the `slot`/`other` ledger buckets and in `rows_reused`. What the
+caveat above is therefore FOR: the non-echoing reading (0.5355 at K=4) is
+recorded as EVIDENCE about the default, never as a refusal trigger. The
+operator's depth is named per run through `--residency-tg-retain N`; a NAMED
+depth is a contract that is never silently reduced (the bare flag is the one
+that fits itself to the device), and either way the bytes come out of the
+`moe-row-cache` allowance, so the depth is an explicit trade against the slot
+window this SDD's charter defends.
+
 Context statistics may be reported in either direction (`/ |A|` or `/ |B|`),
 but the direction must be stated wherever they appear; the verdict statistic
 is always next-window-in-denominator. Exact window-hash equality and exact
