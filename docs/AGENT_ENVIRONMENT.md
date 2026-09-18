@@ -544,6 +544,7 @@ Measured while building and testing through `ctx_shell`:
 | `CUDA_PATH` in the app's terminal | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2` (with `CUDA_PATH_V13_2`) |
 | `CMakeCache.txt` after the failed `ctx_shell` configure | CUDA still resolved to v13.2 (`CUDAToolkit_NVCC_EXECUTABLE`, `CUDAToolkit_BIN_DIR`, `CUDA_CUDART`) — the cache was NOT damaged |
 | `ctest --test-dir ... -R ...` inside `ctx_shell` | BLOCKED: `'ctest' is not in the shell allowlist. This is a permanent restriction, not a transient error.` (`where.exe` behaves the same) |
+| `powershell -NoProfile -File tools/run-*-locked.ps1` inside `ctx_shell` | BLOCKED the same way: `'powershell' is not in the shell allowlist.` — this is what blocks launching a mutex-held arm through `ctx_shell`; the app's terminal launches them (as it always has) |
 
 Cause of the CUDA failure: the MSBuild CUDA build customization resolves
 `CudaToolkitDir` from the `CUDA_PATH` environment variable at BUILD time, so a
