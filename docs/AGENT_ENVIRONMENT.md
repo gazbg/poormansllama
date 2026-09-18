@@ -655,6 +655,44 @@ which is a usage error, not a test failure. Always pass `-C Release`; the same
 applies to `ctest -R "layer-streaming"`, whose model-backed `-run` targets also
 fail without `Q38LS_MODEL_PATH` set.
 
+**Addendum H — lean-ctx MCP tool ergonomics, measured 2026-09-18 (working with the
+MCP tools as the primary interface).** Five facts that change how a search or a
+read should be trusted here:
+
+1. **`ctx_search` SKIPS LARGE FILES SILENTLY, and still prints "0 matches".**
+   `docs/currentstate.md` (7,091 lines, ~546 KB) is the "1 large files skipped"
+   note in every search result — it is never scanned. Measured: the pattern
+   `ROW-CACHE A/B ON THE HONEST STREAM` returns no matches although that heading is
+   in the file, and passing `path` to that file directly does NOT lift it (still
+   "0 matches in 0 files"). Workaround, verified: `ctx_shell` +
+   `grep -n "<pattern>" <absolute path>`, which found the line immediately.
+   **Consequence: a `ctx_search` zero is NOT evidence whenever the answer could
+   live in `docs/currentstate.md`** — the canonical state file is exactly the
+   place a stale claim hides. Cross-check with grep before concluding "nothing
+   references X".
+2. **No `path` means the scan is refused**, not silently mis-rooted: `.` resolves
+   to `$HOME` (addendum E) and the call errors with *refusing to scan '.' — it
+   resolves to a broad or privacy-protected directory*. Always pass an absolute
+   repo `path`.
+3. **`ctx_read` on a project file INJECTS THE RULES**: the full `AGENTS.md`
+   ("Rules in scope for this file") is appended to the payload — ~4k tokens in
+   this repo — and truncates the result when the budget runs out. Cause:
+   `rules_scope = "both"` in `.lean-ctx.toml`. Not a defect, a cost to know before
+   reading many files; the key is security-sensitive and pinned to the file's
+   contents, so changing it needs `lean-ctx trust` again.
+4. **`ctx_search` regex is line-based and case-sensitive**: a pattern cannot span
+   a line break, so a phrase split across two lines will not match however it is
+   written, and `AMBI` does not match `ambiguous`.
+5. **`ctx_patch` returns a RECEIPT**: every successful edit reports preimage and
+   postimage `blake3`, byte counts, mtime, and a bounded redacted diff — so an
+   edit's identity is recorded rather than asserted. Its errors are specific: a
+   wrong `old_string` guess came back naming the CRLF endings and the nearest
+   matching line.
+
+Working rule that follows: `ctx_search` for orientation across the tree,
+`ctx_shell` + `grep` for anything that might sit in a large file or span lines,
+`ctx_read mode="lines:N-M"` for a window, and `ctx_patch` for edits.
+
 ## Detached runs and waiting (convention, 2026-09-18)
 
 How to start long work and how to find out what happened to it, without

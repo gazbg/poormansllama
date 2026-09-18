@@ -1581,7 +1581,7 @@ Owner direction, 2026-09-14: "set K=4 as default for now". It rests on the **ech
 crossing — K=4 is the first recorded reading at or above 0.6 (0.6284) — and it is
 explicitly a PROVISIONAL OPERATING DEFAULT, not a gate verdict: no PASS is established
 at any depth, and the SDD scope amendment (2026-09-14) owns that decision. The
-VRAM-adaptive fit added afterwards (`kRowSetRetainDefault = 4`) keeps K=4 wherever the
+VRAM-adaptive fit added afterwards (`kRowSetRetainDefault = 4`, **RAISED TO 8 on 2026-09-18** -- see the entry at the top of this file for that owner decision and its evidence) keeps K=4 wherever the
 device affords it (arms F1/F2, free 19,775,094,784 B) and downscales only the *bare*
 default on a tight device (F4 -> K=3; F5 -> refuse, not even K=1 fits). A depth the
 operator NAMES is a contract and is never reduced. So the default today is: chosen on a
