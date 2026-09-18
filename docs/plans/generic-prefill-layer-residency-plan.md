@@ -216,9 +216,16 @@ Escalate before implementation if
   the refusal-reason enum change collides with an in-flight task; branch B
   would contradict a newer SDD amendment.
 
-### T-GPLR-27: Second-architecture first pass — dense target (item 6 brief)
+### T-GPLR-27 (CLOSED — DEFERRED 2026-09-18 by owner decision): Second-architecture first pass — dense target (item 6 brief)
 
-Status: DRAFT — pending owner pick of the architecture. Decision material is
+Status: CLOSED — DEFERRED (2026-09-18, owner decision). **Owner, verbatim: "I do not
+need to prove genaralization now, note it and close it."** This is closed as
+INTENTIONALLY NOT PURSUED, not as done: no second-architecture adapter exists and
+none is planned, and the T-GPLR-04 preflight / T-GPLR-22 refusal path remain
+arch-independent in code but exercised against the Qwen MoE vehicle only — so no
+generic-architecture claim is made or implied by closing this. The draft below is
+kept as the design record and as the starting point if that decision is reversed.
+Historical decision material (for such a reversal) is
 the 2026-09-14 brief in docs/currentstate.md ("which second architecture
 should be the first to pass the generic gates?"); the brief recommends
 Gemma-4 12B with the qwen35-arch small models run first as a cheap precursor
@@ -1484,6 +1491,152 @@ Non-goals
 Recon result (measured, 2026-09-17)
 : * Arm: `tools/run-gplr39-recon.ps1`, u2048 / 3 slots / ron / 4k anchor /
   `--pp-repeat 2`; checker OK; trace `build/llama-cuda/gplr39-u2048-recon.jsonl`.
+
+#### T-GPLR-39 implementation arm (2026-09-18 — COMMITTED, vendored tree c5d79ad5c)
+
+Fix class implemented: (d) exact bounded host selection, alongside the
+(a)/(b)/(c) options above. `tel_route` and `read_router_ids` now derive the
+top-k ids with `llama_ls_route_topk_row` (O(n_expert*k) bounded insertion and
+one reused ids buffer) instead of rebuilding an index array and
+`std::stable_sort`ing all n_expert experts per token; the route event's union
+moves from `unordered_set` to a byte map. The derivation is unchanged by
+construction, so no emitted evidence changes meaning: route ids, union, hash
+and `sampled_ids` stay the same values.
+
+Second call site is NOT telemetry: `read_router_ids` produces the row-set
+ROUTING decision that the caller memcpys into `sel_in`, so the replacement had
+to preserve the id ORDER (ties by ascending expert index). Equivalence
+argument: its only live output is `ids_per_token` (`probs_buf` is written but
+never read at its single call site), the ids are bit-identical, and the staged
+row set derives from those same ids. End-to-end confirmation is unmeasured.
+
+Host validation (measured, no GPU): `tests/test-layer-streaming-route-topk.cpp`
+34/34 PASS — 28 row-level cases (k=1..n_expert, heavy ties, all-equal, all-zero
+underflow, signed zeros, n_expert 1..5 exhaustive, clamp, degenerate inputs)
+plus 6 row-set cases (ubatch rows, duplicate rows, ties, W=1, k extremes) that
+also compare the caller's `sel_in` packing, each against the pre-change
+derivation kept verbatim as the oracle.
+
+Unmeasured / open: (1) wall-clock effect — the per-call device->host probs
+readback is untouched and is the larger term, so expect a modest trim rather
+than the 32-64x class (a) targets; (2) end-to-end row-set equality (arm:
+`tools/run-gplr13-rowset-probe.ps1`, GPU mutex); (3) proposed GPU acceptance
+for this arm: re-run the u2048 recon arm and require all 80 route records
+(hash/union/sampled_ids) to match `build/llama-cuda/gplr39-u2048-recon.jsonl`,
+measured reproducible (80/80 keys identical across pass 1 and pass 2).
+
+#### T-GPLR-36 host-memory instrument (2026-09-18 — COMMITTED, vendored tree c5d79ad5c)
+
+The open question from the 200k ledger run — the owner's observed host-RSS climb
+(~19 -> 30 GB across a run) had NO instrument, every byte figure in the trace
+being VRAM-side, and the external `tools/monitor-mem-gplr36.ps1` can only report
+a 5 s time series, never attribute — now has an in-tree per-pass instrument.
+
+What it emits: a `host_mem` record at each PP pass boundary, twice per pass
+(`pass_begin` / `pass_end`), recon-gated exactly like the T-GPLR-36 ledger.
+Fields: process working set, private (anonymous) resident share and the derived
+file-backed/shared share (with `ws_private_known` flagging whether that split is
+available at all — a silent zero would make the file-backed share read as the
+whole working set, so the record says which case it is in), private commit, OS
+lifetime peak and this run's peak,
+deltas since the previous sample and since the run's first sample, system
+free/total RAM and commit, plus `eng_bytes` — the engine's OWN accounted host
+holdings at the same instant (per-slot pinned staging + persistent pinned pool +
+registered mmap spans), read from the live allocations, never re-derived.
+
+Why that shape: `ws - ws_private` separates the runner's own anonymous
+allocations from the mapped model's file-backed pages, and that is the split that
+attributes the climb; `eng_bytes` then says whether the anonymous delta is the
+residency machinery or something else. The baseline deliberately survives
+`reset_stats()` (the runner resets stats at every pass boundary; cross-pass
+growth is the point). Sampler `llama_ls_host_mem_sample()` lives in its own TU
+(`src/llama-layer-streaming-host-mem.cpp`) because `<windows.h>` defines
+min/max/small as macros while the main source uses std::min/max and locals named
+`small`; a platform without the counters reports `ok == false`, not a zero.
+
+Validation (measured, host-only, no GPU): `tests/test-layer-streaming-host-mem.cpp`,
+CTest #50 PASS — field invariants plus the reactivity property (a touched 256 MiB
+allocation moved the working set by exactly +256 MiB and commit by +257 MiB),
+which is what a constant or wrong-process query would fail; CTest #49
+(`test-layer-streaming-route-topk`) still PASSes and llama.dll builds clean with
+the new TU. Checker safety is established, not assumed: unknown non-empty event
+types are ignored by both validators (`check_telemetry` has no unknown-event
+error path; `validate_telemetry` errors only on an EMPTY event field), the same
+property the `host_ledger` record and the T-GPLR-39 sub-buckets already relied on.
+
+Superseded on the same day: the first real arm has since run, so the 19 -> 30 GB
+climb is still UNEXPLAINED — it is now measurable and attributable per pass,
+which is not the same as measured. Consumption is a `--pp-recon 1` arm on any
+crowded shape (the 200k/262k F16 reference is the natural pair to the recorded
+ledger run).
+
+#### T-GPLR-36 host-memory instrument — FIRST REAL ARM (measured, 2026-09-18)
+
+Arm `tools/run-gplr36-hostmem.ps1` (byte-identical flags to the ledger arm: 200k
+anchor, 262k F16 KV config, layer-major, u512, af=1, pinned, bf16 slabs, 3 slots,
+--pp-repeat 2, --pp-recon 1) under the mutex via `tools/run-gplr36-hostmem-locked.ps1`.
+Runner exit 0, strict --check-telemetry OK, pipeline gate PASS (shape-mismatch
+skip: no absolute floors applied). GPU otherwise IDLE at arm start (0 MiB of
+24,463) — the other project under the mutex released just before — so "crowded"
+here is the long-context KV shape, not external VRAM pressure. Trace
+`build/llama-cuda/gplr36-hostmem-200k.jsonl`, wrapper log
+`build/llama-cuda/gplr36-hostmem-wrapper.log`, analyzer
+`tools/analyze-gplr36-hostmem.py`.
+
+Measured (MiB):
+
+| pass | label | ws | private | file | commit | d_ws | eng |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | begin | 4,126.9 | 2,129.3 | 1,997.6 | 12,989.5 | 0.0 | 1,494.0 |
+| 1 | end | 23,457.1 | 3,974.6 | 19,482.5 | 15,752.7 | +19,330.2 | 1,494.0 |
+| 2 | begin | 21,867.5 | 2,385.0 | 19,482.5 | 13,376.9 | (shrank 1,589.6; clamped to 0) | 1,494.0 |
+| 2 | end | 25,054.0 | 5,572.2 | 19,481.8 | 16,929.1 | +3,186.5 | 1,494.0 |
+
+**The climb is the model's own mapping, not the residency machinery.** Working
+set +20,927.1 MiB over the run = 83.5% file-backed/shared (+17,484.2) + 16.5%
+private (+3,442.9), while the engine's accounted host holdings are FLAT at
+1,494.0 MiB (d_eng = 0 at all four samples). File-backed pages land almost
+entirely in PASS 1 (+17,484.9) and are flat in pass 2 (+0.0 / -0.7): the pinned
+staging path memcpy's every package member out of the mapping, so the first pass
+touches essentially the whole 19.92 GiB GGUF. Those are reclaimable model pages,
+not a leak.
+
+**The residue is the anonymous growth and it is NOT ours:** +3,442.9 MiB — pass 1
++1,845.3, a 1,589.6 MiB SHRINK across the pass boundary, then pass 2 +3,186.5.
+That sawtooth is what a buffer freed and re-allocated at the boundary looks like,
+and its magnitude is in the same band as the runner's own byte_account figure for
+the HOST-SPILLED KV at this shape (3,910 MiB), which the engine deliberately does
+not account (KV belongs to the memory module). Leading candidate: the KV host
+spill re-touching across the boundary. Not measured yet — the residue is now
+quantified and its candidate named.
+
+**Cross-instrument agreement:** the independent external monitor
+(`tools/monitor-mem-gplr36.ps1`) measured a 200k arm's max process working set at
+23,458 MiB (T-GPLR-37c); this instrument measured 23,457.1 MiB at pass 1's end.
+Two instruments, different processes, ~1 MiB apart.
+
+**The 19 -> 30 GB observation:** this shape climbs 4.13 -> 25.05 GiB, so the
+mechanism reproduces (a large, overwhelmingly file-backed climb) while the 30 GB
+ceiling does not appear here, and the recorded external maximum (23.5 GiB)
+agrees with this run rather than with 30. Reaching ~30 GB needs more ANONYMOUS
+demand (deeper KV spill, more slots, a pinned pool), not more model mapping, and
+the instrument can now price those knobs separately.
+
+**Instrument limitations this arm demonstrated:** (1) `d_ws` clamps negative
+deltas, so the 1,589.6 MiB boundary shrink is visible only via `g_ws` — deliberate
+(an unsigned wrap would read as 16 EiB), and a signed field is the improvement if
+shrink magnitudes matter. (2) Two samples per pass: a climb INSIDE a pass is
+bracketed, not resolved. (3) `eng_bytes` covers only this module's buffers, so
+"unaccounted" means "outside the residency machinery", not "outside the process".
+
+**Unrelated anomaly in the same run, recorded not explained:** pass 2 (warm) was
+SLOWER than pass 1 (cold) — wall 199,426.3 ms / 1,002.877 tok/s vs 139,073.4 ms /
+1,438.090 tok/s, compute 194,031.5 vs 132,394.9 ms, transfer 363,524.3 vs
+256,427.0 ms — where the recorded ledger reference for this shape is the opposite
+(cold ~146 s, warm 141.8 s). Candidate causes, none tested: GPU contention during
+pass 2, host page-fault pressure on the 19.5 GiB mapping, or a boundary effect
+specific to this shape. Needs the repo's standard replicated adjacent pairs
+before any interpretation.
 
 #### T-GPLR-40 (bisect, 2026-09-17): the 144k pass-2 crash — tail chunk vs long-context+repeat
 

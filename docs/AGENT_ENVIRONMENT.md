@@ -534,6 +534,39 @@ while the detected root is `$HOME` is untested.
 
 
 
+**Addendum F — the lean-ctx shell's environment is narrower than the app's terminal, and two commands are not allowlisted (2026-09-18).**
+Measured while building and testing through `ctx_shell`:
+
+| Observation | Reading |
+| --- | --- |
+| `cmake --build <CUDA build dir>` inside `ctx_shell` | FAILS: `CUDA 13.2.targets(609,9): error : The CUDA Toolkit directory '' does not exist` (project `ggml-cuda.vcxproj`) |
+| The same build in the app's terminal (default tool) | succeeds, repeatedly |
+| `CUDA_PATH` in the app's terminal | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2` (with `CUDA_PATH_V13_2`) |
+| `CMakeCache.txt` after the failed `ctx_shell` configure | CUDA still resolved to v13.2 (`CUDAToolkit_NVCC_EXECUTABLE`, `CUDAToolkit_BIN_DIR`, `CUDA_CUDART`) — the cache was NOT damaged |
+| `ctest --test-dir ... -R ...` inside `ctx_shell` | BLOCKED: `'ctest' is not in the shell allowlist. This is a permanent restriction, not a transient error.` (`where.exe` behaves the same) |
+
+Cause of the CUDA failure: the MSBuild CUDA build customization resolves
+`CudaToolkitDir` from the `CUDA_PATH` environment variable at BUILD time, so a
+build in a shell that inherits no `CUDA_PATH` fails regardless of what CMake
+found at configure time. The MCP child's environment is built from a 12-name
+allowlist plus that server's declared `env` (Addendum E), and `CUDA_PATH` is not
+on the allowlist — the same narrowing that motivated the `PATHEXT`/`COMSPEC`
+declaration, now with a second consequence.
+
+Working route, no config change: pass it per call, e.g.
+`ctx_shell(command="cmake --build C:/.../build/llama-cuda --config Release --target <t>", env={"CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2", "CUDA_PATH_V13_2": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2"})`.
+The durable route is declaring `CUDA_PATH` in the lean-ctx `env` map, which costs
+a launch re-approval (Addendum C). For CTest, use the app's terminal tool: the
+allowlist refusal is permanent for the name, adding one is explicit and additive
+(`lean-ctx allow ctest`), and it was NOT done here because it edits
+`~/.config/lean-ctx/config.toml`, outside this repository.
+
+Long-running work through `ctx_shell` works well and is the right shape here:
+`run_in_background: true` returns a `job_id`; `background_action: "status"`
+returns accrued output (large output is firewalled out-of-band into an archive
+id with head/tail inline); `background_action: "cancel"` stops it. A detached job
+keeps running up to `timeout_ms` (max 3600000) after the ~110 s foreground cap.
+
 ## Canonical Build Commands
 
 All commands run from the workspace root in Git Bash.
