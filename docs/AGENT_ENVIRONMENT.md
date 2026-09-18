@@ -210,6 +210,46 @@ accidental out-of-core result.
 | HEAD at inventory | `04b569142da23d91beca090a99098d592d3f3c80` |
 | Qwen3.5 support | present: `LLM_ARCH_QWEN35` in `src/llama-arch.cpp`, `src/models/qwen35.cpp`, delta-net base in `src/models/delta-net-base.cpp`, `src/llama-memory-recurrent.h` |
 
+## lean-ctx MCP shell environment (observed 2026-09-18)
+
+The lean-ctx MCP server's `ctx_shell` tool runs PowerShell 7 in an environment
+inherited from its launching chain, not from the Windows registry merge. In that
+environment `PATH` and `TEMP` are present (the `PATH` is bash-flavored: Git and
+msys2 directories appear twice and with trailing separators), but `PATHEXT`
+reports only `.CPL` — the suffix PowerShell appends — and `COMSPEC` is empty.
+User-level registry variables (`OLLAMA_HOST`, `OneDrive`, `LEAN_CTX_PROFILE`,
+`HF_TOKEN`, ...) are **not** visible to it, so registry edits cannot reach the
+running MCP child. Machine-level `PATHEXT` and `COMSPEC` are both set correctly.
+
+Consequence: extension-less command names do not resolve inside `ctx_shell`.
+`git`, `python`, `cmake` and `node` all fail with "is not recognized as a name
+of a cmdlet, function, script file, or executable program". PowerShell cmdlets,
+`ctx_read` / `ctx_search` / `ctx_tree`, and the lean-ctx CLI path
+(`lean-ctx -c "git status"`) are unaffected — the CLI inherits the normal shell
+environment.
+
+Workaround (verified: `git version 2.53.0.windows.1`, `Python 3.13.14`,
+`cmake version 4.2.3`): pass the two missing variables on every `ctx_shell`
+call. The payload does **not** persist between calls, and there is no
+`.lean-ctx.toml` knob for it (the config schema has no shell-environment key).
+
+```json
+"env": {
+  "PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW;.CPL",
+  "COMSPEC": "C:\\Windows\\system32\\cmd.exe"
+}
+```
+
+Related lean-ctx shell-policy facts observed in the same session: commands whose
+first token is `$env:VAR` and commands starting with a quoted absolute
+executable path are rejected by the shell allowlist ("not in the shell
+allowlist ... the entire command was rejected"), `git.exe` is not allowlisted
+even though `git` is, and inline interpreter evaluation (`python -c ...`) is
+blocked by policy. Untested: whether relaunching the client from a
+Windows-native context (rather than the current bash-flavored chain) restores
+`PATHEXT` for the MCP child. That relaunch is the falsifier if this is
+revisited; until then the per-call `env` payload is the supported route.
+
 ## Canonical Build Commands
 
 All commands run from the workspace root in Git Bash.
