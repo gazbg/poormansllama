@@ -250,6 +250,25 @@ Windows-native context (rather than the current bash-flavored chain) restores
 `PATHEXT` for the MCP child. That relaunch is the falsifier if this is
 revisited; until then the per-call `env` payload is the supported route.
 
+Addendum (2026-09-18, registry change): the owner set both values at the
+**user** level (`PATHEXT(User)` = `.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW;.CPL`,
+`COMSPEC(User)` = `C:\Windows\system32\cmd.exe`); machine-level `PATHEXT` and
+`COMSPEC` were already correct. Re-checked in place: `ctx_shell` still reports
+`PATHEXT=[.CPL]`, `COMSPEC=[]` and `git` still does not resolve, because an MCP
+child's environment is fixed when the process is spawned -- a registry write
+cannot reach a running session. **Decisive test pending: relaunch the client
+from a Windows-native context, then run in `ctx_shell`:**
+
+```powershell
+Write-Output ('PATHEXT=[' + $env:PATHEXT + ']'); git --version; python --version; cmake --version | Select-Object -First 1
+```
+
+Resolved values -> extension-less names work and the per-call `env` payload can
+be dropped. Still `.CPL` -> the launcher filters the child environment (it also
+drops `OLLAMA_HOST`, `OneDrive`, `HF_TOKEN` and `LEAN_CTX_PROFILE` while keeping
+`PATH`, `TEMP` and `BASH_ENV`, which an ordinary Git Bash on this box carries in
+full), and the per-call payload is the permanent route.
+
 ## Canonical Build Commands
 
 All commands run from the workspace root in Git Bash.
