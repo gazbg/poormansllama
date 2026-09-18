@@ -859,7 +859,8 @@ Escalation condition
 
 ### T-GPLR-35: PP staging overlap — bank DMAs on a second stream inside the compute context (warm 4k ~2.75-2.8 -> ~2.0-2.1 s)
 
-Status: in-progress (2026-09-16) — RECON RUN DONE, FALSIFIER CLASS REACHED
+Status: CLOSED (2026-09-18) — DISCARD the CUDA stream-topology lever; the closure verdict, the acceptance disposition and the default decision are at the END of this block. Closing this task sets NO default.
+Historical status (2026-09-16): in-progress — RECON RUN DONE, FALSIFIER CLASS REACHED
 (NONE). V1 implemented, built clean, and measured: with the aux stream (ov1)
 the warm 4k wall is 3088.4 ms vs the copy-backend baseline's 3089.0 ms —
 measurably identical — and in BOTH arms the copy windows are already pure
@@ -1114,9 +1115,49 @@ still pay at the crowded-VRAM shape? RUN; depth does NOT pay there.
   (optimum stays in the 2-3 slot range) and the remaining lever is the compute
   side, which is 92% of that wall.
 
+Closure (2026-09-18) - VERDICT: **DISCARD the CUDA stream-topology lever** (V1 aux-stream staging).
+Closing this task sets NO default: `--pp-copy-overlap` stays 0, and the slot count stays 2.
+
+: Acceptance disposition: the wall criterion FAILED and the contract's own falsifier clause
+  applies. The overlap=1 arm measured **3088.4 ms** warm 4k against the copy-backend
+  baseline's **3089.0 ms** - measurably identical - while in BOTH arms the copy windows were
+  already pure (median 31.4 ms = 1.00x the 31.37 ms pure-rate ceiling) with lag >= 0 on 76/76
+  samples. The 2.75 -> 2.0-2.1 s target is not reachable from stream/context topology, and the
+  prediction's failure IS the evidence: no DMA ever started while the compute backlog drained,
+  so there was nothing for a second stream to overlap.
+
+: What the wall is instead, per the recon's own ledger: of the 3089 ms, compute 1350 ms and
+  pure DMA 1238 ms, while the 3988 ms host transfer window splits into a 1559 ms host hop
+  (pinned mirror + submit) and 2429 ms of ready latency, of which only 1238 ms is engine time
+  and 1191 ms is queue wait. The choke is host-side pipeline plus one-bank-deep ordering.
+
+: KEPT, because it is a defect fix rather than a performance result: `backend_compute` was
+  published ONLY inside `layer_streaming_compute`, which layer-major PP never calls (it
+  executes graphs directly at :3274), so on the PRIMARY workload the aux mechanism could not
+  engage at all - the flag-on arm aborted loudly and the recon silently emitted nothing. It is
+  now published in `layer_major_pp` with the loud aux-stream refusal, and the recon emits
+  `recon_unavailable` rather than a silent no-op. That fix is what made this falsification
+  observable instead of invisible, and it stays.
+
+: Neither remaining lever is orphaned by this closure, so the closing verdict does not narrow
+  the program: host-hop removal is T-GPLR-37 (V2 mmap-registered staging measured -23.3%/-15.4%
+  warm at 4k at 2/3 slots, at 17.23 GiB of pinned pages, with NO transfer to the crowded shape -
+  owner decision, still open), and pipeline depth is this task's own addenda (3 slots -15.8% at
+  4k; at 200k +0.5%/+0.4% for 3/4 slots, i.e. depth does NOT pay at the shape the charter
+  prioritises).
+
+: Admissibility: both arms check-telemetry OK, no deadlock, the refusal path exercised; the
+  contract states no qa-smoke is required (staging-path only, cannot alter generated output)
+  and no run showed an output difference.
+
+: Disclosed and left unattributed at closure: the 3-slot arm's per-pass compute total rose
+  1369 -> 1611 ms (+18%) with identical bytes and arithmetic. It does not bear on this verdict
+  (which rests on the 2-slot ov0/ov1 pair) and is recorded as an open anomaly, not explained.
+
 ### T-GPLR-36: Long-context PP residual — what is the ~10 s that is neither compute nor engine time?
 
-Status: in-progress (2026-09-17) — RUN; PREDICTION FALSIFIED IN ITS DETAIL. The
+Status: CLOSED (2026-09-18) — the residual is NAMED and it is host bookkeeping; the closure verdict and the Planner hand-back are at the END of this block. Closing this task sets NO default (`--pp-recon` stays opt-in, default 0).
+Historical status (2026-09-17): in-progress — RUN; PREDICTION FALSIFIED IN ITS DETAIL. The
 per-graph-setup hypothesis is answered NO (278.6 ms per pass = 0.017 ms/launch =
 3.0% of the residual), and the residual is per-launch HOST work outside the
 graph window: other 4,516 ms (48.3%, unnamed yet), patch 3,402 ms (36.4%,
@@ -1124,7 +1165,11 @@ redundant per-launch chunk patching), slot 1,065 ms (11.4%), setup 3.0%,
 graph_call 0.2%. Ledger closure exact (0.00%).
 Depends on: T-GPLR-35 (the recon + slot-depth arms whose traces carry the
 residual), T-GPLR-25 (async feed), T-GPLR-29 (pinned staging)
-Commit: (fill on completion)
+Commit: nested 8e14abd36 (the first commit carrying the `host_ledger` emitter and its
+  fields - the ledger was MEASURED 2026-09-17 before it was committed, consistent with that
+  day's "Nothing committed" entries); outer a58fdee (ledger runner + analyzer family); outer
+  4b13ac3 (gplr36 tooling + the verdict docs); the host-RSS half was instrumented later -
+  nested c5d79ad5c, outer fe9c1cf
 
 Goal
 : Name the warm 200k-token PP residual. At 3 slots the recorded pass is
@@ -1242,6 +1287,55 @@ State/document updates
 Escalation condition
 : If the ledger fails to close (buckets do not sum to the sweep within 1%),
   stop and record the discrepancy rather than publishing a decomposition.
+
+Closure (2026-09-18) - VERDICT: **CLOSED; the ~10 s residual is NAMED and it is host
+bookkeeping.** Closing sets NO default: `--pp-recon` stays opt-in (default 0), so the ledger
+and its sub-buckets cost a normal run nothing.
+
+: Answer, with the ledger closing exactly (0.00%): of a 141,847.9 ms warm pass (1,409.96 tok/s)
+  over a 140,807.7 ms sweep with wait 36.5 ms, the residual is `other` 4,516.3 ms (48.3%),
+  `patch` 3,402.3 ms (36.4%), `slot` 1,065.1 ms (11.4%), `setup` 278.6 ms (3.0%) and
+  `graph_call` 22.1 ms (0.2%) across 16,422 launches. The per-graph-setup hypothesis the owner
+  asked to test is FALSIFIED (3.0%), and both pre-registered predictions were wrong in the same
+  informative direction: `graph_call` was predicted to be the largest unattributed bucket and
+  measured 22.1 ms, while `other` was predicted under ~1 s and measured 4,516 ms. The
+  pre-registered falsifier therefore did NOT fire - the residual IS host bookkeeping.
+
+: The `other` bucket was subsequently NAMED by T-GPLR-39's recon: `route_us` = 1161.5 of
+  1152.8 ms at u2048 (the split closes exactly by construction, so the >100% share is closure,
+  not double counting). It is route TELEMETRY - the device->host probs readback through
+  `ggml_backend_tensor_get` stalling the compute stream, plus a host sort of
+  O(n_tok x 512 log 512) - and it scales with ubatch SIZE (237.9 ms at u512, 484.5 at u1024,
+  962.1 at u2048, 959.0 at u4096), not with launch count.
+
+: The owner's separate observation that motivated this family - host RSS growing 19 -> 30 GB
+  with NO instrument - got its own instrument and its first real arm the same day: at the 200k
+  shape the working set climbs 4.13 -> 25.05 GiB, of which **83.5% is the file-backed model
+  mapping** and 16.5% private, while the engine's own accounted host holdings are FLAT at
+  1,494.0 MiB. It is not a leak: the first pass memcpy's every package member out of the model
+  mapping, so it touches essentially the whole 19.92 GiB GGUF once. Reaching a 30 GB ceiling
+  needs more ANONYMOUS demand (deeper KV spill, more slots, a pinned pool), not more mapping.
+  Cross-instrument check: an independent external monitor measured 23,458 MiB max working set on
+  a 200k arm, and this instrument measured 23,457.1 MiB at pass 1's end.
+
+: Acceptance criteria, all met: `host_ledger` appears once per pp pass (2 lines in the trace,
+  one per pass, `launches == ubatches x layers_run`); closure holds exactly (0.00%); the verdict
+  on the per-graph-setup hypothesis is restated with the ledger's own numbers; both strict
+  checkers pass; and the 200k wall (141,847.9 ms) sits inside the session-to-session spread of
+  the recorded 146,030 ms reference (-2.9%).
+
+: Side finding, recorded at closure: the ledger's `compute` bucket exceeds the summary's
+  `total_compute_us` by 274 ms because the embed and output loops execute graphs that no layer
+  stat accumulates - so ~0.27 s of what looked like "residual" is real compute.
+
+: HANDED BACK TO THE PLANNER, not drafted here (drafting tasks is Planner work): this task's
+  own measured lever list is still un-drafted. (2) Make `prepare_chunk` per-chunk instead of
+  per-launch - 3,402.3 ms per pass at 200k, ~97% redundant, because its inputs are per-chunk but
+  it is called once per launch. (3) Deep-submit chunk graphs to remove the per-launch sync,
+  which is what exposes 0.564 ms/launch of host prep on the wall by construction (duty 93.4%).
+  Together they are worth up to ~9.3 s of a 141.8 s pass (-6.5%) at this shape with NO extra
+  VRAM - the largest measured PP lever this program currently has open, and squarely inside the
+  charter's first priority.
 
 ### T-GPLR-37: direct mmap-sourced staging — remove the CPU hop from bank staging
 
@@ -1497,7 +1591,8 @@ Validation commands (addendum 3)
 
 ### T-GPLR-38: ubatch sweep on the 4k anchor — does fewer, fatter launches buy wall time under the current best mode?
 
-Status: run (2026-09-17) — prediction INVERTED at u2048; sweet spot u1024
+Status: CLOSED (2026-09-18) — u1024 is the measured 4k sweet spot and u2048 is a regression under the current host loop; the closure verdict, the output-identity observation and the default decision are at the END of this block. Closing sets NO default (`--ubatch` stays 512).
+Historical status (2026-09-17): run — prediction INVERTED at u2048; sweet spot u1024
 (−4.0% warm wall); the falsifier fired informatively: the `other` ledger bucket
 scales with UBITSIZE, not launch count. Verdict recorded in
 docs/currentstate.md; follow-up lever = make the other-bucket work
@@ -1560,6 +1655,41 @@ State/document updates
 Escalation condition
 : If an arm refuses on VRAM or the checker rejects a trace, record the shape and
   stop the sweep at the last clean point.
+
+Closure (2026-09-18) - VERDICT: **CLOSED; u1024 is the measured 4k sweet spot, and u2048 is a
+regression under the current host loop.** Closing sets NO default: `--ubatch` stays **512**
+(the runner's default, main.cpp:2534; help text line 50) for the three reasons below.
+
+: Measured (four adjacent arms, one mutex hold, all four strict checkers OK): warm wall
+  2317.5 ms (u512) -> **2224.3 ms (u1024, -4.0%)** -> 2510.6 ms (u2048, +8.3%) -> 2435.2 ms
+  (u4096); tok/s 1767.4 -> 1841.4 -> 1631.5 -> 1682.0.
+
+: The pre-registered prediction was WRONG in the informative direction. Consumer wait stayed
+  FLAT (67.7-68.0 ms at every ubatch, so the predicted granularity penalty never materialised),
+  peak VRAM was identical (3265.56 MiB - the known defect reading; the sweep probes the shared
+  3-slot window, so the buf_act deltas of 24 -> 192 MiB hide inside the slack), and the ledger
+  `compute` bucket fell monotonically (1862.6 -> 1525.1 -> 1375.0 -> 1282.7 ms) exactly as
+  predicted - but `other` EXPLODED (237.9 -> 484.5 -> 962.1 -> 959.0 ms), swallowing the compute
+  saving and then some. The falsifier's second clause fired: the per-launch overhead model was
+  **launch-COUNT-based** when the residue is **ubatch-SIZE-based**. u1024 is the only arm that
+  keeps the best of both (-334 ms compute, +247 ms other, net -93 ms wall).
+
+: WHY THE DEFAULT IS NOT RAISED TO 1024 - a decision, not an oversight: (i) the win is a net
+  -93 ms at ONE shape (4k anchor, ron mode, 3 slots) and the gate cannot model a moving ubatch
+  axis - the paired runs correctly REFUSE same-config pairs, so the printed ratios
+  (1.042x / 0.923x / 0.952x) are recorded but ungated; (ii) the MECHANISM says bigger is not
+  generically better, because the bucket that grows is a function of ubatch SIZE, so raising the
+  default before the host loop is fixed trades a 4k gain for a long-context loss; (iii) the only
+  long-context ubatch arm (144k, u1024 vs u2048) is INVALID - both arms crashed in pass 2 and the
+  surviving pass-1 numbers are COLD and arm-order confounded (the crash was later bisected: the
+  tail chunk is exonerated and q8 KV + pass 2 is the trigger). This is the same failure mode
+  that produced the K=4 row-cache default, so it is not repeated here. The lever that would make
+  u2048+ safe is T-GPLR-39's fix class - named and measured, still an open owner decision.
+
+: Output identity, recorded rather than dropped: greedy TG text is byte-identical at u1024 and
+  u2048, but **u4096 DIFFERS (262 vs 305 bytes - the answer is cut short)**. That is an identity
+  sanity check, NOT the semantic-QA gate. It is unexplained, and no arm at or above u4096 should
+  be treated as output-equivalent until it is investigated.
 
 ### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent — the residue that grows with ubatch size
 
