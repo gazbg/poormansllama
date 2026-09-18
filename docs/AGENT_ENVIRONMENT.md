@@ -566,6 +566,9 @@ Long-running work through `ctx_shell` works well and is the right shape here:
 returns accrued output (large output is firewalled out-of-band into an archive
 id with head/tail inline); `background_action: "cancel"` stops it. A detached job
 keeps running up to `timeout_ms` (max 3600000) after the ~110 s foreground cap.
+**These mechanics are consolidated, with the absolute-path and no-unconditional-
+sleep rules, in "Detached runs and waiting" below — read that section before
+launching anything long.**
 
 **Addendum G — the allowlist is name-exact, a project `.lean-ctx.toml` cannot
 reach `ctx_shell`, and trust is pinned to file contents (2026-09-18, measured).**
@@ -651,6 +654,89 @@ generator, so `ctest` without `-C Release` reports both tests **Not Run** with
 which is a usage error, not a test failure. Always pass `-C Release`; the same
 applies to `ctest -R "layer-streaming"`, whose model-backed `-run` targets also
 fail without `Q38LS_MODEL_PATH` set.
+
+## Detached runs and waiting (convention, 2026-09-18)
+
+How to start long work and how to find out what happened to it, without
+watching it. Consolidates the detached-job facts that were scattered across
+addenda E-G plus the two conventions that prevent the mistakes below.
+
+**Two different questions, two different sources.** Do not conflate them, and
+do not answer one with the other's evidence:
+
+| Question | Source | Notes |
+| --- | --- | --- |
+| *Did it start?* | the launch handshake — the `job_id` | The ONLY source that can distinguish "never started" from "still running": an absent sentinel looks identical in both cases (measured 2026-09-18 — the job that never started left exactly the same `ABSENT` as a running one). |
+| *Did it finish, and how?* | the `.done` sentinel beside its verdict | See the next section; one file check, no log tailing. |
+
+**Launch.** `ctx_shell` with `run_in_background: true` returns a job id —
+observed form `shell_<16 hex>` (e.g. `shell_ef7e71caa67cfb45`) — and returns
+immediately. The job keeps its `timeout_ms` (max **3600000** ms) after the
+~110 s foreground cap; that cap is documented tool behaviour, so a foreground
+command that overruns is still detached into a pollable job rather than lost,
+but it must then be polled by job id. **Pass ABSOLUTE paths in a background
+command: `cwd` does not apply to it.** Measured the hard way on 2026-09-18 — a
+detached `powershell -File tools/smoke-gpu-lock-ctxshell.ps1` died in under a
+second with `The argument ... does not exist` (relative path resolved against
+`$HOME`, the server's workspace root per Addendum E), exit 1, while the file
+check for its sentinel simply said `ABSENT`. Absolute `-File` path: same
+command, exit 0, 15.4 s.
+
+**Poll and cancel.** `background_action: "status"` with `job_id` returns the
+job state plus accrued output and the exit code; observed states `running`,
+`completed`, `failed`. `background_action: "cancel"` stops it. An evicted or
+expired job returns a structured *lookup error*, not a stale status. Status is
+how a launch mistake is caught; it is not how a finished run is read — that is
+the sentinel's job.
+
+**The rule against unconditional sleeps.** A wait must be **conditional and
+productive**: it should name the observable it is waiting for, return the moment
+that changes, and print the *results* in the same call. Waiting is otherwise
+idle, and idle waiting costs the whole turn.
+
+- **Measured negative example (2026-09-18):** two `sleep 170` calls while a
+  four-arm A/B ran. They blocked the turn, produced one useful outcome between
+  them (being interrupted twice), and could not have finished early even if the
+  run had — the sleep does not know what it is waiting for. The job did not need
+  the agent to make progress, so the waiting bought nothing.
+- **Accepted shell shape:** a bounded loop on the condition, then the analysis in
+  the same call — `for i in $(seq 1 28); do if [ -f <sentinel-or-summary> ]; then
+  break; fi; sleep 20; done` followed by the tables and criteria. Same wall-clock
+  ceiling, but it returns early and hands back answers instead of "still
+  running".
+- **Accepted library shape:** `Wait-ArmVerdict -Dir <dir> -Tag <tag>
+  -TimeoutSeconds N` in `tools/arm-verdict.ps1` — returns the verdict the moment
+  the sentinel appears, `$null` on timeout. Measured: 0.01 s when already
+  finished, 3.02 s bounded on timeout.
+- **Best shape: do not wait at all.** Make the wrapper compute and write what
+  you would have waited for, so the run leaves its result where a single later
+  check finds it. This is what the sentinel convention below exists to enable.
+
+The whole sequence, as it is actually run (launch, then one check, no polling):
+
+```powershell
+# 1. LAUNCH (absolute path; keep the returned job id so "did it start" is answerable)
+ctx_shell(command="powershell -NoProfile -ExecutionPolicy Bypass -File C:/Development/AI/qwen38GZI/tools/run-gplr36-hostmem-locked.ps1",
+          run_in_background=$true, timeout_ms=1200000)   # -> shell_<hex>
+
+# 2. LATER, ONE CHECK (no loop, no log tail) -- absent means "not finished"
+ls build/llama-cuda/verdicts/run-gplr36-hostmem.done
+cat build/llama-cuda/verdicts/run-gplr36-hostmem.done   # e.g. PASS 0 <utc-iso> run-gplr36-hostmem
+```
+
+Only if that check is `ABSENT` **and** you need to know why: one
+`background_action: "status"` on the job id. That combination is the complete
+diagnosis — sentinel for the outcome, status for the launch — and neither
+replaces the other.
+
+**Known limits, so this is not over-read.** The app terminal's `process_type:
+"BACKGROUND"` is **not implemented in this build** (`not implemented` error);
+launch detached through `ctx_shell` instead. A detached job survives interrupts
+of the agent's own foreground commands — measured, the honest A/B run outlived
+two of them — so a job is never lost merely because the agent moved on. And
+nothing here makes a GPU run cheap: the wrapper above costs one mutex hold and
+seconds of CUDA, and the rule that expensive model runs need a recorded command
+and are not run merely for confidence is unchanged.
 
 ## Arm verdicts and the `.done` sentinel (convention, 2026-09-18)
 
