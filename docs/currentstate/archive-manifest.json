@@ -1,0 +1,141 @@
+{
+  "split_date": "2026-09-18",
+  "source": "docs/currentstate.md",
+  "source_bytes": 557144,
+  "source_sha256": "8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4",
+  "reason": "source exceeded lean-ctx per-file search cap, so ctx_search skipped it silently (docs/AGENT_ENVIRONMENT.md addendum H fact 1)",
+  "policy": "verbatim contiguous line ranges; original order preserved; no text reformatted, reordered or edited",
+  "ranges": [
+    {
+      "lines": [
+        1,
+        2
+      ],
+      "disposition": "replaced by the new header/index block in docs/currentstate.md"
+    },
+    {
+      "lines": [
+        3,
+        43
+      ],
+      "disposition": "kept in docs/currentstate.md"
+    },
+    {
+      "lines": [
+        44,
+        1211
+      ],
+      "disposition": "docs/currentstate/2026-09-15..2026-09-16.md"
+    },
+    {
+      "lines": [
+        1212,
+        2620
+      ],
+      "disposition": "docs/currentstate/2026-09-14.md"
+    },
+    {
+      "lines": [
+        2621,
+        4179
+      ],
+      "disposition": "docs/currentstate/2026-09-12..2026-09-13.md"
+    },
+    {
+      "lines": [
+        4180,
+        6634
+      ],
+      "disposition": "docs/currentstate/2026-08-20..2026-09-11.md"
+    },
+    {
+      "lines": [
+        6635,
+        7065
+      ],
+      "disposition": "docs/currentstate/2026-08-18-and-earlier.md"
+    },
+    {
+      "lines": [
+        7066,
+        7093
+      ],
+      "disposition": "kept in docs/currentstate.md"
+    }
+  ],
+  "shards": [
+    {
+      "file": "docs/currentstate/2026-09-15..2026-09-16.md",
+      "covers": "2026-09-15 .. 2026-09-16",
+      "source_lines": [
+        44,
+        1211
+      ],
+      "bytes": 95563,
+      "header_lines": 8,
+      "entries": 34
+    },
+    {
+      "file": "docs/currentstate/2026-09-14.md",
+      "covers": "2026-09-14",
+      "source_lines": [
+        1212,
+        2620
+      ],
+      "bytes": 98682,
+      "header_lines": 8,
+      "entries": 15
+    },
+    {
+      "file": "docs/currentstate/2026-09-12..2026-09-13.md",
+      "covers": "2026-09-12 .. 2026-09-13",
+      "source_lines": [
+        2621,
+        4179
+      ],
+      "bytes": 108429,
+      "header_lines": 8,
+      "entries": 27
+    },
+    {
+      "file": "docs/currentstate/2026-08-20..2026-09-11.md",
+      "covers": "2026-08-20 .. 2026-09-11",
+      "source_lines": [
+        4180,
+        6634
+      ],
+      "bytes": 147011,
+      "header_lines": 8,
+      "entries": 44
+    },
+    {
+      "file": "docs/currentstate/2026-08-18-and-earlier.md",
+      "covers": "2026-08-18 and earlier",
+      "source_lines": [
+        6635,
+        7065
+      ],
+      "bytes": 26697,
+      "header_lines": 8,
+      "entries": 1
+    }
+  ],
+  "verification": {
+    "method": "reconstruct from disk in ORIGINAL ORDER - preamble kept in the source (19 B) + recent entries kept in the source + each shard read back with its 8-line header stripped + the tail kept in the source - and compare sha256 AND byte count against the original working-tree file",
+    "original_sha256": "8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4",
+    "original_bytes": 557144,
+    "reconstructed_sha256": "8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4",
+    "reconstructed_bytes": 557144,
+    "match": true,
+    "shard_bodies": "each shard body compared against its declared source line range AND its trailing CRLF - all five EXACT",
+    "how_this_check_failed_before_it_passed": [
+      "attempt 1 (in-memory, during the split): PASSED, and is what licensed writing the files",
+      "attempt 2 (from disk): reported FAIL because it omitted the recent-entries range (source lines 3..43, kept in the active file) - artifact correct, check wrong",
+      "attempt 3 (from disk): reported FAIL twice over - the split had introduced a stray blank line after the recent-entries heading (+2 B), and the check concatenated the kept pieces AFTER the shards instead of in original order; the stray blank was removed and the order fixed",
+      "lesson recorded because it matters: a from-disk proof catches integration mistakes the in-memory proof cannot, and a length-preserving reordering is only detectable by the hash"
+    ],
+    "caveat_for_later_verification": "git show HEAD:docs/currentstate.md returns the LF-normalised blob (550,051 B), NOT the CRLF working-tree bytes, because core.autocrlf=true; a verbatim re-check must use the sha256 recorded here (or convert the blob to CRLF first, which reproduces the original exactly - verified)."
+  },
+  "active_file_bytes_after_split": 102456,
+  "index_rows": 121
+}

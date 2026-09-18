@@ -660,8 +660,11 @@ MCP tools as the primary interface).** Five facts that change how a search or a
 read should be trusted here:
 
 1. **`ctx_search` SKIPS LARGE FILES SILENTLY, and still prints "0 matches".**
-   `docs/currentstate.md` (7,091 lines, ~546 KB) is the "1 large files skipped"
-   note in every search result — it is never scanned. Measured: the pattern
+   `docs/currentstate.md` (7,091 lines, 557,144 B) was the "1 large files skipped"
+   note in every search result — it was never scanned. **RESOLVED the same day: that file was
+   SPLIT (see "Where current state lives" below), so the EXAMPLE is now historical — but the
+   CAP and the misleading-zero semantics are not, and any future file over it behaves the same
+   way.** Measured: the pattern
    `ROW-CACHE A/B ON THE HONEST STREAM` returns no matches although that heading is
    in the file, and passing `path` to that file directly does NOT lift it (still
    "0 matches in 0 files"). Workaround, verified: `ctx_shell` +
@@ -733,6 +736,39 @@ Measured 2026-09-18: the native `code_search` tool is WORKING AGAIN (its earlier
 ctx_shell allowlist extras. So `rg` is the COMPLETE, non-truncating search and
 `ctx_search` is the CONVENIENT, incomplete one — pick accordingly, and prefer `rg`
 whenever the answer could be in `docs/currentstate.md`.
+
+## Where current state lives (split 2026-09-18)
+
+`docs/currentstate.md` is still the canonical current-state record, but it no longer holds every
+historical entry: on 2026-09-18 it reached 557,144 B and passed lean-ctx's per-file search cap,
+which made `ctx_search` skip it ENTIRELY while reporting "0 matches" (addendum H, fact 1), so
+the older entries were moved VERBATIM into contiguous shards.
+
+| Part | Where | Size at split |
+| --- | --- | --- |
+| Recent entries (2026-09-17 .. 2026-09-18) | `docs/currentstate.md` | 102,470 B total |
+| 2026-08-18 .. 2026-09-16 | `docs/currentstate/*.md` (5 shards) | 26.7-147.0 KB each |
+| Index of every archived entry (date, shard, line) | `docs/currentstate.md` | 121 rows |
+| Live non-entry state ("Known gaps / risks", "Blocked / escalated") | `docs/currentstate.md` | bottom |
+
+Rules that follow:
+
+- **New entries are written exactly as before** — appended at the top of the "Recent entries"
+  block in `docs/currentstate.md`. The split changed where OLD entries live, nothing else.
+- **Find an older entry by its index row** in `docs/currentstate.md`, which gives
+  `<date> -- <shard>:<line>`; then read that window. `rg` across `docs/currentstate/` also works
+  and is the better tool when the date is unknown.
+- **The split is verifiable, not asserted.** `docs/currentstate/archive-manifest.json` records
+  the original sha256, every line range with its disposition, and the from-disk reconstruction
+  check: stripping the 8-line shard headers and concatenating preamble + recent + shards + tail
+  in ORIGINAL order reproduces the pre-split file byte-for-byte
+  (`8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4`, 557,144 B, PASS).
+- **Verification caveat, measured:** `git show HEAD:docs/currentstate.md` returns the
+  LF-normalised blob (550,051 B), NOT the CRLF working-tree bytes, because `core.autocrlf=true`.
+  A verbatim re-check must use the recorded sha256, or convert the blob to CRLF first (verified
+  to reproduce the original exactly).
+- **When a shard approaches the cap**, split it further by the same method and extend the
+  manifest; never reorder or reword existing entries.
 
 ## Detached runs and waiting (convention, 2026-09-18)
 
