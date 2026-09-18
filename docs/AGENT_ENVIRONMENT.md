@@ -664,7 +664,8 @@ read should be trusted here:
    note in every search result — it was never scanned. **RESOLVED the same day: that file was
    SPLIT (see "Where current state lives" below), so the EXAMPLE is now historical — but the
    CAP and the misleading-zero semantics are not, and any future file over it behaves the same
-   way.** Measured: the pattern
+   way. A host-only guard now checks for it before it can bite again:
+   `python tools/check-doc-sizes.py` (see "Where current state lives" below).** Measured: the pattern
    `ROW-CACHE A/B ON THE HONEST STREAM` returns no matches although that heading is
    in the file, and passing `path` to that file directly does NOT lift it (still
    "0 matches in 0 files"). Workaround, verified: `ctx_shell` +
@@ -769,6 +770,17 @@ Rules that follow:
   to reproduce the original exactly).
 - **When a shard approaches the cap**, split it further by the same method and extend the
   manifest; never reorder or reword existing entries.
+- **The cap is guarded, not remembered.** `tools/check-doc-sizes.py` (host-only, about a second,
+  no GPU and no mutex) scans every tracked text file and FAILS LOUDLY (exit 1) when one reaches
+  the fail band, naming the file, its size as a percentage of the band, and the split remedy.
+  It runs automatically for the host-only suites in `tools/run-tests.ps1` (`-Suite host`,
+  `-Suite telemetry`), so the routine host validation covers it; standalone it is
+  `python tools/check-doc-sizes.py --top 10`. The band is a CALIBRATION to the measured bracket
+  (174,707 B proven NOT skipped; 557,144 B proven skipped), never a verified cap value:
+  `--warn`/`--fail` override it, `--strict` makes a warning fail, and `--selftest` exercises the
+  classification boundaries with negative controls (7/7 cases, including exactly-at-threshold).
+  A file in the FAIL band is to be treated as ALREADY invisible to `ctx_search`; the remedy is
+  the same verbatim split, not a bigger search.
 
 ## Detached runs and waiting (convention, 2026-09-18)
 

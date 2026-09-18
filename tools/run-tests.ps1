@@ -232,6 +232,27 @@ if (-not $spec.Host) {
 Write-Host "Suite: $Suite"
 Write-Host "Command: $ctestCommand"
 
+# --- doc-size guard (host-only, ~1s, no GPU, no mutex) -----------------------
+# A tracked file above lean-ctx's per-file search cap is SKIPPED by ctx_search
+# while it still prints "0 matches", so a large doc silently stops being findable
+# -- the failure mode that hid docs/currentstate.md until it was split on
+# 2026-09-18. Cheap enough to run on every host-only suite. Details and the
+# threshold provenance: tools/check-doc-sizes.py and docs/AGENT_ENVIRONMENT.md
+# ("Where current state lives").
+if (-not $spec.Gpu) {
+    $docGuard = Join-Path $PSScriptRoot 'check-doc-sizes.py'
+    if (Test-Path -LiteralPath $docGuard) {
+        Write-Host "[doc-size] checking tracked files against the ctx_search per-file cap..."
+        & python $docGuard
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: doc-size guard exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[doc-size] WARNING: $docGuard not found; guard skipped." -ForegroundColor Yellow
+    }
+}
+
 if ($spec.Host) {
     # Replicates the CTest telemetry targets without ctest fixtures:
     #  - positive: validate the transition trace (must exit 0, write summary)
