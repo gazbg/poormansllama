@@ -357,7 +357,11 @@ Depends on: owner pick (activation condition); T-GPLR-04 preflight and the
 T-GPLR-22 run_refused path (already arch-independent); T-GPLR-07 semantic-QA
 tooling (needs per-model re-calibration); the Qwen reference gates standing
 green (any regression there blocks this task).
-Commit: (fill on completion)
+Commit: NO code commit - the task was CLOSED-DEFERRED before any implementation, so there
+  is no engine or nested change to point at. The block was drafted in outer 26762d1
+  (2026-09-16, the commit that introduced its text - verified: the section does not exist
+  in 26762d1^), and the deferral itself, with the owner's verbatim decision, was recorded
+  in outer fe9c1cf (2026-09-18).
 
 Goal
 : One non-Qwen architecture passes the SDD §11 gates in their generic form —
@@ -637,14 +641,13 @@ wall and wait verdicts are independent of that limitation.
 --pp-af-serialize stays as opt-in diagnostic tooling (harmless: identical
 walls, checkers OK). Remaining PP lever family: shrink the per-copy window
 itself (member batching / GPU-direct storage) — new task territory.
-Commit: nested 3bc3aff71 (2026-09-16, gate + af_inflight telemetry);
-outer 7b83828 (2026-09-16, verdicts + scripts tools/run-gplr32{,-arms}.ps1,
-analyzer tools/analyze-gplr32.py, charter)
 Depends on: T-GPLR-29 addendum 3 (warm wall engine-bound floor ~1.5-1.8 s;
 pinned A/B methodology), T-GPLR-13/25 trace arms (the 2.2x window-stretch
 evidence), 2026-09-16 research pass in docs/currentstate.md (NVIDIA engine-
 model + WDDM batching sources; asyncEngineCount=5 local measurement).
-Commit: (fill on completion)
+Commit: nested 3bc3aff71 (2026-09-16, gate + af_inflight telemetry);
+outer 7b83828 (2026-09-16, verdicts + scripts tools/run-gplr32{,-arms}.ps1,
+analyzer tools/analyze-gplr32.py, charter)
 
 Goal
 : The traces show concurrent two-copy stretches inflating effective DMA
@@ -765,7 +768,11 @@ latency 69.7 ms = 3 x (10.5 pure + ~12.7 per-submission); banks are
 exactly 3 members x 144 MiB; cudaMemcpyBatchAsync present in the
 installed CUDA 13.2 SDK), T-GPLR-29/30 (pinned staging + pool: sources
 already contiguous in member order).
-Commit: (fill on completion)
+Commit: nested fe6fce575 (2026-09-16, V1 member-batched staging, `--pp-submit-batch`);
+nested a03fe510e (2026-09-16, submit_batch reports the actually-taken staging branch);
+outer 96ad669 (2026-09-16, verdict + why-analysis + scripts tools/run-gplr33{,-arms}.ps1
++ analyzer tools/analyze-gplr33.py, gitlink bump); outer 15615a9 (2026-09-16, branch-true
+submit_batch + analyzer docstring, gitlink bump). All five verified present in this tree.
 
 Goal
 : Convert the per-bank staging from 3 sequential cudaMemcpyAsync calls to
@@ -2290,7 +2297,13 @@ Status: done (2026-09-16) — verdict: allocation is NOT the blocker; 18 GiB poo
 Depends on: T-GPLR-29 (probe methodology; cudaHostRegister OOM precedent;
 Gen4 x8 laptop link), T-GPLR-30 (the fixed40 arm already held 17,478 MiB of
 pinned pool buffers successfully — the direct motivation for this probe).
-Commit: (fill on completion)
+Commit: NO nested commit - the probe is a standalone .cu under tools/, not part of the
+  engine. outer 7b83828 (2026-09-16: introduced this task's block AND its verdict); outer
+  a58fdee (2026-09-16: the probe tooling - tools/gplr31-pinpool-probe.cu (116 lines),
+  tools/run-gplr31-probe.ps1, tools/run-gplr31-262k.ps1, tools/run-gplr31-262k-f16.ps1).
+  No versioned evidence artifact exists for this task by policy: the probe output lives
+  under build/ (`gplr31-pinpool-probe.log`, `gplr31-262k-f16-af1pinned.jsonl`), which
+  .gitignore excludes, so the verdict text above is the record.
 
 Goal
 : Answer, before any persistent-pool design work, the question T-GPLR-30
