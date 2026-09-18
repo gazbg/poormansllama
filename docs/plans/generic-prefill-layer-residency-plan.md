@@ -2629,3 +2629,151 @@ Escalate before implementation if
 : The layer-major controller refuses a second sequential prefill on the
   same context (residency state machine does not reset) - that would be a
   real lifecycle defect to scope separately, not paper over here.
+
+### T-GPLR-44: per-graph patch scoping - stop restoring the whole pw set's inputs on every launch
+
+Status: ready (drafted 2026-09-18 by owner request from T-GPLR-36's hand-back).
+Reconnaissance is DONE and recorded below; the one remaining unknown is resolved
+by step 1, which is host-only except for the arm that carries it.
+Depends on: T-GPLR-36 (the ledger that measured `patch_us` and the launch
+count), T-GPLR-43 (per-pass prebuild is now the default, so the patch caches are
+rebuilt every pass), T-GPLR-07 (the semantic-QA ladder, which a runner change on
+the generation path must pass)
+Commit: (fill on completion)
+
+Goal
+: Remove the per-launch redundancy in `prepare_chunk` so each launch patches only
+  the graph it is about to run, targeting the measured 3,402.3 ms/pass of patch
+  time at the 200k shape (~2.4% of a 141.8 s pass, the charter's priority-1 case)
+  at ZERO VRAM cost and with byte-identical output. This is a PERFORMANCE task:
+  the accepted deliverable is a measured patch_us reduction with identity intact,
+  not a feasibility probe.
+
+Scope
+: `prepare_chunk` (`src/llama-layer-streaming.cpp:3691-3754`) and its three call
+  sites (3759 embed, 3856 the layer loop, 3935 the output loop), plus the per-set
+  caches it builds (`fa_nodes`, `input_tensors` - `llama-layer-streaming.h:398-406`)
+  and the graph-index plumbing needed to address one graph's slice of them.
+  Nothing else: no staging, slot, routing, KV, scheduling, or flag-default change.
+
+Non-goals
+: NO deep-submit and NO removal of the per-launch sync - that is lever (3) of the
+  T-GPLR-36 hand-back, deliberately sequenced after the T-GPLR-39 fix-class
+  decision because it removes ordering the slot-reuse invariant relies on. No
+  change to WHAT is patched per graph: the snapshot values, the causal-window
+  arithmetic, the `ne[1]` shrink and the act-slab repointing stay byte-identical.
+  No new flag, no default flip, no change to the snapshot CAPTURE path.
+
+Known evidence (measured, T-GPLR-36 ledger, 200k shape, 3 slots, layer-major,
+ubatch 512, --pp-repeat 2)
+: `patch` 3,402.3 ms of a 140,807.7 ms sweep across 16,422 launches = 0.207
+  ms/launch; the launch count is `n_layer x n_chunks` (15,640) plus 2 x n_chunks
+  for the embed and output passes. STRUCTURE, established by inspection of this
+  tree (not inferred): with `pw_probe` on - its default in layer-major mode
+  (`tools/layer-streaming/main.cpp:2545`) - sets are per-WIDTH-CLASS and shared
+  across chunks (`sets[c] = cont_set`, :3450-3460), which is exactly why a patch
+  step exists at all; `prepare_chunk(c)` is then called once per (layer, chunk)
+  LAUNCH; and both caches are per-SET while `fa_nodes` is built over ALL layer
+  graphs (`for gi = 1; gi + 1 < graphs.size()`, :3713) and `input_tensors` over
+  the whole set build context (:3721-3727). So each of the 15,640 layer launches
+  restores the entire set's input snapshot and re-patches the entire set's FA
+  nodes when the launch consumes ONE layer's graph.
+
+: THE ONE UNKNOWN, and why step 1 exists: the caches' COMPOSITION is not
+  instrumented - how many input tensors and bytes the set holds and how they
+  distribute across graphs - so the redundancy factor is an inference bounded by
+  `n_layer` (at most ~97.5% redundant), not a measurement. The task makes it
+  measurable BEFORE restructuring, and pre-registers its band from that number.
+
+Design/failure contract
+: 1. INSTRUMENT FIRST. Under `--pp-recon` (like every other diagnostic), emit the
+  per-set cache composition: input tensor count and bytes per graph, FA node
+  count per graph, and the per-launch touched-byte totals for the whole-set and
+  scoped forms. This is the task's INSTRUMENTATION result and it fixes the
+  predicted band for the performance criterion below.
+  2. THEN SCOPE. Key both caches by graph index and pass the graph index into
+  `prepare_chunk(c, gi)`, so a launch touches only that graph's inputs and FA
+  nodes. Correctness argument, stated before coding: every graph of the set is
+  launched exactly once per chunk and each launch patches its own graph before
+  running, so per-graph scoping preserves per-launch semantics by construction; a
+  tensor shared by several graphs is restored by each of them (redundant, still
+  correct).
+  3. EXACTNESS IS PRESERVED BY NARROWING ONLY. The act-slab repointing (already a
+  guarded pointer compare) and the snapshot VALUES are untouched; only the set of
+  tensors VISITED per call narrows, and the causal/`ne[1]` arithmetic is copied
+  verbatim.
+  4. THE GATE STAYS. `if (!pw_probe) return;` is unchanged, so the non-pw path
+  (per-chunk sets, `chunk_match = set.chunk_id == chunk_id`) is untouched.
+  5. LOUD FAILURE / HONEST NULL. If the composition dump shows the caches are
+  already per-graph (no redundancy), STOP, record it, and close the lever - do not
+  manufacture a change to justify the task. If any identity check fails, revert
+  and report the shape rather than tuning the patch to match.
+
+Implementation steps
+: 1. Add the composition dump (contract 1) and read it from ONE arm at the 200k
+  shape, which doubles as the pre-change `patch_us` baseline in the same trace.
+  2. Implement per-graph scoping (contract 2) and the graph-index plumbing.
+  3. Build; host-validate: the existing host tests plus a NEW host-only test
+  asserting the split invariant - the union of the per-graph caches equals the
+  current set-level cache, per set, both for input tensors and FA nodes. A wrong
+  split breaks that equality, which is what the test is for; it needs no GPU.
+  4. Run the identity+performance arm: the recorded 200k shape, `--pp-repeat 2`,
+  in ONE mutex hold with an adjacent unscoped control (the same build with the
+  scoping gated off is NOT acceptable - use the recorded ledger trace for
+  `patch_us` and an in-session paired arm for the wall).
+  5. Run the semantic-QA smoke tier (512, retention) - this change touches the
+  generation path's inputs and causal windows, so the tier is NOT waivable the way
+  T-GPLR-35's staging-only contract waived it.
+  6. Record the verdict; update this task's Status/Commit and docs/currentstate.md.
+
+Acceptance criteria (falsifiable)
+: * INSTRUMENTATION: the dump reports the per-graph composition and the sum over
+  graphs EQUALS the current set-level totals (closure), so the split is proven
+  lossless before anything relies on it.
+  * PERFORMANCE (the verdict): `patch_us` per pass at the 200k shape falls from
+  the recorded 3,402.3 ms to <= 425 ms (an 8x floor). PRE-REGISTERED BAND from the
+  dump's own redundancy factor: n_layer-limited, so 20-40x, i.e. ~85-170 ms; the
+  8x floor is deliberately loose because the 10 full-attention layers' FA patching
+  is NOT n_layer-redundant and may dominate once the input restore is scoped.
+  * CONVERSION (secondary, not the verdict): the warm 200k wall falls by >= 1.0%.
+  The recorded session-to-session spread at this shape is ~2.9%, so a wall claim
+  needs the in-session paired arm; a null wall with a clear patch_us drop is
+  reported as "patch scoped, wall not resolved at this spread", NOT as a failure.
+  * CORRECTNESS (blocking, not advisory): all arms exit 0 with strict
+  `--check-telemetry` OK; greedy token ids byte-identical across arms; route digest
+  identical; staged bytes per round equal; and the semantic-QA rung reports
+  checker OK + answer PASS + negative control FAIL as designed.
+  * FALSIFIER: if the composition dump shows no per-graph redundancy - the set
+  cache already equals the per-graph union, or `patch_us` is dominated by work
+  outside the caches - then STOP, record it, and close the lever without
+  restructuring.
+
+Validation commands
+: * Build: `cmake --build build/llama-cuda --target llama-layer-streaming -j`
+  * Host tests: `powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tests.ps1`
+  (expect the existing layer-streaming tests to stay green, plus the new split
+  test).
+  * Instrument + baseline: one 200k arm under `tools/with-gpu-lock.ps1` at the
+  recorded T-GPLR-36 shape; expect the composition lines and `patch_us` ~3,402 ms.
+  * Scoped arm + identity: the same shape with the scoping in; expect `patch_us`
+  in the pre-registered band and the recorded identity checks (greedy ids, route
+  digest, staged/round) unchanged.
+  * Semantic QA: the T-GPLR-07 smoke tier, 512, retention mode - exact commands
+  are in that task's contract.
+
+State/document updates
+: `docs/currentstate.md` entry with the composition table, `patch_us` before and
+  after, the identity checks and the verdict (labelled as a PERFORMANCE result with
+  its instrumentation result alongside); this block's Status and Commit fields. Also
+  CORRECT the now-stale comment at `src/llama-layer-streaming.cpp:3709-3711`, which
+  justifies pointer stability with "the persistent graphs are never rebuilt
+  (graph_builds == 0 invariant)" - T-GPLR-43 made a per-pass graph rebuild the
+  default, so verify that sentence against the rebuild path and reword it, since
+  this task's caches are built on exactly that assumption.
+
+Escalation condition
+: Stop and escalate if the composition dump shows no redundancy (lever closed); if
+  per-graph scoping cannot preserve identity (any check in the CORRECTNESS clause
+  fails) - do not tune the patch to match a trace; if the change requires touching
+  the snapshot capture path, the slot/staging code, or any public ggml/llama API; or
+  if the paired arm cannot be completed inside one mutex hold.
