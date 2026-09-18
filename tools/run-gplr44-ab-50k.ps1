@@ -30,7 +30,7 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('unscoped', 'scoped')][string] $Label,
     [string] $Exe = '',
-    [ValidateSet(4096, 50000)][int] $PromptTokens = 50000,
+    [ValidateSet(4096, 50000, 200000)][int] $PromptTokens = 50000,
     [int] $TgTokens = 3
 )
 $ErrorActionPreference = 'Continue'
@@ -39,14 +39,14 @@ if (-not $Exe) { $Exe = Join-Path $root 'build\llama-cuda\bin\Release\llama-laye
 $exe  = $Exe
 $base = Join-Path $root 'build\llama-cuda'
 $model  = 'C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf'
-$prompt = Join-Path $base 'gplr07-qa-prompts/anchor-50000.txt'
+$prompt = Join-Path $base ("gplr07-qa-prompts/anchor-{0}.txt" -f $PromptTokens)
 
 $verdictDir = Join-Path $base 'verdicts'
-$shape = if ($PromptTokens -eq 4096) { '4k' } else { '50k' }
+$shape = if ($PromptTokens -eq 4096) { '4k' } elseif ($PromptTokens -eq 200000) { '200k' } else { '50k' }
 $verdictTag = "gplr44-ab-$shape-$Label"
 $trace = Join-Path $base "gplr44-ab-$shape-$Label.jsonl"
 $log   = Join-Path $base "gplr44-ab-$shape-$Label.log"
-$prompt = if ($PromptTokens -eq 4096) { Join-Path $base 'gplr07-qa-prompts/anchor-4096.txt' } else { $prompt }
+
 
 if (-not (Test-Path $prompt)) { Write-Host "MISSING ANCHOR: $prompt"; exit 1 }
 if (-not (Test-Path $exe))    { Write-Host "MISSING EXE: $exe"; exit 1 }
