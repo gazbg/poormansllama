@@ -1341,8 +1341,23 @@ and its sub-buckets cost a normal run nothing.
   it is called once per launch. (3) Deep-submit chunk graphs to remove the per-launch sync,
   which is what exposes 0.564 ms/launch of host prep on the wall by construction (duty 93.4%).
   Together they are worth up to ~9.3 s of a 141.8 s pass (-6.5%) at this shape with NO extra
-  VRAM - the largest measured PP lever this program currently has open, and squarely inside the
+  VRAM, and that is the largest measured PP lever this program has open, squarely inside the
   charter's first priority.
+
+: ATTRIBUTION, CORRECTED AT CLOSE (the Status-block sentence above is the task's own wording
+  and is left intact; what follows is how the 9.3 s actually decomposes). The ~9.3 s is the
+  TOTAL per-launch host prep this task measured as EXPOSED by the per-launch sync -
+  0.564 ms/launch x 16,422 launches = 9.26 s - NOT the sum of levers (2)+(3). Its buckets are
+  `other` 0.275 + `patch` 0.207 + `slot` 0.065 + `setup` 0.017 = 0.564 ms/launch. So:
+  lever (1) `other` = 4.5 s is route TELEMETRY and belongs to T-GPLR-39's fix-class decision,
+  not to this hand-back; lever (2) `patch` = 3.4 s is an INDEPENDENT reduction of real
+  redundant work (~2.4% of a 200k pass); and lever (3) deep-submit is the MECHANISM that would
+  hide the residual exposure rather than a bucket of its own, so it is NOT additive to (1) or
+  (2). Drafting (2) alone is cheap and touches no ordering semantics. Drafting (3) should be
+  SEQUENCED AFTER the T-GPLR-39 decision: it removes the per-launch ordering that the
+  slot-reuse invariant currently relies on (a released slot can still carry `consumer_pending`
+  and the wait can span a pass boundary - `src/llama-layer-streaming.cpp:823`), in an area
+  where this program already took a pass-2 crash (T-GPLR-40/43).
 
 ### T-GPLR-37: direct mmap-sourced staging — remove the CPU hop from bank staging
 
