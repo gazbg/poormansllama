@@ -334,9 +334,8 @@ a verdict and a `.done` sentinel):
 Escalation: a bare-flag run refused for `row_cache_fit` (not even K=1 fits) means
 the ALLOWANCE is too small for any retention — raise `--reserve-mib`/free VRAM or
 set `--residency-budget-mib`; it is not a reason to lower this default.
-Commit: engine `068ee0c75` (vendored tree). The outer repository's commit, which
-bumps the gitlink and carries these records, is named in the follow-up below — a
-commit cannot name its own hash.
+Commit: engine `068ee0c75` (vendored tree); outer `68db1ef` (gitlink bump plus
+these records).
 
 ### T-GPLR-27 (CLOSED — DEFERRED 2026-09-18 by owner decision): Second-architecture first pass — dense target (item 6 brief)
 
