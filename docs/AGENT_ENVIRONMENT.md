@@ -617,6 +617,34 @@ MCP/daemon restart, as its own output claimed. Verified end-to-end: `ctx_shell`
 `ctest --test-dir C:/Development/AI/qwen38GZI/build/llama-cuda -C Release -R
 "route-topk|host-mem"` passed **2/2** (tests #49, #50) from inside `ctx_shell`.
 
+**Arm launches through `ctx_shell` are now VERIFIED end to end (2026-09-18).**
+`tools/smoke-gpu-lock-ctxshell.ps1` exists for exactly this question: one mutex
+hold, the smallest REAL CUDA workload (a few prefill tokens and a few TG rounds
+on the MoE vehicle), strict `--check-telemetry` on its own trace, exit 0 = chain
+healthy. Launched as a detached background job from `ctx_shell`
+(`run_in_background: true` returns a job id; poll with
+`background_action: "status"`), it completed **exit 0**, arm 13.7 s in an 18 s
+job, and its log is self-describing: `CUDA_PATH=[]` and `CUDA_PATH_V13_2=[]` in
+that shell, then `ggml_cuda_init: found 1 CUDA devices ... RTX 5090 Laptop GPU,
+compute capability 12.0`, `Waiting/Acquired/Released GPU mutex
+Global\AI-GPU-EXCLUSIVE-v1`, `check-telemetry: OK (1005 events, 4 slots)`,
+monitoring summary (`phase pp : 512 tokens, 95.736 tok/s`; `phase tg : 8 tokens,
+10.712 tok/s`; `peak VRAM: 5713.56 MiB`), TG text written, and the GPU back to
+0 MiB with no stray compute process. Trace
+`build/llama-cuda/gpu-smoke-ctxshell.jsonl` (320 `rowset_fetch` = 40 layers x 8
+rounds, 0 refusals), log `build/llama-cuda/gpu-smoke-ctxshell.log`.
+
+What that settles, precisely: **CUDA_PATH is needed to BUILD an arm, not to RUN
+one** (addendum F's failure was the MSBuild CUDA target; the exe resolves its own
+DLLs). Two limits of this evidence, stated so it is not over-read: the job lasted
+18 s, so it does NOT test survival past the ~110 s foreground cap (detached
+builds demonstrated that separately), and a smoke arm proves CONNECTIVITY only —
+never a performance number and never any arm's behaviour at a real shape. Real
+arms stay on the `tools/run-*-locked.ps1` wrappers. One unexplained observation
+worth remembering: `--pp-tokens 64` was passed and the runner still reported
+`phase pp : 512 tokens`, i.e. it took the prompt file whole rather than capping
+prefill at the flag — the smoke arm's PP length is the prompt's, not the flag's.
+
 **Related, found by the same run:** this build tree uses a multi-config
 generator, so `ctest` without `-C Release` reports both tests **Not Run** with
 `Test not available without configuration. (Missing "-C <config>"?)` — exit 1,
