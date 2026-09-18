@@ -1,0 +1,29 @@
+# llama.cpp Layer-Residency Research Workspace
+# lean-ctx workspace settings for the generic prefill layer-residency research branch.
+
+# --- Indexing exclusions -----------------------------------------------------
+# Git-ignored paths are excluded by default (this repo's .gitignore already
+# covers /build, /out, third_party/llama.cpp/build, *.obj, *.gguf, telemetry).
+# Add only project-specific suppressions below.
+
+extra_ignore_patterns = []
+
+# --- Tool timeouts -----------------------------------------------------------
+# C/C++ and CUDA compilation on this shared Windows GPU workstation: normal
+# compile checks ~2 min, full CUDA build or integration target up to 10 min.
+shell_timeout_secs = 120
+shell_heavy_timeout_secs = 600
+slow_command_threshold_ms = 10000
+
+# --- Project-appropriate defaults --------------------------------------------
+compression_level = "standard"
+memory_profile = "performance"
+
+# --- Security and behavior ---------------------------------------------------
+# rules_scope "both": honor global and project rules. Requires `lean-ctx trust`.
+rules_scope = "both"
+persona = "coding"
+# shadow_mode false keeps hook behavior deterministic for build tooling.
+shadow_mode = false
+# Aggressive cache favors warm re-reads for repeated source inspection.
+cache_policy = "aggressive"

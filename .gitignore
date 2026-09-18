@@ -69,6 +69,9 @@ __pycache__/
 !/.vscode/settings.json
 !/.vscode/tasks.json
 
+# lean-ctx workspace settings: /.lean-ctx.toml is shared; setup backups stay local
+/.lean-ctx*.bak*
+
 # Operating-system files
 .DS_Store
 Thumbs.db
