@@ -243,10 +243,23 @@ the recorded reason the cheaper branch was chosen: not that binding was found
 wrong, but that it has no work to do at the chosen depth.
 
 Recorded WITH the pick so it cannot be read as an endorsement — three limits, all
-measured: (1) the +12.609 tok/s at K=8 is the OPTIMISTIC echo pairing of the
-T-GPLR-19 A/B (that table's `(b)off` column is the echoed series), so an honest
-stream compresses it by roughly the 0.06-0.09 (b) shift and the figure is an
-upper estimate, unvalidated on a non-echoing stream; (2) the row cache is a
+measured: (1) the +12.609 tok/s at K=8 came from the OPTIMISTIC echo pairing of
+the T-GPLR-19 A/B (that table's `(b)off` column is the echoed series).
+**MEASURED LATER THE SAME DAY, and this limit is now partly closed:** the same A/B
+re-run at K=6 and K=8 on the declared non-echoing prompt (`build/calc-prompt.txt`,
+885 tokens; one mutex acquisition per rung, A,B,A,B inside each) PASSED criteria 1
+and 2 at both rungs and returned honest gains of **+9.944 tok/s at K=6**
+(echoed +10.196) and **+11.414 at K=8** (echoed +12.609). Read that carefully:
+the BYTE-level echo inflation is confirmed and large (**+23.98% and +21.94%** more
+bytes staged per round on the honest stream), while the tok/s delta sits INSIDE
+the within-arm B spread (0.817 and 2.013), so the honest gain is
+INDISTINGUISHABLE from the echoed one at this sample size rather than proven
+uncompressed. The pre-registered honest (b) prediction was reproduced within
+0.840% and 1.157%, with `rows_retained` equal to the offline `hits_total` exactly
+(52,930 / 59,432) and reuse on 40/40 layers. Full table, the length confound
+(honest and echoed also differ in PP length, 885 vs 512), the artifact-path
+defect and the evidence paths: `docs/currentstate.md` 2026-09-18 "ROW-CACHE A/B
+ON THE HONEST STREAM"; driver `tools/run-gplr19-rowcache-ab-honest.ps1`; (2) the row cache is a
 TG-phase residency class, so NO depth changes prefill — this pick does not move
 the program's primary PP objective; (3) K=8 holds 4370.1 MiB of the row-cache
 allowance and its marginal K6->K8 step converts at 7.69 GB/s, the worst step in

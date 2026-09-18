@@ -116,10 +116,24 @@ K=2 +3.853, K=4 +7.865, K=6 +10.196, K=8 +12.609 tok/s — while the byte-to-tim
 conversion DEGRADES (14.29 / 12.18 / 10.67 / 10.52 / 10.23 GB/s; marginal per
 step 8.93 / 8.35 / 9.55 / 7.69), so only the first retained window converts
 above the ~13.7 GB/s link ceiling and every deeper window converts near the
-measured 8.42 GB/s per-fetch rate. Two limits travel with those numbers: the
-A/B's `(b)off` column is the ECHOED series, so the gains are the optimistic
-pairing and an honest stream compresses them by roughly the 0.06-0.09 (b)
-shift; and the row cache is a TG-phase residency class, so no depth changes
+measured 8.42 GB/s per-fetch rate. Two limits travel with those numbers. First,
+the A/B's `(b)off` column is the ECHOED series, so the gains are the optimistic
+pairing. **Honest-stream re-measurement 2026-09-18 (K=6 and K=8, the declared
+non-echoing prompt, one mutex acquisition per rung, A,B,A,B inside each; both
+rungs PASS criteria 1-2):** the byte-level inflation is CONFIRMED and large —
++23.98% (K=6) and +21.94% (K=8) more bytes staged per round than the echoed
+rung staged — while the tok/s consequence does NOT exceed the within-arm spread
+(honest gains +9.944 and +11.414 against echoed +10.196 and +12.609; spreads
+0.817 and 2.013). The honest reading is therefore "indistinguishable at two
+samples per rung", NOT "uncompressed"; the pre-registered honest (b) prediction
+held within 0.840% and 1.157% in bytes, with `rows_retained` exactly equal to
+`hits_total` (52,930 / 59,432) and reuse on 40/40 layers. Disclosed confound: the
+honest and echoed arms also differ in PP LENGTH (885 vs 512 tokens), so the
+two reactive baselines are not comparable in time (11.019/11.145 honest vs
+11.873/11.879 echoed); each rung's A-vs-B gain is a within-prompt difference and
+is unaffected. Evidence: `tools/run-gplr19-rowcache-ab-honest.ps1`,
+`build/llama-cuda/gplr19-honest-*`, `docs/currentstate.md` 2026-09-18.
+Second, the row cache is a TG-phase residency class, so no depth changes
 prefill — this lever does not touch this SDD's primary PP objective, and every
 MiB it takes is a MiB the slot window cannot hold.
 
