@@ -2777,3 +2777,121 @@ Escalation condition
   fails) - do not tune the patch to match a trace; if the change requires touching
   the snapshot capture path, the slot/staging code, or any public ggml/llama API; or
   if the paired arm cannot be completed inside one mutex hold.
+
+Addendum 1 (2026-09-18, owner decision, recorded BEFORE the first arm ran):
+50k IS THE ITERATION SHAPE; 200k IS THE CONFIRMATION SHAPE.
+
+Why: the recorded 200k shape costs ~10 min per arm and up to an hour of mutex
+wait, which is the wrong price for iterating on an instrument and then on a
+patch. Step 1 and the first scoped arm therefore run at 50k, with every flag
+other than the token count identical to the recorded 200k ledger arm
+(`tools/run-gplr36-hostmem.ps1`: layer-major, ubatch 512, 3 slots, f16 KV, bf16
+slabs, pinned, af=1, `--pp-repeat 2`, `--pp-recon 1`). The 200k arm runs ONCE,
+after the patch works, to confirm the share and the identity checks.
+
+What transfers between shapes and what does NOT - stated before measuring:
+
+* TRANSFERS: the composition dump. The dump is about graph STRUCTURE (how many
+  layer graphs share one set, how many input tensors each references), and that
+  is identical at 50k and 200k - same 40 layer graphs, same shared input cache.
+  So step 1's closure check and redundancy factor are valid at 50k.
+* DOES NOT TRANSFER: `patch_us` itself, which is per (layer, chunk) LAUNCH and
+  therefore scales with token count. The 200k baseline of 3,402.3 ms/pass does
+  NOT carry to 50k, and the 50k arm must establish its own baseline in the same
+  trace. Pre-registered 50k prediction, from the 200k per-launch cost at the same
+  ubatch (0.207 ms/launch x 42 graphs x 98 chunks): ~850-900 ms/pass, i.e. the
+  SAME ~2.4% share of the pass. The share is the shape-invariant quantity; the
+  absolute milliseconds are not.
+* ALSO MEASURED, and it is why the ubatch must stay 512: per-launch patch cost
+  scales with chunk WIDTH, not just launch count. The recorded 4k arm at
+  ubatch 2048 (`build/llama-cuda/gplr39-u2048-recon.jsonl`) spent 79.2 ms of
+  patch across 84 launches = 0.943 ms/launch - 4.6x the 0.207 ms/launch of the
+  200k arm at ubatch 512, because a 2048-token chunk restores ~4x the activation
+  bytes. A 50k arm at a different ubatch would therefore not be comparable to
+  the 200k reference in either direction; 512 is held fixed.
+
+Acceptance criteria, as amended by this addendum (the performance verdict is
+taken at 200k; the 50k arms carry the instrumentation and the identity checks):
+
+* STEP 1 (50k): a `patch_cache` event exists with `union_matches == 1`, and the
+  redundancy factor is reported as measured - inside, above, or below the
+  pre-registered 8-40x band, with no rounding into it.
+* STEP 2 IDENTITY (50k, paired unscoped/scoped arms in one mutex hold): greedy
+  token ids byte-identical, route digest identical, staged bytes per round equal,
+  strict `--check-telemetry` OK on both.
+* STEP 2 PERFORMANCE (50k, same pair): `patch_us` per pass falls to <= 1/8 of the
+  50k baseline recorded in this task's own trace, with the dump's redundancy
+  factor as the pre-registered band.
+* STEP 3 CONFIRMATION (200k, once): `patch_us` per pass falls from the recorded
+  3,402.3 ms to <= 425 ms with the same identity checks clean.
+
+Artifacts introduced by this task (step 1):
+
+* `src/llama-layer-streaming.cpp` - `tel_patch_cache()`, emitting the
+  `patch_cache` event gated on `--pp-recon`, once per set at cache-build time.
+* `tools/run-gplr44-dump-50k.ps1` - the step-1 arm; holds the GPU mutex itself
+  (the T-GPLR-19 driver-mutex pattern) and writes its own rich verdict +
+  `.done` sentinel as tag `gplr44-dump-50k` in `build/llama-cuda/verdicts/`.
+* `tools/analyze-gplr44-cache.py` - reads the dump, prints the per-graph
+  composition and the closure verdict, and exits non-zero when closure is broken
+  (the falsifier, made mechanical). `--selftest` is 4/4 including the
+  closure-broken case.
+* Step 1's verdict contract: exit 0 means THE INSTRUMENT IS VALID (dump fired,
+  closure intact). It does NOT mean the lever is worth taking - the redundancy
+  field decides that, and a low or absent factor closes the task without a patch.
+
+Addendum 2 (2026-09-18, STEP 1 RESULT - measured, steps 2-3 still pending):
+
+Trace: `build/llama-cuda/gplr44-dump-50k.jsonl` (50k, ubatch 512, 3 slots, f16 KV,
+bf16 slabs, pinned, af=1, `--pp-repeat 2`, `--pp-recon 1`, pre-patch binary
+`7bad011ed8e3d908`). Verdict: `build/llama-cuda/verdicts/gplr44-dump-50k.verdict.json`.
+
+| | measured |
+| --- | --- |
+| set-level input cache (what ONE launch restores) | **7 tensors, 4,212,740 B** (full 512-wide set) / 2,764,612 B (336-wide tail set) |
+| a scoped launch's share | min 4 B, mean **4,099 B**, max 16,384 B |
+| set-level FA cache (what ONE launch patches) | **10 nodes** = exactly 1 per full-attention layer (10 of 42 graphs carry FA) |
+| `patch_us`, pass 2 | **705,996 us** over 4,116 launches = 0.1715 ms/launch, **3.08%** of a 22,889,693 us sweep |
+| redundancy_input / redundancy_fa | **1,027.4x** / **40.0x** |
+| set ctx tensors | 3,818 |
+
+THE FINDING, and it is not what the pre-registration predicted: the dominant
+member of the per-launch restore is **`inp_embd`, 4,194,304 B (exactly 4 MiB),
+referenced by ZERO of the 42 graphs** - 99.6% of the bytes memcpy'd on every one
+of the 4,116 launches, i.e. ~17.3 GB of dead copying per pass. It is not a leak
+and not this path's doing: `llm_graph_context::build_inp_embd`
+(`src/llama-graph.cpp:2312-2330`) always allocates BOTH `inp_tokens` and `inp_embd`
+and selects between them with `ggml_build_forward_select(..., ubatch.token ? 0 :
+1)`, so in token mode - always, here - the embeddings branch is pruned from the
+graph and its input buffer is left allocated, INPUT-flagged, with data, and
+unconsumed. The patch cache walks the ctx for INPUT-flagged tensors with data, so
+it inherits it; the per-launch restore then faithfully copies it forever.
+
+Members as named by the dump: `inp_embd` 4,194,304 B (graphs=0), `leaf_4` 8,192 B
+(10), `leaf_8` 4,096 B (10), `leaf_10` 4,096 B (10), `inp_tokens` 2,048 B (1),
+`leaf_3` 4 B (30), and a second `leaf_3` of **0 B** (1).
+
+TWO RESULTS ABOUT THE INSTRUMENT ITSELF, reported because both failed first:
+
+* The pre-registered 20-40x band was WRONG, and wrong by 25x: 1,027x. The band
+  came from an inference ("redundancy bounded by n_layer") that is only valid if
+  the cached members are the per-layer shared tensors; it is not, because one
+  member is a 4 MiB single-graph-sized buffer. The band is left as written rather
+  than retro-fitted, and the measured factor is reported as measured.
+* The closure check FIRED (union 6/7) before it passed, and the first version was
+  my own bug: a direct-src attribution misses an input consumed through a VIEW.
+  The fix was a transitive src walk plus NAMING the unowned member, not weakening
+  the guard. The guard is what turned a silent 4 MiB-per-launch copy into a
+  measured, explained fact - had it been relaxed, the orphan would have been
+  dropped by the patch with no evidence that it was safe to drop.
+
+Standing after step 1: redundancy 1,027x with closure now fully explained, so the
+lever is real and much larger than predicted - and a large part of it is a
+framework artifact this path was inheriting, not this path's own redundancy.
+Steps 2-3 (implementation, identity, 200k confirmation) are implemented and
+awaiting the GPU mutex; no verdict is claimed here.
+
+Checkpoint commits for steps 1-2, taken BEFORE any verdict exists: nested
+`f53c1bbf0` (the dump, the split, the begin_set cache reset); outer = the commit
+carrying this addendum, together with `tools/analyze-gplr44-cache.py` and the
+three arm scripts. The task's Commit field stays unfilled until a verdict does.
