@@ -2632,14 +2632,18 @@ Escalate before implementation if
 
 ### T-GPLR-44: per-graph patch scoping - stop restoring the whole pw set's inputs on every launch
 
-Status: ready (drafted 2026-09-18 by owner request from T-GPLR-36's hand-back).
-Reconnaissance is DONE and recorded below; the one remaining unknown is resolved
-by step 1, which is host-only except for the arm that carries it.
+Status: CLOSED 2026-09-18 -- REVERTED-BY-FALSIFIER, with the instrument KEPT as
+read-only telemetry. The pre-registered identity falsifier fired: on the scoped
+build, greedy token ids diverged at BOTH shapes (degenerate pattern 248046,
+198, 248045...), so step 2 was reverted and no scoping ships. Steps 1-3 all ran
+and are recorded below. Historical status preserved beneath.
 Depends on: T-GPLR-36 (the ledger that measured `patch_us` and the launch
 count), T-GPLR-43 (per-pass prebuild is now the default, so the patch caches are
 rebuilt every pass), T-GPLR-07 (the semantic-QA ladder, which a runner change on
 the generation path must pass)
-Commit: (fill on completion)
+Commit: nested f53c1bbf0 (steps 1-2, checkpoint before any verdict), nested
+e045fd611 (the revert), outer 970b7a4 (checkpoint) and outer 55148ea (revert +
+the 200k-parameterized arm).
 
 Goal
 : Remove the per-launch redundancy in `prepare_chunk` so each launch patches only
@@ -2895,3 +2899,45 @@ Checkpoint commits for steps 1-2, taken BEFORE any verdict exists: nested
 `f53c1bbf0` (the dump, the split, the begin_set cache reset); outer = the commit
 carrying this addendum, together with `tools/analyze-gplr44-cache.py` and the
 three arm scripts. The task's Commit field stays unfilled until a verdict does.
+
+CLOSURE (2026-09-18) -- REVERTED-BY-FALSIFIER; the instrument is kept, the
+behavior is not. **Why the falsifier fired, and what was learned:** the scoped
+build's greedy token ids diverged at BOTH shapes (degenerate pattern 248046,
+198, 248045... at 4k) while the unscoped control's did not. The mechanism, from
+the dumps: the scoped build's pw sets REBUILD in pass 2 -- re-entering
+`begin_set` -- and `begin_set`'s own comment states that the existing ctx keeps
+the orphaned old tensors. The first dump's 14 members (the original 7 doubled,
+first copy all orphans) and later 28 are that accumulation. The pre-patch build
+survives the same rebuild because its launches use the original address-stable
+full lists; the scoped path, keyed per-graph and re-walked after the reset, read
+wrong bytes. My `begin_set` cache reset (not the scoping walk itself) was the
+trigger: it changed WHEN the cache re-walks an accumulating ctx. Per the
+pre-registered rule -- identity failure means revert and report the shape, never
+tune the patch to match -- the revert removed the launch-path scoping and the
+`begin_set` cache reset, keeping only the dump. **What ran, all measured:** the
+A/B pair re-run on the reverted binary (`9ba0ab55`) against the preserved
+pre-patch control (`7bad011e`) gives greedy ids BYTE-IDENTICAL (96/96 at 4k,
+3/3 at 50k), `check_telemetry` exit 0 on all four arms, and `patch_us` parity
+(4k last-pass 114.8 -> 110.4 ms; 50k 637.0 -> 648.2 ms, both within the ~2.9%
+session spread) -- the dump-only binary is behaviorally the control. The
+semantic-QA smoke rung (512-token anchor, retention mode) PASSes -- 5/5 needles,
+check-telemetry OK (30,501 events, 3 slots), the negative control fails as
+designed. The 200k confirmation ran on the reverted binary: exit 0 in 359.9 s,
+dump fired 3x with redundancy 1027.7/1027.7/1027.3 and `inp_embd` named as the
+sole closure break each time -- consistent with the 50k dump. Per-pass ledgers:
+pass 1 sweep 140.9 s, patch 2,987.3 ms (2.121%); pass 2 sweep 198.2 s, patch
+2,530.3 ms (1.277%) -- against the different-session T-GPLR-36 baseline of
+3,402.3 ms (2.40%); the pass-2 wall difference (198.2 vs 141.8 s baseline,
+compute-bound at 194.5/198.2) is session-level and is recorded unexplained, not
+smoothed over. **What the closure changes:** step 1's measured composition stands
+as the task's deliverable -- the per-launch restore is dominated by the 4 MiB
+`inp_embd` orphan (99.6% of bytes on all 4,116 launches), and any future attempt
+at this lever must first solve the begin_set/rebuild ctx accumulation and the
+stale-pointer hazard T-GPLR-43's rebuild introduces (the pre-patch build survives
+it only via address-stable stale pointers), not re-tune the scoping walk. The
+4k+96-id identity arm belongs at 4k (layer-major refuses `--tg-tokens 96` at 50k
+without an active handoff). Artifacts: `build/llama-cuda/verdicts/gplr44-*` and
+`gplr44-ab-4k-*`/`gplr44-ab-50k-*` verdicts, `build/llama-cuda/gplr44-ab-200k.jsonl`,
+`build/llama-cuda/gplr07-qa-512-retention.*` (smoke),
+`tools/run-gplr44-pair.ps1` (the driver), `tools/analyze-gplr44-cache.py` (now
+5/5 selftest with the FA-partition negative control).
