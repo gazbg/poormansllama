@@ -128,6 +128,35 @@ New-Item -ItemType Directory -Force -Path $rungRoot | Out-Null
 $drvLog = Join-Path $rungRoot 'driver.log'
 if (Test-Path $drvLog) { Remove-Item $drvLog -Force }
 
+# --- verdict + sentinel (convention in tools/arm-verdict.ps1) ---------------
+# This driver acquires the mutex itself instead of going through
+# tools/with-gpu-lock.ps1, so it writes its own verdict. Checking for
+# <rungRoot>/<tag>.done is the completion signal, which is what lets a launch go
+# unchecked: no log tailing, no polling, and no "did it finish or die?" guessing.
+# The sentinel is deleted first, so a PASS left by an earlier attempt at the same
+# depth and vehicle cannot be read as this run's result.
+$verdictDir    = $rungRoot
+$verdictTag    = "rowcache-$Vehicle-k$RetainK"
+$verdictStart  = (Get-Date).ToUniversalTime().ToString('o')
+$verdictFields = @{ vehicle = $Vehicle; retain_k = $RetainK; rung_root = $rungRoot }
+. (Join-Path $root 'tools\arm-verdict.ps1')
+Clear-ArmVerdict -Dir $verdictDir -Tag $verdictTag
+
+# A run that dies unexpectedly still leaves a verdict. Without this, an
+# uncaught error (the 2026-09-18 cross-vehicle crash) produced no verdict line
+# and no exit code worth reading, which is the worst case: the absence of a
+# result is indistinguishable from a run still in progress.
+trap {
+    $msg = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+    # Deliberately does NOT use Log(): the trap must work even if the error
+    # happened before any helper function in this script was defined.
+    try { Add-Content -LiteralPath $drvLog -Value "[FATAL] $msg" } catch { }
+    Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode 1 -Status 'ERROR' `
+        -StartedUtc $verdictStart -LogPath $drvLog -ErrorText $msg -Fields $verdictFields | Out-Null
+    Write-Host ("VERDICT ERROR (1) -> {0}" -f (Join-Path $verdictDir ($verdictTag + '.done')))
+    exit 1
+}
+
 function Log([string]$msg) {
     $line = ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg)
     Write-Host $line
@@ -610,3 +639,22 @@ Log ("GPLR19 AB DONE vehicle={2} K={1} overall={0}" -f $(if ($crit1 -and $crit2)
 if ($Vehicle -eq 'echoed') {
     Log 'REMINDER: this was the ECHOED vehicle (optimistic pairing). Do not use it alone as the evidence behind a depth decision; the default is -Vehicle honest.'
 }
+
+# --- verdict + sentinel -----------------------------------------------------
+# The sentinel mirrors the driver.log verdict line, in a form a caller can read
+# without parsing a log. Exit code is now meaningful: 0 only when criteria 1 and
+# 2 both pass, 2 when they do not (a NOT-PASSED rung used to exit 0, which made a
+# failed rung indistinguishable from a successful one to any caller).
+$verdictExit = if ($crit1 -and $crit2) { 0 } else { 2 }
+$finalFields = @{}
+foreach ($k in $verdictFields.Keys) { $finalFields[$k] = $verdictFields[$k] }
+$finalFields['crit1'] = [bool]$crit1
+$finalFields['crit2'] = [bool]$crit2
+$finalFields['gain_tok_s']            = $(if ($crit2) { [math]::Round($gain, 3) } else { $null })
+$finalFields['spread_tok_s']          = $(if ($crit2) { [math]::Round($within, 3) } else { $null })
+$finalFields['staged_bytes_per_round'] = $(if ($crit2) { [math]::Round($bBytes, 0) } else { $null })
+$finalFields['analyze_failed']        = $analyzeFailed
+Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode $verdictExit -StartedUtc $verdictStart `
+    -LogPath $drvLog -Fields $finalFields | Out-Null
+Write-Host ("VERDICT {0} ({1}) -> {2}" -f $(if ($verdictExit -eq 0) { 'PASS' } else { 'FAIL' }), $verdictExit, (Join-Path $verdictDir ($verdictTag + '.done')))
+exit $verdictExit

@@ -54,6 +54,27 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 if (Test-Path -LiteralPath $log) { Remove-Item $log -Force }
 foreach ($p in @($trace, $txt)) { if (Test-Path -LiteralPath $p) { Remove-Item $p -Force } }
 
+# --- verdict + sentinel (convention in tools/arm-verdict.ps1) ---------------
+# Two verdicts come out of a run of this wrapper: the ARM's, written by
+# tools/with-gpu-lock.ps1 (tagged gpu-smoke-arm below), and this wrapper's own
+# CHAIN verdict (tagged gpu-smoke-ctxshell, which the inner exit code alone
+# cannot express: a chain can fail after the arm succeeded). Both land here, so
+# one directory check answers "how did the launch go".
+$verdictDir   = $outDir
+$verdictTag   = 'gpu-smoke-ctxshell'
+$verdictStart = (Get-Date).ToUniversalTime().ToString('o')
+$verdictFields = @{ wrapper = 'smoke-gpu-lock-ctxshell' }
+. (Join-Path $root 'tools\arm-verdict.ps1')
+Clear-ArmVerdict -Dir $verdictDir -Tag $verdictTag
+
+trap {
+    $msg = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+    try { Add-Content -LiteralPath $log -Value "[FATAL] $msg" } catch { }
+    Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode 1 -Status 'ERROR' `
+        -StartedUtc $verdictStart -LogPath $log -ErrorText $msg -Fields $verdictFields | Out-Null
+    exit 1
+}
+
 function Log([string]$m) {
     $line = ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss.fff'), $m)
     Write-Host $line
@@ -71,9 +92,19 @@ Log ('CUDA_PATH_V13_2=[{0}]' -f $env:CUDA_PATH_V13_2)
 Log ('COMSPEC=[{0}] PATHEXT present={1}' -f $env:COMSPEC, [bool]$env:PATHEXT)
 
 foreach ($f in @($exe, $lock, $prompt)) {
-    if (-not (Test-Path -LiteralPath $f)) { Log ('FATAL missing: ' + $f); exit 1 }
+    if (-not (Test-Path -LiteralPath $f)) {
+        Log ('FATAL missing: ' + $f)
+        Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode 1 -Status 'ERROR' -StartedUtc $verdictStart `
+            -LogPath $log -ErrorText ('missing: ' + $f) -Fields $verdictFields | Out-Null
+        exit 1
+    }
 }
-if (-not (Test-Path -LiteralPath $moe)) { Log ('FATAL missing model: ' + $moe); exit 1 }
+if (-not (Test-Path -LiteralPath $moe)) {
+    Log ('FATAL missing model: ' + $moe)
+    Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode 1 -Status 'ERROR' -StartedUtc $verdictStart `
+        -LogPath $log -ErrorText ('missing model: ' + $moe) -Fields $verdictFields | Out-Null
+    exit 1
+}
 
 # The exe links llama.dll/ggml.dll/cudart from its own bin/Release directory;
 # put that directory on PATH for the child, exactly as the T-GPLR-40 wrapper does.
@@ -93,7 +124,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 # The mutex hold for this smoke arm, via the repo's shared wrapper. Captured
 # first and piped second on purpose: piping the invocation in the same statement
 # risks reading $LASTEXITCODE after the pipeline, not after the script.
-$lockOut = & $lock -TimeoutSeconds $LockTimeoutSeconds -Command $cmd 2>&1
+$lockOut = & $lock -TimeoutSeconds $LockTimeoutSeconds -Command $cmd -VerdictDir $outDir -VerdictTag 'gpu-smoke-arm' 2>&1
 $armExit = $LASTEXITCODE
 $lockOut | ForEach-Object { Log ('  | ' + $_) }
 $sw.Stop()
@@ -103,17 +134,23 @@ $a1 = & nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
 Log ('GPU after: ' + ($a1 -join '; '))
 
 $ok = $true
+$fetchCount = $null
+$checkerExit = $null
+$tgTextBytes = $null
 if ($armExit -ne 0) { Log ('FAIL: arm exit ' + $armExit); $ok = $false }
 
 if (Test-Path -LiteralPath $trace) {
     $raw = [System.IO.File]::ReadAllText($trace)
     foreach ($ev in @('rowset_init', 'rowset_fetch', 'rowset_round', 'rowset_refused', 'peak_vram_bytes')) {
-        Log ('{0}: {1}' -f $ev, ([regex]::Matches($raw, [regex]::Escape($ev))).Count)
+        $n = ([regex]::Matches($raw, [regex]::Escape($ev))).Count
+        if ($ev -eq 'rowset_fetch') { $fetchCount = $n }
+        Log ('{0}: {1}' -f $ev, $n)
     }
     Log '--- strict check-telemetry ---'
     $c = & $exe --check-telemetry $trace 2>&1
     $c | ForEach-Object { Log ('  # ' + $_) }
-    if ($LASTEXITCODE -ne 0) { Log ('FAIL: check-telemetry exit ' + $LASTEXITCODE); $ok = $false }
+    $checkerExit = $LASTEXITCODE
+    if ($checkerExit -ne 0) { Log ('FAIL: check-telemetry exit ' + $checkerExit); $ok = $false }
 } else {
     Log 'FAIL: no telemetry trace was produced'
     $ok = $false
@@ -121,6 +158,7 @@ if (Test-Path -LiteralPath $trace) {
 
 if (Test-Path -LiteralPath $txt) {
     $t = [System.IO.File]::ReadAllText($txt)
+    $tgTextBytes = $t.Length
     Log ('tg text: {0} bytes' -f $t.Length)
     if ($t.Length -eq 0) { Log 'FAIL: empty TG text'; $ok = $false }
 } else {
@@ -128,5 +166,14 @@ if (Test-Path -LiteralPath $txt) {
     $ok = $false
 }
 
+$verdictFields['cuda_path_empty'] = [bool](-not $env:CUDA_PATH)
+$verdictFields['arm_exit']        = $armExit
+$verdictFields['checker_exit']    = $checkerExit
+$verdictFields['fetch_events']    = $fetchCount
+$verdictFields['tg_text_bytes']   = $tgTextBytes
+Write-ArmVerdict -Dir $verdictDir -Tag $verdictTag -ExitCode $(if ($ok) { 0 } else { 1 }) `
+    -StartedUtc $verdictStart -LogPath $log -Fields $verdictFields | Out-Null
+
 Log ('RESULT: {0}' -f $(if ($ok) { 'CHAIN OK (ctx_shell -> mutex -> CUDA, no CUDA_PATH)' } else { 'FAILED' }))
+Log (('VERDICT {0} ({1}) -> {2}') -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $(if ($ok) { 0 } else { 1 }), (Join-Path $verdictDir ($verdictTag + '.done')))
 exit $(if ($ok) { 0 } else { 1 })

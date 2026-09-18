@@ -652,6 +652,79 @@ which is a usage error, not a test failure. Always pass `-C Release`; the same
 applies to `ctest -R "layer-streaming"`, whose model-backed `-run` targets also
 fail without `Q38LS_MODEL_PATH` set.
 
+## Arm verdicts and the `.done` sentinel (convention, 2026-09-18)
+
+A GPU arm run does not have to be watched. Every arm leaves two files:
+
+```
+<dir>/<tag>.verdict.json   machine-readable status, exit code, timings, fields
+<dir>/<tag>.done           sentinel, written LAST
+```
+
+**The rule that makes the sentinel worth reading:** the verdict is written
+first, the `.done` second, so the presence of a `.done` implies a complete
+verdict beside it. And the `.done` is **deleted before** the run starts, so a
+PASS left by an earlier run at the same depth and vehicle can never be read as
+the current run's result. That stale-sentinel case is the failure mode that
+makes hand-rolled completion files untrustworthy, and it is what
+`tools/test-arm-verdict.ps1` exists to guard.
+
+Where the files land, and the tag:
+
+| Path | Written by | Tag | Dir |
+| --- | --- | --- | --- |
+| `tools/with-gpu-lock.ps1` (every `run-*-locked.ps1` wrapper) | the mutex wrapper, on the normal path **and** from its `finally` | derived from the command (inner script leaf: `run-gplr36-hostmem.ps1` -> `run-gplr36-hostmem`; else the exe leaf; else `gpu-command`) | `build/llama-cuda/verdicts/`, or `-VerdictDir` |
+| `tools/run-gplr19-rowcache-ab.ps1` (acquires the mutex itself) | the driver, on the normal path **and** from a termination handler | `rowcache-<vehicle>-k<K>` | the rung root |
+| `tools/smoke-gpu-lock-ctxshell.ps1` | the wrapper, plus the arm's verdict from the wrapper above | `gpu-smoke-ctxshell` (chain) and `gpu-smoke-arm` (arm) | `build/llama-cuda/` |
+
+Status is **derived from the exit code** (`0` PASS, `124` TIMEOUT, else FAIL);
+only the termination path sets it explicitly (`ERROR`), and that path still
+carries a non-zero code and the exception text in the `error` field. A run that
+dies for an unexpected reason therefore cannot look like a run still in
+progress. `tools/run-gplr19-rowcache-ab.ps1` now also exits `2` when criteria 1
+or 2 do not pass; previously a NOT-PASSED rung exited `0`.
+
+Host-side readers, in `tools/arm-verdict.ps1` (dot-source it):
+`Write-ArmVerdict`, `Read-ArmVerdict`, `Clear-ArmVerdict`, `Wait-ArmVerdict`
+(bounded wait that returns the moment the sentinel appears, or `$null` on
+timeout — never an unbounded sleep), `Get-ArmVerdictPaths`,
+`Get-ArmTagFromCommand`. One check answers the whole question:
+
+```powershell
+. tools/arm-verdict.ps1
+$v = Read-ArmVerdict -Dir build/llama-cuda/verdicts -Tag run-gplr36-hostmem
+if ($v) { $v.status }   # $null = still running (or never started)
+```
+
+This changes **how a run is observed, never what it measures**: no arm's flags,
+criteria, or telemetry changed, and the verdict only restates what the run
+already decided. CPU-only, no CUDA: `powershell -NoProfile -ExecutionPolicy
+Bypass -File tools/test-arm-verdict.ps1` (all cases must pass; it takes the
+mutex around `cmd.exe /c exit N` only).
+
+**Verified end to end (2026-09-18).** The smoke arm (`tools/smoke-gpu-lock-ctxshell.ps1`)
+was launched detached through `ctx_shell` (`run_in_background`) and then **not
+watched**: one file check at the end found `gpu-smoke-arm.done` (`PASS 0`,
+10.8 s, arm command captured in the verdict) and `gpu-smoke-ctxshell.done`
+(`PASS 0`, 15.4 s, fields `arm_exit=0 checker_exit=0 fetch_events=320
+tg_text_bytes=21 cuda_path_empty=true`), with the GPU back to 0 MiB. The
+driver path was verified without the GPU: `-AnalyzeOnly` on a COPY of the
+honest K=6 root left `rowcache-honest-k6.done` = `PASS 0` with `crit1/crit2`,
+`gain_tok_s` and `staged_bytes_per_round` in its fields, and the no-traces
+refusal left `rowcache-honest-k4.done` = `ERROR 1` carrying the full refusal
+text in `error` and `[FATAL]` in `driver.log`.
+
+Two limits of the sentinel, stated so it is not over-read. **Absence is
+ambiguous**: a missing `.done` means "not finished" but cannot distinguish that
+from "never started" — only the launch handshake can, so keep the job id or the
+launcher's immediate output. Measured on the same day: a detached `ctx_shell`
+job that must be given an ABSOLUTE `-File` path, because `cwd` does not apply to
+a `run_in_background` job (a relative path resolved against `$HOME` and the job
+failed with exit 1 in under a second while the file check simply said ABSENT).
+And the verdict is written from a **termination handler**, not from a watchdog:
+a process killed outright (power loss, `taskkill /F`) writes nothing, which is
+correct — an absent sentinel must never be reported as a passing run.
+
 ## Canonical Build Commands
 
 All commands run from the workspace root in Git Bash.
