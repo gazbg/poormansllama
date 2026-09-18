@@ -278,6 +278,66 @@ the ladder, so it is the most tok/s and the least efficient per byte. A NAMED
 depth is a contract: if it does not fit the allowance the run refuses loudly
 (`row_cache_depth`) instead of silently reducing it.
 
+#### T-GPLR-26 FOLLOW-UP (2026-09-18, owner-directed): the bare flag's default depth is raised from K=4 to K=8
+
+Status: DONE (owner decision taken immediately after the advisory closure above).
+**Why:** the advisory closure reasoned that at K=8 a binding gate "has no work to
+do", and called K=4 "the DEPRECATED default" — but the DEFAULT itself was still
+K=4, i.e. the one measured depth that MISSES the 0.6 threshold on the non-echoing
+stream that now decides depth evidence (0.5355, against 0.6487 at K=6 and 0.7283
+at K=8), while already costing ~2.19 GB. The owner picked raising the default to
+K=8: the depth with the best measured honest (b), the best measured honest TG
+gain (+11.414 tok/s) and the owner's own operating depth. The superseded K=4
+sentence in the RESULT above is retained as the record of the reasoning then.
+
+Scope: ONE constant and its two prose sites in
+`third_party/llama.cpp/tools/layer-streaming/main.cpp` — `kRowSetRetainDefault`
+4 -> 8, the comment that justified K=4 (rewritten: its 0.6284 came from the echoed
+stream, and the non-echoing re-probe it named as its own validation MISSES at
+K=4), and the `--help` text. No other behaviour moves: the depth is still fitted
+DOWNWARD to the cache allowance and never upward, and a NAMED depth is still
+never reduced.
+
+This is a DEFAULT change, NOT a gate verdict: **no gate PASS is established at
+K=8 or at any other depth** — gate 9 is still read at the depth a claiming task
+declares, and the honest stream's non-echoing certification remains partial
+(16-gram criterion met, compression criterion not).
+
+Acceptance evidence, all measured 2026-09-18 (one mutex hold per run, each leaving
+a verdict and a `.done` sentinel):
+- Build: the `llama-layer-streaming` target compiles; host-only tests **#49
+  (route-topk) and #50 (host-mem) pass 2/2**.
+- Bare flag on the MoE vehicle (512-anchor prompt, `--layer-slots 4`) resolves to
+  **K=8**: `row-cache (T-GPLR-19): default depth K=8 fitted to the device
+  (4582408192 B of a 17149460480 B cache allowance)`, alloc line `40 layers x 64
+  rows/layer = 4370.1 MiB private VRAM, K=8`, `rowset_init` carries
+  `"retain_k": 8`, `--check-telemetry` OK, peak VRAM 10161.56 MiB, exit 0.
+- The ceiling still fits DOWNWARD: the same bare flag with `--reserve-mib 14000`
+  -> `provisioning the largest fitting depth K=5 (2864250880 B)`, `retain_k: 5`,
+  2731.6 MiB, exit 0. (K=6 would have needed 3436314624 B against a 3006267392 B
+  allowance, so K=5 is the correct largest fit — the search takes the largest
+  depth at or below the request, not a fixed step.)
+- A NAMED depth is still never reduced: explicit `--residency-tg-retain 8` under
+  that same allowance refuses loudly — `run_refused` with `reason:
+  row_cache_depth`, `bytes_needed 4582408192` vs `bytes_allowed 3006267392`,
+  naming K=5 as the largest depth that fits, exit 1.
+- Consumers: no CTest target and no driver uses the bare flag; the only script
+  that does is `tools/run-tests.ps1`'s `retention` semantic-QA smoke mode, whose
+  comment ("bare flag = the device-fitted default depth") stays true while its
+  depth changes from K=4 to K=8. Any retention-mode QA rung recorded before
+  2026-09-18 therefore ran at a DIFFERENT depth than one recorded after it.
+- One probe DISCARDED as mis-parameterized and its artifacts deleted: a first
+  squeeze attempt used `--reserve-mib 19600`, which trips the T-GPLR-04 capacity
+  preflight (bounded residency + reserve exceeds free VRAM) BEFORE the row cache
+  is fitted, so it measures nothing about this default and is not kept.
+
+Escalation: a bare-flag run refused for `row_cache_fit` (not even K=1 fits) means
+the ALLOWANCE is too small for any retention — raise `--reserve-mib`/free VRAM or
+set `--residency-budget-mib`; it is not a reason to lower this default.
+Commit: engine `068ee0c75` (vendored tree). The outer repository's commit, which
+bumps the gitlink and carries these records, is named in the follow-up below — a
+commit cannot name its own hash.
+
 ### T-GPLR-27 (CLOSED — DEFERRED 2026-09-18 by owner decision): Second-architecture first pass — dense target (item 6 brief)
 
 Status: CLOSED — DEFERRED (2026-09-18, owner decision). **Owner, verbatim: "I do not

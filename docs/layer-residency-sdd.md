@@ -74,7 +74,10 @@ Scope amendment 2026-09-14 (owner-directed): the per-layer row cache's DEFAULT
 retention depth is K=4 — 32 rows per layer, ~2.19 GB across the 40 MoE layers,
 the shallowest depth whose offline statistic (b) clears gate 9's 0.6 threshold
 (0.6284, first crossing ~K=3.6). This is a PROVISIONAL OPERATING DEFAULT, not a
-gate verdict. T-GPLR-15's close stands unchanged: the gate is read at the depth
+gate verdict. **[SUPERSEDED 2026-09-18: the default depth is now K=8 -- see the
+2026-09-18 amendment below. This paragraph is retained as the record of what was
+DECIDED then and why; its 0.6284 justification did not survive the non-echoing
+re-probe it names as its own validation.]** T-GPLR-15's close stands unchanged: the gate is read at the depth
 a claiming task declares, and at the SDD's own reference sizing (K=1-2) it was
 measured BELOW 0.6 on the bias-robust half of the measurement. No gate PASS is
 ESTABLISHED at any depth, here or since: every reading above 0.6 (K>=4) comes
@@ -108,8 +111,9 @@ than repetition and was mis-chosen when declared. Full table, the declared
 decision rule and the raw artifacts: `docs/currentstate.md` 2026-09-14.]Scope amendment 2026-09-18 (owner-directed, T-GPLR-26): the retention DEPTH is
 an operator-named operating lever, not a gate outcome. `--residency-tg-retain N`
 names it (1..64 windows, 8 rows/layer per K step = 572,719,104 B per step across
-the 40 layers) and a named depth is never silently reduced; the bare flag keeps
-K=4 as a device-fitted CEILING. Measured on the 512-anchor vehicle (256 TG
+the 40 layers) and a named depth is never silently reduced; the bare flag's depth is a
+device-fitted CEILING (K=4 as this amendment was written; **K=8** since the
+2026-09-18 amendment below). Measured on the 512-anchor vehicle (256 TG
 tokens, `--layer-slots 4`, reactive baseline 11.863-11.967 tok/s held across
 five GPU sessions), the TG gain rises monotonically with depth — K=1 +2.068,
 K=2 +3.853, K=4 +7.865, K=6 +10.196, K=8 +12.609 tok/s — while the byte-to-time
@@ -148,10 +152,37 @@ Second, the row cache is a TG-phase residency class, so no depth changes
 prefill — this lever does not touch this SDD's primary PP objective, and every
 MiB it takes is a MiB the slot window cannot hold.
 
+**Scope amendment 2026-09-18 (owner-directed, follow-up to T-GPLR-26): the bare
+flag's DEFAULT depth is raised from K=4 to K=8** (`kRowSetRetainDefault`,
+`tools/layer-streaming/main.cpp`). Reason, in one line: on the NON-ECHOING stream
+that now decides depth evidence, K=4 is the only measured depth that MISSES the
+0.6 threshold it was chosen for — (b) 0.5355, against 0.6487 at K=6 and 0.7283 at
+K=8 — so the default was the one rung gate 9 would refuse, while already costing
+~2.19 GB. K=8 carries both the highest measured honest (b) and the best measured
+honest TG gain (+11.414 tok/s), and it is the owner's operating depth, so the
+bare flag now resolves to the operating point instead of to a superseded one.
+**This is a DEFAULT change, not a gate verdict: no gate PASS is established at
+K=8 or at any other depth** — gate 9 is still read at the depth a claiming task
+declares, and the honest stream's non-echoing certification remains partial
+(16-gram criterion met, compression criterion not). Cost, stated because it is
+real: where the device affords it the bare flag now allocates up to ~4.27 GB
+instead of ~2.19 GB, all of it out of the same allowance the slot window shares.
+The depth is still fitted DOWNWARD to that allowance and never upward, and a
+NAMED depth is still never reduced. Measured 2026-09-18 on the MoE vehicle
+(512-anchor prompt, `--layer-slots 4`, one mutex hold per run): bare flag ->
+**K=8**, 4370.1 MiB of a 17.1 GB allowance, `retain_k: 8` in `rowset_init`,
+`--check-telemetry` OK, peak VRAM 10161.56 MiB; under `--reserve-mib 14000` the
+same bare flag fitted down to **K=5** (2731.6 MiB, exit 0), and an explicit
+`--residency-tg-retain 8` under that same allowance **refused loudly**
+(`row_cache_depth`, `bytes_needed` 4582408192 vs `bytes_allowed` 3006267392,
+exit 1). Evidence: `build/llama-cuda/bare-default-k.*`, `fitdown-A2.*`,
+`explicit-refuse-B.*`.
+
 The mechanism itself remains opt-in and default-off: disabling the experimental option changes no default placement
 and no non-experimental behaviour, and the depth applies only when an operator
-selects the cache. `--residency-tg-retain` with no value selects K=4 where the
-device affords it and otherwise the largest depth that does, so K=4 is a depth
+selects the cache. `--residency-tg-retain` with no value selects K=8 where the
+device affords it and otherwise the largest depth that does (K=8 since the
+2026-09-18 amendment above; K=4 before it), so the default is a depth
 CEILING for the bare flag rather than a fixed allocation: the depth is fitted at
 bring-up to free VRAM less the operator's `--reserve-mib` and less the slot
 window the run has not allocated yet, and a device that cannot take even K=1 is
@@ -353,10 +384,15 @@ arrives.
   current window is never an eviction victim, so a write that would exceed the
   declared capacity is a loud refusal — never silent growth, and never
   eviction of an entry a running consumer may still read. **Default depth
-  (owner-directed 2026-09-14): K=4** (32 rows/layer, ~2.19 GB over 40 MoE
-  layers), fitted to the device — a caller that selects the cache without naming
-  a depth gets K=4 where the device affords it and otherwise the largest depth
-  that fits, while a NAMED depth is never reduced. The capacity arithmetic above
+  (owner-directed 2026-09-14, RAISED TO K=8 on 2026-09-18): K=8** (64 rows/layer,
+  ~4.27 GB over 40 MoE layers), fitted to the device — a caller that selects the
+  cache without naming a depth gets K=8 where the device affords it and otherwise
+  the largest depth that fits, while a NAMED depth is never reduced. Measured
+  2026-09-18 on the MoE vehicle: the bare flag resolved to K=8 (4370.1 MiB of a
+  17.1 GB allowance, `retain_k: 8` in telemetry, checker OK); with
+  `--reserve-mib 14000` the same bare flag fitted DOWN to K=5, and an explicit
+  `--residency-tg-retain 8` under that same allowance refused loudly
+  (`row_cache_depth`, naming K=5 as the largest depth that fits). The capacity arithmetic above
   is unchanged and any K in 1..64 may be named explicitly. An explicit
   `--residency-budget-mib` caps the cache too: the allowance is the smaller of
   free VRAM and the budget's remainder after the bounded residency, and a named
@@ -608,8 +644,10 @@ come from two streams measured at the wrong size for policy-making, and (b) is
 monotone in stream length, so a binding rule could refuse a productive run
 after a single prompt change — while a genuinely unproductive depth still shows
 up visibly in the `slot`/`other` ledger buckets and in `rows_reused`. What the
-caveat above is therefore FOR: the non-echoing reading (0.5355 at K=4) is
-recorded as EVIDENCE about the default, never as a refusal trigger. The
+caveat above is therefore FOR: the non-echoing reading (0.5355 at K=4) was
+recorded as EVIDENCE about the default, never as a refusal trigger — and that
+evidence has since acted on the DEFAULT rather than on any refusal path: the
+2026-09-18 amendment below raises the default to K=8. The
 operator's depth is named per run through `--residency-tg-retain N`; a NAMED
 depth is a contract that is never silently reduced (the bare flag is the one
 that fits itself to the device), and either way the bytes come out of the

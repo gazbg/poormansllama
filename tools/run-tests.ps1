@@ -83,7 +83,11 @@ param(
     # like on prompt/model/PP/ubatch/tg-tokens:
     #   reactive   `--residency-tg`               (reactive expert row windows)
     #   retention  `--residency-tg --residency-tg-retain` (per-layer row cache,
-    #              bare flag = the device-fitted default depth)
+    #              bare flag = the device-fitted default depth, K=8 since the
+    #              owner-directed change of 2026-09-18 and K=4 before it -- so a
+    #              retention-mode rung recorded before that date ran at a
+    #              DIFFERENT depth than one recorded after, and the two are not
+    #              like-for-like)
     #   handoff    `--handoff`                    (weights migrate to VRAM
     #              after PP; stock decode, no row-set)
     # A non-default mode tags the trace/tg-text/log names with the mode so arms
