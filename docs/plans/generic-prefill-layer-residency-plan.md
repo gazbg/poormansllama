@@ -3098,12 +3098,11 @@ Escalation condition
 
 ### T-GPLR-46: the pass-2 compute regression is REAL and rebuild-linked - isolate the trigger and the growth law
 
-Status: ready (drafted 2026-09-18 from the trace analysis below; corrects the
-"session-level, unexplained" reading first written into the T-GPLR-44 closure).
+Status: done (verdict 2026-09-19; trigger CONFIRMED, growth law replicated, one pre-registered escalation fired - see RESULT at end of file). Deprecates the "session-level, unexplained" reading first written into the T-GPLR-44 closure.
 Depends on: T-GPLR-43 (introduced the per-pass rebuild - the prime suspect),
 T-GPLR-44 (the pair arms that supply two of the five measured points, and the
 pw-ctx accumulation signature found on the same path).
-Commit: (fill on completion)
+Commit: 7f19db8 (arm harness; no code change — diagnosis task, binary 9ba0ab55 unchanged)
 
 Goal
 : Explain the pass-2 compute inflation measured on every post-T-GPLR-43 200k
@@ -3216,3 +3215,46 @@ Escalation condition
   the flag; if the 100k pair contradicts the 50k trigger result; or if the
   excess proves non-reproducible on the day (A shows <= 0.5 s) - then the
   earlier arms were environmentally confounded and the diagnosis restarts.
+
+RESULT (2026-09-19, closed)
+: Five pre-registered arms + two identity probes, all exit 0, strict
+  `--check-telemetry` OK, under the GPU mutex on binary 9ba0ab55. Evidence:
+  `build/llama-cuda/verdicts/gplr46-*`.
+
+1. TRIGGER GATE PASSED. 50k A/B, same binary same session: pass-2 compute
+   excess +3.72 s with rebuild ON (pre-registered band 3.0-4.6 s), -1.31 s
+   (collapse to pass-1 noise) with `--pp-prebuild-per-pass 0`. The per-pass
+   rebuild IS the trigger of the pass-2 compute regression.
+2. GROWTH LAW replicated, not a single clean law. Pass-2 excess by shape:
+   4k ~0 s (7 chunks, below detection), 50k +3.72 s (0.40 ms/chunk^2),
+   100k +31.55 s (0.83 ms/chunk^2 - OUTSIDE the pre-registered 8.7-15.6 s
+   band, ~2x quadratic prediction; recorded honestly, possible second
+   mechanism at 100k), 200k +59.2 s (0.39 ms/chunk^2, prior session).
+   Monotone, large, and reproducible across sessions.
+3. SATURATION: 50k 3-pass arm shows pass-3 compute 21,676 ms vs pass-2
+   21,684 ms - the excess is a one-time jump at the first rebuild, it does
+   not compound per pass.
+4. ESCALATION FIRED (pre-registered: "identity changes across the flag") and
+   resolved by decode, not guesswork. TG ids differ across the flag. Token
+   decode (vocab read from the GGUF, host-only, no new deps) shows:
+   - OFF arms and the repeat-1 probe at 4k emit the CORRECT needle answer
+     (9/9 pieces: QX-7741 TR-2918 MK-5501 LD-8834 Paris), format identical
+     to the passing smoke rung.
+   - The rebuild-ON pair arms at 4k (7bad011e control AND 9ba0ab55 revert,
+     byte-identical to each other) emit document-echo instead: "The
+     maintenance log for row 00114...", 0/9 needle pieces.
+   - EVERY pre-rebuild-binary QA trace on disk (gplr07..gplr39, 09-07 to
+     09-17, layer-major and batch-major) decodes to the correct answer.
+   Conclusion: the per-pass rebuild ALSO degrades TG answer semantics at 4k
+   layer-major (answer -> echo); batch-major q8 smoke with rebuild ON stays
+   correct. Both measured defects - the quadratic pass-2 excess and the TG
+   semantic regression - share the rebuild as their trigger.
+5. T-GPLR-44 root-cause amendment: the run-1 "degenerate" ids (248046,198,
+   248045...) were the ANSWER-format stream; the pre-registered falsifier
+   fired correctly on divergence, but the "corrupted restore" mechanism
+   narrative is withdrawn. The revert decision itself stands per contract.
+6. OWNER DECISION ESCALATED: the default of `--pp-prebuild-per-pass`. The
+   rebuild's only justification is the quantized-KV pass-2 crash; at f16 it
+   buys a quadratic compute excess and TG answer degradation. Recommendation
+   (drafted as follow-up, not implemented): make the default KV-conditional
+   and/or fix the rebuild path. Not actioned here - SDD boundary.
