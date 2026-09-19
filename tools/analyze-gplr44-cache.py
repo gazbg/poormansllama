@@ -20,6 +20,19 @@ What the numbers mean:
                     lever. Exit code is non-zero in that case, so the falsifier
                     fires mechanically rather than by reading.
 
+T-GPLR-45 fields (absent in pre-T-GPLR-45 traces, which keep the behavior
+above): the cache now EXCLUDES zero-consumer members from the restore, and
+the dump reports the excluded set so the filter is auditable:
+
+  excluded_bytes / walked_bytes
+                    byte identity: kept (set_input_bytes) + excluded must
+                    equal the unfiltered candidate walk. A mismatch means the
+                    filter created or lost bytes -> exit non-zero.
+  excluded_members  each dropped member with graphs=0 BY CONSTRUCTION. An
+                    excluded member reporting consumers is the corrupting
+                    direction (a restore something needed was dropped) ->
+                    exit non-zero. This is the negative control.
+
 Usage:  python tools/analyze-gplr44-cache.py <trace.jsonl>
         python tools/analyze-gplr44-cache.py --selftest
 """
@@ -65,6 +78,7 @@ def report(events):
 
     worst_union = 1
     worst_partition = 1
+    worst_filter = 1  # T-GPLR-45 byte identity + two-sided closure (1 = ok/absent)
     orphan_names = []
     for d in dumps:
         members = d.get("graph_members") or []
@@ -108,6 +122,31 @@ def report(events):
                 print("  CLOSURE BROKEN: union %s/%s but no member reports zero refs --"
                       % (union, set_t))
                 print("  the attribution counts disagree with the member table.")
+        # T-GPLR-45: byte identity (kept + excluded == walked) and the
+        # two-sided closure on the EXCLUDED side: an excluded member with
+        # consumers means a restore something needed was dropped. Absent
+        # fields (pre-T-GPLR-45 traces) leave this check inert.
+        if "excluded_bytes" in d or "walked_bytes" in d:
+            excl_b = int(d.get("excluded_bytes", 0))
+            walked = int(d.get("walked_bytes", 0))
+            ident_ok = (int(set_b) + excl_b == walked)
+            worst_filter = min(worst_filter, 1 if ident_ok else 0)
+            print("  filter identity      : kept %s + excluded %s = %s vs walked %s -> %s"
+                  % (set_b, excl_b, int(set_b) + excl_b, walked,
+                     "OK" if ident_ok else "BROKEN"))
+            if not ident_ok:
+                print("  FILTER BROKEN: the restore changed the byte total; the")
+                print("  filter created or lost bytes versus the candidate walk.")
+            consumed_excluded = [m for m in (d.get("excluded_members") or [])
+                                 if m.get("graphs")]
+            if consumed_excluded:
+                worst_filter = 0
+                print("  CORRUPTING EXCLUSION: %d excluded member(s) report consumers: %s"
+                      % (len(consumed_excluded),
+                         ", ".join(m.get("name") for m in consumed_excluded)))
+                print("  A consumed input must never be excluded -- this is the")
+                print("  corrupting direction and the trace must not be trusted.")
+
         print("  layer graph inputs   : min %s  mean %.0f  max %s  B"
               % (d.get("layer_input_bytes_min"), d.get("layer_input_bytes_mean", 0.0),
                  d.get("layer_input_bytes_max")))
@@ -154,6 +193,9 @@ def report(events):
     elif not worst_partition:
         print("VERDICT: split invariant FAILED -> the per-graph FA lists do not")
         print("         partition the set cache. Do not trust the patch: report it.")
+    elif not worst_filter:
+        print("VERDICT: T-GPLR-45 filter invariant FAILED (byte identity or a")
+        print("         consumed-but-excluded member). Do not trust the restore: report it.")
     elif PREDICTED_FLOOR <= r <= PREDICTED_CEIL:
         print("VERDICT: composition CONFIRMS the lever's premise "
               "(input redundancy %.1fx inside the pre-registered %.0f-%.0fx band)."
@@ -170,7 +212,7 @@ def report(events):
         print("         suggested, or the caches were already scoped. The lever is")
         print("         small or absent: report and do not implement.")
     print("-" * 78)
-    return 0 if (worst_union and worst_partition) else 1
+    return 0 if (worst_union and worst_partition and worst_filter) else 1
 
 
 def selftest():
@@ -199,6 +241,11 @@ def selftest():
         ],
         "set_input_tensors": 12, "set_input_bytes": 4000000, "set_fa_nodes": 200,
         "union_input_tensors": 12, "union_matches": 1,
+        # T-GPLR-45: the zero-consumer filter's audit fields. The kept bytes
+        # plus the excluded bytes must equal the unfiltered walk, and every
+        # excluded member must report graphs=0 BY CONSTRUCTION.
+        "excluded_count": 1, "excluded_bytes": 4194304, "walked_bytes": 8194304,
+        "excluded_members": [{"name": "inp_embd", "bytes": 4194304, "graphs": 0}],
         "layer_input_bytes_min": 90000, "layer_input_bytes_max": 110000,
         "layer_input_bytes_mean": 100000.0,
         "layer_fa_min": 4, "layer_fa_max": 6, "layer_fa_mean": 5.0,
@@ -220,12 +267,22 @@ def selftest():
     dropped_members[1]["fa_nodes"] = 199
     split_broken = dict(good, graph_members=dropped_members)
     low = dict(good, redundancy_input=2.0, union_matches=1)
+    # T-GPLR-45 negative controls. (a) Byte identity: kept + excluded must
+    # equal walked -- a mismatch means the filter created or lost bytes.
+    ident_broken = dict(good, walked_bytes=8194305)
+    # (b) The corrupting direction: an EXCLUDED member that reports consumers
+    # means a restore something needed was dropped. The selftest must FAIL on
+    # it -- this is the control that would have caught a direct-src walk
+    # silently excluding a view-consumed input (the T-GPLR-44 closure bug).
+    corrupt = dict(good, excluded_members=[{"name": "inp_embd", "bytes": 4194304, "graphs": 2}])
 
     cases = [
         ("closure intact", [good], 0),
         ("closure broken", [broken], 1),
         ("split dropped FA", [split_broken], 1),
         ("no dump at all", [{"event": "host_ledger"}], 1),
+        ("filter identity", [ident_broken], 1),
+        ("corrupt exclusion", [corrupt], 1),
     ]
     for label, events, want in cases:
         path = write(label.replace(" ", "-") + ".jsonl", events)
