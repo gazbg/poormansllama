@@ -3555,6 +3555,51 @@ Escalation condition
   mid-run cannot be made safe without broad allocator changes, or if the q8
   rescue needs semantics beyond view re-derivation to survive the swap.
 
+PRE-START EVIDENCE (2026-09-19, owner-requested attribution run; adds evidence, changes no contract line)
+: T-GPLR-49's closure left one measured observation unowned - at 4k/96 the pw
+  arms emit document-echo while the repaired non-pw arm answers correctly with the
+  same rebuild default - and the owner asked which path THIS task must target. Four
+  cells of the (schedule x `--pp-prebuild-per-pass`) 2x2 now exist ON ONE BINARY
+  (`gplr49-changed`), same 4k anchor / ubatch 512 / tg 96:
+    pw   + ON  -> echo   (needle FAIL; the control and every pre-T-GPLR-49 4k/96
+                          trace on disk agree, ids byte-identical)
+    pw   + OFF -> ANSWER (needle PASS 5/5)   [gplr49b-4k-pw-rebuild0]
+    nopw + ON  -> ANSWER (needle PASS 5/5)   [gplr49-4k-nopw-changed]
+    nopw + OFF -> ANSWER (needle PASS 5/5)   [gplr49b-4k-nopw-rebuild0]
+  Both new arms exited 0 with strict `--check-telemetry` OK. So the echo requires
+  the INTERACTION: the pw schedule alone is not sufficient (rebuild OFF restores the
+  answer) and the rebuild alone is not sufficient (non-pw with the rebuild ON
+  answers). T-GPLR-46's trigger finding is therefore refined, not repeated: the
+  rebuild is the trigger of the pass-2 COMPUTE excess in both modes, while its
+  TG-semantic damage is pw-specific.
+  TARGET (recorded, owner-requested): the PW REBUILD PATH - precisely what this
+  task's fresh-context swap replaces, namely the per-pass re-entry of `begin_set`
+  into the pw WIDTH-CLASS sets (the continuing rs_z = -1 class shared across
+  chunks). NOT `prepare_chunk` (pw + rebuild OFF is clean, so the per-chunk patch
+  by itself does not break the answer) and not the rebuild's bookkeeping in general
+  (non-pw + rebuild ON is clean).
+  CHEAP OBSERVABLE, mechanical, no decode: in a clean `--pp-repeat 2` trace every
+  sampled route tuple `(chunk, layer, hash, route_union)` appears EXACTLY TWICE,
+  because route telemetry samples every 10th chunk (`telemetry_chunk_stride` = 10).
+  Measured: pw + ON diverges at EVERY sampled chunk EXCEPT the first - chunk 7 of 8
+  at 4k, and chunks 10, 20, ..., 90, 97 at 50k, on BOTH binaries (120 distinct
+  tuples of 160 at 4k; 840 of 880 at 50k) - while pw + OFF, nopw + ON and nopw + OFF
+  are exactly 2-per-tuple at 4k, and nopw + ON also at 50k. Chunk 0 stays clean in
+  every arm. RECOMMENDED FOR THIS TASK'S AC1 EVIDENCE (planner to accept or
+  decline): pass-1 == pass-2 route parity, which is available at 50k where the
+  answer cannot be graded, and is far cheaper than a decode.
+  Evidence: `build/llama-cuda/verdicts/gplr49b-*`, traces
+  `build/llama-cuda/gplr49b-4k-{pw,nopw}-rebuild0.jsonl`, harness
+  `tools/run-gplr49b-echo-attrib.ps1`.
+  NOT THIS TASK'S, recorded so it is not lost: pw and non-pw route the sampled LAST
+  chunk differently in BOTH rebuild states (identical (chunk, layer) keys and event
+  counts, different hashes and slightly different `route_union`), yet pw + OFF
+  answers correctly with them - so that schedule difference is not the echo's cause
+  and needs its own owner if it ever matters. Also recorded: `host_ledger` and the
+  `host_mem` `pass_end` markers exist only when the rebuild is ON, so a
+  `--pp-prebuild-per-pass 0` trace carries no per-pass ledger (a harness that
+  requires one will fail a working rebuild-OFF arm).
+
 ### T-GPLR-48: make --pp-prebuild-per-pass KV-conditional (default ON only for quantized KV) per the T-GPLR-46 owner decision
 
 Status: ready (drafted 2026-09-19 from the T-GPLR-46 verdict and its
