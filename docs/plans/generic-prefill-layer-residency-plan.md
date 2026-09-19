@@ -3741,14 +3741,21 @@ Escalation condition
 
 ### T-GPLR-49: fix the layer-major act-slab offset formula - bf16 element size and the chunk-0 cursor inheritance
 
-Status: ready (drafted 2026-09-19 from the T-GPLR-47 invariant-2 rehearsal,
-which surfaced the defect while reading the call site; owner picked the repair
-over declaring the mode unsupported)
+Status: done (verdict 2026-09-19 - the defect is REAL and its pre-registered
+refusal chunks were measured EXACTLY on the pre-fix control (chunk 4 of 8 at
+4k, chunk 49 of 98 at 50k); the repaired `--no-pw-probe` mode completes at both
+shapes with a DECODE-GRADED correct answer at 4k; and the pw DEFAULT path did
+not move at all - ids, act_bind, route and the T-GPLR-45 dumps identical, no
+non-timing field differing - so no falsifier fired. See RESULT below.)
 Depends on: T-GPLR-12 (introduced the bf16 slab default and made pw the
 layer-major default - the two facts that decide reachability), T-GPLR-45 and
 T-GPLR-47 (compose: neither touches the offset path, and this must not move
 the pw path either)
-Commit: (fill on completion)
+Commit: nested 8c5ec1c04 (the pure `llama_ls_slab_region_of` derivation, the
+non-aliasing `claim_slab_region` rule and the 21-assertion host layout test);
+outer 4455733 (the pw/non-pw arm harness, its pw-only dump expectation and the
+gitlink bump). The verdict commit that fills this field carries the plan RESULT
+and the `docs/currentstate.md` entry.
 
 Goal
 : Make the layer-major act-slab offset a PURE function of
@@ -3896,3 +3903,99 @@ Escalation condition
   not an offset fix); if the control does not refuse at the predicted chunks
   (the code model is wrong and must be re-read); or if the pw path's act_bind
   walk cannot be held byte-identical while correcting the non-pw derivation.
+
+RESULT (2026-09-19, closed)
+: Host unit gate plus EIGHT arms in one session (4 pw identity + 4 `--no-pw-probe`
+  refusal/repair pairs), all exit 0 except the two pre-fix control arms which exit
+  nonzero BY DESIGN under the pre-registered prediction; strict
+  `--check-telemetry` OK on every arm that completed a pass. Control = nested HEAD
+  (post-T-GPLR-45, pre-T-GPLR-49) built into `build/llama-cuda/bin/gplr49-control`
+  (exe `1DE09BC164A026A0`, llama.dll `26A384FF3DE07077`); changed =
+  `build/llama-cuda/bin/gplr49-changed` (exe `65047AA91D706E2D`, llama.dll
+  `76017976E3478CF6`), both exe + ALL DLLs. Evidence:
+  `build/llama-cuda/verdicts/gplr49-*`, traces
+  `build/llama-cuda/gplr49-<shape>-<mode>-<label>.jsonl`, harnesses
+  `tools/run-gplr49-pair.ps1` / `tools/run-gplr49-arm.ps1` /
+  `tools/run-gplr49-nopw-rerun.ps1`.
+
+1. THE DEFECT IS REAL, AND ITS PREDICTED SYMPTOM LANDS ON THE NOSE. Only one CLI
+   combination reaches it (`--pp-schedule layer-major --no-pw-probe`, bf16 slabs),
+   and it had never been exercised. Pre-fix control, 4k: exit 1 with
+   `activation slab A exhausted (18874368>16777216)` at **chunk 4 of 8**; 50k:
+   exit 1 with `activation slab A exhausted (207618048>204800000)` at **chunk 49
+   of 98**. Both match the pre-registered prediction (`2*sum_{j<c} n_j + n_c > pp`),
+   re-derived independently BEFORE the arms ran. The arithmetic identifies the
+   mechanism, not just the symptom: 18,874,368 = (2*2048 + 512) * 2048 * 2 and
+   207,618,048 = (2*25,088 + 512) * 2048 * 2, i.e. the offset really was doubled
+   against a slab half sized with the 2-byte element. Refusal happens in the
+   PREBUILD (9.3 s / 3.2 s wall), before any compute and before any chunk at the
+   wrong offset is executed.
+2. THE REPAIR WORKS. Fixed binary, same flags: exit 0, strict check-telemetry OK,
+   NO slab-exhausted message, 96 ids at 4k / 3 ids at 50k, act_bind 16 / 196. At 4k
+   the stream also DECODES CORRECTLY - `tools/decode-tg-ids.py` needle aggregate
+   **PASS 5/5** (`QX-7741 TR-2918 MK-5501 LD-8834 Paris`) - so the repaired mode is
+   functionally right, not merely non-refusing.
+3. PW REGRESSION GATE CLEAN; THE FALSIFIER (a) DID NOT FIRE. Paired, one session.
+   4k: greedy ids 96/96 byte-identical; `act_bind` 16/16 ORDER-SENSITIVELY
+   identical (chunk, slab, off_bytes, n_bytes); `route` 160/160 identical including
+   the per-layer hash; the T-GPLR-45 `patch_cache` dumps identical field-for-field
+   (kept 18,436 B; `excluded_count` 8 / 8,407,044 B at the accumulated set;
+   `union_matches` 1); `run_start`, `pkg_member`, `graph_footprint`, `byte_account`
+   identical; every event-kind count identical except `recon_attr` (74 -> 75).
+   50k: ids 3/3, act_bind 196/196, route 880/880, dumps 3/3 identical, only
+   `recon_attr` moving (86 -> 84). `recon_attr` carries `copy_gpu_ms`/`lag_ms` for
+   async-feed attribution - its cardinality follows scheduling, it moves nothing
+   semantic, and every other kind is count-equal. `patch_us` per pass 0.61 -> 0.64 ms
+   (4k) and 4.96 -> 5.48 ms (50k): unchanged, which is what the contract demands of a
+   task that repairs an unexercised mode.
+4. NON-ALIASING (contract 2): MECHANISM, AND ITS NEGATIVE CONTROL PROVEN. Step 1
+   resolved from the code: in non-pw layer-major the prebuild builds ONE set per
+   chunk (`find_set` keys on `chunk_id`), so descriptor-derived offsets are adjacent
+   and non-aliasing by construction; in pw mode it builds one set per
+   (width, rs_z) class and `slab_slice`'s cursor advances once per class, so classes
+   are sequential. A per-slice region CLAIM with a loud collision refusal is
+   therefore safe in both modes, and it never fired in any of the eight arms. Its
+   negative control is proven on the host twice: the preset duplicate-claim case
+   fails as designed, and a PROBE that disabled the overlap check inside
+   `claim_slab_region` produced exactly the two aliasing failures (repeated claim
+   accepted, one-byte overlap accepted) while the offset assertions still passed -
+   so the two halves of the fix are independently tested.
+5. HOST UNIT GATE (blocking, cheapest). `test-layer-streaming-layout` now asserts
+   the descriptor-derived {offset, bytes, half} table over 7 shapes (512, 513, 4096,
+   50k, 200k, a non-512 ubatch, plus F32), chunk 0 derived rather than inherited, no
+   two chunk claims overlapping, the F32 case bit-identical to the pre-fix formula,
+   the pre-fix bf16 offset exactly 2x the truth for every chunk >= 1, every refusal
+   case, the half-open overlap predicate (touching does NOT overlap), and the claim
+   registry itself. 21 checks, all pass. Against the PRE-fix formula (probe) 519
+   assertions fail, so the test is load-bearing in the direction the task claims.
+   Full host suite 37/37 and the telemetry suite pass; `tools/check-doc-sizes.py` PASS.
+6. VENDORED-ONLY SCOPE, AND ONE HARNESS CORRECTION DECLARED OPENLY. The change is
+   confined to `src/llama-layer-streaming.{h,cpp}` and the host test. The first pass
+   of the two non-pw CHANGED arms was verdicted FAIL by the arm wrapper because it
+   demanded the T-GPLR-45 composition dump - which CANNOT exist in this mode:
+   `prepare_chunk` opens with `if (!ls->pw_probe) return;`, so with pw off there is no
+   per-launch patch at all and no patch cache to describe. That was a harness
+   expectation error, not a code failure; the expectation is now pw-only and the two
+   arms were re-run, so the recorded verdicts describe reality.
+7. FIRST COST MEASUREMENT OF THE REPAIRED MODE (reported, NOT gated; no speedup or
+   parity is claimed - the pre-repair binary could not complete a pass). Same
+   session, 50k: repaired non-pw pass-1 sweep 25,044.9 ms / compute 23,380.4 ms /
+   patch ~0 ms against pw 19,467.8 / 17,872.5 / 5.3 ms; pass 2 23,895 / 23,289 / ~0
+   vs 22,267 / 21,669 / 5.5 ms. The non-pw mode now has a baseline where it had none;
+   whether the extra compute is inherent to one-set-per-chunk or an artifact of that
+   mode's launch shape is NOT established here.
+8. OPEN, RECORDED NOT RESOLVED. (a) The AC's overlap question cannot be answered
+   from these arms: the control refuses in the prebuild, so the in-bounds-but-doubled
+   chunks (3 at 4k, 48 at 50k) are never executed by a pre-fix binary at all. The
+   measured facts are that the pre-fix mode never reaches them, and that the repaired
+   mode computes them at their true offsets and grades correct at 4k. (b) MEASURED
+   OBSERVATION, not attributable to this change: at 4k/96 the pw arms emit the
+   document-continuation stream (needle grade FAIL) while the repaired non-pw arm at
+   the same shape emits the correct answer (PASS). The pw stream is byte-identical to
+   ALL FOUR pre-existing 4k/96 traces on disk (`gplr44-ab-4k-{unscoped,scoped}`,
+   `gplr45-4k-{control,changed}`), so it is a long-standing property of the pw path,
+   and both pw arms carry the T-GPLR-43 per-pass rebuild at its default - consistent
+   with T-GPLR-46's answer -> echo finding at 4k layer-major, EXCEPT that the non-pw
+   arm also has that rebuild on and still answers correctly, which points at the pw
+   rebuild path rather than at `--pp-repeat > 1` alone. That hypothesis is NOT tested
+   here and belongs with T-GPLR-47/T-GPLR-48.
