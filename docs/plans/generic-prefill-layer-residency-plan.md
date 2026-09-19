@@ -3738,3 +3738,161 @@ Escalation condition
   a structural problem this task's one-line change must not paper over.
   Also escalate if the strict checker rejects the new run_start keys after
   whitelisting was attempted: schema ownership there outranks this task.
+
+### T-GPLR-49: fix the layer-major act-slab offset formula - bf16 element size and the chunk-0 cursor inheritance
+
+Status: ready (drafted 2026-09-19 from the T-GPLR-47 invariant-2 rehearsal,
+which surfaced the defect while reading the call site; owner picked the repair
+over declaring the mode unsupported)
+Depends on: T-GPLR-12 (introduced the bf16 slab default and made pw the
+layer-major default - the two facts that decide reachability), T-GPLR-45 and
+T-GPLR-47 (compose: neither touches the offset path, and this must not move
+the pw path either)
+Commit: (fill on completion)
+
+Goal
+: Make the layer-major act-slab offset a PURE function of
+  (chunk_id, chunks[], n_embd_io, act_slab_dtype) - one element size on every
+  offset path and no reliance on prior cursor state - while leaving the pw
+  default path's bindings, ids and act_bind telemetry byte-identical and
+  keeping distinct coexisting sets non-aliasing.
+
+Defect (measured by reading, 2026-09-19; not yet exercised by any run)
+: begin_set's `!pw_probe && chunk_id > 0` branch computes its offset as
+  `sum_{c<chunk_id} chunks[c].n_tokens * n_embd_io * sizeof(float)`
+  (llama-layer-streaming.cpp:2011-2018), while slab_slice sizes slices and the
+  slab half with `ggml_type_size(act_slab_dtype)` (1960-1983). At bf16 - the
+  DEFAULT since T-GPLR-12 (main.cpp:2571) - sizeof(float) is exactly 2x
+  slab_elt, so every chunk >= 1 is placed at TWICE its descriptor-derived
+  offset. Chunk 0 takes no derivation branch at all and inherits whatever
+  slab_off_A/B hold (correct only because a fresh run starts at the member
+  initialiser 0). Reachability is exactly one CLI combination:
+  `--pp-schedule layer-major --no-pw-probe` (pw_probe defaults true for
+  layer-major, main.cpp:2545; the opt-out parses ungated at 2709-2712; the
+  default is dropped only when batch-major is pinned, 3065-3066; the reverse
+  combination is refused at 3068). No recorded arm, script, test or doc in
+  this repo passes `--no-pw-probe`, so the defect has been exercised by
+  nothing - it is latent, not historical.
+  PREDICTED SYMPTOM, falsifiable from the formulas and the slab sizing: a half
+  is sized for the whole prompt, so the doubled offset survives only while
+  2*sum_{j<c} n_j + n_c <= pp_tokens, i.e. chunk 4 (of 8) at 4k and chunk 49
+  (of 98) at 50k; from there slab_slice's bound check fires the loud
+  "layer-major activation slab A exhausted" refusal. Chunks before that
+  threshold bind at wrong-but-in-bounds offsets and OVERLAP other chunk sets'
+  regions. Whether that overlap corrupts output or is masked (chunk sets run
+  sequentially and every launch re-patches its own act region) is NOT
+  established by the read - step 2 measures it rather than assuming it.
+
+Scope
+: The layer-major offset derivation in begin_set (llama-layer-streaming.cpp),
+  the small pure helper it should become, and the host-only layout test target
+  that asserts it. Nothing else.
+
+Non-goals
+: NO change to pw (the layer-major DEFAULT) behavior: its slices stay pinned
+  at their current addresses and its act_bind walk stays byte-identical - that
+  walk is a checker contract, not a description of the addresses. NO change to
+  slab sizing/allocation (`buf_slab` stays 2 halves of n_embd_io x pp_tokens x
+  slab_elt), to `buf_act`/batch-major allocation, to T-GPLR-45's filter or to
+  T-GPLR-47's swap. NO default flip: pw_probe stays the layer-major default.
+  NO new dependency. NO change to the `--no-pw-probe` opt-out's existence: the
+  owner chose repair over declaring the mode unsupported, so the mode must
+  work, not disappear.
+
+Design/failure contract
+: 1. ONE ELEMENT SIZE. Every offset and slice computation uses
+  `ggml_type_size(act_slab_dtype)`. No `sizeof(float)` remains on any offset
+  path. F32 is the only dtype where the two coincide; the fix must not depend
+  on that coincidence.
+  2. PURE DERIVATION, AND NON-ALIASING AS A SEPARATE, ASSERTED PROPERTY. The
+  descriptor stores what each chunk IS; it does not know how many live sets
+  claim a chunk_id. Pinning every set to its chunk's descriptor offset would
+  therefore alias any second set sharing that chunk_id (the find_set key
+  includes rs_z and n_outputs, and in pw mode chunk_match is forced true -
+  non-pw keys by chunk_id, so a second variant is constructible). Step 1
+  decides and RECORDS which mechanism provides non-aliasing - a per-set region
+  claim with a collision assert, or the existing claim-cursor seeded
+  deterministically from the descriptor - and the mechanism must fail LOUDLY on
+  a collision. An offset fix that introduces aliasing is worse than the defect.
+  3. PW PATH BYTE-IDENTICAL. The new derivation is gated so the pw path's
+  bindings and emitted act_bind events do not move at all.
+  4. LOUD, NEVER SILENT. The exhausted-slab check stays a refusal; the fix must
+  not clamp, wrap, or re-bind to a different region to make a run proceed.
+  5. CHUNK 0 IS DERIVED TOO. Chunk 0 gets its offset from the derivation (0 in
+  a fresh run) rather than inheriting the cursor, so the same class of gap
+  cannot reappear when a set is created after a non-zero cursor.
+  Failure contract: any violated invariant refuses the prebuild loudly via
+  error_msg - never a silent rebind, never a kept-both.
+
+Implementation steps
+: 1. Decide and record the non-aliasing mechanism (contract 2) by reading how
+     many live sets can share a chunk_id in each mode. Do this before editing.
+  2. Extract the derivation into a small pure helper (host-testable, alongside
+     `llama_ls_chunk_layout`) and implement contract 1/5 in begin_set.
+  3. Extend `third_party/llama.cpp/tests/test-layer-streaming-layout.cpp`
+     (host-only; built by `llama_build_and_test`, `LLAMA_LAYER_STREAMING`
+     defined - no GPU, no mutex): bf16 offset table for a 4-chunk layout, the
+     exact-multiple and 513-tail shapes, the 50k/200k shapes, the F32 case
+     (must equal the pre-fix values exactly), the largest legal offset (no
+     refusal) and one element past it (refusal), plus a seeded duplicate claim
+     that must trip the non-aliasing assertion.
+  4. PRESERVE THE CONTROL before any rebuild: side-copy the current exe AND all
+     DLLs (the streaming code lives in llama.dll - the AGENTS.md rule).
+  5. Identity gate on the DEFAULT path: 4k/96-id and 50k pw arms on the fixed
+     binary vs the preserved control - greedy ids byte-identical AND the
+     act_bind event sequence byte-identical.
+  6. Characterize the non-pw path: `--no-pw-probe` at 4k/96-id and 50k on BOTH
+     binaries. Control is expected to refuse at chunk 4 (4k) / chunk 49 (50k)
+     per the predicted symptom; the fixed binary is expected to exit 0 with
+     strict check-telemetry OK, no slab-exhausted message, and a decode-graded
+     needle PASS at 4k. Record what the overlap actually did on the control.
+  7. Record the verdict; fill Status/Commit; update docs/currentstate.md.
+
+Acceptance criteria (falsifiable)
+: * HOST UNIT (cheapest, blocking): the new layout-test assertions FAIL against
+  the pre-fix formula and PASS after the fix; bf16 offsets equal the
+  descriptor-derived truth at every shape; F32 offsets are unchanged from the
+  pre-fix values bit for bit; the past-the-end case refuses and the last legal
+  case does not; the injected duplicate claim fails loudly as designed.
+  * PW REGRESSION (blocking): on the default path, greedy ids byte-identical
+  and the act_bind event stream byte-identical to the preserved control at 4k
+  (96 ids) and 50k; no other telemetry key moves beyond run ids and timestamps.
+  * NON-PW REPAIR: `--no-pw-probe` at 4k/96-id exits 0, strict check-telemetry
+  OK, no slab-exhausted message, and `tools/decode-tg-ids.py` grades the stream
+  PASS; at 50k it completes where the control refused. If the control does NOT
+  refuse at the predicted chunks, the predicted symptom is WRONG - stop and
+  re-read before proceeding (the model of the code, not the test, is the
+  suspect).
+  * NO NEW ALIASING: the mechanism from contract 2 holds in every arm, and its
+  negative control (seeded duplicate claim) fails as designed.
+  * FALSIFIERS: (a) any movement in the pw path's ids or act_bind walk ->
+  REVERT; this repairs an unexercised mode and must never cost the default
+  path; (b) the non-pw overlap measured as BENIGN (control completes with
+  correct ids) -> report it as a finding and hand the land/don't-land decision
+  to the owner rather than landing a change with no measured effect - a fix on
+  theory alone is not a verdict.
+
+Validation commands
+: * Host: `powershell -NoProfile -ExecutionPolicy Bypass -File
+  tools/run-tests.ps1` (the layout target must pass; it needs no model).
+  * Build: `cmake --build build/llama-cuda --target llama-layer-streaming -j`
+  * Identity (mutex): the gplr49 pw arms at 4k/96-id and 50k against the
+  preserved control; compare ids and the act_bind sequence.
+  * Non-pw (mutex): the gplr49 `--no-pw-probe` arms per step 6.
+  * Grading: `python tools/decode-tg-ids.py --trace <jsonl> --model <gguf>`
+  (exit 0 = PASS, 1 = FAIL, 2 = error).
+
+Required state and document updates
+: Plan: fill Commit, append RESULT (the pre-fix vs post-fix offset table, the
+  chosen non-aliasing mechanism, the measured overlap behavior, the pw
+  regression evidence). currentstate.md: new entry. AGENTS.md: add a
+  vendored-engine gotcha line ONLY if the overlap turned out masked-and-benign
+  or if the non-aliasing mechanism is non-obvious enough to trip a future
+  reader.
+
+Escalation condition
+: Stop and escalate if step 1 finds that no cheap mechanism can keep
+  coexisting same-chunk_id sets non-aliasing (that is a slab-allocator redesign,
+  not an offset fix); if the control does not refuse at the predicted chunks
+  (the code model is wrong and must be re-read); or if the pw path's act_bind
+  walk cannot be held byte-identical while correcting the non-pw derivation.
