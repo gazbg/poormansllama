@@ -3236,7 +3236,9 @@ RESULT (2026-09-19, closed)
    not compound per pass.
 4. ESCALATION FIRED (pre-registered: "identity changes across the flag") and
    resolved by decode, not guesswork. TG ids differ across the flag. Token
-   decode (vocab read from the GGUF, host-only, no new deps) shows:
+   decode (tools/decode-tg-ids.py --trace <jsonl> --quiet: GGUF vocab walk
+   with a host-only JSON cache, graded by check-answer.py; PASS on
+   gplr46-4k-off.jsonl, FAIL on gplr44-ab-4k-unscoped.jsonl) shows:
    - OFF arms and the repeat-1 probe at 4k emit the CORRECT needle answer
      (9/9 pieces: QX-7741 TR-2918 MK-5501 LD-8834 Paris), format identical
      to the passing smoke rung.
@@ -3376,9 +3378,9 @@ Pre-registered falsifier (revert, never tune to match)
 Acceptance criteria
 : AC1 (identity + semantics): 4k layer-major f16, fresh binary, rebuild ON:
   the 96 TG ids are byte-identical to the same-session rebuild-OFF arm, and
-  the decoded stream contains the needle answer (9/9 pieces via the
-  gplr46-vocab.json decode probe, or check-answer 5/5 on the QA anchor) -
-  i.e. rebuild ON regains the correct-answer stream instead of echo.
+  the decoded stream contains the needle answer (tools/decode-tg-ids.py
+  --trace <V1 fresh arm> --quiet exits 0 = 5/5 needle items) - i.e. rebuild
+  ON regains the correct-answer stream instead of echo.
 : AC2 (trigger removed): 50k pair on the fresh binary, same session: pass-2
   compute excess with rebuild ON is <= 0.5 s (vs +3.72 s on the current
   binary, and vs the OFF arm's -1.31 s noise floor).
@@ -3409,7 +3411,8 @@ Validation (exact)
   - V4: q8 B1 rebuild-ON (AC4) - clone the T-GPLR-43 arm shape.
   - V5: qa-smoke rung (AC8) per the T-GPLR-07 contract.
   Extraction: the T-GPLR-46 ledger one-liner for pass excesses; the
-  T-GPLR-44 dump analyzer for AC5; the vocab decode probe for AC1 semantics.
+  T-GPLR-44 dump analyzer for AC5; tools/decode-tg-ids.py (graded decode,
+  not raw ids) for AC1 semantics.
 
 Required state and document updates
 : Plan: fill Commit, append RESULT with the measured table (excess by shape
