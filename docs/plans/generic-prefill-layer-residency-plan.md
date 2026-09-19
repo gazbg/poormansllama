@@ -3401,16 +3401,63 @@ Design and failure contract
      (564 violations). Distinguish first-creation from replacement with an
      explicit flag threaded from the per-pass prebuild path - NOT by
      heuristic (build_generation counting is fragile).
-  2. Act-slab offsets are re-derived DETERMINISTICALLY: per-chunk layer-major
-     sets recompute slab_off from the immutable chunks[] descriptor (the
-     existing chunk_id > 0 branch does this; PITFALL: chunk 0 after pass 1
-     inherits whatever the cursor holds - the per-pass prebuild must reset
-     the slab cursors before rebuilding, matching whatever the current
-     in-place path does today; verify by reading the call site first).
-     Batch-major sets allocate act pairs from buf_act at a cursor - the
-     replacement MUST capture the old set's buf_act region and re-alloc at
-     the SAME offsets (rewind then re-alloc), or every pass burns another
-     act-pair-sized hole in the activation buffer.
+  2. Act-slab offsets are REPLAYED from the replaced set - never re-derived
+     from a cursor. The rehearsal this invariant now rests on was read off the
+     code 2026-09-19 (implementation step 1, discharged); the draft's earlier
+     wording ("reset the slab cursors") was inferred and is WRONG in a way that
+     would corrupt output, so the measured facts are recorded here:
+     (a) WHAT THE CURRENT PATH DOES. `slab_off_A/B` are module-wide members
+     initialised to 0 and assigned in exactly ONE place: begin_set's
+     `!pw_probe && chunk_id > 0` branch, which computes
+     sum_{c<chunk_id} chunks[c].n_tokens * n_embd_io * sizeof(float) and gives
+     BOTH cursors that same value. `slab_slice` then binds A at `base + off` and
+     B at `base + half_bytes + off` and ADVANCES the caller's cursor by
+     `n_embd_io * n_tokens * ggml_type_size(act_slab_dtype)`. Non-aliasing comes
+     from the slab HALF (which = 0/1, half_bytes apart), never from the offset.
+     (b) NOTHING RESETS THE CURSORS. Not `reset_stats()` (it clears the stats
+     struct, the byte/eviction counters and the rowset timestamps only - read,
+     not assumed), not `llama_memory_clear`, not `layer_streaming_prebuild`.
+     `buf_act_off` has no assignment anywhere outside its declaration; it moves
+     only through the by-reference `alloc_tensors` call.
+     (c) WHY THE IN-PLACE REBUILD SURVIVES TODAY - the concrete form of the
+     "address-stability accident": the rebuild does NOT allocate. `find_set`
+     matches the existing set (in pw mode `chunk_match` is forced true), so
+     begin_set takes the `set != nullptr` path and never re-enters
+     slab_slice/alloc_tensors; the cursors stay frozen at their post-first-pass
+     values and the rebuilt graphs keep their original act bindings.
+     (d) TWO BYTE-SIZE FACTS THE REPLACEMENT MUST NOT INHERIT. The recompute
+     branch uses `sizeof(float)` (4) while slab_slice sizes slices with
+     `ggml_type_size(act_slab_dtype)` (2 under bf16, the DEFAULT of
+     `--act-slab-dtype` since T-GPLR-12, main.cpp:2571 - so the mismatch is live
+     by default, not only in arms that pass the flag; every recorded arm does)
+     - a re-derived offset is therefore exactly 2x too large unless the run
+     explicitly asks for f32; and the pw-mode act_bind walk emitted on chunk 0's
+     creation uses act-dtype sizing to describe a layout the real bindings only
+     approximate (pw mode pins each slice at the cursor value at creation time,
+     one set per width class). That walk is a CHECKER CONTRACT, not an offset
+     source - do not replay from it.
+     (e) THEREFORE, the rule. The replacement MUST NOT re-run a cursor-based
+     allocation from a stale position, and MUST NOT reset `slab_off_A/B` to 0
+     and re-slice: at 0 it would bind the replaced set onto the FIRST width
+     class's live region (`base + 0` in each half) and silently alias it - the
+     corrupting direction. It must equally not lean on the descriptor recompute:
+     chunk 0 skips that branch entirely (the cursor keeps whatever it held), and
+     at bf16 its value is 2x the truth. Instead REPLAY: capture the replaced
+     set's `act[0]`/`act[1]` data pointers before the swap and re-bind the fresh
+     tensors to those exact addresses (bind-to-region, not allocate), leaving
+     both cursors and `buf_act_off` untouched. Assert
+     `new_act[i]->data == old_act[i]->data` for i = 0,1 and
+     `old_act[0]->data != old_act[1]->data` (non-aliasing); refuse the prebuild
+     loudly otherwise.
+     (f) Batch-major sets (chunk_id < 0) allocate their act pair from `buf_act`
+     at `buf_act_off`. Same rule, stronger stake: rewind-then-realloc is safe
+     only if the replaced set is the LAST allocation out of that buffer, which
+     nothing asserts, so replay the captured region instead. The stake is not
+     "another hole" in a run-sized buffer but ALIASING a coexisting set that was
+     allocated at a later cursor.
+     (g) Replaying act BINDINGS must not become replaying the CONTEXT: the fresh
+     ctx's tensor objects, the fresh res and (invariant 5) the re-derived KV
+     views stay fresh - only the device region addresses are carried over.
   3. gparams.res == set->res for the in-flight build (llama-layer-streaming.h
      begin_build comment): the fresh res must be installed BEFORE the rebuild
      writes into it; rebuilds happen between passes, so no build is in
@@ -3427,9 +3474,13 @@ Design and failure contract
   prebuild) - never silently reuses the old ctx or skips the swap.
 
 Implementation steps
-: 1. Read the per-pass rebuild call site (runner --pp-repeat pass loop) and
-     record exactly what the current path does to slab_off_A/B and buf_act_off
-     before re-invoking the prebuild; this anchors invariant 2.
+: 1. DISCHARGED 2026-09-19 - the rehearsal is now recorded IN invariant 2: the
+     runner pass loop (tools/layer-streaming/main.cpp) calls
+     `llama_layer_streaming_prebuild` between `llama_memory_clear` and the next
+     `llama_layer_major_pp` when `--pp-prebuild-per-pass 1`; the prebuild reaches
+     `begin_set` directly (llama-context.cpp:1441) once per chunk, and neither it
+     nor `reset_stats()` assigns `slab_off_A/B` or `buf_act_off`. That frozen
+     cursor is exactly why the replay rule (invariant 2e/2f) is mandatory.
   2. Add the replacement flag to the streaming module (set by the runner
      before the pass-2+ prebuild call, cleared after) and the swap-in-slot
      path in begin_set; add the assert for invariant 3.
