@@ -3096,3 +3096,123 @@ Escalation condition
   any normal-path code (owner-gated boundary); or if the paired arms cannot
   complete inside one mutex hold.
 
+### T-GPLR-46: the pass-2 compute regression is REAL and rebuild-linked - isolate the trigger and the growth law
+
+Status: ready (drafted 2026-09-18 from the trace analysis below; corrects the
+"session-level, unexplained" reading first written into the T-GPLR-44 closure).
+Depends on: T-GPLR-43 (introduced the per-pass rebuild - the prime suspect),
+T-GPLR-44 (the pair arms that supply two of the five measured points, and the
+pw-ctx accumulation signature found on the same path).
+Commit: (fill on completion)
+
+Goal
+: Explain the pass-2 compute inflation measured on every post-T-GPLR-43 200k
+  arm (pass-2 `compute_us` 194.3-194.5 s vs pass 1 132.7-135.3 s, against a
+  pre-rebuild baseline pair of 131.2 -> 131.5 s) by isolating its TRIGGER and
+  characterizing its GROWTH LAW. DIAGNOSIS task: the deliverable is a
+  mechanism-level answer (which switch turns the excess on) plus a replicated
+  growth law - not a fix, and not a performance claim.
+
+Known evidence (all measured, from existing traces; no new run yet)
+: Per-pass `host_ledger` records exist for FIVE arms on disk:
+  * `gplr36-ledger-200k` (09-17 10:02, binary predates T-GPLR-43): pass 1
+    compute 131,159.7 ms -> pass 2 131,523.3 ms. EXCESS +0.36 s. Single-prebuild.
+  * `gplr36-hostmem-200k` (09-18, post-rebuild, SAME launcher config as the
+    baseline): 132,667.8 -> 194,304.4 ms. EXCESS +61.6 s.
+  * `gplr44-ab-200k-scoped` (09-18, post-revert binary `9ba0ab55`, 200k prompt):
+    135,337.5 -> 194,530.8 ms. EXCESS +59.2 s.
+  * `gplr44-ab-50k-{unscoped,scoped}` (09-18, both binaries): pass 1 ~17,594 ->
+    pass 2 ~21,418 ms. EXCESS +3.82 s, AGREEING across the A/B pair.
+  * `gplr44-ab-4k-*`: excess -0.1 s (invisible at 7 chunks).
+  The excess is QUADRATIC IN CHUNK COUNT: excess/chunks^2 = 0.235 (512 chunks),
+  0.389 (390), 0.406 (97, two independent sessions) ms per chunk^2; the baseline
+  shows 0.0014. Every other ledger bucket stays flat while `compute_us`
+  inflates (patch/slot/other move < 1 s). `launches` = 16,422 in ALL arms
+  including the baseline (its `--pp-tokens 262144` over-ask clamps to the same
+  200k-token prompt), so launch count, ubatch, tg-tokens and scheduler are
+  IDENTICAL - the config deltas between arms were recovered from the verdict
+  commands and ELIMINATED as explanations. The prime suspect is the T-GPLR-43
+  per-pass graph rebuild (nested `0ffd0ab14`, 09-17 19:51, after the baseline
+  binary's tree state `8e14abd36`): its default fires for ANY `--pp-repeat > 1`,
+  while its own help text says the fix targets the QUANTIZED-KV pass-2 crash -
+  so every f16 arm pays it without its justification. `--pp-prebuild-per-pass 0`
+  restores single-prebuild ON THE SAME BINARY (flag parsed at
+  `tools/layer-streaming/main.cpp:2834`, incompatible only with `--mtp`), and
+  the baseline arm is itself evidence that single-prebuild f16 pass 2 runs
+  clean. MECHANISM HYPOTHESIS (unproven, for the task to test): the rebuild
+  re-enters `begin_set`, whose ctx ACCUMULATES the previous pass's orphaned
+  tensors (T-GPLR-44 measured 7 -> 14 members), so pass-2 graphs are built in a
+  fragmented/accumulated allocation state - the excess is the cost of executing
+  against that state, not of the rebuild event itself.
+
+Design/failure contract
+: 1. RESPONSE VARIABLE: pass-2 excess = pass2.compute_us - pass1.compute_us,
+  SAME RUN, which cancels day/session drift in pass 1 by construction - this is
+  what separates "session noise" from a real regression.
+  2. TRIGGER ISOLATION FIRST, CHEAPEST SHAPE. Two 50k arms on the CURRENT
+  binary, one mutex hold, identical config to the recorded 50k pair except the
+  rebuild flag: (A) default (rebuild on) - same-session reference; (B)
+  `--pp-prebuild-per-pass 0`. DECISION GATE: B's excess <= 0.5 s confirms the
+  rebuild as the trigger and the task proceeds; B's excess ~ A's REFUTES the
+  rebuild - STOP, record, and escalate to a binary bisect (8e14abd36 vs
+  0ffd0ab14 requires building the old commit; owner-gated GPU time).
+  3. GROWTH LAW, ONE PAIRED POINT. 100k (195 chunks) default vs off, same
+  hold: the default arm's excess falls in the pre-registered 8.7-15.6 s band
+  (0.23-0.41 ms/chunk^2 x 38,025) and the off arm stays <= 0.5 s - confirming
+  the law and the trigger at a second shape in one pair.
+  4. SATURATION TEST. One 50k arm with `--pp-repeat 3` (default rebuild): the
+  quadratic law predicts the pass-3 excess GROWS again (pass3-pass2 >= pass2-
+  pass1); if it instead collapses to ~0, the growth SATURATES after one rebuild
+  and the law is not quadratic-in-pass - record which, honestly.
+  5. IDENTITY SANITY, NOT A GATE: every arm records its greedy ids; a change of
+  ids across the rebuild flag at f16 would be a NEW finding (the flag should
+  touch rebuild timing only) and blocks interpretation until explained.
+  6. NO BEHAVIOR CHANGE IN THIS TASK: no default flip, no code edit. Whether
+  `--pp-prebuild-per-pass` should become KV-conditional (or whether the fix is
+  rebuilding into a FRESH ctx instead of the accumulated one) is an owner
+  decision made FROM this task's evidence, drafted as its own follow-up.
+
+Implementation steps
+: 1. Write the arm script (T-GPLR-44 pair-driver pattern, tags `gplr46-*`, one
+  mutex hold, verdict + `.done` sentinels), cloning the recorded 50k command
+  from the pair verdict verbatim plus only the flag under test.
+  2. Run A/B (50k). Apply the decision gate. If refuted: stop, record, escalate.
+  3. Run the 100k pair (C/E) and the `--pp-repeat 3` arm (D).
+  4. Extract per-pass ledgers with the T-GPLR-46 extraction one-liner; fit the
+  coefficient; fill the prediction-vs-measured table in this block.
+  5. Record Status/Commit here and the entry in docs/currentstate.md, including
+  the mechanism verdict (trigger confirmed/refuted, law quadratic/saturating)
+  and the follow-up decision handed to the owner.
+
+Acceptance criteria (falsifiable)
+: * TRIGGER: B (50k, rebuild off) excess <= 0.5 s while A (50k, default) excess
+  is 3.0-4.6 s. PRE-REGISTERED FALSIFIER: B shows ~A's excess -> rebuild
+  REFUTED as the trigger; escalate to the binary bisect.
+  * LAW: C (100k, default) excess in 8.7-15.6 s with the off arm <= 0.5 s; the
+  fitted coefficient lands in 0.23-0.41 ms/chunk^2. A coefficient outside the
+  band does not fail the task - it REFINES the law - but a 100k excess outside
+  4-25 s would (non-monotone or absent), and must be reported as such.
+  * SATURATION: D's pass-3 excess vs pass-2 is reported as GROWING or
+  SATURATED, with the number; no pass/fail, the law is the deliverable.
+  * IDENTITY: greedy ids identical across the rebuild flag at every shape; any
+  difference blocks interpretation (loud, not tuned around).
+  * TOTAL COST: five arms (~2x 50k + 2x 100k + 1x 3-pass 50k, ~25 min GPU) in
+  at most two mutex holds; exceeding that without a verdict is an escalation.
+
+Validation commands
+: * Extraction (per arm):
+  `python -c "import json,io; [print(round(e['compute_us']/1e6,1)) for e in map(json.loads, io.open('build/llama-cuda/gplr46-<tag>.jsonl',encoding='utf-8',errors='replace')) if (e.get('event') or e.get('type'))=='host_ledger']"`
+  * Verdicts: `build/llama-cuda/verdicts/gplr46-*.verdict.json` (+ `.done`).
+
+State/document updates
+: This block's Status/Commit; `docs/currentstate.md` entry with the
+  prediction-vs-measured table and the mechanism verdict; the two superseded
+  "session-level noise" claims (T-GPLR-44 closure addendum, currentstate
+  T-GPLR-44 entry) already carry dated pointers to this task.
+
+Escalation condition
+: Stop and escalate if the trigger A/B refutes the rebuild (binary bisect is
+  owner-gated GPU time plus an old-commit build); if identity changes across
+  the flag; if the 100k pair contradicts the 50k trigger result; or if the
+  excess proves non-reproducible on the day (A shows <= 0.5 s) - then the
+  earlier arms were environmentally confounded and the diagnosis restarts.
