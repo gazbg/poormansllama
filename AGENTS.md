@@ -177,6 +177,8 @@ authoritative online sources before improvising:
 
 - `llm_graph_context::build_inp_embd` always allocates BOTH `inp_tokens` and `inp_embd` (F32, ~4 MiB at ubatch 512), then `ggml_build_forward_select` prunes the embeddings branch in token mode — leaving a tensor that is INPUT-flagged, allocated, and consumed by NO graph. Any cache built by walking a graph ctx for INPUT tensors inherits it; attribute inputs by TRANSITIVE src walk (an input consumed through a view sits one hop past the node's direct src), never direct sources alone.
 - `--pp-schedule layer-major` refuses `--tg-tokens > 3` when handoff auto does not activate (exit 2). Long-id identity arms at the 50k shape are impossible without forcing handoff (which changes the execution mode); run them at 4k instead.
+- `prepare_chunk` early-returns when `pw_probe` is off, so `--no-pw-probe` mode does NO per-launch patch: no act repointing, no snapshot restore, and **no `patch_cache` recon dump to inspect**. Any harness or checker that requires that dump will verdict a working non-pw run FAIL (measured 2026-09-19, T-GPLR-49). Treat it as a pw-only artifact.
+- The act-slab region claims (`slab_claims`) live for the module's lifetime and are only consistent with the offset cursors while nothing clears one without the other; derive slab offsets from the immutable chunk descriptor, never from a cursor, or a reordered/repeated pass silently re-binds a slice over a live one.
 
 ## Validation and Evidence
 
