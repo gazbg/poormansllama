@@ -3427,3 +3427,187 @@ Escalation condition
   accumulated-ctx hypothesis and redirects the diagnosis), or if ggml_free
   mid-run cannot be made safe without broad allocator changes, or if the q8
   rescue needs semantics beyond view re-derivation to survive the swap.
+
+### T-GPLR-48: make --pp-prebuild-per-pass KV-conditional (default ON only for quantized KV) per the T-GPLR-46 owner decision
+
+Status: ready (drafted 2026-09-19 from the T-GPLR-46 verdict and its
+escalated owner decision; the cheap hedge that runs independently of and
+composes with T-GPLR-47's root fix)
+Depends on: T-GPLR-46 (the measured evidence this acts on: quadratic pass-2
+compute excess and TG answer->echo at 4k layer-major under rebuild ON at f16,
+with the rebuild's only justification being the T-GPLR-43 quantized-KV
+pass-2 crash fix)
+Commit: (fill on completion)
+
+Goal
+: Change the default resolution of --pp-prebuild-per-pass so that an
+  explicitly-unset flag defaults ON only when the run actually uses a
+  quantized KV cache (q8/q4 - the only case with a proven pass-2 crash that
+  the rebuild fixes), and OFF for f16. Explicit --pp-prebuild-per-pass 0/1
+  continues to override everything, so every recorded arm command and every
+  future experiment can still pin either behavior. This removes the default
+  f16 cost measured in T-GPLR-46 (+3.72 s pass-2 excess at 50k, +59.2 s at
+  200k, TG answer->echo at 4k layer-major) without touching the rebuild
+  mechanism itself (that is T-GPLR-47's task).
+
+Hypothesis (falsifiable)
+: The default condition "pp_repeat > 1" over-triggers the rebuild: it fires
+  in the one configuration where it is a pure cost (f16, no crash to fix)
+  and gates nothing the user asked for. Conditioning it on the KV type keeps
+  the crash fix where it is load-bearing and removes the measured defects
+  from the default path. If any non-quantized KV shape still needs the
+  rebuild to survive pass 2 (a crash or corruption at f16 with rebuild OFF,
+  repeat > 1), the hypothesis is wrong and this default change is unsafe -
+  escalate instead of narrowing further.
+
+Scope
+: third_party/llama.cpp/tools/layer-streaming/main.cpp ONLY: (1) the default
+  resolution block (lines ~2967-2971: `if (pp_prebuild_per_pass == -1)
+  pp_prebuild_per_pass = (pp_repeat > 1) ? 1 : 0;`) gains a KV-type
+  condition; (2) the flag's help text (lines ~120-123) states the new
+  default; (3) the resolved default is announced so runs are
+  self-describing. No changes to llama-layer-streaming.cpp/h (the rebuild
+  mechanism), no changes to any other flag, no changes to cparams or the
+  KV cache implementation. The q8/q4 pass-2 crash path is NOT touched:
+  quantized KV keeps today's default exactly.
+
+Non-goals
+: - Do NOT change the rebuild mechanism or attempt the fresh-context fix
+    (T-GPLR-47 owns that; the two compose - this task reduces default-harm
+    while T-GPLR-47 removes the cost class).
+  - Do NOT change behavior for explicitly-set flag values: explicit 0 and
+    explicit 1 must behave exactly as today in all configurations (this is
+    what keeps every recorded arm command reproducible).
+  - Do NOT infer KV type from the model file or env: the runner's --kv-cache
+    string ("f16" | "q8" | "q4", default "q8" per line 2553) is the single
+    source of truth, matching cparams.type_k/v and the run_start
+    telemetry key.
+  - Do NOT re-litigate the T-GPLR-46 measurements or add new perf arms
+    beyond the validation set below.
+
+Design contract
+: 1. The default condition becomes: rebuild default = ON iff
+     (pp_repeat > 1 AND kv_cache != "f16"). Concretely, in the -1 sentinel
+     branch: `pp_prebuild_per_pass = (pp_repeat > 1 && kv_cache != "f16") ?
+     1 : 0;`. kv_cache is already validated ("f16"|"q8"|"q4") before this
+     point, so no new validation is needed.
+  2. Announcement + telemetry: the resolved value and the reason must be
+     observable per run - (a) one stderr line in the existing preflight
+     style, e.g. "layer-major preflight: pp-prebuild-per-pass = 0 (default:
+     f16 KV, no per-pass rebuild needed)" or "= 1 (default: quantized KV q8,
+     pass-2 rebuild active)", emitted ONLY when the value came from the
+     default (not explicit); (b) a "pp_prebuild_per_pass" key (resolved
+     int) and a "pp_prebuild_per_pass_source" key ("explicit" | "default")
+     in run_start telemetry. The run_start head lives in
+     llama-layer-streaming.cpp (tel_run_start, line ~4062) and already
+     carries kv_cache; adding the two keys follows the T-GPLR-12
+     handoff_mode pattern (conditional suffix member + append in the
+     format string). This is the only llama-layer-streaming.cpp touch, it
+     is telemetry-only, and it is within the established experimental
+     module boundary.
+  3. Invariants:
+     - INV1 (explicit overrides): an explicit --pp-prebuild-per-pass 0/1
+       produces byte-identical behavior to today's binary at both f16 and
+       q8 (same arms, same pass ledgers, same resolved value - only the new
+       telemetry keys are added).
+     - INV2 (quantized default unchanged): at q8/q4 with repeat > 1 and no
+       explicit flag, the rebuild still fires (resolved 1) - the T-GPLR-43
+       crash fix remains the default where it is load-bearing.
+     - INV3 (f16 default flips): at f16 with repeat > 1 and no explicit
+       flag, resolved 0 - the T-GPLR-46 defects leave the default path.
+     - INV4 (single source of truth): the condition reads only the
+       already-validated kv_cache string; no second KV-type inference path
+       is introduced.
+
+Failure contract (loud)
+: There is no new failure mode to fail loudly on: the flag is still
+  0/1-only, still validated, still gated on repeat > 1 and != mtp. The only
+  new observable is the announcement + telemetry keys. If implementation
+  discovers the KV type is NOT knowable at the resolution point (it is:
+  validation at line ~3057 precedes resolution at ~2969 - if that ordering
+  is wrong in the real tree, fix the ordering as part of this task and say
+  so in the RESULT).
+
+Falsifier (pre-registered)
+: Any of: (a) an f16 repeat>1 default run (no explicit flag) still performs
+  the between-pass rebuild (resolved value 1 or the pass-2 excess remains
+  ~+3.7 s at 50k); (b) a q8 B1 repeat>1 default run (no explicit flag)
+  crashes in pass 2 (the quantized default did NOT stay ON); (c) any
+  explicitly-set-flag arm diverges from the same command on today's binary
+  (behavioral change beyond the default). Any firing reverts the default
+  change per contract and reports the shape - never tunes the condition to
+  make the symptom disappear.
+
+Implementation steps
+: 1. Read the resolution block and its ordering against kv_cache validation
+     in the current tree; confirm the q8 default note (line 2553) and the
+     f16/q8/q4 validation (~3057) both precede resolution (~2969) at
+     runtime; note anything that contradicts this draft's ordering claim.
+  2. One-line condition change in the -1 branch (per Design contract 1).
+  3. Help-text update (~lines 120-123): state "DEFAULT: on when --pp-repeat
+     > 1 AND KV is quantized (q8/q4); off for f16 (T-GPLR-46: the rebuild
+     costs quadratic pass-2 compute and TG semantics at f16); explicit 0/1
+     always overrides".
+  4. Announcement stderr line + run_start telemetry keys (per Design
+     contract 2), following the T-GPLR-12 handoff_mode pattern; touch
+     tel_run_start's signature/format minimally; update the telemetry schema
+     section this repo keeps for run_start keys (the strict checker may
+     need the two new optional keys whitelisted - check its run_start
+     schema before building).
+  5. Rebuild llama-cuda, side-copy the current Release exe + ALL DLLs to a
+     control dir BEFORE rebuilding (the streaming code lives in
+     llama.dll).
+  6. Run the validation arms below; extraction via the T-GPLR-46 ledger
+     one-liner; semantics via tools/decode-tg-ids.py.
+
+Acceptance criteria
+: AC1 (INV3, the point of the task): f16 layer-major 50k, repeat 2, NO
+  explicit flag: run_start carries pp_prebuild_per_pass=0 with source
+  "default"; the pass-2 compute excess is within the OFF-arm noise floor
+  (<= 0.5 s, vs +3.72 s measured under the old default).
+: AC2 (INV3 semantics): the same arm's TG ids, decoded by
+  tools/decode-tg-ids.py, PASS the needle grade (9/9 pieces; today's old-
+  default f16 arm echoes).
+: AC3 (INV2, no regression for quantized): q8 B1 shape, repeat 2, NO
+  explicit flag: BOTH passes survive, strict --check-telemetry OK, resolved
+  value 1 with source "default" (identical to today's default behavior).
+: AC4 (INV1, explicit unchanged): four arms - f16 and q8, each with explicit
+  --pp-prebuild-per-pass 0 and explicit 1 - produce pass ledgers and TG ids
+  matching the same commands on the control binary (telemetry may add the
+  two new keys; nothing else differs).
+: AC5 (announcement): the stderr announcement appears exactly when the
+  default was used and never when the flag was explicit; the run_start keys
+  are present in all arms and parse with the strict checker.
+: AC6 (no cost): f16 explicit-1 arm's pass ledgers within the ~3% session
+  spread of the control's (the change must not slow the pinned-ON path).
+
+Validation (exact)
+: Control: side-copy build/llama-cuda/bin/Release (exe + all DLLs) BEFORE
+  rebuilding. All arms under tools/with-gpu-lock.ps1 with
+  started/verdict/done sentinels, cloned from the T-GPLR-46 recorded
+  commands verbatim (same prompts, same shapes):
+  - A1: f16 50k layer-major repeat 2, no explicit flag (AC1, AC2, AC5).
+  - A2: q8 B1 repeat 2, no explicit flag (AC3, AC5) - T-GPLR-43 arm shape.
+  - A3: the four explicit-flag arms of AC4 at 50k layer-major repeat 2,
+    byte-compared to the same commands on the control.
+  - A4: f16 4k 96-id arm, no explicit flag, graded by
+    tools/decode-tg-ids.py (AC2's 4k form; the echo shape from T-GPLR-46).
+  Extraction: T-GPLR-46 ledger one-liner; run_start keys via python json
+  line scan; decode grading via tools/decode-tg-ids.py.
+
+Required state and document updates
+: Plan: fill Commit, append RESULT (resolved-default table across A1-A4,
+  announcement/telemetry evidence, any ordering fix from step 1).
+  currentstate.md: new entry; note that the T-GPLR-46 escalated owner
+  decision is now actioned. AGENTS.md: add the new default to the
+  vendored-engine gotchas only if it surprises (e.g. the f16 default flips
+  and old commands that relied on the ON default now need the explicit
+  flag).
+
+Escalation condition
+: Stop and escalate if the falsifier fires (any clause), or if step 1 finds
+  the resolution ordering contradicts this draft (kv_cache not knowable at
+  the resolution point) - that would mean the runner's flag resolution has
+  a structural problem this task's one-line change must not paper over.
+  Also escalate if the strict checker rejects the new run_start keys after
+  whitelisting was attempted: schema ownership there outranks this task.
