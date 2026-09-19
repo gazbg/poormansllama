@@ -3258,3 +3258,169 @@ RESULT (2026-09-19, closed)
    buys a quadratic compute excess and TG answer degradation. Recommendation
    (drafted as follow-up, not implemented): make the default KV-conditional
    and/or fix the rebuild path. Not actioned here - SDD boundary.
+
+### T-GPLR-47: rebuild graph sets into a FRESH context (swap-in-slot), fixing the pass-2 regression and the T-GPLR-44 stale-pointer hazard at the root
+
+Status: ready (drafted 2026-09-19 from the T-GPLR-46 verdict; follows the
+owner's decision to fix the rebuild path rather than only re-default the flag)
+Depends on: T-GPLR-43 (the rebuild is load-bearing: it is the quantized-KV
+pass-2 crash fix - this task must preserve that guarantee), T-GPLR-46
+(trigger + growth law + the TG answer-to-echo regression measured), T-GPLR-44
+(the stale-pointer hazard note and the patch_cache dump used as structural
+proof)
+Commit: (fill on completion)
+
+Goal
+: Replace the per-pass rebuild's accumulate-in-place path (begin_set find_set
+  match -> res->reset + graph lists cleared + rebuild into the SAME ggml ctx)
+  with a fresh-context rebuild that swaps into the SAME graph_set slot, so
+  that (a) no orphaned tensors accumulate across passes, (b) every pointer to
+  a set stays valid by construction instead of by the address-stability
+  accident T-GPLR-44 documented, and (c) both measured T-GPLR-46 defects -
+  the quadratic pass-2 compute excess and the TG answer-to-echo regression at
+  4k layer-major - disappear with rebuild ON, while the T-GPLR-43 quantized-KV
+  rescue survives unchanged.
+
+Hypothesis (falsifiable)
+: The pass-2 defects are caused by executing against sets whose ggml ctx
+  pool and input-tensor closure ACCUMULATED across the in-place rebuild
+  (measured signature: patch_cache members 7 -> 14 -> 28 across rebuilds,
+  T-GPLR-44 dumps). A fresh ctx per rebuild removes the accumulated closure;
+  if the defects persist with the accumulation structurally gone, the
+  mechanism is elsewhere and the diagnosis escalates (see falsifier).
+
+Scope
+: third_party/llama.cpp/src/llama-layer-streaming.{cpp,h} (begin_set rebuild
+  path + graph_set fields) and the runner call site in
+  tools/layer-streaming/main.cpp (the --pp-repeat pass loop that re-invokes
+  llama_layer_streaming_prebuild). Experimental module only; no upstream-
+  facing material; the normal (non-rebuild) paths are untouched.
+
+Non-goals
+: No change to --pp-prebuild-per-pass DEFAULTS (the owner decision escalated
+  in T-GPLR-46 is a separate task and stays open); no change to f16 single-
+  pass behavior (repeat 1 never rebuilds); no change to patch-cache CONTENT
+  (T-GPLR-45's zero-consumer filter composes with this task and stays
+  separate); no new dependency; batch-major semantics unchanged except that a
+  batch-major rebuild also gets a fresh ctx.
+
+Design and failure contract
+: Mechanism - when the per-pass prebuild re-enters begin_set for a set that
+  already exists and is BUILT, construct the replacement state OUTSIDE the
+  live set (new ggml ctx via ggml_init with the same 96 MiB no-alloc params,
+  new llm_graph_result, re-derived act slices), then move-assign the fresh
+  state into the EXISTING vector slot and ggml_free/delete the old state.
+  Vector element addresses are unchanged by assignment, so every stored
+  graph_set* (cur, controller lookups, runner-held pointers) remains valid
+  and now addresses fresh state - the stale-pointer hazard is closed by
+  construction, not by luck. The patch caches are per-set members, so a fresh
+  set naturally re-walks the FRESH ctx on its first prepare_chunk - the
+  T-GPLR-44 doubled-cache corruption path becomes structurally impossible.
+  Invariants that MUST hold, each with its failure mode:
+  1. act_bind telemetry stays silent on replacement (emit only on true first
+     creation). A replacement must not re-emit, or the checker's one-bind-
+     per-chunk invariant trips exactly as in the T-GPLR-43 probe artifact
+     (564 violations). Distinguish first-creation from replacement with an
+     explicit flag threaded from the per-pass prebuild path - NOT by
+     heuristic (build_generation counting is fragile).
+  2. Act-slab offsets are re-derived DETERMINISTICALLY: per-chunk layer-major
+     sets recompute slab_off from the immutable chunks[] descriptor (the
+     existing chunk_id > 0 branch does this; PITFALL: chunk 0 after pass 1
+     inherits whatever the cursor holds - the per-pass prebuild must reset
+     the slab cursors before rebuilding, matching whatever the current
+     in-place path does today; verify by reading the call site first).
+     Batch-major sets allocate act pairs from buf_act at a cursor - the
+     replacement MUST capture the old set's buf_act region and re-alloc at
+     the SAME offsets (rewind then re-alloc), or every pass burns another
+     act-pair-sized hole in the activation buffer.
+  3. gparams.res == set->res for the in-flight build (llama-layer-streaming.h
+     begin_build comment): the fresh res must be installed BEFORE the rebuild
+     writes into it; rebuilds happen between passes, so no build is in
+     flight - assert this.
+  4. Old state is fully released (ggml_free(old ctx), delete old res) -
+     bounded per-set pool at one build's worth; if ggml_free mid-run
+     surfaces allocator assertions (the end-of-run cleanup path is the only
+     current ggml_free caller), that is a redesign-inside-task trigger, not
+     a silent keep-both.
+  5. The rebuild still re-derives KV views against the POST-clear memory -
+     the exact property that fixes the quantized-KV pass-2 crash (T-GPLR-43
+     row 1). The fix must not skip or defer that re-derivation.
+  Failure contract: any violated invariant fails loudly (error_msg, refused
+  prebuild) - never silently reuses the old ctx or skips the swap.
+
+Implementation steps
+: 1. Read the per-pass rebuild call site (runner --pp-repeat pass loop) and
+     record exactly what the current path does to slab_off_A/B and buf_act_off
+     before re-invoking the prebuild; this anchors invariant 2.
+  2. Add the replacement flag to the streaming module (set by the runner
+     before the pass-2+ prebuild call, cleared after) and the swap-in-slot
+     path in begin_set; add the assert for invariant 3.
+  3. Rewrite the T-GPLR-44 "do not fix blind" comment block (begin_set,
+     ~line 2124) to describe the fresh-context rebuild; update the header
+     comment at the in-flight-build invariant.
+  4. Build; host-only checks first (ctest unit families for the module if
+     present; the strict checker on a 4k trace).
+  5. Side-copy the CURRENT validated binary (exe + ALL DLLs) as the control
+     BEFORE rebuilding (AGENTS.md rule), then build the fresh-set binary.
+  6. Run the validation arms below, one mutex hold per shape.
+  7. Record evidence, fill Commit, close with the owner summary.
+
+Pre-registered falsifier (revert, never tune to match)
+: ANY of - (a) 4k layer-major f16 rebuild-ON ids on the fresh binary diverge
+  from the same-session rebuild-OFF arm; (b) the q8 B1 rebuild-ON arm crashes
+  (the T-GPLR-43 rescue is broken); (c) act_bind violations from the checker.
+  Revert the behavior change, keep any telemetry added, report the shape.
+  If the patch_cache dump still shows member doubling after the swap, the
+  swap is incomplete - fix the implementation, that is not a falsifier.
+
+Acceptance criteria
+: AC1 (identity + semantics): 4k layer-major f16, fresh binary, rebuild ON:
+  the 96 TG ids are byte-identical to the same-session rebuild-OFF arm, and
+  the decoded stream contains the needle answer (9/9 pieces via the
+  gplr46-vocab.json decode probe, or check-answer 5/5 on the QA anchor) -
+  i.e. rebuild ON regains the correct-answer stream instead of echo.
+: AC2 (trigger removed): 50k pair on the fresh binary, same session: pass-2
+  compute excess with rebuild ON is <= 0.5 s (vs +3.72 s on the current
+  binary, and vs the OFF arm's -1.31 s noise floor).
+: AC3 (growth law gone at the charter shape): 200k confirmation on the fresh
+  binary: pass-2 compute excess <= 5 s (vs +59.2 s measured) and pass-2 wall
+  within ~2% of pass 1.
+: AC4 (rescue preserved): q8 B1 shape, rebuild ON, fresh binary: BOTH passes
+  survive and the strict checker is OK (T-GPLR-43's result reproduced).
+: AC5 (structural proof): the patch_cache dump fires post-rebuild with
+  exactly the first-build member count (7), not 14/28.
+: AC6 (no re-emission): every arm's trace passes strict --check-telemetry
+  with zero act_bind violations.
+: AC7 (no cost): 4k warm wall, patch_us and compute_us within the ~3%
+  session spread of the side-copied control; rebuild wall reported (was
+  7.4 ms in T-GPLR-43; fresh+free must stay the same order).
+: AC8 (smoke unchanged): the semantic-QA 512 smoke rung on the fresh binary:
+  checker PASS, negative control fails as designed.
+
+Validation (exact)
+: Control: copy build/llama-cuda/bin/Release (exe + all DLLs) to a side dir
+  BEFORE the rebuild build. Arms, each under tools/with-gpu-lock.ps1, each
+  leaving started/verdict/done sentinels:
+  - V1: 4k layer-major f16 rebuild-ON pair fresh-vs-control (ids, AC1, AC7)
+    plus a same-session rebuild-OFF arm for the byte-identity reference.
+  - V2: 50k ON/OFF pair on the fresh binary (AC2) - clone the T-GPLR-46
+    command recorded in the gplr46 verdicts verbatim.
+  - V3: 200k rebuild-ON on the fresh binary with --pp-recon 1 (AC3).
+  - V4: q8 B1 rebuild-ON (AC4) - clone the T-GPLR-43 arm shape.
+  - V5: qa-smoke rung (AC8) per the T-GPLR-07 contract.
+  Extraction: the T-GPLR-46 ledger one-liner for pass excesses; the
+  T-GPLR-44 dump analyzer for AC5; the vocab decode probe for AC1 semantics.
+
+Required state and document updates
+: Plan: fill Commit, append RESULT with the measured table (excess by shape
+  before/after, ids verdict, q8 survival, dump member counts, rebuild wall).
+  currentstate.md: new entry; retire the T-GPLR-46 "unproven mechanism"
+  caveat if AC2+AC3 land. Code: the begin_set comment block rewrite (step 3).
+  AGENTS.md: only if a new non-obvious invariant emerges.
+
+Escalation condition
+: Stop and escalate if AC1 or AC2 fail while AC5 passes (accumulation
+  structurally removed but the regression persists - this kills the
+  accumulated-ctx hypothesis and redirects the diagnosis), or if ggml_free
+  mid-run cannot be made safe without broad allocator changes, or if the q8
+  rescue needs semantics beyond view re-derivation to survive the swap.
