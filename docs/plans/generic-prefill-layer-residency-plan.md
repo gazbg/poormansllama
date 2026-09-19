@@ -2944,13 +2944,18 @@ without an active handoff). Artifacts: `build/llama-cuda/verdicts/gplr44-*` and
 
 ### T-GPLR-45: drop the zero-consumer orphan from the patch restore - stop memcpy-ing the framework's pruned inp_embd on every launch
 
-Status: ready (drafted 2026-09-18 by owner request from T-GPLR-44's closure; the
-owner picked the framework-level fix over re-attempting per-graph scoping).
+Status: done (verdict 2026-09-19 - PERFORMANCE target met with room: `patch_us`
+per pass fell 96x-166x per launch and >= 95.9x per pass at all three shapes, the
+identity gate is clean at 4k/50k/200k, no falsifier fired; see RESULT below).
 Depends on: T-GPLR-44 (the composition instrument, the measured 1,027x
 redundancy, and the falsifier lesson), T-GPLR-43 (the per-pass rebuild that makes
 the cache-lifecycle question live), T-GPLR-07 (the semantic-QA ladder, owed
 because this touches the generation path's inputs).
-Commit: (fill on completion)
+Commit: nested 8125026a9 (the consumption-classified cache: one walk, filter at
+capture, the `excluded_*` dump fields and the `union_matches` closure flag);
+outer c24f555 (paired arm harness + analyzer closure assertions + gitlink
+bump). The verdict commit that fills this field carries the plan RESULT and the
+`docs/currentstate.md` entry.
 
 Goal
 : Remove from the per-launch patch restore every INPUT tensor that NO graph of
@@ -3095,6 +3100,77 @@ Escalation condition
   any operating shape; if a correct fix requires touching `build_inp_embd` or
   any normal-path code (owner-gated boundary); or if the paired arms cannot
   complete inside one mutex hold.
+
+RESULT (2026-09-19, closed)
+: Three paired shapes in ONE session under one mutex hold (6 arms), all exit 0,
+  strict `--check-telemetry` OK, no falsifier fired. Changed binary
+  89A7E7E275CC4AFD against the preserved control 9BA0AB55A05D5A98 (exe plus all
+  DLLs side-copied before the rebuild). Evidence: `build/llama-cuda/verdicts/gplr45-*`
+  and the traces `build/llama-cuda/gplr45-<shape>-<label>.jsonl`.
+
+1. INSTRUMENTATION / TWO-SIDED CLOSURE. The dump reports the classified
+   composition and the byte identity `kept + excluded == walked` holds at every
+   changed-arm dump, with the walked total EQUAL to the control's at every paired
+   dump (the filter cannot create or lose bytes). Candidates: 7 at 4k set 0 and at
+   every 50k/200k dump (4,212,740 B; 2,764,612 B at 50k set 97; 2,632,964 B at 200k
+   set 390); 14 at the 4k arm's second dump (8,425,480 B). Kept: 18,436 B at the
+   full-batch dumps, 12,100 B / 11,524 B at the partial final chunks. Excluded:
+   1 member (`inp_embd`) at every full-batch dump; 8 members at the 4k second dump
+   (`inp_tokens:2048`, two `inp_embd:4194304`, four leaf views: 4/4096/4096/8192 B
+   plus a 0 B leaf), all zero-consumer. `union_matches` - the engine's own closure
+   flag, 1 meaning every cached tensor has >= 1 consumer - reads 0 on the control
+   (the orphan is unattributed) and 1 on the changed arm at every dump.
+   `redundancy_input` collapses 1,027.748x -> 4.498x: the T-GPLR-44 headline
+   redundancy is gone, and the restore now copies ~4.5x the transitive minimum
+   instead of ~1,028x. Analyzer selftest 7/7, including the new
+   consumed-but-excluded negative control failing as designed.
+2. IDENTITY GATE CLEAN at all three shapes (the blocking criterion).
+   - greedy ids byte-identical: 96/96 at 4k, 3/3 at 50k, 3/3 at 200k.
+   - routing identity: all `route` events match field-for-field - 160/160 at 4k,
+     880/880 at 50k, 3200/3200 at 200k - including the per-layer route `hash`
+     this contract called the route digest (there is no separate digest event in
+     the engine; the hash stream IS it).
+   - staged bytes per round equal: `phase_summary.bytes_transferred` identical at
+     every phase and shape (18,327,011,328 for both pp phases at 4k/50k/200k;
+     54,981,033,984 for the 50k/200k tg phase). Evictions (37/40/120), layers_run
+     (40) and launches (336 / 4116 / 16422) all identical.
+   - smoke rung (512, retention mode): check-telemetry OK, 5/5 needles PASS
+     (QX-7741 TR-2918 MK-5501 LD-8834 Paris), negative control fails as designed.
+3. PERFORMANCE (the verdict). Paired `patch_us` per PASS, one session:
+   4k   106,742 us -> 645 us (165.5x, 5.168% -> 0.033% of the sweep)
+   50k  598,152 us -> 6,234 us (95.9x, 2.659% -> 0.028%)
+   200k 2,432,783 us -> 19,033 us (127.8x, 1.231% -> 0.010%)
+   Per launch: 317.7 / 145.3 / 148.1 us -> 1.92 / 1.51 / 1.16 us (96x-166x). The
+   >= 50% bar is cleared by more than an order of magnitude at 200k (99.2%).
+   Secondary (not the verdict): pass-2 sweep wall delta -82.8 ms (-4.01%) at 4k,
+   -271.8 ms (-1.21%) at 50k, -737.9 ms (-0.37%) at 200k. The 4k and 50k shapes
+   clear the 1.0% secondary bar; at 200k it is below it, so per contract this is
+   reported as "restore narrowed, wall not resolved at this spread": the 200k
+   restore is only 1.23% of the sweep, and the changed arm's compute bucket ran
+   +1.5 s higher (session spread, T-GPLR-46 recorded ~3%), which offsets most of
+   the 2.4 s patch saving. The wall lever at 200k remains the pass-2 rebuild
+   excess (T-GPLR-46 / T-GPLR-47), not this one.
+4. COMPOSITION, measured - supersedes the draft's 50k expectation. The draft
+   predicted the 50k excluded set at 4,194,304 B + a 0 B member, extrapolated from
+   the 4k dump. Measured, the excluded `inp_embd` scales with the FINAL CHUNK's
+   token count, because `inp_embd` is allocated per ubatch shape: 4k (4096 = 8 x
+   512, no partial chunk) 4,194,304 B; 50k (98 chunks, last 336 tokens) 2,752,512 B
+   = 336 x 8192; 200k (391 chunks, last 320 tokens) 2,621,440 B = 320 x 8192. The
+   larger 50k figure does not hold; the AC's real content - the byte identity - does.
+   The 4k arm's second dump shows the doubled candidate list T-GPLR-44 recorded
+   (7 -> 14 members): the accumulation is real and the filter drops every extra
+   member. The 50k/200k dumps do NOT show the doubling; that shape difference is
+   not explained here and belongs to T-GPLR-47 (fresh-context rebuild).
+5. NO FALSIFIER FIRED. No identity divergence; the orphan was consumed by 0 graphs
+   (g0) at every dump, so it is not load-bearing at this operating shape; `patch_us`
+   fell far past the 50% hand-back trap, so the memcpy cost model is confirmed, not
+   wrong. The exclusion stays unconditional within the already-opt-in pw path, as
+   disclosed in the contract's Non-goals.
+6. RECORDED CONDITION (not task-owned). `tools/run-tests.ps1` host and telemetry
+   suites are green on the changed binary; the 8 model-backed `-run` tests fail a
+   handoff invariant (`handoff_mode on/auto-on but no handoff events`) - and fail
+   IDENTICALLY, with identical messages, on the preserved control binary, so they are
+   pre-existing. They need an owner; this task neither caused nor repaired them.
 
 ### T-GPLR-46: the pass-2 compute regression is REAL and rebuild-linked - isolate the trigger and the growth law
 
