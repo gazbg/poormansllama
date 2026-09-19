@@ -2941,3 +2941,158 @@ without an active handoff). Artifacts: `build/llama-cuda/verdicts/gplr44-*` and
 `build/llama-cuda/gplr07-qa-512-retention.*` (smoke),
 `tools/run-gplr44-pair.ps1` (the driver), `tools/analyze-gplr44-cache.py` (now
 5/5 selftest with the FA-partition negative control).
+
+### T-GPLR-45: drop the zero-consumer orphan from the patch restore - stop memcpy-ing the framework's pruned inp_embd on every launch
+
+Status: ready (drafted 2026-09-18 by owner request from T-GPLR-44's closure; the
+owner picked the framework-level fix over re-attempting per-graph scoping).
+Depends on: T-GPLR-44 (the composition instrument, the measured 1,027x
+redundancy, and the falsifier lesson), T-GPLR-43 (the per-pass rebuild that makes
+the cache-lifecycle question live), T-GPLR-07 (the semantic-QA ladder, owed
+because this touches the generation path's inputs).
+Commit: (fill on completion)
+
+Goal
+: Remove from the per-launch patch restore every INPUT tensor that NO graph of
+  the set consumes. T-GPLR-44 measured that set exactly: per launch the restore
+  copies 7 tensors / 4,212,740 B of which `inp_embd` (4,194,304 B, referenced by
+  ZERO of the 42 graphs - a framework artifact of `build_inp_embd` allocating
+  both inputs and pruning the embeddings branch in token mode) is 99.6%, plus one
+  0 B member. Filtering zero-consumption members narrows the restore to
+  ~18,436 B per launch (~228x fewer bytes) WITHOUT per-graph scoping: no offsets,
+  no per-graph slices, no lifecycle change. This captures the bulk of T-GPLR-44's
+  scoped target (mean 4,099 B/launch) at a fraction of its risk, and it also
+  stops snapshotting the orphan at capture time. PERFORMANCE task: the accepted
+  deliverable is a measured `patch_us` reduction at the 200k shape with the
+  identity gate fully clean - not a feasibility probe.
+
+Scope
+: The patch-cache build walk and its snapshot capture behind
+  `input_tensors` (`src/llama-layer-streaming.cpp`, the walk T-GPLR-44 recorded
+  at :3721-3727 pre-revert), and the `patch_cache` dump event (new
+  `excluded_*` fields). The consumption walk that T-GPLR-44 built for the dump
+  becomes THE walk: filter and dump share it so they cannot drift. Nothing else.
+
+Non-goals
+: NO per-graph scoping - T-GPLR-44's reverted lever stays reverted; this task
+  narrows the SET, never the per-launch visit. NO `begin_set` or cache-lifecycle
+  change and NO re-walk: the cache remains first-capture and address-stable
+  exactly as today. The T-GPLR-44 hazard (begin_set/rebuild ctx accumulation,
+  stale pointers) fires only when a cache RE-WALKS mid-flight; this task never
+  introduces one, which is how its dependency on that hazard is discharged - and
+  the hazard itself remains OPEN, belonging to a separate hardening task (a loud
+  begin_set accumulation invariant), not this one. NO change to
+  `build_inp_embd`/`llama-graph.cpp`: that is the NORMAL EXECUTION PATH and is
+  owner-gated under the vendored-tree boundary; it is recorded here deliberately
+  as the upstream-facing alternative and refused by default. NO name-based skip
+  (never "if name == inp_embd"): the filter is consumption-based by construction,
+  so a shape where the embeddings branch is live keeps restoring it. No change to
+  snapshot VALUES of kept members, no staging/slot/routing/KV change, no
+  flag-default flip. The exclusion is unconditional WITHIN the already-opt-in
+  layer-residency pw path - disclosed here so the owner can demand a gate flag
+  before the verdict rather than after (same disclosure T-GPLR-44 made).
+
+Design/failure contract
+: 1. ONE WALK. The dump's transitive consumption walk (inputs reached through
+  views are consumers - the exact bug T-GPLR-44's closure guard caught) is
+  refactored into the function the cache build also calls. The dump and the
+  filter therefore report and act on the same classification by construction.
+  2. CONSUMPTION-BASED FILTER AT CAPTURE, ONE PASS. At cache build, a candidate
+  INPUT tensor with data and ZERO live-graph consumers is skipped by BOTH the
+  member list and the snapshot capture in the same walk. Kept members' snapshot
+  bytes are identical to today's; the capture layout is not redesigned - the
+  filter only removes members before capture. No offsets exist in this design,
+  so the T-GPLR-44 failure mode (offset/layout mismatch after a re-walk) cannot
+  arise.
+  3. TWO-SIDED CLOSURE, MECHANICAL. The dump event gains `excluded_count`,
+  `excluded_bytes`, and `excluded_members` (name, bytes, graphs=0 each), and the
+  analyzer asserts the byte identity `kept_bytes + excluded_bytes ==
+  walked_bytes` - the filter can neither create nor lose bytes - plus the
+  two-sided closure: every kept member has >= 1 consumer, every consumed input
+  is kept. A consumed-but-excluded member is the corrupting direction, so the
+  analyzer's selftest gains that negative control and must FAIL on it.
+  4. THE DELTA IS A STRICT SUBSET. The changed restore copies exactly what
+  today's restore copies, minus zero-consumer members. For kept members nothing
+  differs byte-for-byte; dropped members are read by no graph (closure-proven at
+  capture, and the 200k trace's three dumps all name `inp_embd` as the sole
+  closure break, so the classification is stable across generations).
+  5. HONEST NULL. If any arm's dump shows the orphan CONSUMED (> 0 graphs) - e.g.
+  a non-token ubatch mode - the filter must not fire for it; if that is the
+  operating shape, STOP and close the task honestly as "orphan is load-bearing
+  here". If `patch_us` does not move despite the byte drop, the memcpy is not
+  the patch cost: record the composition and hand back to the Planner - do not
+  iterate blind.
+
+Implementation steps
+: 1. Refactor the consumption walk into one shared function; add the
+  `excluded_*` fields to `tel_patch_cache` and the byte-identity assertion to
+  `tools/analyze-gplr44-cache.py` (or its successor), selftest extended with the
+  consumed-but-excluded negative control.
+  2. Implement the filter at capture (contract 2). Build:
+  `cmake --build build/llama-cuda --target llama-layer-streaming -j`.
+  3. Host-validate: `powershell -NoProfile -ExecutionPolicy Bypass -File
+  tools/run-tests.ps1` (all suites green, analyzer selftest now 6/6), plus
+  `python tools/check-doc-sizes.py` stays green.
+  4. PRESERVE THE CONTROL before any rebuild: side-copy the current exe AND all
+  DLLs (the streaming code lives in llama.dll - the AGENTS.md rule).
+  5. Identity gate, paired in ONE session via the T-GPLR-44 pair-driver pattern
+  (new tags `gplr45-*`): 4k with `--tg-tokens 96` (long-id identity; layer-major
+  refuses 96 TG tokens at 50k, so this arm belongs at 4k) and 50k. Control = the
+  preserved binary.
+  6. On clean identity: the semantic-QA smoke tier (512, retention mode), then
+  the 200k confirmation arm with `--pp-recon 1` for the dump and ledger.
+  7. Record the verdict; fill this block's Status/Commit; update
+  docs/currentstate.md.
+
+Acceptance criteria (falsifiable)
+: * INSTRUMENTATION: on the changed binary, the dump reports `excluded_bytes`
+  equal to the zero-consumer sum AS REPORTED (50k expectation: 4,194,304 B plus
+  the 0 B member), `kept_bytes + excluded_bytes == walked_bytes` holds, and the
+  two-sided closure passes with the new negative control failing as designed.
+  * IDENTITY GATE (blocking, not advisory): all arms exit 0 with strict
+  `--check-telemetry` OK; greedy token ids BYTE-IDENTICAL to the preserved
+  control (96/96 at 4k, 3/3 at 50k); route digest identical; staged bytes per
+  round equal; the smoke rung reports checker OK + answer PASS + the negative
+  control FAILING as designed. Any failure here means REVERT and report the
+  shape - the T-GPLR-44 rule, never tune the filter to match a trace.
+  * PERFORMANCE (the verdict): `patch_us` per pass at the 200k shape falls
+  >= 50% versus the SAME-SESSION control's `patch_us` (paired arms - NOT versus
+  the cross-session 3,402.3 ms baseline; the ~2.9% session-spread lesson). The
+  byte arithmetic admits up to ~200x on the memcpy component alone; the 50%
+  floor is deliberately conservative because `patch_us` also contains FA
+  patching and repointing, whose shares are not separately measured. Secondary,
+  not the verdict: the warm 200k wall falls >= 1.0% with the paired-arm rule; a
+  null wall with a clear `patch_us` drop is reported as "restore narrowed, wall
+  not resolved at this spread", NOT as a failure.
+  * FALSIFIERS: (a) any identity check fails -> revert, report the shape;
+  (b) the orphan proves consumed at any arm -> STOP, close honestly;
+  (c) `patch_us` fails to fall >= 50% despite the byte drop -> the cost model is
+  wrong; record and hand back.
+
+Validation commands
+: * Build: `cmake --build build/llama-cuda --target llama-layer-streaming -j`
+  * Host: `powershell -NoProfile -ExecutionPolicy Bypass -File
+  tools/run-tests.ps1` (expect all green; analyzer selftest 6/6)
+  * Identity: the `gplr45-4k` and `gplr45-50k` paired arms under one mutex hold
+  (pair-driver pattern; expect byte-identical ids and `patch_us` dropping on the
+  changed arm already at 50k: the restore there was 637.0 ms/pass)
+  * Semantic QA: the T-GPLR-07 smoke tier, 512, retention mode
+  * Confirmation: one 200k arm with `--pp-recon 1`; expect the dump's
+  `excluded_*` fields, `patch_us` <= 50% of the same-session control, and the
+  ledger split per pass
+
+State/document updates
+: This block's Status/Commit; `docs/currentstate.md` entry with the dump's
+  excluded/kept table, the paired `patch_us` numbers, the identity checks and
+  the verdict (labelled PERFORMANCE with its instrumentation result alongside);
+  the cache-build site's comment updated to reference the closure proof. If
+  closed via a falsifier, the closure addendum records which one and what it
+  means for the remaining patch lever family.
+
+Escalation condition
+: Stop and escalate if identity fails and the cause is not identifiable from the
+  dump and traces (do not tune to match); if the orphan proves load-bearing at
+  any operating shape; if a correct fix requires touching `build_inp_embd` or
+  any normal-path code (owner-gated boundary); or if the paired arms cannot
+  complete inside one mutex hold.
+
