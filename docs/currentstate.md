@@ -1,5 +1,50 @@
 # Current State
 
+
+## 2026-09-21: Per-launch patch lever RE-MEASURED at 200k -> CLOSE the idea; a NEW finding takes its place
+
+One 200k arm on the current binary (`gplr36-remeasure-200k`, the recorded hostmem shape
+with the tree's own defaults: copy mmap-registered (T-37 default, resolved
+`default`), route telemetry OFF (T-39 default, resolved `default`), f16 KV rebuild
+OFF (T-48 default, resolved `default`), af 1, 3 slots, repeat 2, recon 1).
+Verdict PASS, checker OK, sentinels in `build/llama-cuda/verdicts/gplr36-remeasure-200k.*`.
+
+**Per-launch patch lever: CLOSED.** Warm-pass `patch_us` = 26.1 ms = 0.013% of the
+sweep (pass 1: 20.8 ms / 0.015%). The recorded pre-T-45 baseline was 3,402.3 ms/pass
+(2.40%); T-45's zero-consumer filter already removed 99.4% of it, and nothing
+worth drafting remains. The "shrank, needs re-measuring" item is settled: the lever
+is gone, not merely shrunken.
+
+**Deep-submit: the per-launch sync it targets now hides ~0.9% of a pass, not 6.5%.**
+The remaining named host buckets at 200k (pass 2): slot 72.4 ms, other ~0 (negative
+residual: the ledger's loop residue went negative because route telemetry no longer
+runs), setup 371.9 ms, graph_call 30.9 ms, patch 26.1 ms. Its ordering risk in the
+T-40/43 crash area now buys almost nothing. Recommendation recorded: do NOT draft.
+
+**NEW measured finding (first rebuild-OFF 200k measurement ever):** pass-2 compute
+excess is BACK under the T-48 f16 default: pass 1 compute 138.0 s -> pass 2 205.4 s
+= **+67.4 s (+48.9%)**, and per-`layer_compute` ratios are ~1.5x UNIFORM across all
+chunk positions (flat vs chunk index; pass-1 346 ms/ubatch -> pass-2 525 ms/ubatch).
+Ladder for this shape: pre-T-43 single-prebuild +0.36 s; T-43 in-place rebuild
++59-62 s; T-47 fresh-context rebuild ON +0.10 s; T-48 f16 default (rebuild OFF)
++61.5/+61.3 s (T-45 arms, rebuild state equivalent) and +67.4 s today. The T-46
+"rebuild is the trigger" conclusion and the "rebuild OFF is clean at 50k" result DO
+NOT transfer to 200k: with rebuild OFF the excess is worse than with the in-place
+rebuild. The T-47 mechanism (fresh-context rebuild) remains the only configuration
+that eliminates the excess at this shape — but T-48's f16 default turned it OFF.
+Escalated to the owner: the f16 KV-conditional default (T-48) costs ~+65 s per
+pass-2 at 200k vs rebuild ON; a default re-decision (rebuild ON everywhere now that
+T-47 fixed its cost) or a new investigation is an owner call, not a planner call.
+Arm was run under the GPU mutex while another project held other windows; pass-2
+wall 206.1 s reproduces the hostmem arm's 198.1 s slow-pass-2 signature, so this
+is NOT the previously-suspected session noise.
+
+Commits: none yet (evidence-only entry). Trace
+`build/llama-cuda/gplr36-remeasure-200k.jsonl`, verdict
+`build/llama-cuda/verdicts/gplr36-remeasure-200k.verdict.json`, harness
+`tools/run-gplr36-remeasure-200k.ps1`.
+
+
 ## 2026-09-20: T-GPLR-39 CLOSED — route telemetry defaults OFF (owner decision)
 
 The route event is a diagnostic that cost 1161.5 ms/pass at u2048 (100.8% of the
