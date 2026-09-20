@@ -25,6 +25,11 @@ Usage:
 Exit codes: 0 = every trace parity-clean; 1 = at least one diverged (the
 diverging (chunk, layer) pairs are printed); 2 = a trace has no route events
 (nothing to evaluate -- NOT a pass).
+
+T-GPLR-39 (owner decision 2026-09-20): route telemetry DEFAULTS OFF, so a
+defaulted run's trace exits 2 by design. The parity gate requires an explicit
+--route-telemetry 1 run; exit 2 on such a trace still means the run died
+before routing (see the AGENTS.md route-parity note).
 """
 import argparse
 import collections
