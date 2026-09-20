@@ -303,7 +303,7 @@ Validation commands (addendum 3)
 
 ### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent — the residue that grows with ubatch size
 
-Status: in-progress (2026-09-17) — RECON RUN: attribution complete.
+Status: DONE (2026-09-20) — route telemetry DEFAULTS OFF (owner decision); RESULT block below.
 **`route_us` = 1161.5 of 1152.8 ms `other` (100.8%, closure exact) at u2048**;
 tel 1.0 ms; loop −9.7 ms. The prediction ("route dominates, ubatch-scaled") is
 CONFIRMED; the falsifier did not fire. The growth is route TELEMETRY (device
@@ -316,7 +316,7 @@ measuring itself.
 Depends on: T-GPLR-38 (the sweep that measured `other` 237.9 -> 959.0 ms as
 ubatch 512 -> 4096 at fixed launch count), T-GPLR-36 (the ledger that names the
 bucket)
-Commit: (fill on completion)
+Commit: nested f6d104c1f (engine: gate + provenance keys + dense register coalescing), outer 52e66c4 (harness: arm/set/qasmoke runners + parity-tool note), outer (this commit) (plan + currentstate)
 
 Goal
 : T-GPLR-38 measured that the host loop's `other` bucket (loop body + sampled
@@ -385,6 +385,22 @@ than the 32-64x class (a) targets; (2) end-to-end row-set equality (arm:
 for this arm: re-run the u2048 recon arm and require all 80 route records
 (hash/union/sampled_ids) to match `build/llama-cuda/gplr39-u2048-recon.jsonl`,
 measured reproducible (80/80 keys identical across pass 1 and pass 2).
+
+#### T-GPLR-39 RESULT (2026-09-20): route telemetry DEFAULTS OFF — the diagnostic no longer measures itself
+
+**Owner decision, verbatim: "This can be turn off as it is a diagnostic and it should be run only when needed; by default it should be off if not used in code or for predictions."** The route event (device->host probs readback + host sort, 1161.5 ms/pass at u2048 — 100.8% of the measured `other` bucket) is now opt-in: `--route-telemetry 1` restores the observational event (route-parity gate, route analyses), the bare default resolves `0` with the T-37/T-48 self-describing pattern (stderr announcement emitted only when the default decided; `run_start` gains `route_telemetry` + `route_telemetry_source` (`explicit|default`); strict checker validates both keys and REJECTS route events in a telemetry-off trace). The FUNCTIONAL routing path (`read_router_ids` -> `sel_in`) is untouched — this is the recon's decision point resolved as "off unless needed", not a new fix class; the (d) bounded top-k host selection from the 2026-09-18 arm stays in place for both the diagnostic and the functional path.
+
+**One session, three arms + the smoke rung (MoE vehicle, 4k/3 slots, q8):** control = `bin/gplr37-changed` (the T-37 RESULT binary, pre-T-39), changed = `bin/Release` (exe `B75661AC5F50060B`, dll `A6519AC5E2F9913E`).
+- **D1 (default):** resolves `route_telemetry=0` source `default`, announcement present, **ZERO route events** in the trace, checker OK, decode PASS 5/5.
+- **E1 (`--route-telemetry 1`):** resolves `1`/`explicit`, NO announcement, 160 route events, **route parity clean (0 singletons)**, decode PASS, pair identity vs D1 identical (tg ids + pass structure).
+- **C1 (control INV1):** at bare default carries NO new keys and NO announcement, 160 route events (pre-T-39 behavior exactly).
+- **Identity:** the 96 greedy tg ids are **byte-identical across D1/E1/C1** (first id 248046) — recording or not recording routing does not change the stream.
+- **Timing (same session, warm pass-2 walls, recorded NOT gated):** D1 1951.0 ms, E1 1958.9 ms, C1 1985.0 ms — telemetry on/off is within session noise at this 4k shape, as expected (the 1161.5 ms figure was measured at u2048 where route events carry 4 MiB readbacks; the u2048 wall win predicted by the recon accrues when u2048 is adopted, not here).
+- **Smoke rung (512 anchor, bare default, batch-major q8, repeat 2):** runner 0, strict checker 0, needle **PASS 5/5**, negative control FAILs as designed.
+- **Dense-fixture defect fixed en route (T-37-owned, surfaced by this task's host suite):** `register_all_pkg_sources` refused on dense models ("cudaHostRegister ... already mapped", layer 1) because consecutive dense layers' page-rounded spans share a boundary page — the MoE vehicle never hit it (non-package tensors separate consecutive banks). Fixed by greedy coalescing of page-touching spans: MoE grouping unchanged (40 init-once events / 17.23 GiB, all pre-compute), dense groups merge into one registration owned by the group's first layer, members marked covered. Dense CTest fixtures run again; the CTest `--layer-slots 1` pair (`qwen38-layer-boundary`, `layer-slot-lifecycle`) still fails PRE-EXISTING (profile-v3's `--pp-async-feed` default-1 refuses single slots — recorded, not this task's).
+- **Consumer contract changes:** the route-parity gate now requires an explicit `--route-telemetry 1` run (a telemetry-off trace exits 2 by design — "no route events" is the DESIGNED outcome, not a pass or a failure); the AGENTS.md route-parity note is updated accordingly.
+- **Falsifiers: NONE fired** (no identity divergence, no parity failure in any on-arm, no silent route events in the off-arm).
+**Evidence:** verdicts `build/llama-cuda/verdicts/gplr39-{D1-default,E1-on,C1-control}.verdict.json` (+ started/done), traces `build/llama-cuda/gplr39-{D1-default,E1-on,C1-control}.jsonl`, smoke `build/llama-cuda/gplr39-qa-512.{jsonl,txt,log}`, harnesses `tools/run-gplr39-{arm,set,qasmoke}.ps1`, binaries `build/llama-cuda/bin/{Release,gplr37-changed}`.
 
 #### T-GPLR-36 host-memory instrument (2026-09-18 — COMMITTED, vendored tree c5d79ad5c)
 
