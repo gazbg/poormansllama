@@ -782,6 +782,20 @@ Rules that follow:
   A file in the FAIL band is to be treated as ALREADY invisible to `ctx_search`; the remedy is
   the same verbatim split, not a bigger search.
 
+The same convention was applied to the executable plan on 2026-09-20: before its
+split `docs/plans/generic-prefill-layer-residency-plan.md` held all 20 task
+blocks (274,413 B, 57.2% of the fail band); the 18 closed blocks moved VERBATIM
+to `docs/plans/generic-prefill-layer-residency-archive.md` (221,619 B on disk)
+and the live file keeps only in-progress/draft blocks (55,984 B on disk; LF
+committed sizes differ under autocrlf) plus the index of
+archived blocks. `docs/plans/archive-manifest.json` records the mechanical
+split — including BOTH sha256 forms (worktree CRLF and git blob LF, which
+differ under `core.autocrlf`) — and `python tools/split-gplr-plan.py --verify`
+re-proves the byte-exact reconstruction from disk any time. Closed task blocks
+are never edited in place: a closure appends its RESULT in the live file, and
+the block moves on the NEXT split. Search across the archive with `rg`, same
+rule as the currentstate shards.
+
 ## Detached runs and waiting (convention, 2026-09-18)
 
 How to start long work and how to find out what happened to it, without

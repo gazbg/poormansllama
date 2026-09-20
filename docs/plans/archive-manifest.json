@@ -1,0 +1,122 @@
+{
+  "archive": "docs/plans/generic-prefill-layer-residency-archive.md",
+  "archive_header_lines": 6,
+  "archived_blocks": [
+    {
+      "orig_line_end": 148,
+      "orig_line_start": 1,
+      "title": "### T-GPLR-25: PP eviction prefetch-overlap prototype (device-side copy overlap in layer-major PP)"
+    },
+    {
+      "orig_line_end": 339,
+      "orig_line_start": 149,
+      "title": "### T-GPLR-26: Gate-eligibility decision recording \u2014 binding vs advisory (item 4 brief)"
+    },
+    {
+      "orig_line_end": 430,
+      "orig_line_start": 340,
+      "title": "### T-GPLR-27 (CLOSED \u2014 DEFERRED 2026-09-18 by owner decision): Second-architecture first pass \u2014 dense target (item 6 brief)"
+    },
+    {
+      "orig_line_end": 619,
+      "orig_line_start": 431,
+      "title": "### T-GPLR-29: Pinned-pool probe \u2014 measure the true pinned H2D ceiling vs the direct-copy path"
+    },
+    {
+      "orig_line_end": 715,
+      "orig_line_start": 620,
+      "title": "### T-GPLR-32: WDDM DMA-inflation serialization \u2014 one H2D in flight at a time (af worker DMA gate)"
+    },
+    {
+      "orig_line_end": 866,
+      "orig_line_start": 716,
+      "title": "### T-GPLR-33: Member-batched submission \u2014 one submission per bank (91 -> ~44-58 ms window)"
+    },
+    {
+      "orig_line_end": 1163,
+      "orig_line_start": 867,
+      "title": "### T-GPLR-35: PP staging overlap \u2014 bank DMAs on a second stream inside the compute context (warm 4k ~2.75-2.8 -> ~2.0-2.1 s)"
+    },
+    {
+      "orig_line_end": 1361,
+      "orig_line_start": 1164,
+      "title": "### T-GPLR-36: Long-context PP residual \u2014 what is the ~10 s that is neither compute nor engine time?"
+    },
+    {
+      "orig_line_end": 1715,
+      "orig_line_start": 1614,
+      "title": "### T-GPLR-38: ubatch sweep on the 4k anchor \u2014 does fewer, fatter launches buy wall time under the current best mode?"
+    },
+    {
+      "orig_line_end": 2409,
+      "orig_line_start": 2309,
+      "title": "### T-GPLR-31: Locked-RAM probe \u2014 does the driver grant a full-pool-size pinned allocation on this box?"
+    },
+    {
+      "orig_line_end": 2525,
+      "orig_line_start": 2410,
+      "title": "### T-GPLR-30: Partial persistent pinned pool \u2014 warm-wall savings curve vs RAM cost"
+    },
+    {
+      "orig_line_end": 2632,
+      "orig_line_start": 2526,
+      "title": "### T-GPLR-28: In-process layer-major PP repeat \u2014 first-touch mechanism experiment"
+    },
+    {
+      "orig_line_end": 2944,
+      "orig_line_start": 2633,
+      "title": "### T-GPLR-44: per-graph patch scoping - stop restoring the whole pw set's inputs on every launch"
+    },
+    {
+      "orig_line_end": 3174,
+      "orig_line_start": 2945,
+      "title": "### T-GPLR-45: drop the zero-consumer orphan from the patch restore - stop memcpy-ing the framework's pruned inp_embd on every launch"
+    },
+    {
+      "orig_line_end": 3339,
+      "orig_line_start": 3175,
+      "title": "### T-GPLR-46: the pass-2 compute regression is REAL and rebuild-linked - isolate the trigger and the growth law"
+    },
+    {
+      "orig_line_end": 3676,
+      "orig_line_start": 3340,
+      "title": "### T-GPLR-47: rebuild graph sets into a FRESH context (swap-in-slot), fixing the pass-2 regression and the T-GPLR-44 stale-pointer hazard at the root"
+    },
+    {
+      "orig_line_end": 3996,
+      "orig_line_start": 3677,
+      "title": "### T-GPLR-48: make --pp-prebuild-per-pass KV-conditional (default ON only for quantized KV) per the T-GPLR-46 owner decision"
+    },
+    {
+      "orig_line_end": 4256,
+      "orig_line_start": 3997,
+      "title": "### T-GPLR-49: fix the layer-major act-slab offset formula - bf16 element size and the chunk-0 cursor inheritance"
+    }
+  ],
+  "blob_bytes_lf": 270157,
+  "blob_sha256_lf": "00fa4b792cfe128ffe32124e2c8c293da3270d079e57eef30cde412d07aa68ee",
+  "blocks_archived": 18,
+  "blocks_live": 2,
+  "blocks_total": 20,
+  "line_ending_note": "worktree CRLF == git blob LF with \\n -> \\r\\n (core.autocrlf); split done in LF, verify compares the blob hash",
+  "live_blocks": [
+    {
+      "orig_line_end": 1613,
+      "orig_line_start": 1362,
+      "title": "### T-GPLR-37: direct mmap-sourced staging \u2014 remove the CPU hop from bank staging"
+    },
+    {
+      "orig_line_end": 2308,
+      "orig_line_start": 1716,
+      "title": "### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent \u2014 the residue that grows with ubatch size"
+    }
+  ],
+  "live_file": "docs/plans/generic-prefill-layer-residency-plan.md",
+  "live_file_terminator_stripped": true,
+  "original_worktree_bytes": 274413,
+  "original_worktree_sha256": "f76c319ac3edbfc64116d2885512a8c0002b96df3695434f35b62769cac54966",
+  "source": "docs/plans/generic-prefill-layer-residency-plan.md",
+  "split_date": "2026-09-20",
+  "tiling_note": "blocks cut at the next '^### ' position, so each chunk carries its own trailing blank separator; files built by plain concatenation",
+  "verify_command": "python tools/split-gplr-plan.py --verify"
+}
