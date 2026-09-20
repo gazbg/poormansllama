@@ -3339,14 +3339,24 @@ RESULT (2026-09-19, closed)
 
 ### T-GPLR-47: rebuild graph sets into a FRESH context (swap-in-slot), fixing the pass-2 regression and the T-GPLR-44 stale-pointer hazard at the root
 
-Status: ready (drafted 2026-09-19 from the T-GPLR-46 verdict; follows the
-owner's decision to fix the rebuild path rather than only re-default the flag)
+Status: done (verdict 2026-09-20 -- the per-pass rebuild now swaps in a
+FRESH context per set instead of accumulating in place: the 4k echo is gone with
+rebuild ON, the pass-2 compute excess collapses at every length, route parity is
+clean at 4k/50k/143k/200k, and the T-GPLR-43 quantized-KV rescue survives. The
+pre-change control reproduces the echo and the divergence at the same flags.
+No falsifier fired. See RESULT below.)
 Depends on: T-GPLR-43 (the rebuild is load-bearing: it is the quantized-KV
 pass-2 crash fix - this task must preserve that guarantee), T-GPLR-46
 (trigger + growth law + the TG answer-to-echo regression measured), T-GPLR-44
 (the stale-pointer hazard note and the patch_cache dump used as structural
 proof)
-Commit: (fill on completion)
+Commit: nested 4403c10970f7fa267ca750b9dd9fe4aa01e286b1 (the swap-in-slot
+rebuild: replace_set_with_fresh_rebuild + the rebuild_replacement gate in
+begin_set, the runner flag around pass-2+ prebuilds, the T-GPLR-44 comment
+rewrite); outer da1c54b57a6e636b06d5f39ead7c2c5a17c34709 (the harnesses
+tools/run-gplr47-{arm,set,qasmoke}.ps1 and the gitlink bump). The verdict
+commit that fills this field carries the plan RESULT, the docs/currentstate.md
+entry and the AGENTS.md parity-gate update.
 
 Goal
 : Replace the per-pass rebuild's accumulate-in-place path (begin_set find_set
@@ -3599,6 +3609,70 @@ PRE-START EVIDENCE (2026-09-19, owner-requested attribution run; adds evidence, 
   `host_mem` `pass_end` markers exist only when the rebuild is ON, so a
   `--pp-prebuild-per-pass 0` trace carries no per-pass ledger (a harness that
   requires one will fail a working rebuild-OFF arm).
+
+RESULT (2026-09-20, closed)
+: Host unit gate 115/117 on the changed binary (the two failures,
+  `qwen38-layer-boundary` and `layer-slot-lifecycle`, are the disclosed
+  pre-existing fixture-vs-default mismatch -- the pinned control refuses their
+  argv identically at arg-parse before any model load). Control =
+  `build/llama-cuda/bin/gplr47-control` (exe `A05738CE609618EF`, llama.dll
+  `57E81B5664A7EC6D`, the pinned post-T-GPLR-48 tree); changed =
+  `build/llama-cuda/bin/gplr47-changed` (exe `77542EC1386641F5`, llama.dll
+  `754D1AD5BFA13048`), exe + ALL DLLs. Seven arms + the V5 smoke in one session,
+  each under the GPU mutex with started/verdict/done sentinels. Evidence:
+  `build/llama-cuda/verdicts/gplr47-*`, traces `build/llama-cuda/gplr47-*.jsonl`,
+  harnesses `tools/run-gplr47-arm.ps1` / `tools/run-gplr47-set.ps1` /
+  `tools/run-gplr47-qasmoke.ps1`.
+
+1. AC1 (identity + semantics) LANDS EXACTLY. 4k/96 layer-major f16 rebuild ON on
+   the changed binary: 96 greedy ids BYTE-IDENTICAL to the same-session
+   rebuild-OFF arm and to the recorded cross-session `gplr46-4k-off`;
+   `tools/decode-tg-ids.py` needle aggregate PASS 5/5
+   (`QX-7741 TR-2918 MK-5501 LD-8834 Paris`, exit 0). The pre-change control at
+   the same flags emits the document-echo (ids start 760, "The maintenance log
+   for row 00114...", decode FAIL) -- the T-GPLR-46 regression reproduced on the
+   pinned binary, so the echo's disappearance is attributable to THIS change.
+2. AC2 (trigger removed at 50k): pass2-pass1 compute excess +0.23 s with rebuild
+   ON (gate <= 0.5 s; was +3.72 s on the pre-fix default), statistically
+   indistinguishable from the same-session OFF arm's +0.15 s. Ids
+   `[248046,198,248045]` on both.
+3. AC3 (growth law gone at the charter shape): 200k rebuild ON, excess
+   **+0.10 s** (was +59.2 s measured in T-GPLR-46); pass-2 wall within 1.0% of
+   pass 1 (135.2 s vs 136.5 s). Route parity clean at 3200 events.
+4. AC4 (the T-GPLR-43 rescue survives): q8 B1 shape (143360 tokens, ubatch 1024,
+   mmap-registered), rebuild ON: BOTH passes survive, exit 0 in 154.5 s, strict
+   checker OK, route parity clean (1200 events, 0 singletons). The swap did not
+   cost the crash fix.
+5. AC5 (structural proof): the changed arms' `patch_cache` dumps fire per
+   rebuild with a CONSTANT member count (4k: 6,6,6,6 across four rebuilds; 50k
+   and 200k: 6,6,6,6,6,6 across six; the count is 6 not the contract's 7 because
+   T-GPLR-45's zero-consumer filter removed the `inp_embd` orphan the 7th
+   member was) -- no 7 -> 14 -> 28 accumulation anywhere. The control's rebuild
+   arms emit only TWO dumps total (its in-place rebuild never re-walks), which
+   is the old mechanism's own signature.
+6. AC6/AC7 (no re-emission, no cost): strict `--check-telemetry` OK on all six
+   completing changed arms + the smoke rung; act_bind stays silent on
+   replacement (the checker's one-bind-per-chunk invariant never trips). 4k warm
+   pass compute 1.20 s vs the control's 1.36 s and the OFF arm's 1.32 s (same
+   session); total 4k wall 15.8 s (ON) vs 15.7 s (OFF), so the rebuild's
+   overhead stays in the recorded 7.4 ms order. `host_ledger` wall on the
+   50k-ON arm: 21.3 s pass 1, 18.2 s pass 2.
+7. THE DECODE-FREE GATE FLIPS, WHICH IS THE CLEANEST ONE-NUMBER SUMMARY. Route
+   parity (`tools/check-route-parity.py`): control + rebuild ON DIVERGED at
+   every sampled chunk except the first (4k: 80 singletons of 160, chunk 7;
+   the recorded `gplr46-50k-on`: 800 of 880, chunks 10..97) -- the
+   implementation-matched defect. Changed + rebuild ON: CLEAN at 4k (0 of 160),
+   50k (0 of 880), 143k B1 (0 of 1200) and 200k (0 of 3200). Rebuild OFF is
+   clean on both binaries, as before.
+8. AC8 (smoke unchanged): the 512 semantic-QA smoke rung on the changed binary
+   (batch-major q8, --pp-repeat 2, so the swap is exercised): runner exit 0,
+   strict checker OK, needle aggregate PASS 5/5, negative control aggregate FAIL
+   as designed.
+9. Falsifiers: NONE fired (no identity divergence, no q8 crash, no act_bind
+   violation). The one harness gap found en route: no dedicated rebuild-wall
+   event exists, so AC7's rebuild wall is bounded by the same-session total-wall
+   delta instead of being measured directly -- recorded as the task's only
+   un-instrumented residual.
 
 ### T-GPLR-48: make --pp-prebuild-per-pass KV-conditional (default ON only for quantized KV) per the T-GPLR-46 owner decision
 
