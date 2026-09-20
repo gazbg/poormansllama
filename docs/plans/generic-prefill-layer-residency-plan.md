@@ -3602,14 +3602,22 @@ PRE-START EVIDENCE (2026-09-19, owner-requested attribution run; adds evidence, 
 
 ### T-GPLR-48: make --pp-prebuild-per-pass KV-conditional (default ON only for quantized KV) per the T-GPLR-46 owner decision
 
-Status: ready (drafted 2026-09-19 from the T-GPLR-46 verdict and its
-escalated owner decision; the cheap hedge that runs independently of and
-composes with T-GPLR-47's root fix)
+Status: done (verdict 2026-09-19 -- the f16 default FLIPPED to the rebuild-OFF path and the flip is
+behavioral, not cosmetic: resolved 0 with source "default", announcement present, pass2-pass1
+compute excess +0.02 s against the old default's +3.72 s, greedy ids byte-identical to BOTH the
+explicit-OFF arm and the recorded gplr46-50k-off, and route parity DIVERGED -> clean; quantized KV is
+UNCHANGED (resolved 1, B1 both passes survive) and every explicit-flag arm keeps identical behavior.
+No falsifier fired. See RESULT below.)
 Depends on: T-GPLR-46 (the measured evidence this acts on: quadratic pass-2
 compute excess and TG answer->echo at 4k layer-major under rebuild ON at f16,
 with the rebuild's only justification being the T-GPLR-43 quantized-KV
 pass-2 crash fix)
-Commit: (fill on completion)
+Commit: nested ac2f615ed1a34c01db2bfeee3389b9e6aff1b81c (the KV-conditional default resolution, the hoisted `--kv-cache` validation,
+the help text, the default-only announcement and the two `run_start` keys in
+`tel_run_start`); outer 550046a33058ba733ec1c751ba2584b543abf556 (the arm harness `tools/run-gplr48-arm.ps1`, the set driver
+`tools/run-gplr48-set.ps1`, the new host-only gate `tools/check-route-parity.py` and the
+gitlink bump). The verdict commit that fills this field carries the plan RESULT, the
+`docs/currentstate.md` entry and the `AGENTS.md` gotcha.
 
 Goal
 : Change the default resolution of --pp-prebuild-per-pass so that an
@@ -3784,6 +3792,134 @@ Escalation condition
   Also escalate if the strict checker rejects the new run_start keys after
   whitelisting was attempted: schema ownership there outranks this task.
 
+
+RESULT (2026-09-19, closed)
+: The default is now KV-conditional and the change is confined to the default
+  path. TWELVE arm tags in one GPU session: the eleven repeat-2 arms of
+  T-GPLR-48 A1-A4 (A1 f16 50k no flag, A2 q8 B1 143360 no flag, A4 f16 4k 96
+  no flag, plus the four explicit-flag control/changed pairs of AC4), the A5
+  repeat-1 probe (f16 4k, no flag), and three in-session reruns after a
+  harness-expectation fix (the q8 pbp0 pair and the f16 pbp1 changed arm;
+  evidence fields identical to their first runs), all under the GPU mutex with
+  started/verdict/done sentinels; strict --check-telemetry OK on every arm that
+  completed a pass. Control = `build/llama-cuda/bin/gplr48-control` (exe
+  `65047AA91D706E2D`, llama.dll `76017976E3478CF6` -- byte-identical llama.dll
+  to the recorded `gplr49-changed` binary the gplr49/gplr49b 4k+50k echo arms
+  ran on, verified by hash AND by the absence of the new
+  `pp_prebuild_per_pass_source` string in the DLL); changed =
+  `build/llama-cuda/bin/Release` (exe `A05738CE609618EF`, llama.dll
+  `57E81B5664A7EC6D`), both exe + ALL DLLs side-copied BEFORE the rebuild.
+  Evidence: `build/llama-cuda/verdicts/gplr48-*`, traces
+  `build/llama-cuda/gplr48-<arm>.jsonl`, summary
+  `build/llama-cuda/gplr48-summary.json`, harnesses
+  `tools/run-gplr48-arm.ps1` / `tools/run-gplr48-set.ps1`, and the new
+  host-only gate `tools/check-route-parity.py`.
+1. INV3, THE POINT OF THE TASK -- THE f16 DEFAULT FLIPPED, AND THE FLIP IS
+   BEHAVIORAL, NOT COSMETIC. A1 (f16, 50k, layer-major, repeat 2, NO explicit
+   flag): run_start carries `pp_prebuild_per_pass=0` with
+   `pp_prebuild_per_pass_source="default"`; stderr announces
+   `layer-major preflight: pp-prebuild-per-pass = 0 (default: f16 KV, no
+   per-pass rebuild needed)`; pass2-pass1 compute excess **+0.02 s** against the
+   old default's **+3.72 s** at 50k and **+31.55 s** at 100k (recorded
+   gplr46-50k-on / gplr46-100k-on); and -- the load-bearing point -- the arm's
+   3 TG ids `248046,198,248045` are byte-identical to BOTH the same-session
+   explicit-OFF arm and the recorded T-GPLR-46 OFF arm, while the ON arm gives
+   `3702,279,2128`. A telemetry key alone would prove nothing; the ids and the
+   parity flip below are what prove the new default is the OFF path.
+2. ROUTE PARITY FLIPPED DIVERGED -> CLEAN, WHICH IS THE AC1 EVIDENCE THAT NEEDS
+   NO DECODE. New host-only gate `tools/check-route-parity.py`: under
+   `--pp-repeat 2` every sampled route tuple must appear EXACTLY TWICE, so a
+   pass-2 divergence is visible from a trace alone. A1 is **clean** (880 route
+   events, 440 distinct, 0 singletons) whereas the old-default 50k arm
+   `gplr46-50k-on` is **DIVERGED** (880 events, 840 distinct, **800 singletons**,
+   40 layers in each of chunks 10..97). Validated against six recorded traces
+   with known ground truth before use: clean for every rebuild-OFF trace
+   (gplr49b-4k-pw/nopw-rebuild0, gplr49-4k/50k-nopw, gplr45-50k-* keep-out) and
+   DIVERGED for every pw + rebuild-ON trace (gplr49-4k-pw, gplr49-50k-pw x2,
+   gplr46-50k-on, gplr43-fix-B1-q8), and it exits 2 (never 0) on a trace with no
+   route events -- a run that crashed before routing is NOT a pass. That
+   generalization (pw AND rebuild ON are jointly required, at 4k, 50k and 143k)
+   is handed to T-GPLR-47 as a cheap no-decode gate.
+3. AC2 -- THE 4k STREAM DECODES CORRECT. A4 (f16, 4k, tg 96, NO flag):
+   `tools/decode-tg-ids.py` aggregate **PASS, 5/5 items found** (N1 `QX-7741`,
+   N2 `TR-2918`, N3 `MK-5501`, N4 `LD-8834`, K1 `Paris`; decode exit 0). The
+   contract's "9/9 pieces" wording predates the decoder's 5-item needle set --
+   the measured claim is the tool's, and it is 5/5. A4's 96 greedy ids are
+   byte-identical to the recorded T-GPLR-46 explicit-OFF arm
+   `gplr46-4k-off`, drift included: the new default reproduces the OFF stream
+   exactly, on a different binary. (The 50k arms carry only 3 TG ids by
+   construction, so AC2's decode form is the 4k arm; the 50k evidence for the
+   same claim is id identity, clause 1.)
+4. INV2 / AC3 -- QUANTIZED KEEPS THE REBUILD, CRASH FIX STILL DEFAULT. A2 (q8,
+   143360 tokens, the T-GPLR-43 B1 shape, NO flag): resolved 1 with source
+   `default`, announcement `= 1 (default: quantized KV q8, pass-2 rebuild
+   active)`, BOTH passes survive, strict checker OK, exit 0, 190 s. Its routing
+   signature is the recorded B1 one: 1200 route events / 1120 singletons /
+   diverging chunks 10..140, matching `gplr43-fix-B1-q8` exactly.
+5. INV1 / AC4 -- EXPLICIT FLAGS ARE UNCHANGED, EXCEPT WHERE THE SHAPE CRASHES ON
+   BOTH BINARIES. Each explicit command was run on the changed AND the control
+   binary in one session, same shape. Identity fields compared exactly (tg ids,
+   pass ledgers count, per-pass launches, route events, route parity):
+   f16 pbp0 pair identical (timing -0.44% / +0.10%); f16 pbp1 pair identical
+   (timing within 3%); q8 pbp1 pair identical (timing within 3%). The q8 pbp0
+   PAIR CANNOT PRODUCE ids: **both binaries die with exit -1073740791
+   (0xC0000409) in pass 2**, i.e. the quantized-KV + rebuild-OFF crash
+   reproduces at a mere 50k, not only at the 143k T-GPLR-43 shape. That is
+   identity in the only form the shape admits (same defect, same signature, both
+   binaries) AND the strongest available support for INV2: the configuration the
+   new default refuses to enter is one that crashes. Both arms are therefore
+   graded with -ExpectCrash rather than being reported as harness failures
+   (graded on their re-runs, after the harness learned the expectation; the
+   first-run and re-run evidence fields are identical).
+6. STEP 1 (ORDERING) FOUND THE DRAFT'S CITATION STALE -- AND ONE REAL, DISCLOSED
+   CONSEQUENCE. The draft claimed the f16/q8/q4 validation (~3057) precedes the
+   resolution (~2969). In the real tree only the `--inspect-model` path's check
+   (former 2888) preceded it; the MAIN path's identical check sat at former
+   3095, AFTER the resolution, so at the resolution point `kv_cache` was
+   assigned but not yet validated. The value is knowable either way (an invalid
+   string still fails loudly before any work), so this was not a correctness
+   hole -- but the announcement would have named an unvalidated value. Fixed as
+   part of this task by hoisting the main-path check above the resolution, and
+   verified on both binaries: with TWO invalid flags the changed binary now
+   reports `--kv-cache` first where the control reports `--copy-source` first;
+   all three accepted values (f16/q8/q4) still reach model loading; the accepted
+   value set is unchanged. This diagnostic-order reordering is the ONLY
+   observable difference on the invalid-input path and it is disclosed here
+   rather than buried.
+7. AC5 -- SELF-DESCRIBING RUNS. The announcement is emitted ONLY when the value
+   came from the default: present in A1, A2, A4 (all `... = 0/1 (default: ...)`),
+   ABSENT in all four explicit-flag arms, and absent in the control arms because
+   that binary has no such code. Traces never lie about it: the two run_start
+   keys are present and validated (strict checker) in every changed-binary arm
+   and absent from every control arm -- asserted as a POSITIVE property of the
+   control (a control arm that carries the key fails). The `layer-major
+   preflight:` prefix follows the file's existing convention (line 3909's
+   `initializing streaming module` fires regardless of schedule), so the line is
+   not a mislabel on a batch-major run. The A5 repeat-1 probe confirms prior
+   behavior for --pp-repeat 1 as well: resolved 0 with source `default`, the
+   announcement names the repeat-1 case (`pp-prebuild-per-pass = 0 (default:
+   --pp-repeat 1, there is no pass boundary)`), strict checker OK, and the
+   96-id stream needle-grades PASS 5/5 -- identical to pre-change behavior by
+   construction (both old and new default evaluate to 0 when pp_repeat == 1)
+   and now also by measurement.
+8. FALSIFIERS: NONE FIRED. (a) "an f16 repeat>1 default run still performs the
+   rebuild" -- no: resolved 0, parity clean, excess +0.02 s vs +3.72 s.
+   (b) "a q8 default run crashes in pass 2" -- no: A2 survived both passes.
+   (c) "an explicitly-set arm diverges from today's binary" -- no: every pair's
+   identity fields are equal, and the one nonzero exit (q8 pbp0) is identical on
+   both binaries.
+9. LIMITS AND WHAT THIS DOES NOT CLAIM. The 50k arms cannot be needle-graded
+   (3 ids), so answer-quality evidence is the 4k arm. Timing claims are
+   within-session only (the ~3% session spread); no speedup is claimed beyond
+   removing the measured pass-2 compute excess from the default path. The
+   quantized path's route parity is still DIVERGED (clause 2): this task removes
+   that configuration from the default, it does not repair it -- that is
+   T-GPLR-47, whose target the parity gate now names precisely (the pw
+   width-class rebuild re-entry). CTest: 68/70 on the changed binary; the two
+   failures (`qwen38-layer-boundary`, `layer-slot-lifecycle`) are a fixture-vs-
+   default mismatch (`--pp-async-feed` defaults to 1, the fixtures pin
+   `--layer-slots 1`) and were proved pre-existing by running the CONTROL binary
+   with the fixture's exact argv: it fails with the identical message.
 ### T-GPLR-49: fix the layer-major act-slab offset formula - bf16 element size and the chunk-0 cursor inheritance
 
 Status: done (verdict 2026-09-19 - the defect is REAL and its pre-registered

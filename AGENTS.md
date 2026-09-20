@@ -179,6 +179,9 @@ authoritative online sources before improvising:
 - `--pp-schedule layer-major` refuses `--tg-tokens > 3` when handoff auto does not activate (exit 2). Long-id identity arms at the 50k shape are impossible without forcing handoff (which changes the execution mode); run them at 4k instead.
 - `prepare_chunk` early-returns when `pw_probe` is off, so `--no-pw-probe` mode does NO per-launch patch: no act repointing, no snapshot restore, and **no `patch_cache` recon dump to inspect**. Any harness or checker that requires that dump will verdict a working non-pw run FAIL (measured 2026-09-19, T-GPLR-49). Treat it as a pw-only artifact.
 - The act-slab region claims (`slab_claims`) live for the module's lifetime and are only consistent with the offset cursors while nothing clears one without the other; derive slab offsets from the immutable chunk descriptor, never from a cursor, or a reordered/repeated pass silently re-binds a slice over a live one.
+- `--pp-prebuild-per-pass` is KV-CONDITIONAL since T-GPLR-48: an UNSET flag means ON iff `--pp-repeat > 1` AND `--kv-cache != f16`. A recorded command that omits the flag therefore runs differently today at f16 (rebuild OFF) than when it was recorded — read the resolved value from the trace's `run_start` (`pp_prebuild_per_pass` + `..._source`), never from command history.
+- Route parity is a free pass-2 integrity signal: in a clean `--pp-repeat 2` trace every sampled `route` tuple appears EXACTLY TWICE. pw + rebuild ON breaks it at every sampled chunk except the first (4k, 50k and 143k), rebuild OFF is clean — `tools/check-route-parity.py`, host-only, no decode. Its exit 2 (no route events) means the run died before routing, which is NOT a pass.
+- Quantized KV with the rebuild OFF crashes in pass 2 with exit `-1073740791` (0xC0000409) at the **50k** shape, not just T-GPLR-43's 143k one — never pin `--pp-prebuild-per-pass 0` alongside `--kv-cache q8/q4` and read the result as a measurement.
 
 ## Validation and Evidence
 
@@ -268,6 +271,7 @@ This machine shares one GPU across multiple projects. Before any command that in
 - Do not use a sentinel file or delete another process's lock. Windows releases the named mutex if its owning process exits unexpectedly.
 - Other projects sharing this GPU must use the same mutex name and equivalent acquire-wait-release behavior.
 - Detached arm launches: the LAUNCHER must dot-source `tools/arm-verdict.ps1` and run `Clear-ArmVerdict` for the tag BEFORE `Start-Process`. The arm clears its own files only after the process starts, so an immediate `Wait-ArmStart`/`Wait-ArmVerdict` reads the PREVIOUS run's marker and verdict (measured 2026-09-18: stale pid and `started_utc`).
+- NEVER launch a detached arm through `setsid` (e.g. `(setsid nohup bash script.sh &)`). Under it PowerShell does NOT wait for a native child: `& exe > log 2>&1` returns in 0 s with `$LASTEXITCODE` UNSET and the child's redirected output never reaching the log, so the arm verdicts a run that is still in flight and the engine finishes orphaned. Use plain `nohup` or `Start-Process` (measured 2026-09-19 with one 6 s child in three launcher shapes: direct and plain `nohup` both `exit=0 dur=5.1s logbytes=1056`; `setsid` `exit=<null> dur=0.0s logbytes=0`).
 
 Expensive model runs require a recorded command, model artifact identity, hardware, relevant flags, exit status, and telemetry path. Do not run them merely for confidence.
 
