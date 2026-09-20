@@ -36,7 +36,7 @@ Status: in-progress (2026-09-17) — PROBE FEASIBLE; V1 (per-bank churn)
 (churn-free, register once at init — see addendum 2 below) **CONFIRMS the churn
 mechanism and WINS at 4k at both depths** (warm -23.3% at 2 slots, -15.4% at 3,
 paired against adjacent pinned controls), at a measured cost of 17.23 GiB of
-pinned file pages. Not promoted to default; owner decision.
+pinned file pages. PROMOTED TO DEFAULT 2026-09-20 by owner decision (verbatim in the RESULT at the end of this block).
 
 V1 detail (kept as the falsified half of the family) The hop was removed from the accounting (host submit 1587.8 ->
 1222.3 ms/pass at 2 slots; `slot` bucket 1315.6 -> 1153.3) but per-launch host
@@ -56,7 +56,9 @@ T-GPLR-36 (the ledger that showed no host bucket contains the hop, because it
 runs on the async-feed worker)
 Commit: nested 7bcbd7a75 (cudaHostRegister host-range API) + 8e14abd36
 (register-once staging + ledger sub-buckets) + 1e72d62c7 (runner wiring); outer
-4b13ac3 (evidence/tooling, gitlink bump)
+4b13ac3 (evidence/tooling, gitlink bump); 2026-09-20 default flip: nested 8ab3f1f00
+(default + copy_source_source provenance + --pp-pool refusal), outer 63bfaa6 (harness +
+gitlink), plus this verdict commit
 
 
 
@@ -280,6 +282,24 @@ Validation commands (addendum 3)
 * `python tools/analyze-gplr37.py build/llama-cuda/gplr37c-{pin,ron}-s{2,3}.jsonl`
 * RAM monitor `tools/monitor-mem-gplr36.ps1` (fixed: process-anchored window +
   sys_free column) writes `build/llama-cuda/gplr37c-mem-monitor.csv`
+
+
+#### T-GPLR-37 RESULT (2026-09-20): PROMOTED TO DEFAULT by owner decision — the flip is behavioral, self-describing, and costed
+
+**Owner decision, verbatim: "Promote to default — you always pay 17 GiB of locked RAM, always get the speedup where it exists."** The churn-free register-once mode (`--copy-source mmap-registered`) is now the DEFAULT copy source; explicit `--copy-source` still overrides everything, so every recorded arm command stays reproducible. The change: the default literal, a stderr announcement emitted ONLY when the default decided (T-GPLR-48 pattern), a new `run_start` key `copy_source_source` (`explicit|default`) beside the already-recorded resolved `copy_source`, the strict checker validating the new key, an updated help entry, and one disclosed consequence — bare `--pp-pool` (a pinned staging structure) now refuses BEFORE model load with the one-flag fix in the message, where it previously only failed at pool configure under the pinned default.
+
+**One session, five arms + the smoke rung, all under the GPU mutex with started/verdict/done sentinels.** Control = `bin/gplr37-control` (exe `150B6351833DA150`, llama.dll `7EBB3803CDD67B41`), changed = `bin/gplr37-changed` (exe `A3EB9C3A32F1DA0E`, dll `89CE209871DA7DFB`). **The control-preserving lesson re-measured:** the first "control" copy was taken AFTER the build had already compiled the change into the live `bin/Release` — grep for the new key in the would-be control DLL exposed it — so the control was rebuilt from pristine nested HEAD (diff saved/reverted/built/pinned/restored, patch-identical restore verified) before anything ran.
+
+- **INV1 (control silence):** the control at bare default resolves `pinned`, carries NO `copy_source_source` key and NO announcement (C1); at explicit `--copy-source pinned` it behaves exactly as the pre-change tree did (A3).
+- **The new default, measured (A1, 4k/3 slots):** resolved `mmap-registered` with source `default`, announcement present, **40 init-once `mmap_register` events = 18,500,517,888 B (17.23 GiB) pinned in 2.66 ms, ALL before the first `layer_compute`** — the addendum-2 churn-free signature exactly; strict `--check-telemetry` OK; route parity clean (160 events, 0 singletons).
+- **Identity:** the 96 greedy ids are **byte-identical across ALL FOUR 4k arms** (control default, control pinned, changed default, changed pinned); first id 248046; graded decode **PASS 5/5** (`QX-7741 TR-2918 MK-5501 LD-8834 Paris`) in every arm.
+- **Timing (same session, same binary, warm pass-2 walls — recorded, NOT gated):** control pinned 2095.4 ms (A3), changed pinned 2121.7 ms (A2), changed **default 1953.5 ms (A1) = -6.8% vs the same binary pinned and -7.9% vs the control**. This is the honest current-tree number: addendum 2 measured -15.4% at 3 slots on the pre-T-45/47/48/49 tree, and the pinned path itself got faster since, so the same absolute win is now a smaller fraction. Single pair, one session, no replication — the delta is directional evidence, not a certified constant. A1's pass-1 compute (3.71 s vs 1.84 s pass 2) carries the expected first-touch page-in of the pinning itself; disclosed, not a regression claim.
+- **A4 (b1, 143k q8, the T-GPLR-43/47 reference shape):** resolved default, 40/17.23 GiB pre-compute, checker OK, parity clean (1200 events, 0 singletons), 154.4 s — the long quantized-KV shape works unchanged under the new default.
+- **Smoke rung (V2, 512 anchor, bare default, batch-major q8, repeat 2):** runner exit 0, strict checker 0, needle **PASS 5/5**, negative control FAILs as designed — the DEFAULT path answers the needle.
+- **Consumers:** every recorded script and CTest fixture passes `--copy-source` explicitly (all `pinned`), so no recorded command changes behavior; the only `--pp-pool` consumer pins it too. Host suite 37/37, telemetry suite pass, doc-size guard PASS.
+- **Limits, stated:** the 17.23 GiB pinned-RAM price is UNCONDITIONAL under this default (that is the owner's recorded choice); addendum 3 measured the crowded 200k shape wall-neutral (-0.22%/-0.38%, within noise) with no memory-pressure event at 61.7 GiB, and the default now applies there too. The -6.8% wall delta is one session, one pair. Host-RSS at rest is ~20.5 GB for a defaulted run (measured via the live process working set during A4), most of it the pinned mapping.
+- **Falsifiers: NONE fired** (no identity divergence anywhere, no parity failure, no refusal in any supported combination).
+**Evidence:** verdicts `build/llama-cuda/verdicts/gplr37-*.verdict.json` (+ `.started`/`.done`), traces `build/llama-cuda/gplr37-*.jsonl`, smoke `build/llama-cuda/gplr37-v2-qa-512.{jsonl,log,txt}`, harnesses `tools/run-gplr37-arm.ps1` / `tools/run-gplr37-set.ps1` / `tools/run-gplr37-qasmoke.ps1`, binaries `build/llama-cuda/bin/gplr37-{control,changed}`.
 
 ### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent — the residue that grows with ubatch size
 
