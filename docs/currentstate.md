@@ -1,5 +1,23 @@
 # Current State
 
+## 2026-09-21: T-GPLR-51 CLOSED - 3 slots measured-optimal (S2), default combo confirmed, plan re-split
+
+- S2 (2 slots - the leg A1-A4 never measured; current binary, hash-matched,
+  gpu_pre/post_run clean, 2-slot shape proven in-trace by distinct-slot
+  census): exposed ready_wait 6.08 s = 1.66x the 3-slot 3.67 s; tok/s
+  1456.9/1476.2 in band. With A3 (4 slots: copies inflate ~4x, tail max
+  12.31 s), 3 slots is the saturation optimum in BOTH directions.
+- Owner default CONFIRMED on every leg, current binary: layer-slots 3 +
+  pp-async-feed 1 + copy-source mmap-registered (slots: S2+A3 bracket;
+  async-feed: A4 neutral at 200k, documented hiding mechanism where slots
+  are scarce; mmap: A2 equal exposure, 2.4x faster typical copies, 2x at 4k).
+- Copy-tail question stays CLOSED as structural; framing correction owed to
+  T-GPLR-52 stands: copy p50/max are host-observed waits, not DMA times.
+- Plan index updated by the first RESPLIT: T-GPLR-39, T-GPLR-50, T-GPLR-51
+  blocks moved verbatim to the archive (tools/resplit-gplr-plan.py, manifest
+  docs/plans/resplit-manifest-2026-09-21.json, --verify PASS). Live plan now
+  holds T-GPLR-37 (in-progress) and T-GPLR-52 (draft) only.
+
 ## 2026-09-21: Copy-tail follow-up - "40 vs 160" premise CORRECTED; the real anomaly is per-copy cost scaling with prompt length
 
 Re-decomposition of copy_complete across all recent traces (host-only, no GPU):

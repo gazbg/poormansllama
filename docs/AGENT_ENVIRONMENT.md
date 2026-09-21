@@ -791,7 +791,13 @@ committed sizes differ under autocrlf) plus the index of
 archived blocks. `docs/plans/archive-manifest.json` records the mechanical
 split — including BOTH sha256 forms (worktree CRLF and git blob LF, which
 differ under `core.autocrlf`) — and `python tools/split-gplr-plan.py --verify`
-re-proves the byte-exact reconstruction from disk any time. Closed task blocks
+re-proves the byte-exact reconstruction from disk any time. RESPLIT
+2026-09-21: once the live file grew with new closures, that first verify went
+historical (it hashes the pre-split original). The NEXT and future splits are
+`python tools/resplit-gplr-plan.py`: --apply moves newly-closed blocks to the
+archive VERBATIM and rebuilds the live header's archived-block index;
+--verify re-proves the CURRENT state byte-exactly against
+docs/plans/resplit-manifest-2026-09-21.json. Closed task blocks
 are never edited in place: a closure appends its RESULT in the live file, and
 the block moves on the NEXT split. Search across the archive with `rg`, same
 rule as the currentstate shards.

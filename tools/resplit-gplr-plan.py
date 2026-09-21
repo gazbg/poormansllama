@@ -75,8 +75,10 @@ def main_apply():
     live = live_crlf.replace("\r\n", "\n")
     arch = load(ARCHIVE).replace("\r\n", "\n")
 
+    pre_sha_blocks = sha256(live[live.find('### '):])
     pre_sha = sha256(live)
-    print("pre-resplit live (LF) sha256:", pre_sha)
+    print('pre-resplit live (LF) sha256:', pre_sha)
+    print('pre-resplit BLOCKS-ONLY (LF) sha256:', pre_sha_blocks)
 
     blocks = tile(live)
     print("blocks:", len(blocks))
@@ -112,7 +114,10 @@ def main_apply():
     # live header rebuilt: same preamble updated, index = ALL archived titles
     idx = [ln for ln in live.split("\n")[:40] if ln.startswith("- ### ")]
     moved_titles = [r["title"] for r in moving]
-    new_idx = idx + moved_titles
+    # index lines carry the "- " prefix; moved titles are bare headings and
+    # MUST get the prefix or they parse as phantom blocks in the live header
+    # (measured: bare lines made --verify see 114 B "blocks" at the index)
+    new_idx = idx + ["- " + t for t in moved_titles]
     header = (
         "# Generic prefill layer residency — executable backlog (live tasks only)\n"
         "\n"
@@ -146,6 +151,8 @@ def main_apply():
         "resplit_date": "2026-09-21",
         "tool": "tools/resplit-gplr-plan.py",
         "pre_resplit_live_sha256_lf": pre_sha,
+        "pre_resplit_blocks_sha256_lf": pre_sha_blocks,
+        "verify_note": "--verify hashes the BLOCKS-ONLY concatenation (everything from the first '### ' heading); the whole-file hash includes the old live header, which reconstruction correctly excludes (measured 2026-09-21: header was 2,873 B and made the first verify FAIL). Manifest note: the recorded blocks hash was regenerated post-apply after this invariant fix - the per-block titles and line spans remain apply-time records from the pre-split file, and every extracted block matched its span exactly.",
         "pre_resplit_live_bytes": len(live.encode("utf-8")),
         "archive_header_lines": ARCHIVE_HEADER_LINES,
         "live_header_rule": "live body = everything from the first '### ' heading",
@@ -199,12 +206,35 @@ def main_verify():
 
     # reassemble pre-resplit live by original line order
     ordered = sorted(wanted.values(), key=lambda b: b["orig_line_start"])
+    stripped = man.get("archive_terminator_stripped", False)
+    if stripped:
+        # the archive's EOF-terminator strip (git diff --check convention)
+        # removed the trailing blank of the ARCHIVE-FINAL chunk (the last
+        # archived block, NOT the orig-order-last block - measured: T-GPLR-51
+        # is archive-final while T-GPLR-52 is order-final). Restore it.
+        arch_titles_in_order = []
+        for m in re.finditer(r"(?m)^### ", arch_body):
+            s = m.start()
+            t = arch_body[s:arch_body.find("\n", s)].rstrip("\r")
+            if t in wanted:
+                arch_titles_in_order.append(t)
+        if arch_titles_in_order:
+            last_arch = arch_titles_in_order[-1]
+            if got[last_arch].endswith("\n"):
+                got[last_arch] += "\n"
+    for b in ordered:
+        span = b["orig_line_end"] - b["orig_line_start"] + 1
+        lines = got[b["title"]].count("\n") + (0 if got[b["title"]].endswith("\n") else 1)
+        assert lines == span, "block span drift: %s (%d vs %d)" % (b["title"][:50], lines, span)
     rebuilt = "".join(got[b["title"]] for b in ordered)
+    expected = man.get("pre_resplit_blocks_sha256_lf")
+    if expected is None:
+        expected = man["pre_resplit_live_sha256_lf"]
+        print("(manifest predates the blocks-only invariant; comparing whole-file hash)")
     got_sha = sha256(rebuilt)
-    ok = got_sha == man["pre_resplit_live_sha256_lf"]
-    print("reconstructed (LF): %d B  sha256 %s" % (len(rebuilt.encode("utf-8")), got_sha))
-    print("manifest pre-split : %d B  sha256 %s" % (
-        man["pre_resplit_live_bytes"], man["pre_resplit_live_sha256_lf"]))
+    ok = got_sha == expected
+    print("reconstructed blocks (LF): %d B  sha256 %s" % (len(rebuilt.encode("utf-8")), got_sha))
+    print("manifest expected        : %s" % expected)
     print("RESULT:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
