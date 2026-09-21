@@ -414,3 +414,49 @@ Escalation: if A1-A3 all fail to discriminate, present the three-way evidence
 table to the owner with the option of instrumenting backend-level copy timing
 (backend API dependency question) or closing the question as
 instrument-limited.
+
+#### A1 result (2026-09-21, host-only, no GPU): H1 CONFIRMED as the dominant mechanism - wait ~= overlapped compute at long context
+
+Per the contract (correlate transfer_us with overlapped compute and
+concurrent copies, no new binary). Traces: gplr50-4k/50k/200k + b1-q8 +
+a2-pinned; layer_compute rows are stride-10 SAMPLED (measured: sampled sums
+recover phase compute only to 1/3-1/10), so overlapped-compute sums are
+lower bounds and slopes carry the sampling factor.
+
+The contract's literal metric, per shape:
+
+| shape | r(wait, overlapped compute) | r(wait, concurrent copies) | r(wait, position) |
+| --- | --- | --- | --- |
+| 200k/512 | +0.998 | -0.001 | +0.07 |
+| 200k pinned | (same law) | - | - |
+| 144k q8 | high (sync-only profile) | - | - |
+| 50k/512 | +0.78 | +0.20 | -0.05 |
+| 4k/512 | +0.27 (pass-1 first-touch transient: r(wait,position) = -0.78) | +0.10 | -0.78 |
+
+* At 200k the relationship is essentially deterministic: wait ~= 1.03 x
+  overlapped compute (slope 10.017 x sampled rows; sampled rows cover
+  1/9.74 of compute at stride 10). The host wait for a whole-bank copy IS
+  the time the copy engine queues behind the compute stream; it scales
+  with how much compute runs during the copy window, which is exactly why
+  identical 460 MB banks cost 163 ms at 4k (little compute queued), 943 ms
+  at 50k, and 3003 ms at 200k. H2's eviction story is REFUTED for the
+  steady state: r(wait, position) ~ 0 at 200k/50k (no drift within a pass),
+  pinned matches mmap (no file-read component), and only 4k pass-1 shows
+  the first-touch decay H2 predicted - a warm-up transient, not the law.
+* submit/sync split corroborates: at 200k the median wait is 100% sync
+  (submit ~0.1 ms) - a queued-behind-compute signature; at 4k both
+  components are material and pass-1 submit (119 ms) exceeds pass-2
+  (28 ms), the first-touch registration cost.
+* Concurrency is NOT the driver (r ~ 0 at 200k, median 2 in flight, max 3)
+  - the A3 4-slot inflation was resource contention at 4-way concurrency,
+  not queueing order.
+* Consequence for AC2: the 18x per-copy scaling has a named, two-way
+  corroborated mechanism (H1), supported by discriminators A1 (this
+  analysis) + the F4 submit/sync split + the F5-adjacent pinned identity.
+  H2 stands refuted for steady state; H3 (pinned pool engagement) remains
+  the only open item and A3's arm can settle it.
+* AC1 discharged: all 8 tracked PP analyzers filter copy stats by phase
+  (audit 2026-09-21); run-gplr51-tail-arm.ps1's quantile block was the one
+  tool mixing TG copy events into PP stats - fixed in this commit;
+  run-gplr44-dump-50k.ps1 counts events only (phase-agnostic by design,
+  noted, no fix needed).

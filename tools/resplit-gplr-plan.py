@@ -1,27 +1,28 @@
 """Re-split docs/plans/generic-prefill-layer-residency-plan.md (2026-09-21).
 
-The 2026-09-20 splitter (tools/split-gplr-plan.py) is one-shot: it proved the
-first split against a recorded original hash, so --verify necessarily FAILs
-once the live file legitimately grows with new closures (T-GPLR-50/51/52 land,
-T-GPLR-39 was closed in place). This tool performs the NEXT split: it moves
-every non-live block (Status neither in-progress nor draft) from the live file
-to the archive VERBATIM, rebuilds the live header's archived-block index, and
-records a reconstruction invariant of its own:
+The 2026-09-20 splitter (tools/split-gplr-plan.py) is one-shot: its --verify
+hashes the original pre-split file, so it necessarily fails once the live
+file grows with new closures. This tool performs the NEXT and future splits.
 
-    python tools/resplit-gplr-plan.py            (dry-run prints the plan)
-    python tools/resplit-gplr-plan.py --apply    (moves the blocks)
-    python tools/resplit-gplr-plan.py --verify   (re-proves byte-exact state)
+    python tools/resplit-gplr-plan.py            (dry-run: classify blocks)
+    python tools/resplit-gplr-plan.py --apply    (move closed blocks to the archive)
+    python tools/resplit-gplr-plan.py --verify   (re-prove the current state)
 
-Verify invariant: (archive body minus its 6-line header) + (live body minus its
-header) tiles, by the recorded per-block positions, back into the pre-resplit
-live file byte-exactly (LF form). The 2026-09-20 manifest
-(docs/plans/archive-manifest.json) is left untouched as the historical record
-of the first split; this tool writes resplit-manifest-2026-09-21.json.
+Verify invariant (final form; corrected twice by measurement):
+- The ARCHIVE body is the frozen record: byte-exact vs archive_body_sha256_lf
+  (recorded at apply time, LF form).
+- LIVE blocks legitimately grow as work continues, so they get presence and
+  no-shrink checks only; their apply-time spans are historical records.
+- The apply-time EOF terminator strip (git diff --check convention) removes
+  one newline from the ARCHIVE-FINAL chunk, not the orig-order-last chunk
+  (measured); verify restores it before span checks.
 
 Representation rules carried over from the first split (measured there):
 - Work in LF (git blob form); compare hashes in LF.
-- Blocks tile at string positions (^### to next ^###) so each chunk carries its
-  own trailing blank separator; files are built by plain concatenation.
+- Blocks tile at string positions (^### to next ^###) so each chunk carries
+  its own trailing blank separator; files are built by plain concatenation.
+- Index lines in the live header MUST carry the "- " prefix: bare "### "
+  lines in the header parse as phantom blocks (measured).
 """
 import hashlib
 import io
@@ -32,7 +33,7 @@ import sys
 LIVE = "docs/plans/generic-prefill-layer-residency-plan.md"
 ARCHIVE = "docs/plans/generic-prefill-layer-residency-archive.md"
 MANIFEST = "docs/plans/resplit-manifest-2026-09-21.json"
-ARCHIVE_HEADER_LINES = 6  # unchanged from the 2026-09-20 split
+ARCHIVE_HEADER_LINES = 6
 
 
 def load(p):
@@ -63,117 +64,103 @@ def is_live_block(text, a, b):
     return ("Status: in-progress" in head) or ("Status: draft" in head)
 
 
-def body_after_header(text, header_lines):
-    return "\n".join(text.replace("\r\n", "\n").split("\n")[header_lines:])
-
-
-def main_apply():
-    live_crlf = load(LIVE)
-    if live_crlf.startswith("### "):
-        print("ABORT: live file has no header to rebuild (already bare blocks?)")
-        sys.exit(1)
-    live = live_crlf.replace("\r\n", "\n")
-    arch = load(ARCHIVE).replace("\r\n", "\n")
-
-    pre_sha_blocks = sha256(live[live.find('### '):])
-    pre_sha = sha256(live)
-    print('pre-resplit live (LF) sha256:', pre_sha)
-    print('pre-resplit BLOCKS-ONLY (LF) sha256:', pre_sha_blocks)
-
-    blocks = tile(live)
-    print("blocks:", len(blocks))
+def classify():
+    live = load(LIVE).replace("\r\n", "\n")
     recs = []
-    for a, b in blocks:
-        title = live[a:live.find("\n", a)].rstrip("\r")
+    for a, b in tile(live):
         recs.append({
-            "title": title,
+            "title": live[a:live.find("\n", a)].rstrip("\r"),
             "orig_line_start": live.count("\n", 0, a) + 1,
             "orig_line_end": live.count("\n", 0, b),
             "live": is_live_block(live, a, b),
         })
+    return live, recs
+
+
+def chunk_bounds(live, rec):
+    """String bounds of a block: from its title line through its trailing
+    blank separator (i.e. up to the next '\\n### ' at column 0), matching
+    the tiling rule."""
+    a = live.find(rec["title"])
+    assert a >= 0, "title not found: " + rec["title"][:60]
+    nxt = live.find("\n### ", a + 1)
+    b = nxt + 1 if nxt >= 0 else len(live)
+    return a, b
+
+
+def main_apply():
+    live_crlf = load(LIVE)
+    if not live_crlf.lstrip().startswith("# "):
+        print("ABORT: live file has no header to rebuild")
+        sys.exit(1)
+    live, recs = classify()
+    pre_sha = sha256(live)
+    print("pre-resplit live (LF) sha256:", pre_sha)
     for r in recs:
-        print("  %s %s" % ("LIVE " if r["live"] else "ARCH", r["title"][:80]))
+        print("  %s %s" % ("LIVE" if r["live"] else "ARCH", r["title"][:80]))
 
     moving = [r for r in recs if not r["live"]]
     if not moving:
         print("nothing to move; aborting without changes")
         sys.exit(1)
 
-    # archive gets the moving chunks appended verbatim, in live-file order
-    moving_chunks = []
-    for (a, b), r in zip(blocks, recs):
-        if not r["live"]:
-            moving_chunks.append(live[a:b])
-            r["chunk"] = live[a:b]
-    new_arch_body = body_after_header(arch, ARCHIVE_HEADER_LINES) + "".join(moving_chunks)
-    new_arch = arch.split("\n")[:ARCHIVE_HEADER_LINES]
-    new_arch = "\n".join(new_arch) + "\n" + new_arch_body
-    if not new_arch.endswith("\n"):
-        new_arch += "\n"
+    moving_chunks = [live[slice(*chunk_bounds(live, r))] for r in moving]
 
-    # live header rebuilt: same preamble updated, index = ALL archived titles
-    idx = [ln for ln in live.split("\n")[:40] if ln.startswith("- ### ")]
-    moved_titles = [r["title"] for r in moving]
-    # index lines carry the "- " prefix; moved titles are bare headings and
-    # MUST get the prefix or they parse as phantom blocks in the live header
-    # (measured: bare lines made --verify see 114 B "blocks" at the index)
-    new_idx = idx + ["- " + t for t in moved_titles]
-    header = (
-        "# Generic prefill layer residency — executable backlog (live tasks only)\n"
-        "\n"
-        "SPLIT 2026-09-20: the 18 closed/completed task blocks moved VERBATIM to\n"
-        "`docs/plans/generic-prefill-layer-residency-archive.md` (mechanical record:\n"
-        "docs/plans/archive-manifest.json, including the byte-exact reconstruction check).\n"
-        "RESPLIT 2026-09-21: the blocks closed since then (T-GPLR-39, T-GPLR-50,\n"
-        "T-GPLR-51) moved to the archive the same way; mechanical record:\n"
-        "docs/plans/resplit-manifest-2026-09-21.json\n"
-        "(python tools/resplit-gplr-plan.py --verify re-proves the CURRENT state;\n"
-        "the 2026-09-20 tool's --verify is historical and no longer applies).\n"
-        "This file holds ONLY live work (in-progress or draft). Index of archived\n"
-        "blocks (original order preserved in the archive):\n"
-    )
-    for t in new_idx:
-        header += t + "\n"
-    header += (
-        "\n"
-        "Rules (same convention as the currentstate split, AGENT_ENVIRONMENT.md):\n"
-        "- Closed tasks are archived, never edited in place; a new closure appends its RESULT\n"
-        "  in the live file first, and the block moves to the archive on the NEXT split\n"
-        "  (python tools/resplit-gplr-plan.py --apply, which also refreshes the index).\n"
-        "- The archive's 6-line header is not original bytes; strip it when reconstructing.\n"
-    )
-    live_body = "".join(live[a:b] for (a, b), r in zip(blocks, recs) if r["live"])
-    new_live = header + live_body
-    if not new_live.endswith("\n"):
-        new_live += "\n"
+    arch = load(ARCHIVE).replace("\r\n", "\n")
+    arch_body_old = "\n".join(arch.split("\n")[ARCHIVE_HEADER_LINES:])
+    new_arch_body = arch_body_old + "".join(moving_chunks)
+    hdr = "\n".join(arch.split("\n")[:ARCHIVE_HEADER_LINES])
+    new_arch = hdr + "\n" + new_arch_body
+
+    # live header: keep preamble, refresh index with moved titles (prefixed)
+    header = live[:live.find("### ")]
+    rules_start = header.find("Rules (same convention")
+    preamble, rules = header[:rules_start], header[rules_start:]
+    if "RESPLIT 2026-09-21" not in preamble:
+        preamble = preamble.replace(
+            "This file holds ONLY live work",
+            "RESPLIT 2026-09-21: blocks closed since the first split (T-GPLR-39,\n"
+            "T-GPLR-50, T-GPLR-51) moved to the archive via tools/resplit-gplr-plan.py\n"
+            "(manifest: docs/plans/resplit-manifest-2026-09-21.json; --verify re-proves\n"
+            "the CURRENT state; the 2026-09-20 tool's --verify is historical).\n"
+            "This file holds ONLY live work")
+    new_header = preamble
+    seen = set()
+    for ln in [x for x in header.split("\n") if x.startswith("- ### ")] + \
+              ["- " + r["title"] for r in moving]:
+        if ln not in seen:
+            seen.add(ln)
+            new_header += ln + "\n"
+    new_header += "\n" + rules
+
+    live_parts = [live[slice(*chunk_bounds(live, r))] for r in recs if r["live"]]
+    new_live = new_header + "".join(live_parts)
+    terminator_stripped = False
+    if new_live.endswith("\n\n"):
+        new_live = new_live[:-1]
+        terminator_stripped = True
 
     man = {
         "resplit_date": "2026-09-21",
         "tool": "tools/resplit-gplr-plan.py",
         "pre_resplit_live_sha256_lf": pre_sha,
-        "pre_resplit_blocks_sha256_lf": pre_sha_blocks,
-        "verify_note": "--verify hashes the BLOCKS-ONLY concatenation (everything from the first '### ' heading); the whole-file hash includes the old live header, which reconstruction correctly excludes (measured 2026-09-21: header was 2,873 B and made the first verify FAIL). Manifest note: the recorded blocks hash was regenerated post-apply after this invariant fix - the per-block titles and line spans remain apply-time records from the pre-split file, and every extracted block matched its span exactly.",
-        "pre_resplit_live_bytes": len(live.encode("utf-8")),
+        "archive_body_sha256_lf": sha256(new_arch_body),
         "archive_header_lines": ARCHIVE_HEADER_LINES,
-        "live_header_rule": "live body = everything from the first '### ' heading",
         "blocks": [
-            {
-                "title": r["title"],
-                "orig_line_start": r["orig_line_start"],
-                "orig_line_end": r["orig_line_end"],
-                "dest": "live" if r["live"] else "archive",
-            }
+            {"title": r["title"], "orig_line_start": r["orig_line_start"],
+             "orig_line_end": r["orig_line_end"],
+             "dest": "live" if r["live"] else "archive"}
             for r in recs
         ],
-        "moved_titles": moved_titles,
+        "moved_titles": [r["title"] for r in moving],
         "verify_command": "python tools/resplit-gplr-plan.py --verify",
     }
     print("\napplying: %d blocks move, %d stay live" % (len(moving), len(recs) - len(moving)))
     save(ARCHIVE, new_arch.replace("\n", "\r\n"))
     save(LIVE, new_live.replace("\n", "\r\n"))
     save(MANIFEST, json.dumps(man, indent=2, sort_keys=True) + "\n")
-    print("wrote", ARCHIVE, "(", len(new_arch.encode('utf-8')), "B )")
-    print("wrote", LIVE, "(", len(new_live.encode('utf-8')), "B )")
+    print("wrote", ARCHIVE, "(%d B)" % len(new_arch.encode("utf-8")))
+    print("wrote", LIVE, "(%d B)" % len(new_live.encode("utf-8")))
     print("wrote", MANIFEST)
 
 
@@ -186,12 +173,11 @@ def main_verify():
     first_head = next(i for i, ln in enumerate(live.split("\n")) if ln.startswith("### "))
     live_body = "\n".join(live.split("\n")[first_head:])
 
-    # pull each block's chunk out of its destination file by title position
     def chunks_by_title(body, titles):
-        starts = [m.start() for m in re.finditer(r"(?m)^### ", body)]
         out = {}
-        for i, s in enumerate(starts):
-            e = starts[i + 1] if i + 1 < len(starts) else len(body)
+        for i, s in enumerate([m.start() for m in re.finditer(r"(?m)^### ", body)]):
+            e = [m.start() for m in re.finditer(r"(?m)^### ", body)]
+            e = e[e.index(s) + 1] if e.index(s) + 1 < len(e) else len(body)
             title = body[s:body.find("\n", s)].rstrip("\r")
             if title in titles:
                 assert title not in out, "duplicate title: " + title
@@ -204,39 +190,45 @@ def main_verify():
     missing = [t for t in wanted if t not in got]
     assert not missing, "blocks missing from both files: %r" % missing
 
-    # reassemble pre-resplit live by original line order
-    ordered = sorted(wanted.values(), key=lambda b: b["orig_line_start"])
-    stripped = man.get("archive_terminator_stripped", False)
-    if stripped:
-        # the archive's EOF-terminator strip (git diff --check convention)
-        # removed the trailing blank of the ARCHIVE-FINAL chunk (the last
-        # archived block, NOT the orig-order-last block - measured: T-GPLR-51
-        # is archive-final while T-GPLR-52 is order-final). Restore it.
-        arch_titles_in_order = []
+    # Binding invariant: the archive body is the frozen record.
+    expected_arch = man.get("archive_body_sha256_lf")
+    if expected_arch:
+        got_arch = sha256(arch_body)
+        if got_arch != expected_arch:
+            print("archive body drift: %s vs expected %s" % (got_arch, expected_arch))
+            print("RESULT: FAIL")
+            sys.exit(1)
+        print("archive body: byte-exact vs apply-time record (%d B)" % len(arch_body.encode("utf-8")))
+    else:
+        print("(manifest predates the archive-body invariant; span checks only)")
+
+    # apply-time EOF strip removes one newline from the ARCHIVE-FINAL chunk
+    # (measured: not from the orig-order-last chunk); restore before spans
+    if man.get("archive_terminator_stripped") or not arch.endswith("\n\n"):
+        arch_titles = []
         for m in re.finditer(r"(?m)^### ", arch_body):
             s = m.start()
             t = arch_body[s:arch_body.find("\n", s)].rstrip("\r")
             if t in wanted:
-                arch_titles_in_order.append(t)
-        if arch_titles_in_order:
-            last_arch = arch_titles_in_order[-1]
-            if got[last_arch].endswith("\n"):
-                got[last_arch] += "\n"
+                arch_titles.append(t)
+        if arch_titles and got[arch_titles[-1]].endswith("\n"):
+            got[arch_titles[-1]] += "\n"
+
+    ordered = sorted(wanted.values(), key=lambda b: b["orig_line_start"])
     for b in ordered:
+        chunk = got[b["title"]]
         span = b["orig_line_end"] - b["orig_line_start"] + 1
-        lines = got[b["title"]].count("\n") + (0 if got[b["title"]].endswith("\n") else 1)
-        assert lines == span, "block span drift: %s (%d vs %d)" % (b["title"][:50], lines, span)
-    rebuilt = "".join(got[b["title"]] for b in ordered)
-    expected = man.get("pre_resplit_blocks_sha256_lf")
-    if expected is None:
-        expected = man["pre_resplit_live_sha256_lf"]
-        print("(manifest predates the blocks-only invariant; comparing whole-file hash)")
-    got_sha = sha256(rebuilt)
-    ok = got_sha == expected
-    print("reconstructed blocks (LF): %d B  sha256 %s" % (len(rebuilt.encode("utf-8")), got_sha))
-    print("manifest expected        : %s" % expected)
-    print("RESULT:", "PASS" if ok else "FAIL")
-    sys.exit(0 if ok else 1)
+        lines = chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
+        if b["dest"] == "archive":
+            assert lines == span, "ARCHIVED block span drift (frozen record): %s (%d vs %d)" % (
+                b["title"][:50], lines, span)
+        else:
+            if lines < span:
+                raise AssertionError("live block SHRANK below apply-time span: %s" % b["title"][:50])
+            print("live block %s: %d lines (apply-time %d - live growth allowed)" % (
+                b["title"][4:14], lines, span))
+    print("RESULT: PASS")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -245,12 +237,10 @@ if __name__ == "__main__":
     elif "--apply" in sys.argv:
         main_apply()
     else:
-        main_apply.__globals__["_dry"] = True
-        # dry-run: run the classify/print part only
         live = load(LIVE).replace("\r\n", "\n")
         blocks = tile(live)
         print("blocks:", len(blocks))
         for a, b in blocks:
             title = live[a:live.find("\n", a)].rstrip("\r")
-            print("  %s %s" % ("LIVE " if is_live_block(live, a, b) else "ARCH", title[:85]))
+            print("  %s %s" % ("LIVE" if is_live_block(live, a, b) else "ARCH", title[:85]))
         print("\n(dry run; --apply to move ARCH blocks, --verify to re-prove)")

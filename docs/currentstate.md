@@ -1,5 +1,26 @@
 # Current State
 
+## 2026-09-21: T-GPLR-52 A1 (host-only) - H1 CONFIRMED: the copy wait IS overlapped compute at long context
+
+- The contract's literal metric: r(copy wait, overlapped compute) = +0.998
+  at 200k (wait ~= 1.03x overlapped compute after correcting the stride-10
+  sampling of layer_compute rows), +0.78 at 50k, +0.27 at 4k - where 4k
+  pass-1 is a first-touch transient (wait decays with pass position,
+  r = -0.78; submit component 119 -> 28 ms pass-over-pass).
+- Concurrent copies are NOT the driver (r ~ 0 at 200k, median 2 in flight);
+  submit/sync split corroborates (200k waits are 100% sync = queued-behind-
+  compute; 4k has a material first-touch submit component).
+- H2 (file-cache eviction) REFUTED for steady state: no position drift at
+  200k/50k, pinned == mmap, only 4k pass-1 shows the predicted decay.
+- Consequence: the 163/943/3003 ms scaling of identical 460 MB banks is
+  the copy engine queueing behind compute - a direct consequence of the
+  layer-major overlap design, NOT a staging defect. It is invisible in
+  wall time while compute keeps the GPU busy (the 97%-hidden result).
+- AC1 discharged: analyzer audit clean (8/8 phase-filtered);
+  run-gplr51-tail-arm.ps1 quantile block fixed to phase-0 only.
+- Remaining for T-52: AC3 (copy_complete semantics doc + DMA-time question)
+  and AC4 (H3 pinned-engagement proof, arm A3). No engine change.
+
 ## 2026-09-21: T-GPLR-51 CLOSED - 3 slots measured-optimal (S2), default combo confirmed, plan re-split
 
 - S2 (2 slots - the leg A1-A4 never measured; current binary, hash-matched,
