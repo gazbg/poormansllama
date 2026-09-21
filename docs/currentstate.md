@@ -48,8 +48,17 @@ in-place rebuild path (pre-T-47 `build_patch_split` re-used accumulated contexts
 the first sampled chunks of pass 2 read slightly different probs. **The bug was REAL
 in compute** (pw-changed and pw-control TG streams differ from nopw from token 0;
 pw pass-2 chunk-7 differs deterministically and identically in both binaries) but
-**harmless to the graded answer** (both pw and nopw grade PASS 5/5 - the perturbation
-is too small to change top-k routing outcomes materially). T-GPLR-47's fresh-context
+**NOT harmless to the graded answer after all** (corrected 2026-09-21 when the
+T-GPLR-50 survey decoded the pw stream): the pw arm's TG stream is a
+DOCUMENT-ECHO derailment - `gplr49-4k-pw-changed-dec.json` grades **FAIL 0/5**
+(`The maintenance log for row ...` echo, no needle), not PASS as this entry
+first claimed. The graded answer stays protected because (a) rebuild-OFF + pw
+grades PASS 5/5 (`gplr49b-4k-pw-rebuild0`) and (b) nopw + rebuild-ON grades
+PASS (T-47 v1-on, ids identical to the nopw default stream), so the echo
+needs pw AND rebuild-ON TOGETHER (T-49b's attribution, now confirmed from the
+other side) - and every post-T-47 default-era gate run is clean. The
+T-GPLR-50 draft's AC2 re-runs this trigger on the current tree before any
+f16 rebuild-default flip completes. T-GPLR-47's fresh-context
 rebuild eliminated it: every post-T-47 trace is clean, including the within-session
 T-47 v1 control-vs-changed pair, which is the cleanest proof available. The T-48
 session's pbp1 arms are clean at 4k-default but anomalous at 50k/q8 because that
