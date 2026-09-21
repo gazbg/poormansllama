@@ -1,5 +1,23 @@
 # Current State
 
+## 2026-09-21: T-GPLR-52 A3 - H3 falsified with in-trace proof: pinned WAS engaged, no fallback ever existed (AC4 discharged)
+
+- run_start now carries ENGINE-DERIVED staging_source + staging_source_match
+  (nested 23e5d1b6e); both validators fail a mismatch/missing pair, legacy
+  traces stay admissible. Fixture-proven both ways before the GPU arms.
+- 200k A/B, same binary, clean gates: mmap p50 2984.4 ms / ready_wait 3.67 s
+  vs pinned p50 3062.7 ms / ready_wait 3.61 s, both arms
+  engine_staging_source match=1. H3's collapse prediction (pinned <= 0.5x
+  mmap) FALSIFIED at parity 1.03x.
+- F5 resolved: the staging path has no silent fallback by construction; the
+  T-51 A2 addendum needs no correction. The mmap banner in pinned-arm logs is
+  the model loader's message, orthogonal to staging.
+- Corroboration: the new binary reproduces baseline numbers exactly (p50
+  ~2984-3003 ms, ready_wait 3.67 s) - the assertion is performance-neutral.
+- Remaining T-52 items: AC3 (document copy_complete's host-wait semantics in
+  AGENT_ENVIRONMENT.md, or state why a true-DMA field is not measurable with
+  the current backend API) and AC5 closure.
+
 ## 2026-09-21: T-GPLR-52 A2 - H2 (file-cache eviction) FALSIFIED as a mechanism; the 50k falsifier is the discriminating datum
 
 - --pp-repeat 3 arms, baseline binary (hash-matches A1), clean GPU gates,

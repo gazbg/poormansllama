@@ -509,3 +509,35 @@ copy p50 = 31.5 ms (120 TG micro-copies dominate) where the true PP median is
 3003.2 ms - a 95x understatement of typical copy cost, the exact mechanism
 behind the T-51 tail-stat contamination (F1). AC1 remains discharged with the
 tooling now provably clean; any future copy stat must cite a phase filter.
+
+#### A3 result (2026-09-21, proven-active pinned A/B under the GPU mutex)
+
+Mechanism first: run_start now emits ENGINE-DERIVED staging_source (from the
+init state flags copy_src_reg_churn / copy_src_registered / use_pinned_staging,
+not an argv echo) plus staging_source_match vs the declared copy_source; both
+validators treat a mismatch or missing pair as FATAL, legacy traces stay
+admissible (nested commit 23e5d1b6e, gitlink 59a0266). Fixture-proven both
+ways before any GPU time: injected match=0 refused by --check-telemetry AND
+--validate-telemetry with the exact invariant message.
+
+Both arms PASS on the new binary, gpu_pre/post clean, 80 phase-0 copies,
+check-telemetry OK:
+
+| arm | engine staging_source | match | copy p50 | p90 | max | ready_wait | tok/s |
+|-----|----------------------|-------|----------|-----|-----|-----------|-------|
+| mmap-registered | mmap-registered | 1 | 2984.4 ms | 10734 ms | 10.80 s | 3.67 s | 1462/1485 |
+| pinned | pinned | 1 | 3062.7 ms | 10798 ms | 11.01 s | 3.61 s | 1459/1476 |
+
+H3 verdict (pre-registered bands): the collapse prediction (pinned p50 <=
+0.50 x mmap) is FALSIFIED - pinned was engaged (in-trace proof, match=1) and
+per-copy cost held at parity (1.03x). F5 is RESOLVED: no silent fallback
+exists in the staging path; the T-51 A2 pinned arm genuinely ran pinned, its
+mmap banner was the model loader's message, and the T-51 A2 addendum needs NO
+correction. AC4 discharged with in-trace proof instead of the assumed
+conclusion. The new binary reproduces the baseline numbers (p50 ~2984-3003 ms,
+ready_wait 3.67 s) - the one-field telemetry addition is performance-neutral.
+The staging_source assertion is now permanent: every future trace carries
+engine-proven staging identity, checker-enforced.
+
+Artifacts: build/llama-cuda/gplr52-a3-mmap.jsonl + .verdict.json,
+gplr52-a3-pinned.jsonl + .verdict.json; tools/run-gplr52-a3-arm.ps1.
