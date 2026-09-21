@@ -1089,3 +1089,96 @@ nested 40bca9f44), sentineled verdicts in build/llama-cuda/verdicts/gplr50-*:
 Verdicts: build/llama-cuda/verdicts/gplr50-*.verdict.json (+ .done sentinels);
 traces build/llama-cuda/gplr50-*.jsonl; contention evidence and the withdrawn
 P3 in docs/currentstate.md (2026-09-21 T-GPLR-50 entry).
+
+### T-GPLR-51 (draft): attack the EXPOSED transfer at the charter shape - copy-tail and hiding robustness at 200k
+
+Status: draft (2026-09-21) - awaiting owner decision. Evidence-gathering
+outside the plan so far: trace decompositions recorded in currentstate
+2026-09-21 (the two entries below this block) and the gplr51-4k-mmap probe.
+Depends on: T-GPLR-50 (closed; the current default binary), T-GPLR-37
+(copy-source default under test), T-GPLR-25 (async-feed hiding mechanism).
+Commit: (fill on completion)
+
+Motivation (measured, from today's 200k traces - NOT the 249 s bucket)
+: The 249 s transfer bucket at 200k is ~97% HIDDEN: wall 135.5 s ~= compute
+  133.3 s, exposed layer_ready_wait totals 3.67 s (2.7%), because the 3-slot
+  + async-feed pipeline overlaps staging with compute. The bucket also sums
+  OVERLAPPING per-event transfer durations (40 parallel copies, per-event
+  mean 6.2 s) and therefore overstates serial transfer time. Every quiet-GPU
+  shape today is compute-bound (200k 1476 tok/s, 144k q8 1961, 50k 2614).
+  What IS measured and wrong-shaped:
+    * Copy-tail pathology at 200k mmap-registered: per-copy p50 32 ms but
+      max 10.8 s (pass-1 mean ~74 MB/s per ~460 MB layer bank -
+      page-fault-driven file IO, not PCIe). The exposed 3.67 s is the
+      bubble residue of that tail; a colder file or a slower GPU generation
+      grows it (the charter's crowded case).
+    * Same-binary copy-source A/B never ran at 200k. At 4k (same binary,
+      same session class) mmap-registered beats pinned 2x: 3.3 vs 11.7
+      s/pass staged, warm tok/s 2582 vs 1824 (gplr51-4k-mmap vs
+      gplr50-4k-f16-default). The T-37 default is right at 4k; 200k is
+      untested same-binary (T-36's pinned 141.8 s was a different binary).
+    * b1 q8 at u1024 shows the same big-copy pattern as 200k pass 1 (40
+      copies/pass, mean 3.4 s) while 50k u512 pinned shows 160 small ones -
+      chunk-to-copy mapping differs by shape and is unexplained.
+
+Goal
+: Cut the EXPOSED transfer at 200k - layer_ready_wait below 1% of wall and
+  a bounded copy tail - and establish which copy-source hides better at the
+  charter shape on one binary, so the crowded/cold case inherits the
+  strongest hiding baseline. PP tok/s at 200k is NOT expected to move beyond
+  noise on a quiet GPU (compute-bound); the prize is robustness of the
+  hiding under the charter's priority-3 condition.
+
+Arms (all repeat 2, owner-invoked one at a time under the mutex, sentineled)
+: A1 200k mmap-registered (default) - EXISTS: gplr50-200k-on (baseline, no
+    rerun unless stale).
+  A2 200k pinned (same binary, --copy-source pinned) - the never-run
+    same-binary staging A/B at the charter shape.
+  A3 200k default + --layer-slots 4 (slot_vram 1.4 GiB of 24 GB today; a
+    4th slot deepens the staging pipeline against the 10.8 s tail).
+  A4 200k default + --pp-async-feed 0 (hiding-ablation control: how much of
+    the 97% hiding is the async worker vs the slot window alone).
+  A5 (optional, owner-gated) 200k default with a flushed file cache for a
+    best-effort cold-read datum; recorded as uncontrolled per the standing
+    Windows file-cache caveat.
+
+Pre-registered predictions (written before the arms run)
+: P1 A2 (pinned) exposes MORE wait than A1 at 200k (the 4k result inverts
+    at 391 ubatches because mmap amortizes page-fault IO across a much
+    longer pass) - falsified if pinned's ready_wait <= mmap's 3.67 s.
+  P2 A3 (4 slots) cuts exposed wait below 2 s and shrinks the copy tail's
+    p99.9 (max) by >= 30% vs A1 - falsified if the tail max stays > 7 s.
+  P3 A4 (no async feed) exposes >= 10x A1's wait (~40 s class) - falsified
+    below 5 s (would mean the slot window alone does the hiding).
+  P4 No arm moves pass tok/s beyond +/- 3% of 1464-1485 (compute-bound
+    prediction) - any bigger move is a finding about compute, not staging.
+
+Acceptance criteria (falsifiable)
+: AC1 A1/A2 same-binary pair completes with verdicts, check-telemetry clean,
+    and gpu_pre_run=clean; per-pass wall/compute/transfer + copy p50/max
+    recorded for both.
+  AC2 The exposed-wait metric (ready_wait total / wall) is < 1% for the
+    winning copy-source at 200k, or the failure is characterized per-shape
+    and the result recorded (an honest negative also closes the task).
+  AC3 The copy-tail ratio (max/p50) at 200k is explained by a named
+    mechanism (page-fault vs PCIe vs slot contention) with at least one
+    corroborating probe (e.g. pass-1 vs pass-2 pattern, or an
+    event-tracing run) - no speculative fix ships without it.
+  AC4 A4's ablation quantifies the async-feed contribution; the number is
+    recorded in currentstate regardless of direction.
+  AC5 No regression: every arm's 4k-proxy identity check (tg ids at the
+    4k shape when run) stays byte-identical to the recorded streams; the
+    200k arms carry tg 3 smokes and check-telemetry only.
+
+Non-goals
+: No engine change in this task unless AC3's mechanism names a one-site
+    fix (then it returns to the Planner with the evidence). No new
+    telemetry events; no KV-type change; no multi-GPU; no host-RAM
+    prefetch (T-GPLR-08 falsified); no readahead tuning inside this task.
+
+Escalation condition
+: If A2 (pinned) beats A1 at 200k - inverting the 4k result - the
+    copy-source default question reopens with a shape split and goes back
+    to the owner before any default change. If P4 falsifies (tok/s moves >
+    3%), stop and re-attribute before continuing: a staging change that
+    moves compute is a different defect.

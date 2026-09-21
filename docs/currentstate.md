@@ -1,5 +1,36 @@
 # Current State
 
+## 2026-09-21: Transfer-bucket decomposition at 200k + the 4k copy-source discriminator (T-GPLR-51 draft evidence)
+
+Attacking "the 249 s transfer bucket" required decomposing it first, from the
+T-GPLR-50 session traces (host-only, no new GPU time):
+
+* The bucket is ~97% HIDDEN: wall 135.5 s ~= compute 133.3 s; exposed
+  layer_ready_wait totals 3.67 s (2.7%) at 200k (3.61 s at 50k, 0.71 s at
+  b1 q8). The bucket sums OVERLAPPING per-event copy durations (40 parallel
+  copies in flight; per-event mean 6.2 s), so it is not serial wall time.
+  On a quiet GPU every shape is compute-bound (200k 1476 tok/s, 144k q8
+  1961, 50k 2614) - the transfer lever buys wall time only where hiding
+  breaks (the tail, the cold file, fewer slots).
+* Copy-tail pathology at 200k mmap-registered: per-copy p50 32 ms, max
+  10.8 s; pass 1 runs 40 whole-bank copies (mean 6.2 s ~ 74 MB/s per 460 MB
+  layer bank - page-fault-class throughput), pass 2 runs 160 smaller ones
+  (p50 31 ms). The pass-1/pass-2 chunk-to-copy split differs by shape
+  (b1 q8 u1024 shows the pass-1 pattern; 50k pinned shows the small-copy
+  one) and is unexplained - recorded for T-GPLR-51 AC3.
+* Same-binary copy-source discriminator at 4k (new probe arm
+  gplr51-4k-mmap vs gplr50-4k-f16-default, same argv except --copy-source):
+  mmap-registered beats pinned ~2x - staged 18.3 GB in 3.3 vs 11.7 s/pass,
+  first-touch tok/s 1154 vs 708, warm 2582 vs 1824. At 200k the same-binary
+  pair has never run (T-36's pinned number was a different binary); it is
+  arm A2 of the draft.
+
+T-GPLR-51 drafted in the plan: five arms (existing-mmap baseline, same-binary
+pinned, 4 slots, async-feed ablation, optional cold-cache), predictions P1-P4
+pre-registered, AC1-AC5 falsifiable. Honest target: exposed wait < 1% of wall
+and a mechanism-explained copy tail - NOT the bucket total, which the
+3-slot pipeline already hides.
+
 ## 2026-09-21: Clean PP/TG reference numbers for the current binary (T-GPLR-50 session)
 
 All numbers from today's sentineled, GPU-gate-era traces (binary exe
