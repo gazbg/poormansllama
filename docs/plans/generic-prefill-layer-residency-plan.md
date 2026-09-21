@@ -912,13 +912,14 @@ Run result (2026-09-17): INCOMPLETE — deterministic pass-2 crash in BOTH arms.
 
 ### T-GPLR-50 (draft): make the f16 rebuild default follow the charter shape — ON where the pass-2 excess is measured (flip the T-GPLR-48 f16 default back to ON)
 
-Status: draft (2026-09-21) — awaiting owner decision (escalated in currentstate
-2026-09-21: "the f16 KV-conditional default costs ~+65 s per pass-2 at 200k vs
-rebuild ON; a default re-decision is an owner call").
+Status: done (2026-09-21) - all acceptance criteria validated; the RESULT block
+below records the measured outcome, including the P3 premise failure that
+re-attributes the recorded +67.4 s pass-2 excess to GPU contention.
 Depends on: T-GPLR-48 (the default being changed), T-GPLR-47 (the fresh-context
 rebuild that makes rebuild-ON cheap and correct), T-GPLR-46 (the regression
 evidence this reverses), T-GPLR-49b (the echo-attribution the validation reuses).
-Commit: (fill on completion)
+Commit: nested 40bca9f44 (engine flip); outer harness/gitlink and plan/state
+commits follow in the outer repo (hashes: git log after 2026-09-21).
 
 Survey context (why this is the highest-value remaining PP lever)
 : With T-GPLR-39 closed, the recorded host ledgers leave exactly one lever whose
@@ -1042,3 +1043,49 @@ Escalation condition
   flip; if AC3 fails (excess persists with rebuild ON on the current tree),
   the pass-2 excess is a NEW defect distinct from T-46's — escalate with the
   ledger rather than tuning.
+
+#### RESULT (2026-09-21): SHIPPED - flip validated; the motivating excess was GPU contention, not the rebuild-OFF path
+
+All arms on the changed binary (exe 1B08B382ACA4694D / dll B540024042E8B1F2,
+nested 40bca9f44), sentineled verdicts in build/llama-cuda/verdicts/gplr50-*:
+
+* AC2 (echo trigger, pre-flip): pw + rebuild-ON on the CURRENT tree ANSWERS -
+  gplr50-ac2-pw-on grades PASS 5/5 (needle intact); pw-OFF also PASS. The T-49b
+  echo did not reproduce post-T-49; the escalation branch never fired. AC6
+  discharged: qa-smoke 512 rung PASS with the negative control failing as designed.
+* AC1 (identity): the 4k f16 default arm's 96 greedy tg ids are byte-identical to
+  BOTH recorded references (T-47 v1-on rebuild-ON and gplr48-a4 rebuild-OFF) and
+  to every other 4k arm in the set - the flip moves no token.
+* AC5 (provenance): default resolves pp_prebuild_per_pass=1 source=default on f16
+  (gplr50-4k-f16-default, gplr50-50k-f16-default) and q8 (gplr50-b1-q8-default);
+  explicit 0 -> 0/explicit (gplr50-ac2-pw-off), explicit 1 -> 1/explicit
+  (gplr50-expl-on); the pre-T-50 control resolves 0/default on f16 with the T-48
+  announcement and zero T-50 markers (gplr50-ctl-4k-f16), 1/default on q8
+  (gplr50-ctl-4k-q8). Cosmetic note: q8 default arms now announce "default since
+  T-GPLR-50" although the q8 VALUE dates to T-GPLR-48 (one announcement text for
+  both branches; recorded in currentstate).
+* AC4 (no collateral): 50k f16 pass-2 compute 17.795 s vs 17.813 s pass-1 (-0.1%);
+  b1 q8 72.52 s vs 73.27 s (-1.0%). Both inside the +5% guard.
+* AC3 (200k confirmation): single-binary A/B pair under ONE mutex hold, remeasure
+  shape verbatim (tools/run-gplr50-200k-pair.ps1): OFF (explicit 0) pass-2 compute
+  134.24 s vs pass-1 135.06 s (excess -0.81 s); ON (default) 134.67 s vs 136.14 s
+  (-1.47 s). P1 PASSES (|excess| <= 5 s in both states). P3's PREMISE FAILED: the
+  recorded +67.4 s rebuild-OFF excess (gplr36-remeasure-200k, pre-T-50 binary) DID
+  NOT REPRODUCE on the byte-equivalent engine path. Re-attribution: that
+  remeasure's pass-2 carried uniformly-inflated layer_compute with normal
+  transfer ratios - the contention signature reproduced exactly by two ctest
+  fixtures that crashed (teardown cudaFree OOM) while deepseek_v4.exe held
+  ~16.5 GiB VRAM DURING this project's own mutex-held host suite; both fixtures
+  PASS on rerun under a free GPU (234.9 -> 19.1 s, 148.5 -> 11.3 s). The GPU
+  mutex does not exclude non-conforming projects. Consequence: the flip's
+  charter value is unrealized-today (nothing to reclaim at 200k on a quiet GPU),
+  but the default is still the correct posture: neutral where quiet (measured),
+  and it reclaims the excess automatically if a genuine rebuild-path regression
+  ever reappears (the T-46-class cause).
+* Host suite: 68/70 on the changed binary after contention reruns - the two
+  remaining failures are the documented pre-existing --layer-slots 1 refusal
+  pair. Doc-size guard PASS.
+
+Verdicts: build/llama-cuda/verdicts/gplr50-*.verdict.json (+ .done sentinels);
+traces build/llama-cuda/gplr50-*.jsonl; contention evidence and the withdrawn
+P3 in docs/currentstate.md (2026-09-21 T-GPLR-50 entry).

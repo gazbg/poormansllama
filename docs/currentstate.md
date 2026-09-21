@@ -1,5 +1,42 @@
 # Current State
 
+## 2026-09-21: T-GPLR-50 CLOSED - f16 rebuild default flipped ON; the +67.4 s 200k pass-2 excess RE-ATTRIBUTED to GPU contention
+
+Shipped: --pp-prebuild-per-pass now defaults ON whenever --pp-repeat > 1 for
+EVERY KV type (f16 included) - nested commit 40bca9f44. Announcement cites
+T-GPLR-50; explicit 0/1 unchanged; --pp-repeat 1 stays rebuild-OFF. Validation:
+AC1 identity (96 tg ids byte-identical to T-47 v1-on AND gplr48-a4), AC5 full
+provenance matrix incl. the control INV1 (control shows 0/default on f16, no
+T-50 marker), AC4 neutral at 50k f16 (-0.1%) and b1 q8 (-1.0%), AC2 pw+rebuild-ON
+ANSWERS on the current tree (no echo; the escalation branch never fired), AC6
+qa-smoke PASS with the negative control failing as designed, host suite 68/70
+(= the T-48 baseline; the 2 fails are the documented --layer-slots 1 refusals).
+Full evidence table in the plan's T-GPLR-50 RESULT block.
+
+The AC3 finding that outlives the flip: in a single-binary A/B pair under one
+mutex hold (explicit-0 vs default, remeasure shape verbatim, 200k/f16/tg 3),
+BOTH states came back pass-2-neutral (excess -0.81 s OFF / -1.47 s ON, two-pass
+wall ~270 s both) - the recorded +67.4 s (+48.9%) rebuild-OFF excess from
+gplr36-remeasure-200k did not reproduce on the byte-equivalent engine path (the
+pre-T-50 binary's explicit-0 resolves and executes identically to today's
+explicit-0; the only difference is the session). Classification evidence:
+(a) that remeasure's pass-2 shows uniformly-inflated layer_compute with normal
+transfer ratios - the contention signature; (b) the same signature crashed two
+ctest fixtures (teardown cudaFree OOM, 0xc0000409) while deepseek_v4.exe held
+~16.5 GiB VRAM DURING this project's own mutex-held host suite - both fixtures
+PASS on a free-GPU rerun (234.9 -> 19.1 s, 148.5 -> 11.3 s). Conclusion: the GPU
+mutex Global\AI-GPU-EXCLUSIVE-v1 is cooperative and does not exclude
+non-conforming projects; single-session 200k timings taken while another
+project was active are contaminated. The 2026-09-21 remeasure entry's "rebuild
+OFF costs +67.4 s" claim and T-GPLR-50's P3 wall prediction are WITHDRAWN as
+confounded; the flip stands on P1/P2/P4 + the identity/provenance gates, and it
+remains the correct posture (measured-neutral on a quiet GPU; reclaims the
+excess automatically if a genuine rebuild-path regression ever reappears).
+
+Also recorded: q8 default arms now announce "default since T-GPLR-50" although
+the q8 VALUE dates to T-GPLR-48 (one announcement for both branches; cosmetic).
+New harness: tools/run-gplr50-200k-pair.ps1 (one-mutex-hold A/B, P1/P3 gates).
+
 ## 2026-09-21: T-GPLR-50 DRAFTED — the survey answer to "highest-value remaining PP lever": flip the T-48 f16 rebuild default back to ON (owner decision pending)
 
 Survey (plan + currentstate, post-T-39): the remaining named levers are
