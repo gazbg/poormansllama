@@ -1252,3 +1252,109 @@ remains owner-invoked optional. The staging-bound framing of the reference
 table stands: PP at 200k is compute-bound on a quiet GPU; the exposed
 transfer floor (~2.7%) is the cost of staging 18.3 GB twice per run under a
 97%-efficient hiding pipeline.
+
+### T-GPLR-52 (draft): attribute the shape-dependent per-copy staging cost (identical bytes, 18x wall) and correct the T-GPLR-51 copy-tail framing
+
+Status: draft (2026-09-21)
+Dependencies: T-GPLR-51 (closed; its A2/A3/A4 verdicts and framing are inputs and correction targets)
+Commit:
+
+Goal. Explain, with a named mechanism and pre-registered discriminators, why two
+whole-bank copies of the SAME ~460 MB routed-expert bank in the same binary show
+host-observed per-copy costs of 163 ms (4k prompt), 943 ms (50k), and 3003 ms
+(200k). Secondary: establish what copy_complete actually measures and put an
+instrument beside it that future staging claims can trust.
+
+Established facts (host-only re-decomposition of existing traces, 2026-09-21):
+
+- F1 - Staging granularity is shape-invariant: exactly 2 copy events per layer
+  per PP pass (one per whole routed-expert bank) in EVERY recent trace (200k,
+  144k, 50k, 4k, 512). The earlier "fractional copies per layer / chunking
+  differs by shape" reading lumped phase-1 (TG) copy events into phase-0 (PP)
+  stats. There is no 40-vs-160 chunking to explain.
+- F2 - Per-copy host cost scales with prompt length, not bytes: median PP copy
+  163 ms (4k) -> 943 ms (50k) -> 3003 ms (200k), an 18x swing for identical
+  bank bytes. At 4k, pass-2 halves vs pass-1 (109 vs 285 ms); at 200k it does
+  not (3003 vs 3007 ms).
+- F3 - Heavy-layer byte correlation (layers 24-39 vs 0-23) is ~1.15-1.16 in the
+  200k regime but ~1.06/1.01 at 4k - byte-proportionality exists only when
+  copies are slow.
+- F4 - copy_complete is a HOST-side event wait (wait_slot_ready):
+  transfer_us = host_submit_us + ready_latency_us = enqueue + sync time, NOT
+  DMA duration. It legitimately includes waiting behind concurrent compute and
+  other queued copies. Every T-51 tail statistic (p50/max) is therefore
+  host-observed cost, not transfer time; the A2/A3/A4 "exposed wait" numbers
+  remain valid (they measure the same wait) but the "copy tail" framing is
+  instrument-limited.
+- F5 - A2's pinned arm shows mmap-identical 3.0 s medians at 200k, but its log
+  retains the mmap banner ("expert banks in host mmap", load_mode = mmap) and
+  the trace carries only copy_source=pinned, no in-trace proof the pinned pool
+  was active. The engine has separate pinned machinery (--pp-set-pp-pool
+  REQUIRES --copy-source pinned), which the A2 arm did not pass. If pinned
+  silently fell back to the registered-mmap pool, the A2 "source-independent
+  tail" attribution is unfounded.
+
+Hypotheses (pre-registered; state which prediction each arm tests BEFORE it runs):
+
+- H1 (queue-wait behind compute): the host wait grows because per-ubatch
+  compute grows with prompt length and the copy event fires only after the
+  copy engine gets the bus. Prediction: per-copy transfer_us correlates with
+  concurrently-overlapping compute, not with bytes; true DMA duration would be
+  near the 4k regime at all shapes.
+- H2 (file-cache eviction on the registered mapping): pass-1 copies fault
+  file pages at disk-class rate; effective 18.3 GB / ~250 s = ~73 MB/s matches
+  disk-class read throughput. Prediction: at shapes whose working set survives
+  in the Windows file cache (4k), later passes halve; at 200k the far-ahead
+  pages are evicted before use, so every pass stays slow regardless of pass
+  index or copy source reading the file.
+- H3 (pinned never engaged): A2's arm exercised the mmap path. Prediction:
+  with in-trace proof of an active pinned pool, 200k per-copy cost collapses
+  toward the 4k regime (RAM-speed source), refuting the file-read component of
+  H2 and correcting the T-51 A2 verdict.
+
+Discriminating arms (each owner-invoked, GPU mutex, ~5 min; A1 first is
+host-only and free):
+
+- A1 (host-only): from existing traces, correlate per-copy transfer_us with
+  the compute window it overlaps (layer_compute rows inside the copy interval)
+  and with the copy queue's concurrent copy count. AC: a per-shape attribution
+  table; if transfer_us ~ overlapped compute, H1 is confirmed without any new
+  binary.
+- A2 (warm/eviction probe): run the charter shape with --pp-repeat 3 (200k and
+  50k) and build the pass-index vs median-copy table. H2 predicts pass-3
+  ~ pass-2 at 200k (evicted) but a drop at 50k if its working set survives.
+  AC: the table plus a verdict per H2's prediction.
+- A3 (proven-active pinned): add an in-trace pinned_active assertion (staging
+  pool address range check, or the set-pp-pool path) and rerun the 200k
+  copy-source A/B. AC: trace carries pinned_active=true; medians compared
+  against the mmap baseline settle H3 and correct the T-51 A2 addendum.
+
+Acceptance criteria:
+
+- AC1: the 40-vs-160 premise is corrected in the plan (this block) and
+  currentstate; tracked analyzers that report PP staging stats are verified to
+  split phase-0 (PP) from phase-1 (TG) copy events or to label the mixture.
+- AC2: a named mechanism explains the 163/943/3003 ms scaling, supported by at
+  least two independent discriminators from A1-A3, each prediction recorded
+  before its arm runs.
+- AC3: copy_complete's semantics (host-observed wait = enqueue + sync) are
+  documented in AGENT_ENVIRONMENT.md, and either a true-DMA field lands behind
+  the experimental gate or the doc states why it cannot be measured with the
+  current backend API.
+- AC4: the pinned-active question is settled with in-trace proof, and the
+  T-GPLR-51 A2 addendum is corrected if a fallback is confirmed.
+- AC5: closure follows the established pattern: plan RESULT block + commit
+  hashes, currentstate entry, doc-size guard PASS.
+
+Non-goals: no placement, routing, or package-content change; no performance
+tuning based on an unproven mechanism; no new dependency; TG-phase copy
+accounting is excluded from PP stats but not otherwise studied.
+
+Focused validation: the host-only decomposition script from the drafting
+session (AC1); owner-invoked mutex arms with the busy-gate verdict pattern
+(A1-A3); python tools/check-doc-sizes.py after doc edits.
+
+Escalation: if A1-A3 all fail to discriminate, present the three-way evidence
+table to the owner with the option of instrumenting backend-level copy timing
+(backend API dependency question) or closing the question as
+instrument-limited.

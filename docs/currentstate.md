@@ -1,5 +1,29 @@
 # Current State
 
+## 2026-09-21: Copy-tail follow-up - "40 vs 160" premise CORRECTED; the real anomaly is per-copy cost scaling with prompt length
+
+Re-decomposition of copy_complete across all recent traces (host-only, no GPU):
+
+- Staging granularity is shape-invariant: 2 whole-bank copies/layer/pass in
+  every trace (200k/144k/50k/4k/512). The "fractional copies per layer" note in
+  the T-GPLR-51 drafting session lumped phase-1 (TG) events into phase-0 (PP).
+- Per-copy host cost scales with prompt length for IDENTICAL bytes: median PP
+  copy 163 ms (4k) / 943 ms (50k) / 3003 ms (200k). 4k pass-2 halves vs pass-1;
+  200k is pass-invariant. Heavy-layer ratio 1.15-1.16 at 200k, ~1.0 at 4k.
+- copy_complete is a HOST event wait (enqueue + sync), not DMA time; the
+  T-GPLR-51 "copy tail" statistics are host-observed cost, not transfer time.
+  The exposed-wait (layer_ready_wait) numbers from A2/A3/A4 remain valid.
+- A2's pinned arm shows mmap-identical costs and its log retains the mmap
+  banner; pinned-active is unproven in-trace (the separate --pp-set-pp-pool
+  machinery requires --copy-source pinned and was not passed). If pinned fell
+  back to the registered pool, "source-independent tail" is unfounded.
+
+T-GPLR-52 drafted with pre-registered H1 (queue-wait behind compute) /
+H2 (file-cache eviction, ~73 MB/s effective read rate) / H3 (pinned never
+engaged) and arms A1 (host-only overlap correlation) / A2 (--pp-repeat 3
+pass-index table) / A3 (proven-active pinned with in-trace assertion). No
+engine change until a mechanism is named.
+
 ## 2026-09-21: T-GPLR-51 A3/A4 verdict - copy-tail question CLOSED (structural); async-feed redundant at 200k; 4 slots worse
 
 Arms (same binary, clean-gated): A3 (--layer-slots 4) FALSIFIED P2 - pass-1
