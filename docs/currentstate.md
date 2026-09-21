@@ -1,5 +1,21 @@
 # Current State
 
+## 2026-09-21: T-GPLR-52 A2 - H2 (file-cache eviction) FALSIFIED as a mechanism; the 50k falsifier is the discriminating datum
+
+- --pp-repeat 3 arms, baseline binary (hash-matches A1), clean GPU gates,
+  mmap-registered explicit at BOTH shapes (the recorded 50k baseline ran
+  pinned, possibly never engaged per F5): 200k pass p50 3002.9/2996.2/3007.7 ms
+  (flat, tok/s 1458/1483/1480); 50k pass p50 771.2/758.5/760.3 ms (flat, tok/s
+  2420/2741/2738).
+- The 200k confirmation band is NON-DISCRIMINATING (H1 predicts flat there
+  too - per-pass compute is flat and r(wait, compute) = +0.998); the 50k
+  survivor prediction (pass-3 <= 0.85 x pass-2) is FALSIFIED. Combined with
+  A1's first-touch re-explanation of 4k, H2 retains no discriminating
+  evidence at any shape: eviction is not the mechanism behind per-copy cost;
+  queued-behind-compute (H1) is.
+- Scope note: A2 did NOT re-test copy source (both arms mmap); the
+  pinned-engagement question (H3/AC4) remains A3's, owner-invoked.
+
 ## 2026-09-21: T-GPLR-52 A1 (host-only) - H1 CONFIRMED: the copy wait IS overlapped compute at long context
 
 - The contract's literal metric: r(copy wait, overlapped compute) = +0.998

@@ -460,3 +460,40 @@ The contract's literal metric, per shape:
   tool mixing TG copy events into PP stats - fixed in this commit;
   run-gplr44-dump-50k.ps1 counts events only (phase-agnostic by design,
   noted, no fix needed).
+
+#### A2 result (2026-09-21, --pp-repeat 3 arms under the GPU mutex)
+
+Both arms PASS on the baseline binary (exe 1B08B382ACA4694D / dll B540024042E8B1F2,
+matches-A1 true), gpu_pre/post_run = clean, check-telemetry OK, 120 phase-0 copies
+verified in-trace, copy_source mmap-registered EXPLICIT at both shapes (the recorded
+50k baseline ran pinned, which F5 flags as possibly-never-engaged - A2 had to
+exercise the file-read path to test H2 at all).
+
+| shape | pass-1 p50 | pass-2 p50 | pass-3 p50 | 1->2 | 2->3 | tok/s (p1/p2/p3) |
+|-------|-----------|-----------|-----------|------|------|------------------|
+| 200k  | 3002.9 ms | 2996.2 ms | 3007.7 ms | +0.2% | -0.4% | 1458/1483/1480 |
+| 50k   |  771.2 ms |  758.5 ms |  760.3 ms | +1.6% | -0.2% | 2420/2741/2738 |
+
+Verdict per the pre-registered bands:
+- 200k: pass-3 ~ pass-2 (0.4%) -> band CONFIRMED. BUT this arm does not
+  discriminate: H1 predicts pass-3 ~ pass-2 here too (per-pass compute is flat
+  134.2/134.2/134.4 s and A1's r = +0.998 law makes copy waits track it). A
+  confirmed H2 prediction that H1 also makes is not H2 evidence.
+- 50k: pass-3 ~ pass-2 (0.2%) -> the survivor prediction FALSIFIED. This is the
+  discriminating datum: H2 predicted pass-3 <= 0.85 x pass-2 if the ~18 s pass's
+  working set survives in the file cache; H1 predicts flat (per-pass compute
+  flat ~17.6 s after the pass-1 first-touch). Measured flat. With 4k's pass-2
+  halving already re-explained by A1 as a first-touch submit transient
+  (119 -> 28 ms), H2 retains NO discriminating evidence at any tested shape:
+  not at 4k (first-touch), not at 50k (falsified), not at 200k
+  (non-discriminating).
+- H2 (file-cache eviction as the mechanism behind per-copy cost) is CLOSED as
+  refuted for the steady state and unnecessary elsewhere; H1 stands as the
+  single surviving mechanism, pending only A3's pinned-engagement proof (H3),
+  which can only ADD corroboration to the source-independence H1 already
+  showed.
+
+Artifacts: build/llama-cuda/gplr52-a2-200k.jsonl + .verdict.json,
+gplr52-a2-50k.jsonl + .verdict.json; tools/run-gplr52-a2-arm.ps1 (in-trace band
+evaluation), tools/analyze-gplr52-a2.py (host-only table re-derivation; self-test
+PASS on 4 synthetic bands + loud count refusal).
