@@ -1,5 +1,41 @@
 # Current State
 
+## 2026-09-21: Anomaly sweep, host-only on existing traces: 4 of 5 explained, 1 open unknown (pass-1 exposed gap); recon gen off-by-one logged as a hygiene task
+
+Sweep over gplr52-a3-mmap/pinned, gplr52-a2-50k/200k, gplr50-200k-on (no GPU
+time). Findings, each pinned to numbers:
+
+1. Pinned-arm 1485.6 ms GPU window (REAL, benign): 2 of 83 recon windows
+   exceed 100 ms (layer 36 = 1485.6, layer 0 = 140.1); mmap max is 36.3 ms;
+   both arms p50 31.5 ms. One window, one layer, one arm - likely queueing
+   behind a compute kernel inside the bracketed window. Not a source
+   signature; leave alone unless it reproduces.
+2. recon 85/83 windows vs 80 PP copies: integrity OK. Every PP copy has
+   exactly one window (zero duplicates); the remainder are TG-phase brackets
+   plus one unbracketed first PP copy.
+3. Layer-0 sub-100 ms host waits (mmap arm only - pinned arm min is 123.2 ms):
+   31.4/33.7 ms == copy_gpu_ms 31.5, because layer 0 stages while the compute
+   stream is still empty at the pass boundary. Not an anomaly: the H1 law
+   (wait = queued compute + DMA) seen with zero queue.
+4. HYGIENE TASK (new): recon_attr.generation and copy_complete.generation
+   label the SAME physical copy off by exactly one - join exact=0, join at
+   gen+1 = 79/85, 118/125, 79/87 across the three traces. Harmless for
+   medians, silently breaks any cross-event join. Fix: align one side or add
+   a shared copy_id; until then every cross-event join must pin the offset.
+5. OPEN UNKNOWN - pass-1 exposed gap: phase_summary unaccounted (wall -
+   compute - wait) is 2.35 s at 50k pass-1 (0.16 s later) and 2.88/2.13 s at
+   200k pass-1 (0.64 s later). Closes the tok/s jump arithmetic exactly
+   (50k 2419->2740 = +13.3%; 200k ~+1.1-1.7%). Both staging and compute are
+   flat across passes, so it is neither; same order as the 4k first-touch
+   submit transient (119->28 ms, A1). Candidate: first-touch
+   registration/page-warming of the staging path. Draft T-GPLR-53 with the
+   decay-with-chunk-index discriminator (host-only first).
+
+Honest refinements vs the sweep as first reported: the pinned arm shows NO
+sub-100 ms host wait (layer-0 min 123.2 ms), so the collapse-to-DMA
+signature is observed only in the mmap arm; and the off-by-one join was
+re-verified exact=0 on all three traces, not just one.
+
 ## 2026-09-21: T-GPLR-52 AC3 - true-DMA timing was possible all along (recon copy_gpu_ms); DMA = 1% of host cost
 
 - copy_complete semantics documented in AGENT_ENVIRONMENT.md: host-side event
