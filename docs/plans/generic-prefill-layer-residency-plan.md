@@ -541,3 +541,29 @@ engine-proven staging identity, checker-enforced.
 
 Artifacts: build/llama-cuda/gplr52-a3-mmap.jsonl + .verdict.json,
 gplr52-a3-pinned.jsonl + .verdict.json; tools/run-gplr52-a3-arm.ps1.
+
+#### AC3 result (2026-09-21, host-only; the AC's either/or resolved as "possible - and already built")
+
+The AC asked for documentation of copy_complete's host-wait semantics PLUS
+either a true-DMA field behind the gate or a documented impossibility. The
+code read found a third, better branch: the vendored tree ALREADY carries the
+instrument. T-GPLR-35's recon (--pp-recon 1, default in every recorded arm)
+brackets each bank's DMA with TIMING-ENABLED CUDA events
+(ggml_backend_cuda_timing_event_* on the stream that carries the DMA; regular
+ggml events are cudaEventDisableTiming and cannot measure) and emits
+recon_attr events with copy_gpu_ms.
+
+The answer from data that already existed (gplr52-a3 A/B traces, no new GPU
+time): true DMA of a ~460 MB bank is copy_gpu_ms p50 = 31.5 ms (~14.6 GB/s
+PCIe), IDENTICAL for mmap-registered and pinned sources, heavy layers 36.3 ms
+= exactly the byte ratio (522/453 x 31.5). The DMA is ~1.0-1.1% of the
+host-observed copy_complete cost (2984-3063 ms): ~99% is queueing behind
+compute, corroborating H1 from the GPU clock side and retroactively
+explaining the T-51 "10.9 s copy tail" as host-wait queueing, not transfer.
+
+Discharged: the semantics section is now in AGENT_ENVIRONMENT.md
+("copy_complete host-wait semantics", incl. the phase-split discipline and
+the A3 staging_source assertion), with the rule: copy_gpu_ms for wire time,
+transfer_us for host cost, never mixed in one statistic. T-51's tail
+attribution now carries the correction pointer: those numbers were host-wait
+distributions all along.

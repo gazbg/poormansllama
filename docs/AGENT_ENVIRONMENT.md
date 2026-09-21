@@ -1040,6 +1040,40 @@ always the verdict, never the marker. And the verdict is still written from a
 **termination handler**, not a watchdog: a hard-killed process writes no verdict,
 which is why its state is `died` rather than `finished` — an absent sentinel must
 never be reported as a passing run.
+## copy_complete host-wait semantics (T-GPLR-52 AC3, 2026-09-21)
+
+`copy_complete` is a HOST-side event-wait measurement, not DMA time. It is
+produced in `wait_slot_ready` (llama-layer-streaming.cpp): the host blocks on
+the slot's `ev_copy_ready` and reports
+
+    transfer_us     = host_submit_us + ready_latency_us
+    host_submit_us  = enqueue time (t_copy_enqueue_done - t_copy_submit)
+    ready_latency_us= the blocking wait (event sync return - enqueue done)
+
+Because the copies are enqueued ASYNC on the copy stream while the compute
+stream runs ahead, `transfer_us` legitimately includes standing behind
+concurrent compute and queued copies. The measured law (T-52 A1, r = +0.998
+at 200k): the wait IS overlapped compute; per-copy cost scales with prompt
+length for identical bytes (163/943/3003 ms at 4k/50k/200k). Every staging
+number derived from copy_complete is therefore "host-observed cost", never
+wire time. Phase discipline: PP stats must filter copy_complete to phase=0;
+TG micro-copies (phase=1) drag p50 by orders of magnitude (measured 95x at
+200k, the T-51 contamination). Since the T-GPLR-52 A3 commit, run_start also
+carries ENGINE-DERIVED staging_source + staging_source_match; both telemetry
+validators refuse a mismatch, so a trace's staging identity is provable, not
+assumed.
+
+True-DMA timing IS possible and already exists: the T-GPLR-35 recon
+instrument (--pp-recon 1, default in recorded arms) brackets each bank's DMA
+with timing-enabled CUDA events and emits `recon_attr` events with
+`copy_gpu_ms` (GPU clock, on the stream that carries the DMA). Measured at
+200k on the A3 binary: copy_gpu_ms p50 = 31.5 ms (~14.6 GB/s over PCIe),
+identical for mmap-registered and pinned sources, heavy layers 36.3 ms =
+exactly the byte ratio. The DMA is ~1.0-1.1% of the host-observed copy cost -
+the other ~99% is queueing behind compute. Copy-queue-vs-DMA confusion is
+over: cite copy_gpu_ms for wire time, transfer_us for host cost, and never
+mix them in one statistic.
+
 
 ## Canonical Build Commands
 

@@ -1,5 +1,20 @@
 # Current State
 
+## 2026-09-21: T-GPLR-52 AC3 - true-DMA timing was possible all along (recon copy_gpu_ms); DMA = 1% of host cost
+
+- copy_complete semantics documented in AGENT_ENVIRONMENT.md: host-side event
+  wait (submit + sync), phase-split discipline, staging_source assertion.
+- The "true-DMA field or impossibility" either/or resolved: T-GPLR-35's recon
+  (--pp-recon 1, default in recorded arms) already emits copy_gpu_ms from
+  timing-enabled CUDA events on the DMA's own stream.
+- Measured from the existing A3 traces (no new GPU time): DMA p50 31.5 ms
+  (~14.6 GB/s), source-identical, heavy-layer 36.3 ms = byte ratio; DMA is
+  1.0-1.1% of the 2984-3063 ms host-observed cost - ~99% is queueing behind
+  compute (H1 corroborated from the GPU side; T-51's "copy tail" was
+  host-wait, not transfer).
+- Remaining T-52 item: AC5 closure (RESULT block, Status, commit hashes,
+  index resplit).
+
 ## 2026-09-21: T-GPLR-52 A3 - H3 falsified with in-trace proof: pinned WAS engaged, no fallback ever existed (AC4 discharged)
 
 - run_start now carries ENGINE-DERIVED staging_source + staging_source_match
