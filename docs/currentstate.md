@@ -1,5 +1,24 @@
 # Current State
 
+## 2026-09-21: T-GPLR-51 A2 verdict - copy-source stays mmap at 200k; the 10.9 s copy tail exists in BOTH sources (structural, not page-fault)
+
+Arm A2 (gplr51-a2-pinned, 200k f16, 3 slots, repeat 2, tg 3, shape verbatim
+vs the A1 baseline, only --copy-source pinned changed): PASS verdict,
+check-telemetry clean, gpu_pre_run/post_run both clean. Exposure is EQUAL
+(ready_wait 3.62 s pinned vs 3.67 s mmap; ~2.7% of wall) - P1 falsified, no
+inversion, the copy-source default does not reopen. tok/s 1477/1456 vs band
+1464-1485 +/- 3% (P4 held; compute-bound again). mmap keeps its typical-copy
+advantage (p50 31.5 vs 75.8 ms).
+
+The sharp finding: the ~10.9 s worst-case copy exists in BOTH sources (10.82
+mmap / 10.97 pinned). Pinned never reads the file during the pass, so the
+tail is not the mmap page-fault path - it is structural (staging queueing /
+slot contention / PCIe congestion with parallel copies). This redirects
+T-GPLR-51: A3 (4 slots) is the prime tail probe; the page-fault mechanism
+remains only the pass-1 whole-bank-copy pattern (40 copies at ~74 MB/s).
+AC2 (< 1% exposed wait) unmet by both sources today. A3/A4 remain
+owner-invoked.
+
 ## 2026-09-21: Transfer-bucket decomposition at 200k + the 4k copy-source discriminator (T-GPLR-51 draft evidence)
 
 Attacking "the 249 s transfer bucket" required decomposing it first, from the

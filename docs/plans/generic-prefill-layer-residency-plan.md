@@ -1182,3 +1182,34 @@ Escalation condition
     to the owner before any default change. If P4 falsifies (tok/s moves >
     3%), stop and re-attribute before continuing: a staging change that
     moves compute is a different defect.
+
+#### A2 result (2026-09-21, arm run gplr51-a2-pinned): copy-source question CLOSED at 200k - mmap stays; the copy tail is NOT source-specific
+
+Same binary as the A1 baseline (exe 1B08B382ACA4694D / dll B540024042E8B1F2,
+hash-verified), same day, both verdicts gpu_pre_run=clean (the 001bf65 gate):
+
+| metric | A2 pinned | A1 mmap-registered |
+| --- | --- | --- | --- |
+| pass walls | 135.4 / 137.4 s | 136.6 / 135.1 s |
+| pass compute | 133.1 / 134.8 s | 134.4 / 134.4 s |
+| tok/s | 1477 / 1456 | 1464 / 1480 |
+| exposed ready_wait | 3.62 s | 3.67 s |
+| copy p50 | 75.8 ms | 31.5 ms |
+| copy max | 10.97 s | 10.82 s |
+
+* P1 FALSIFIED: pinned does not expose more wait at 200k (3.62 vs 3.67 s -
+  equal); the 4k inversion does not extend to exposure at 391 ubatches.
+* P4 HELD: tok/s inside the +/-3% band; compute-bound confirmed again.
+* mmap keeps the typical-copy advantage (p50 2.4x faster), consistent with
+  the 4k discriminator. The copy-source default does not reopen; per the
+  draft's escalation condition no inversion occurred.
+* NEW, sharper finding for AC3: the ~10.9 s copy tail exists in BOTH sources
+  (10.82 mmap / 10.97 pinned). Pinned staging never touches the file during
+  the pass (21.5 GiB pre-pinned at startup), so the tail cannot be the
+  mmap page-fault path - it is STRUCTURAL: staging-worker queueing /
+  slot-window contention / PCIe congestion with parallel copies. A3 (4
+  slots) is now the prime tail probe; the page-fault hypothesis is demoted
+  to the pass-1 pattern only (40 whole-bank copies at ~74 MB/s).
+
+Remaining arms: A3 (4 slots), A4 (async-feed ablation); AC2's < 1% exposed
+wait is not met by either source today (both ~2.7%).
