@@ -117,7 +117,9 @@ try {
         # copy distribution + the exposed-wait metric (P1's object)
         $t = @(); $lat = @()
         foreach ($ln in (Get-Content $trace)) {
-            if ($ln -like '*"event":"copy_complete"*') {
+            # T-GPLR-52 F1/AC1: PP phase-0 only - TG copy events (one micro-copy
+            # per layer per token) must not pollute PP staging stats.
+            if ($ln -like '*"event":"copy_complete"*' -and $ln -like '*"phase":0,*') {
                 $e = $ln | ConvertFrom-Json
                 $t += [double]$e.transfer_us
                 $lat += [double]$e.ready_latency_us

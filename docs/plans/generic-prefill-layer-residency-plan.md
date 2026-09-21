@@ -497,3 +497,15 @@ Artifacts: build/llama-cuda/gplr52-a2-200k.jsonl + .verdict.json,
 gplr52-a2-50k.jsonl + .verdict.json; tools/run-gplr52-a2-arm.ps1 (in-trace band
 evaluation), tools/analyze-gplr52-a2.py (host-only table re-derivation; self-test
 PASS on 4 synthetic bands + loud count refusal).
+
+AC1 re-audit (2026-09-21, post-A2): re-ran the phase-separation audit over all
+16 copy_complete-consuming tools after the A2 tools landed. 10 Python
+analyzers filter phase == 0 explicitly; the T-51 tail-arm/S2 arms and both A2
+tools filter correctly; run-gplr44-dump-50k.ps1 counts events only
+(phase-agnostic by design, noted). ONE violation found and fixed:
+run-gplr51-a2-pinned.ps1 collected transfer_us/ready_latency_us unfiltered.
+Demonstrated cost of the bug on the 200k baseline: the mixed reading reports
+copy p50 = 31.5 ms (120 TG micro-copies dominate) where the true PP median is
+3003.2 ms - a 95x understatement of typical copy cost, the exact mechanism
+behind the T-51 tail-stat contamination (F1). AC1 remains discharged with the
+tooling now provably clean; any future copy stat must cite a phase filter.
