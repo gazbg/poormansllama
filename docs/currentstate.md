@@ -1,5 +1,23 @@
 # Current State
 
+## 2026-09-21: T-GPLR-50 DRAFTED — the survey answer to "highest-value remaining PP lever": flip the T-48 f16 rebuild default back to ON (owner decision pending)
+
+Survey (plan + currentstate, post-T-39): the remaining named levers are
+deep-submit (~0.9% of a 200k pass, ordering risk, recorded do-not-draft) and
+the per-launch patch lever (closed, 26.1 ms = 0.013%). The one lever worth tens
+of seconds per pass at the charter's 200k shape is the T-GPLR-48 f16 default
+(rebuild OFF), which re-exposed the pass-2 compute excess that only T-47's
+fresh-context rebuild eliminated: recorded ledger pairs — 200k f16 ON
+(p1 133.85 s / p2 133.95 s compute, excess +0.10 s) vs OFF (p1 138.0 s / p2
+205.4 s, excess +67.4 s, uniform ~1.5x per layer_compute); 50k neutral in both
+states. The draft (plan block T-GPLR-50) flips the f16 branch of the
+KV-conditional default to ON for repeat > 1, with pre-registered predictions
+P1-P4, AC1-AC7, and a pre-flight echo-trigger rerun (AC2) because the T-49
+session's pw+rebuild+echo observation predates T-49's slab fix and is genuinely
+open on the current tree — if it reproduces, the task escalates instead of
+flipping. Not implemented; nothing committed beyond this entry and the plan
+block.
+
 ## 2026-09-21: BOTH PARKED ODDITIES RESOLVED FROM RECORDED TRACES (no new GPU arms)
 
 Owner request: investigate (1) pw vs non-pw last-chunk routing difference and (2) the

@@ -909,3 +909,136 @@ Run result (2026-09-17): INCOMPLETE — deterministic pass-2 crash in BOTH arms.
   143360` (140x1024, no tail) vs 144000 to separate tail-chunk from long-ctx
   + repeat, then fix the reset path. Route telemetry measured 4.39 s/4.31 s
   per pass (~3%), extending the T-GPLR-39 scaling line.
+
+### T-GPLR-50 (draft): make the f16 rebuild default follow the charter shape — ON where the pass-2 excess is measured (flip the T-GPLR-48 f16 default back to ON)
+
+Status: draft (2026-09-21) — awaiting owner decision (escalated in currentstate
+2026-09-21: "the f16 KV-conditional default costs ~+65 s per pass-2 at 200k vs
+rebuild ON; a default re-decision is an owner call").
+Depends on: T-GPLR-48 (the default being changed), T-GPLR-47 (the fresh-context
+rebuild that makes rebuild-ON cheap and correct), T-GPLR-46 (the regression
+evidence this reverses), T-GPLR-49b (the echo-attribution the validation reuses).
+Commit: (fill on completion)
+
+Survey context (why this is the highest-value remaining PP lever)
+: With T-GPLR-39 closed, the recorded host ledgers leave exactly one lever whose
+  prize is measured in tens of seconds per pass at the charter's crowded
+  long-context shape, and it is a default flip, not new machinery. The T-48 f16
+  default (rebuild OFF) re-exposed the pass-2 compute excess that only T-47's
+  fresh-context rebuild ever eliminated:
+    * 200k f16, rebuild ON  (T-47 v3, 2026-09-20): pass 1 = 141.3 s wall /
+      133.85 s compute; pass 2 = 133.95 s compute — excess **+0.10 s**.
+    * 200k f16, rebuild OFF (remeasure, 2026-09-21): pass 1 = 144.8 s wall /
+      138.0 s compute; pass 2 = 205.4 s compute — excess **+67.4 s (+48.9%)**,
+      uniform ~1.5x per layer_compute across all chunk positions.
+    * 50k f16, both states: pass-2 compute within ~0.2 s of pass 1 in every
+      recorded arm (v2 on 17.70 s vs off 17.76 s; T-48 default 17.86 s) — the
+      excess does NOT appear at 50k under either state.
+  The T-46-era justification for KV-conditionality (rebuild was expensive and
+  carried a crash risk) is gone: T-47 rebuilt the rebuild into a fresh context,
+  T-49 fixed the slab-offset derivation, and T-48's own q8 arms prove the
+  rebuilt path clean at b1. What remains of the T-48 rationale is one measured
+  fact — the f16+rebuild+pw combination at 4k/96 echoed instead of answering
+  (T-49 session, pre-T-49b attribution) — and T-49b already bounded that: the
+  echo needs pw AND rebuild TOGETHER; rebuild OFF + pw is clean (PASS 5/5), and
+  nopw + rebuild ON is clean (v1-on PASS, ids byte-identical to the nopw
+  default stream). The default path (pw ON, layer-major) would therefore take
+  the echo risk back on f16 unless the validation below pins its trigger —
+  which is exactly what this task's AC6 does before any flip is claimed.
+
+Goal
+: Change the T-GPLR-48 default resolution so f16 KV also prebuilds per pass
+  (rebuild ON) whenever `--pp-repeat > 1`, with the same provenance pattern
+  (announcement + `pp_prebuild_per_pass_source`), keeping explicit flags
+  authoritative. Expected effect, per the recorded ledger deltas: the 200k
+  pass-2 excess falls from +67.4 s to ~+0.1 s (measured ON/OFF pair already in
+  hand), i.e. ~33% of warm two-pass wall at the charter's primary crowded
+  shape. No other shape has a recorded regression to trade: 50k is neutral in
+  both states.
+
+Pre-registered predictions (written before the arms run)
+: * P1 (primary): on the current tree, the 200k f16 rebuild-ON arm's pass-2
+    compute lands within ~1 s of its pass-1 compute (recorded delta +0.10 s;
+    falsified if the excess exceeds 5 s).
+  * P2: the flip does not move pass-1 compute at any shape beyond session
+    noise (rebuild happens between passes; falsified if pass-1 compute shifts
+    > 3% paired within-session).
+  * P3: the warm two-pass 200k wall improves >= 25% paired within-session vs
+    the rebuild-OFF control (measured ON-side wall 141.3 s vs OFF-side 198.2 /
+    206.1 s pass-2 sessions; falsified below 15%).
+  * P4: 50k f16 and b1 q8 stay wall-neutral to +2% (rebuild adds ~3-7 s of
+    slot-bucket variance at 50k per the v2 pairs; falsified beyond +5%).
+
+Scope
+: One resolution site in the runner (main.cpp, the T-48 block at ~3078):
+  `(pp_repeat > 1 && kv_cache != "f16")` -> `(pp_repeat > 1)`; announcement
+  text gains an f16 branch naming the charter shape; `run_start` keys and
+  checker validation are already generic (no engine change expected; if the
+  checker hard-codes the f16 expectation anywhere, that is in scope).
+  Harness: one arm/set runner pair + the flip's validation arms, reusing the
+  T-48 harness shapes verbatim (a1-style 50k default, a2-style b1 q8 default,
+  a4-style 4k f16 default, plus a new 200k f16 default arm on the hostmem
+  shape) and the recorded pw/nopw 4k identity pair for AC6.
+
+Acceptance criteria (falsifiable)
+: AC1 (identity, default path): the 96 greedy tg ids of the 4k f16 default arm
+  (rebuild ON after the flip) are byte-identical to the recorded T-47 v1-on
+  stream (the rebuild-ON reference already in hand) AND to the current
+  rebuild-OFF default stream (gplr48-a4) — both comparisons, else falsified.
+: AC2 (echo trigger pinned, pre-flip): the pw+rebuild+echo interaction is
+  re-run on the CURRENT tree in both states (pw rebuild-OFF vs pw rebuild-ON
+  at 4k/96, decode-graded). If pw+ON echoes on the current tree (T-49b was
+  pre-T-49's slab fix, so this is genuinely open), the default flip MUST NOT
+  complete while the default path uses pw; instead the task escalates back
+  with the pinned trigger and the owner chooses between flipping pw's default,
+  shipping rebuild-ON-for-f16 as explicit-only, or accepting the documented
+  limitation. If it answers (PASS 5/5), AC6 is discharged trivially.
+: AC3 (primary performance): the 200k f16 pair (OFF control = current default
+  vs ON changed, same session under one mutex hold, repeat 2, hostmem shape,
+  recon 1) shows pass-2-minus-pass-1 compute excess shrinking from the
+  recorded +67.4 s class to <= 5 s (P1) and warm two-pass wall improving
+  >= 25% (P3), with per-layer_compute uniformity restored (max/min ratio
+  across chunk positions < 1.1, vs ~1.5 today).
+: AC4 (no collateral regression): the 50k f16 default arm and the b1 q8
+  default arm both PASS their strict checkers with pass-2 compute within +5%
+  of pass 1 (both states were already clean at these shapes — this guards the
+  flip against silently breaking the quantized-KV path it does not touch).
+: AC5 (provenance): a defaulted run announces the new f16 branch and
+  `run_start` carries `pp_prebuild_per_pass=1` + source `default`; explicit
+  `--pp-prebuild-per-pass 0` and `1` arms resolve `explicit` and reproduce
+  recorded behavior (the T-48 a3 matrix reruns clean, INV1 on the explicit
+  paths); route-parity style integrity on the 200k pair via the ledger
+  closures (each pass's ledger closes within noise as today).
+: AC6 (semantic gate): the qa-smoke rung (512) passes on the new default;
+  if AC2's current-tree rerun echoes at pw+ON, the smoke rung runs BOTH pw
+  and nopw defaults and only the answering one may ship the flip.
+: AC7 (long-context discipline): the 200k arms run one at a time under the
+  GPU mutex as owner-invoked acceptance runs (never batched), per the ladder
+  policy; single-slot refusals and handoff auto interactions checked exactly
+  as the T-47 v-arms did.
+
+Non-goals
+: No engine (llama-layer-streaming) changes unless the checker hard-codes the
+  old default; no pw-path redesign (that is the echo trigger's own task, if
+  AC2 pins it live); no ubatch default change; no second-architecture work;
+  no deep-submit or patch scoping revival.
+
+Known evidence and unknowns
+: Known: all ledger numbers above (recorded, mtime-attributable to binaries);
+  the T-47 v1 within-session identity pair; the T-49b echo attribution; the
+  T-48 a3 explicit-path matrix.
+: Unknowns: (1) whether the pw+rebuild echo reproduces on the CURRENT tree
+  (post-T-49 slab fix) — AC2 resolves it first, and its outcome selects
+  between the plain flip and the escalate branch; (2) whether the 200k excess
+  has a second contributor that rebuild-ON masks but does not fix (the +67.4 s
+  was uniform, which argues no; AC3's uniformity metric catches it if yes);
+  (3) pass-1 wall at 200k shifted +3.5 s between the T-47 and remeasure
+  sessions — AC3's paired design cancels it, but absolute two-pass walls
+  should be reported with the session caveat.
+
+Escalation condition
+: If AC2 shows the echo live on the current tree AND the owner is not
+  reachable to choose, the task parks with the pinned trigger recorded and no
+  flip; if AC3 fails (excess persists with rebuild ON on the current tree),
+  the pass-2 excess is a NEW defect distinct from T-46's — escalate with the
+  ledger rather than tuning.
