@@ -267,6 +267,7 @@ A task is not reported complete while any of these parts is missing.
 This machine shares one GPU across multiple projects. Before any command that initializes CUDA or uses the GPU, acquire the Windows named mutex `Global\AI-GPU-EXCLUSIVE-v1`.
 
 - Use `tools/with-gpu-lock.ps1` to run GPU tests, model traces, benchmarks, profilers, and GPU-backed CTest targets.
+- The wrapper probes nvidia-smi after acquiring the mutex and REFUSES with exit 125 while any compute process is visible (teardown grace 30 s; `-AllowBusy` overrides). Verdicts carry `gpu_pre_run`/`gpu_post_run`; `probe-unavailable` proceeds UNVERIFIED.
 - The wrapper waits for the mutex and exits on timeout. It must never start a GPU workload while another holder owns the mutex.
 - CPU-only configuration, compilation, source inspection, and static checks do not require the mutex.
 - Do not use a sentinel file or delete another process's lock. Windows releases the named mutex if its owning process exits unexpectedly.

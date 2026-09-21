@@ -284,3 +284,53 @@ function Get-ArmTagFromCommand {
     }
     return 'gpu-command'
 }
+
+# ---------------- GPU busy probe (T-GPLR-50 contention follow-up) -----------
+# The GPU mutex is cooperative: a non-conforming project can hold VRAM and run
+# compute DURING a mutex-held arm and poison it (uniformly-inflated per-layer
+# compute, teardown cudaFree OOM, normal transfer ratios -- measured 2026-09-21).
+# These helpers let a wrapper check the observable GPU state before trusting a
+# hold and record what it saw in the verdict.
+
+# One compute-apps query. Returns a list of { pid, name, short } rows, an EMPTY
+# list when the GPU has no compute apps, or $null when the probe cannot run
+# (nvidia-smi missing/errored). $null means UNVERIFIED -- never read it as
+# clean. Tests can stub the probe by setting GPU_BUSY_PROBE_CMD to a command
+# that prints nvidia-smi-compatible CSV (pid, process_name[, used_memory]).
+function Get-GpuComputeApps {
+    param([string] $NvidiaSmi = 'nvidia-smi')
+    $out = $null
+    try {
+        if ($env:GPU_BUSY_PROBE_CMD) {
+            $out = & cmd.exe /d /c $env:GPU_BUSY_PROBE_CMD 2>&1
+            if ($LASTEXITCODE -ne 0) { return $null }
+        } else {
+            $out = & $NvidiaSmi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1
+        }
+    } catch {
+        return $null
+    }
+    if (-not $env:GPU_BUSY_PROBE_CMD -and $LASTEXITCODE -ne 0) { return $null }
+    $apps = @()
+    foreach ($line in @($out)) {
+        $s = ("$line").Trim()
+        if (-not $s) { continue }
+        $parts = $s.Split(',')
+        if ($parts.Count -lt 2) { continue }
+        $procId = 0
+        if (-not [int]::TryParse($parts[0].Trim(), [ref]$procId)) { continue }
+        $name = $parts[1].Trim()
+        if (-not $name) { continue }
+        $apps += [pscustomobject]@{ pid = $procId; name = $name; short = (Split-Path -Leaf $name) }
+    }
+    return , $apps
+}
+
+# Human-readable one-line summary for logs and verdict fields.
+function Format-GpuBusy {
+    param($Apps)
+    if ($null -eq $Apps) { return 'probe-unavailable' }
+    $list = @($Apps)
+    if ($list.Count -eq 0) { return 'clean' }
+    return (($list | ForEach-Object { '{0} {1}' -f $_.pid, $_.short }) -join '; ')
+}

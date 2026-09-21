@@ -1,5 +1,25 @@
 # Current State
 
+## 2026-09-21: GPU-mutex wrapper hardened against non-conforming compute processes
+
+Follow-up to the T-GPLR-50 contention re-attribution (deepseek_v4.exe holding
+~16.5 GiB VRAM during mutex-held runs). `tools/with-gpu-lock.ps1` now probes
+`nvidia-smi --query-compute-apps` AFTER acquiring the mutex: visible compute
+processes get a 30 s teardown grace, then the wrapper refuses with exit 125
+naming the process (`-AllowBusy` overrides, loudly). A post-run probe catches a
+process that ARRIVED mid-run and annotates the verdict (`gpu_pre_run` /
+`gpu_post_run` fields; `refused_busy` on the 125 path; `probe-unavailable`
+proceeds unverified rather than blocking). Probe helpers
+(`Get-GpuComputeApps`/`Format-GpuBusy`) live in `tools/arm-verdict.ps1` with a
+stub point (`GPU_BUSY_PROBE_CMD`) so the gate is host-testable without a GPU.
+
+Validation (all host-only, no CUDA): six branches through the REAL wrapper -
+clean start, busy-refuse (exit 125), busy-allow, probe-unavailable,
+busy-clears-in-grace (`build/gpu-gate-tests/run-gate-cases.ps1`, all PASS), and
+the appeared-mid-run case caught by the post-run probe (`gpu_pre_run=clean`,
+`gpu_post_run=1234 deepseek_v4.exe`) - plus one live run against real
+nvidia-smi (`gategen-live`: clean/clean, PASS).
+
 ## 2026-09-21: T-GPLR-50 CLOSED - f16 rebuild default flipped ON; the +67.4 s 200k pass-2 excess RE-ATTRIBUTED to GPU contention
 
 Shipped: --pp-prebuild-per-pass now defaults ON whenever --pp-repeat > 1 for

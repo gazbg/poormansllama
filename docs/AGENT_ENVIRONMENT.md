@@ -796,6 +796,42 @@ are never edited in place: a closure appends its RESULT in the live file, and
 the block moves on the NEXT split. Search across the archive with `rg`, same
 rule as the currentstate shards.
 
+## GPU busy gate in with-gpu-lock.ps1 (contention defense, 2026-09-21)
+
+The GPU mutex `Global\AI-GPU-EXCLUSIVE-v1` is cooperative: it excludes only
+projects that acquire it. A non-conforming project can hold VRAM and run
+compute DURING a mutex-held arm and poison it - uniformly-inflated
+per-layer compute with normal transfer ratios, teardown `cudaFree` OOM
+(exit 0xc0000409). Measured 2026-09-21: deepseek_v4.exe held ~16.5 GiB during
+a mutex-held host suite (two fixtures crashed, both PASS on a free-GPU rerun),
+and the same signature contaminated the recorded 200k remeasure (the
+"+67.4 s rebuild-OFF pass-2 excess" was withdrawn as confounded in T-GPLR-50).
+
+The wrapper therefore probes `nvidia-smi --query-compute-apps` and behaves as
+follows:
+
+- **Pre-run (after acquiring the mutex):** any visible compute process first
+  gets a grace window (`-BusyGraceSeconds`, default 30 s) - a pre-existing
+  holder usually tears down once it loses the mutex - then the wrapper
+  **refuses to run with exit 125** naming the process, unless the caller
+  passes `-AllowBusy` (which runs and says so in a warning).
+- **Post-run:** the probe runs again after the command exits. A process that
+  ARRIVED during the run did not exist at the pre-check; it is caught here
+  and the verdict is annotated.
+- **Verdict fields:** `gpu_pre_run` and `gpu_post_run` carry
+  `clean`, `probe-unavailable` (nvidia-smi missing/errored - the run proceeds
+  UNVERIFIED rather than blocking), or `"<pid> <exe-name>; ..."`; `refused_busy`
+  is set on the exit-125 path.
+- **Exit code 125** is reserved for the busy refusal (PASS/FAIL/TIMEOUT are
+  unchanged).
+
+Tests can stub the probe for host-only branch testing by setting
+`GPU_BUSY_PROBE_CMD` to a command that prints nvidia-smi-compatible CSV
+(pid, process_name[, used_memory]); the stub's non-zero exit means
+probe-unavailable. The six branches (clean / busy-refuse / busy-allow /
+probe-unavailable / busy-clears-in-grace / busy-appeared-post-run) are
+validated under `build/gpu-gate-tests/` (`run-gate-cases.ps1` covers five;
+the appeared-post-run case runs the real wrapper against a flipping stub).
 ## Detached runs and waiting (convention, 2026-09-18)
 
 How to start long work and how to find out what happened to it, without
@@ -939,7 +975,9 @@ Host-side readers, in `tools/arm-verdict.ps1` (dot-source it):
 `Clear-ArmVerdict`, `Test-ArmMarkerAlive`, and the three bounded waits —
 `Wait-ArmStart` / `Wait-ArmVerdict` (each returns the moment its observable
 appears, or `$null` on timeout: never an unbounded sleep) — plus
-`Get-ArmVerdictPaths`, `Get-ArmTagFromCommand`, and `Get-ArmRunState`.
+`Get-ArmVerdictPaths`, `Get-ArmTagFromCommand`, and `Get-ArmRunState` - and the
+GPU busy probe helpers `Get-GpuComputeApps` / `Format-GpuBusy` (stub point
+`GPU_BUSY_PROBE_CMD`).
 `Get-ArmRunState` is the one call that answers the whole question:
 
 ```powershell
