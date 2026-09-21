@@ -1,5 +1,44 @@
 # Current State
 
+## 2026-09-21: Clean PP/TG reference numbers for the current binary (T-GPLR-50 session)
+
+All numbers from today's sentineled, GPU-gate-era traces (binary exe
+1B08B382ACA4694D / dll B540024042E8B1F2, nested 40bca9f44), measured on a
+verified-quiet GPU during the T-GPLR-50 arms - the honest reference table for
+the Qwen3.6-35B-A3B vehicle. Shape: layer-major, moe-expert-bank, 3 slots,
+--pp-async-feed 1; PP tok/s is the phase_summary `tokens_per_s` of each pass;
+TG is the 96-token greedy needle decode at 4k unless stated.
+
+PP (prompt processing, tok/s by shape):
+
+| Shape | KV / ubatch | pass-1 | pass-2 | trace |
+| --- | --- | --- | --- | --- |
+| 200k (charter) | f16 / u512 | 1476 | 1485 | gplr50-200k-off (this is the explicit-0 arm; the default-ON pair run: 1464 / 1480) |
+| 144k (b1) | q8 / u1024 | 1894 | 1961 | gplr50-b1-q8-default |
+| 50k | f16 / u512 | 2374 | 2614 | gplr50-50k-f16-default |
+| 4k | f16 / u512 | 708 first-touch | 1824 | gplr50-4k-f16-default |
+| 512 (QA anchor) | q8 / u512 | 130 | 372 | gplr50-qa-512 |
+
+Rebuild ON vs OFF at 200k: 1464/1480 (ON) vs 1476/1485 (OFF) tok/s - equal
+within session noise (the AC3 pair result; wall ~270 s both).
+
+TG (96-token greedy, 4k needle shape): 77.8-80.2 tok/s on the changed binary
+across the four same-session arms (wall 1.20-1.23 s, compute 9.7 ms/token);
+control binary 85.6 and recorded T-47/T-48 references 85.8-86.9. The
+session-to-session spread is wider than any in-session difference, so the
+honest TG reference is ~78-87 tok/s with no rebuild-state dependence. The
+3-token TG smokes in the 50k/200k arms (0.5-0.8 tok/s) are transfer-dominated
+and are NOT TG benchmarks.
+
+Staging note (charter priority check): at 200k the transfer bucket is ~249 s
+vs ~134 s compute - PP on this GPU remains staging-bound, not compute-bound.
+
+Contamination rule applied when picking these: the gplr50-qa-512 trace's own
+TG phase (0.8 tok/s, 55.7 s compute for 96 tokens) carries the deepseek
+contention signature and is excluded; every number above comes from
+pre-run-probe-clean sessions. Future reference numbers should carry
+`gpu_pre_run: clean` in their verdicts (gpu-lock 001bf65).
+
 ## 2026-09-21: GPU-mutex wrapper hardened against non-conforming compute processes
 
 Follow-up to the T-GPLR-50 contention re-attribution (deepseek_v4.exe holding
