@@ -1213,3 +1213,42 @@ hash-verified), same day, both verdicts gpu_pre_run=clean (the 001bf65 gate):
 
 Remaining arms: A3 (4 slots), A4 (async-feed ablation); AC2's < 1% exposed
 wait is not met by either source today (both ~2.7%).
+
+#### A3+A4 result (2026-09-21, arms gplr51-a3 / gplr51-a4): the copy-tail question CLOSED - structural to the shape, not a fixable staging defect
+
+Same binary as A1 (hash-verified), all verdicts gpu_pre_run/post_run clean:
+
+| metric | A1 (mmap, 3 slots, af1) | A2 pinned | A3 (4 slots) | A4 (af 0) |
+| --- | --- | --- | --- | --- |
+| tok/s | 1464 / 1480 | 1477 / 1456 | 1475 / 1490 | 1485 / 1485 |
+| exposed ready_wait | 3.67 s | 3.62 s | 3.57 s | 3.67 s |
+| copy p50 | 31.5 ms | 75.8 ms | 31.8 ms | 31.5 ms |
+| copy p90 | - | - | 12,072 ms | 10,796 ms |
+| copy max | 10.82 s | 10.97 s | 12.31 s | 10.80 s |
+
+* P2 FALSIFIED (A3): the 4th slot did NOT deepen useful overlap - pass-1
+  per-copy times inflated ~4x (p50 3.0 -> 11.8 s; transfer bucket 249 -> 370
+  s) because more in-flight copies contend for the same file/PCIe resources,
+  and the tail max GREW (10.82 -> 12.31 s). Exposed wait barely moved
+  (3.57 s). 3 slots is the saturation point; more slots are worse.
+* P3 FALSIFIED (A4): async-feed contributes ~NOTHING to hiding at 200k -
+  af 0 is byte-identical to the baseline (3.67 s, p50 31.5 ms, max 10.80 s,
+  tok/s equal). The hiding is done by the slot window + recon pipeline
+  alone; the T-25 worker is idle-redundant at this shape.
+* AC2 verdict: < 1% exposed wait is NOT reachable by any tested staging
+  configuration (floor ~2.7% across A1-A4). An honest negative.
+* AC3 mechanism (named, corroborated in 4 arms): the ~11 s worst-case copy
+  is per-layer-file READ throughput, not queueing or PCIe. It sits at the
+  heaviest layers (24-39, 522 MB vs 453 MB - 16% more bytes, ~16% slower
+  means), is byte-identical across pinned (no file reads during the pass),
+  4-slot, and af-0 arms, and scales DOWN with contention measured the other
+  way (A3's inflation shows the resource, not the fix). The copy tail is a
+  property of the 200k shape's file layout, not a staging defect; it hides
+  at 97% today and its exposure is flat under every lever tried.
+
+Consequences: no engine change is justified by this task (the draft's
+non-goal holds). A2/A3/A4 are recorded as falsifiers; A5 (cold cache)
+remains owner-invoked optional. The staging-bound framing of the reference
+table stands: PP at 200k is compute-bound on a quiet GPU; the exposed
+transfer floor (~2.7%) is the cost of staging 18.3 GB twice per run under a
+97%-efficient hiding pipeline.

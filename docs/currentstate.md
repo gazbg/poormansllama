@@ -1,5 +1,28 @@
 # Current State
 
+## 2026-09-21: T-GPLR-51 A3/A4 verdict - copy-tail question CLOSED (structural); async-feed redundant at 200k; 4 slots worse
+
+Arms (same binary, clean-gated): A3 (--layer-slots 4) FALSIFIED P2 - pass-1
+per-copy times inflated ~4x (p50 3.0 -> 11.8 s, bucket 249 -> 370 s), tail
+max grew to 12.31 s, exposed wait flat (3.57 s): 3 slots is the saturation
+point. A4 (--pp-async-feed 0) FALSIFIED P3 - byte-identical to baseline
+(ready_wait 3.67 s, p50 31.5 ms, max 10.80 s, tok/s equal): the T-25
+async-feed worker contributes ~nothing to hiding at 200k; the slot window +
+recon pipeline does it all.
+
+AC3 mechanism, named and corroborated across 4 arms: the ~11 s worst-case
+copy is per-layer-file READ throughput on the heaviest layers (24-39: 522 MB
+vs 453 MB elsewhere; heavy/light mean-copy ratio 1.15-1.16 = the byte
+ratio). It is source-independent (identical under pinned, which never reads
+the file mid-pass), slot-count-independent in direction, and af-independent.
+Not a staging defect; a property of the shape's file layout, hidden at 97%.
+AC2's < 1% exposed-wait target is unreachable by staging configuration
+(floor ~2.7%, honest negative). No engine change justified; A5 (cold cache)
+remains optional owner-invoked. The charter-relevant bottom line: PP at 200k
+is compute-bound on a quiet GPU, and the staging pipeline is already at its
+saturation point - further PP wall gains must come from compute or
+residency policy, not staging.
+
 ## 2026-09-21: T-GPLR-51 A2 verdict - copy-source stays mmap at 200k; the 10.9 s copy tail exists in BOTH sources (structural, not page-fault)
 
 Arm A2 (gplr51-a2-pinned, 200k f16, 3 slots, repeat 2, tg 3, shape verbatim
