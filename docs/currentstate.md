@@ -1,5 +1,69 @@
 # Current State
 
+## 2026-09-21: BOTH PARKED ODDITIES RESOLVED FROM RECORDED TRACES (no new GPU arms)
+
+Owner request: investigate (1) pw vs non-pw last-chunk routing difference and (2) the
+u4096 "truncated answer" (262 vs 305 bytes). Both resolved entirely from existing
+traces; the parked phrasings were both **wrong in their attribution**.
+
+**Oddity 1 - RESOLVED: it was never pw-vs-nonpw, and it was a real bug that T-GPLR-47
+already fixed at the root.** Re-analysis of every repeat-2 trace with route telemetry
+(pass-1 vs pass-2 hash comparison, both passes in the same run):
+
+| trace (binary era) | mode | kv | pass1v2 route diffs |
+|---|---|---|---|
+| gplr38-u512..u4096 (pre-T-43) | pw default | f16 | **0** at all sampled chunks |
+| gplr45-4k/50k/200k (T-45 era) | pw | f16 | 40 (last chunk), 400, 1560 - every sampled chunk |
+| gplr49-4k-pw (T-49 era) | pw explicit | f16 | **40/40 = last chunk only** |
+| gplr49-4k-nopw (T-49 era) | nopw | f16 | 0 |
+| gplr49-50k-pw (T-49 era) | pw explicit | f16 | **400/440 = all but chunk 0** |
+| gplr49b-4k both (rebuild 0) | both | f16 | 0 in both |
+| gplr48-a3-50k-pbp1 (T-48 session) | pw | f16 | 400 (changed AND control) |
+| gplr48-a2-b1-q8-default | pw | q8 | 560/600 (all but chunk 0) |
+| gplr47-v1-4k-**control** (same session, pre-T-47 binary) | pw | f16 | **40 (last chunk)** |
+| gplr47-v1-4k-**changed** (T-47 binary) | pw | f16 | **0** |
+| gplr47-v2-50k / v3-200k / v4-b1-q8 (T-47) | pw | f16/q8 | 0, 0, 0 |
+| gplr39-C1/E1 (post-T-49) | pw | q8 | 0 at 4k |
+
+Mechanism: pw + per-pass rebuild (ON) left a stale pointer/binding window in the
+in-place rebuild path (pre-T-47 `build_patch_split` re-used accumulated contexts);
+the first sampled chunks of pass 2 read slightly different probs. **The bug was REAL
+in compute** (pw-changed and pw-control TG streams differ from nopw from token 0;
+pw pass-2 chunk-7 differs deterministically and identically in both binaries) but
+**harmless to the graded answer** (both pw and nopw grade PASS 5/5 - the perturbation
+is too small to change top-k routing outcomes materially). T-GPLR-47's fresh-context
+rebuild eliminated it: every post-T-47 trace is clean, including the within-session
+T-47 v1 control-vs-changed pair, which is the cleanest proof available. The T-48
+session's pbp1 arms are clean at 4k-default but anomalous at 50k/q8 because that
+session ran a pre-T-47-era binary for the a3 matrix (commit 8ab3f1f00 landed after;
+its pbp1 rows are the old engine). No open defect remains; the "pw vs non-pw"
+framing was a red herring - nopw with rebuild ON was ALSO anomalous at 50k/200k
+(T-45 era), it just sampled differently (4k samples chunks 0+7 only).
+
+**Oddity 2 - RESOLVED: u4096 does NOT truncate the answer; it derails AFTER it.**
+Decode of the u4096 greedy stream (`gplr38-u4096-dec.json`, decode-graded): the full
+needle answer is present and intact - normalized answer
+`imendimstartqx7741tr2918mk5501ld8834parisimend` contains QX-7741, TR-2918, MK-5501,
+LD-8834, Paris, i.e. the semantic content is COMPLETE at u4096. What differs: after
+the answer region (TG index 41 of 96), u4096 drifts into a template-token repeat loop
+(`<|im_end|><|im_start|>...`) while u512/u1024/u2048 continue document echo. The 305
+vs 262 byte difference is the STRIPPED-SPECIALS decode of that tail difference, not a
+cut-off answer. The first 41 TG ids (the entire needle-answer span) are byte-identical
+at every ubatch. Classification: benign greedy tail drift under a 1-chunk prefill
+(u4096 = 1 x 4096-token chunk vs 8/4/2 chunks elsewhere - a different graph shape,
+not a bigger version of the same shape), no identity or semantic gate impacted.
+Lifting the recorded "no arm at or above u4096 can be called output-equivalent"
+caution: arms at u>=4096 may be called **answer-equivalent** (needle grading), not
+greedy-id-equivalent; if id-equivalence at u4096 is ever needed, it needs its own
+investigation (single-chunk shape vs multi-chunk shape).
+
+**Nothing to implement; no code changed.** The only artifact change: the T-48
+gotcha in AGENTS.md already carries the parity/rebuild lessons this confirms; the
+u4096 equivalence caution is lifted here and supersedes the T-GPLR-38 closure text.
+Evidence: `build/llama-cuda/gplr{38,45,47,48,49,49b}-*.jsonl` (routes + tg_tokens +
+grade files), decode artifacts `gplr38-u{512,4096}-dec.json`, vendored commit
+chronology via `git log` (T-47 = 4403c1097, 09-20 16:43).
+
 
 ## 2026-09-21: Per-launch patch lever RE-MEASURED at 200k -> CLOSE the idea; a NEW finding takes its place
 
