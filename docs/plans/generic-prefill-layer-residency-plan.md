@@ -68,7 +68,7 @@ describes the LAYER sweep only - the pass-1 excess lives before it); T-GPLR-37 (
 mmap-registered default is the probed mode, and its promoted flip is why every real
 first prefill now pays this); T-GPLR-36 (the ledger found double-booked here); the
 2026-09-21 anomaly sweep (currentstate item 5 is the input this task adjudicates).
-Commit:
+Commit: nested 043fceedc (instruments: A4 pre-warm modes, recon-gated embed_chunk, recon generation join) + 36f0ae090 (whitespace fixup); outer 050f8f9 (analyzers, checker, A3/A4 arm drivers), ea1ab5d (host-suite registrations + plan-split guard), f2c385f (plan/env/state records), b716289 (plan whitespace)
 
 Goal. Name what the "unaccounted" pass-1 gap is (wall - sum layer compute - sum layer
 wait = 2.35 s at 50k pass 1, 2.83-2.88 s at 200k pass 1, 0.16/0.64 s later), explain
@@ -1527,7 +1527,7 @@ marking it ready (both change product intent, neither is an implementer choice):
 Dependencies: T-GPLR-37 (the mmap-registered source whose commit this pays); T-GPLR-53
 (the attribution and dose curve - this block's premise); T-GPLR-52 (the copy-path laws the
 span arm must not disturb). Not blocking: T-GPLR-54/T-GPLR-55 (their shapes stay untouched).
-Commit:
+Commit: nested 8633f8099 (pre-sink process-life markers + tel-mark test); outer 19d7e33 (acceptance-quantity Q checker), ea1ab5d (host-suite registration), f2c385f (records)
 
 Goal. Make the first prefill stop paying the ~1.9 s commit of the 18,500,517,888 B
 registered span IN ITS CRITICAL PATH - by issuing registration earlier and overlapping the

@@ -1,5 +1,21 @@
 # Current State
 
+## 2026-09-23: THE UNCOMMITTED T-GPLR-53/54/56 WORK IS COMMITTED AS A TASK-SPLIT SERIES (seven outer + five nested commits, no GPU time spent)
+
+Mechanical record of the commit pass requested after the T-54 A3 verdict and the two owner-authorized one-liners.
+
+Outer (oldest first): 8127ddd docs close-out resplit (T-37/T-52/T-54 blocks archived, the resplit header/index rule + manifest) - 050f8f9 T-53 instruments (tools) - ca1ba98 T-54 A1/A2/A3 tools - 19d7e33 T-56 A1 Q checker - ea1ab5d host-suite registrations (plan-split guard + the T-53/54/56 selftests, plus the host Include clause) - f2c385f T-53/54/56 records (plan blocks, AGENT_ENVIRONMENT sections, currentstate entries) - b716289 plan whitespace - ba63777 pin bump. Nested (oldest first): 8633f8099 T-56 A1 pre-sink markers - 3bb01baca T-54 tg_logits readout + wiring fix - 043fceedc T-53 instruments - 59073be2a the two owner-authorized one-liners (--pp-async-feed 0 ctests, recon ring ubatch label) - 36f0ae090 whitespace fixup. Pin: 36f0ae090.
+
+T-54 hashes, for the record (its block is in the frozen archive and cannot carry them): nested 3bb01baca + outer ca1ba98 (tools) / f2c385f (records).
+
+**The shared files were committed by SECTION, not wholesale.** A concurrent thread has uncommitted work in the same tree (T-16/T-55/T-57 blocks, four Arm-provenance blocks and the suite-results block in the plan; five currentstate entries plus the 2026-09-23 predictor-screening entry; the provenance and T-57 sections in AGENT_ENVIRONMENT; the suite-revision binding, the doc-size "missing checker FAILS" rule and the provenance/T-57 guards in tools/run-tests.ps1; arm-verdict.ps1, with-gpu-lock.ps1, test-arm-verdict.ps1, smoke-gpu-lock-ctxshell.ps1, source-revision.ps1, check-arm-provenance.ps1, check-gplr16-revert.py, check-tg-part-timings.py, run-gplr57-a1-ladder.ps1, predictor-screen-gplr.py, docs/findings/, the SDD edits, the 2026-09-12..13 currentstate archive and gplr13-bottlenecks-hypotheses.md). Those stay uncommitted; the committed versions of the four shared files were rebuilt from HEAD + this session's lines only, so no foreign hunk was staged.
+
+Verification: the committed versions of the plan, AGENT_ENVIRONMENT and currentstate were RE-DERIVED from the worktree by the same predicates and compared byte-for-byte (MATCH); run-tests.ps1 was parse-checked with the PowerShell parser and every block confirmed present exactly once; git diff --check is clean on both series; resplit-gplr-plan.py --verify and check-doc-sizes.py PASS. One defect was found and repaired during the pass: a text-mode read of a committed blob mangled the em-dashes on 16 plan lines in the whitespace commit - the commit was rebuilt from a UTF-8 decode (b716289) and a scan for that mojibake class over every committed blob in both series is now clean. `tools/layer-streaming/tests/gplr53-embed-chunk.jsonl.summary.json` (a --validate-telemetry byproduct of a fixture run, regenerable) was deleted, not committed.
+
+Residual: the concurrent thread's changes above, and nothing else - the nested worktree holds only the T-16 revert hunk in main.cpp.
+
+**Restored 2026-09-23.** This entry was DELETED by commit `9e2f3ed` (docs: enforcement, suite-revision, T-16 closure and T-55 retraction records), which committed the WORKTREE copies of the shared docs: the two `Commit:` hash lines this entry records sat in the plan's worktree copy as empty, and this entry was absent from the worktree copy entirely, so a wholesale commit reverted both. The hashes are re-stated above and the plan's `Commit:` fields are filled again. Nothing else in this entry was affected, and the underlying commits are untouched. Lesson recorded rather than fixed elsewhere: content that exists ONLY in a sectioned (synthetic) commit is not safe from a wholesale commit of the same file - the worktree copy must be brought level in the same pass.
+
 ## 2026-09-23: T-GPLR-53 BAND-QUANTITY ESCALATION SETTLED (owner directive, OPTION A) AND THE REPORTING FIX LANDED - host-only, no GPU, no mutex, no arm re-run
 
 - **Decision (A): the pre-registered `>= 70%` band's QUANTITY is the per-chunk embed EXCESS removal** against the
