@@ -1074,6 +1074,92 @@ the other ~99% is queueing behind compute. Copy-queue-vs-DMA confusion is
 over: cite copy_gpu_ms for wire time, transfer_us for host cost, and never
 mix them in one statistic.
 
+## host_ledger closure identity: other_us/loop_us are minus the embed and output steps (T-GPLR-53 drafting recon, 2026-09-21)
+
+`host_ledger` (--pp-recon 1) accumulates its per-launch buckets (patch, setup,
+compute, graph_call) over the embed step (step 1), the layer sweep (step 3) and
+the output step (step 4), while `sweep_us` starts AFTER the embed step. The
+emitter then computes
+
+    other_us = sweep_us - (patch+setup+compute+graph_call+slot)
+    loop_us  = other_us - (route+tel)
+
+so the embed and output steps are double-booked and both buckets go negative by
+approximately their spans whenever the layer-scoped residue is small. Measured,
+exact, four traces: `loop_us + embed_us + output_us` = +0.10/+0.16/+0.13 ms at
+gplr52-a2-50k passes 1/2/3 and +0.73/+0.73/+0.70 ms at gplr52-a2-200k. The
+T-GPLR-36 "the ledger closes exactly" reading was made while route telemetry
+supplied a +4.5 s `other` that masked the -embed; since T-GPLR-39/T-45 the same
+algebra reads other_us ~= -embed_us. Reading rule: never interpret other_us or
+loop_us alone - add embed_us + output_us back, or read
+`loop_us + embed_us + output_us` as the closure residual.
+
+`phase_summary`'s unaccounted (wall - total_compute_us - total_wait_us) is NOT an
+unnamed bucket either: at every mmap-registered shape it is the embed step -
+embed_us 2246.3 -> 62.5 ms (50k pass 1 -> 2, gplr52-a2-50k), 2482.8 -> 249.2
+(200k a2), 2438.2 -> 251.0 (200k a3, adjacent pinned control 251.1/248.6 = NO
+embed excess), 1774.1 -> 5.6 (4k gplr51-4k-mmap): 99.7-100% of the pass-1 gap
+excess, with the leftover (preload + output + the flat ~0.37 s of sweep host
+buckets at 200k) pass-invariant. The pass-1 one-off changes BUCKET with
+--copy-source: the pinned path pays it in slot/preload/host_submit (a3-pinned
+slot 1827.8/322.4, copy host_submit p50 110.0/42.6 ms per bank) instead of the
+embed step. T-GPLR-53 (draft) pre-registers the mechanism probe for the embed
+step's excess; cite this section before attributing any pass-1 PP gap.
+
+
+## Greedy identity at u >= 4096: the arm rule (T-GPLR-54, owner decision 2026-09-22)
+
+At prefill shapes at or above u4096 (single-chunk prefill of a 4096-token
+prompt), greedy-id streams are NOT id-equivalent to multi-chunk prefill, by
+design of batched kernels: the recorded u-arms (gplr38) differ from u512 by
+exactly ONE bounded 7-id template insertion at index 41 with byte-exact tail
+realignment (`tools/analyze-gplr54-ubatch-identity.py`, selftest 7/7), and the
+mechanism (near-tie tie-break vs confident shift) was deliberately left
+undecided (owner decision 2026-09-22, T-GPLR-54 RESULT).
+
+MEASURED UPDATE (same day, owner-invoked A3 session): the margin-band
+discriminator ran and returned BENIGN (H1) - margin_u4096(step 40) = 1.28
+to a threshold of 21.54; at the flip step itself both arms sat in near-ties
+over the same top-2 pair (u4096 0.138 vs u512 0.0127). The undecided
+mechanism is now decided benign at this prompt/shape; the RULE below is
+unchanged - it remains the standing gate, and a FAIL is still an escalation
+candidate (a genuinely new divergence can look different). Evidence:
+docs/currentstate.md, the 2026-09-22 A3 entry.
+
+THE RULE: never demand 96-id identity from a u >= 4096 arm; demand the
+ID-CHECK. Any arm that changes the prefill chunk shape (ubatch, pp_tokens,
+chunk layout), the KV type, or the prefill execution path runs
+
+    python tools/analyze-gplr54-ubatch-identity.py <candidate> <reference>
+
+against a same-session multi-chunk reference (and `--repeat A B` for its
+repeats). PASS = IDENTICAL, or BOUNDED-INSERTION with the answer span intact
+(C1 prefix past the answer span, C2 one insertion K <= 8 with byte-exact
+realignment, C3 template-only inserted ids, C4 repeats id-identical). FAIL =
+escalate BEFORE recording any timing number from that session. A check that
+cannot evaluate (no tg_tokens) is exit 2, never a pass. Same discipline for
+any model change that moves the prefill path: re-run the tool, never assume
+the old divergence shape. The needle-answer grader stays the answer gate; the
+ID-CHECK grades ids only.
+
+## Process-life markers (`proc_start`/`load_begin`/`load_end`): the pre-sink buffer and `late` (2026-09-22)
+
+`llama_ls_tel_mark` records a process-life marker for Q. The telemetry sink does not exist until the
+streaming object's `init` opens it, so markers are BUFFERED and then written, in call order, as the trace's
+first lines: `pre_run:1`, a `seq` proving order, and no `run_id`. `test-layer-streaming-tel-mark`
+(`ctest -C Release -R layer-streaming-tel-mark`) is the host proof; the trace's `t_us` base is PROCESS
+ENTRY (`ggml_time_init` at the top of `main`), not backend init.
+
+- A marker taken AFTER a sink has been flushed is emitted by the NEXT flush and carries **`late:1`**.
+  Without that flag it is indistinguishable from a second emission of the same event name (a duplicated
+  `load_end`). The engine's teardown, run-end and refusal paths re-flush with `tel_out` immediately BEFORE
+  their `fclose`, which is what turns such a marker into a line: before 2026-09-22 it was pushed into a
+  buffer that had already been flushed and was silently lost, with no error and no flag.
+- A late line's `t_us` is truthful; its LINE POSITION is not chronological - read the timestamp, not the
+  position. With no sink at all there is no file to write to, so those markers stay buffer-only.
+- There is deliberately no stashed `FILE*`: one buffer, one emission path. A stashed sink would be written
+  to after a caller `fclose`d it (undefined behaviour) - the shared test's first case does exactly that,
+  which is how the first version of this fix was caught before it shipped.
 
 ## Canonical Build Commands
 

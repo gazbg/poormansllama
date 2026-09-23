@@ -1,5 +1,940 @@
 # Current State
 
+## 2026-09-22: TWO OWNER-AUTHORIZED ONE-LINERS APPLIED - stale one-slot CTest tests fixed (--pp-async-feed 0), recon emitter ubatch label landed and proven on a fresh arm
+
+- TEST #53/#54 FIX: `qwen38-layer-boundary` and `layer-slot-lifecycle` were refusing
+  since the T-GPLR-25 async-feed default flip (one-slot tests never passed
+  `--pp-async-feed 0`); both CTest definitions now carry it. Validated: 2/2 PASS
+  under the mutex with `Q38LS_MODEL_PATH` set (11.3 s / 9.7 s). The whole ctest layer
+  family is now 74/74 with the env var restored (72/74 before this fix).
+- RECON LABEL FIX: `ls_recon_ev.ubatch` captured at enqueue; emitter prints the entry's
+  own value instead of the flush-time global. Engine-side only, recon-gated path only
+  (a non-recon run's trace is byte-identical - the emitter is the only reader). Validated
+  on a fresh 4k anchor `--pp-repeat 2 --pp-recon 1` arm (77 samples, 77/77 join at their
+  own key, zero stale-label outliers; run PASS, gpu probes clean). The -14/-15 label
+  class seen on gplr50/gplr52 is gone at the source; old traces keep their labels as
+  recorded history (the keyed checker's classifications are unchanged and remain valid).
+- Guards: host suite SUCCESS, nested `git diff --check` clean, doc-size PASS,
+  resplit --verify PASS. Commit: pending (no commit authorized).
+
+## 2026-09-22: T-GPLR-52's forwarded recon off-by-one join concern - DECIDED CLOSED, host-only from the 126 recorded traces
+
+The last unowned item P5 carried. Decided from the traces on disk, not from the record that claimed
+the fix: 126 traces in `build/llama-cuda/` carry `recon_attr` samples, 97 recorded before the A2
+stamp fix and 28 after it.
+
+- **Pre-fix era (97 traces, 7,379 samples): 0 exact `(layer, generation)` matches against
+  `copy_submit`, 7,379 (100%) match after a +1 generation shift, 0 ordering violations.** So the
+  stamp was exactly one generation behind and nothing else - the signature of `recon_begin_bank`
+  reading `slot.generation` before the increment. This also reproduces the record's counts
+  (`gplr51-a3` 0/89, `gplr52-a2-50k` 0/125, `gplr52-a3-mmap` 0/85).
+- **Post-fix era (28 traces, 2,281 samples): 2,281/2,281 exact, 0 ordering violations.** The re-keyed
+  `(layer, generation)` join also kills the old phantom: under `(layer, ubatch)` the 6 samples per
+  trace flushed across a pass boundary (layers 38/39) drifted by exactly the inter-pass stride,
+  because `ubatch` is the LIVE `n_ubatches` at flush time, not the measured copy's chunk. Under the
+  current key that class is **0 across all 126 traces**.
+- **The gate agrees on real inputs:** `check-gplr53-embed-chunks.py gplr53-a3-50k --join` -> PASS
+  (`CHK-join ok`); `gplr51-a3 --join` -> FAIL, "89 sample(s) carry a generation NO copy of that layer
+  ever had - the pre-T-GPLR-53 stamp offset". Old traces FAIL rather than being silently re-keyed,
+  which is correct: **no tool in `tools/` adds 1 to a recon generation** (checked), so a pre-fix
+  trace stays honestly unbucketable.
+- **Disposition: CLOSED, with one standing negative requirement** - a future pass must not add a +1
+  shim to a checker to make pre-fix traces pass; the offset belongs in analysis prose if ever needed.
+  **Own error, recorded:** this scan's first run reported 271 pre-fix samples unmatched after +1;
+  that was a falsy-zero bug in the scan (`(generation or -99) + 1` sends generation 0 to -98), not a
+  second stamp defect. Corrected: 0. Left uncorrected it would have entered the record as a phantom
+  3.7% residue.
+
+## 2026-09-22: T-GPLR-56 OWNER CALLS DECIDED - first-token PP latency in scope, bounded (A3 decides on one 4k hold); registration-timing authority = A2's narrowed form; block is READY, no arm run yet
+
+The owner answered the two calls the draft block named as product-intent decisions
+(documents only; the block's pre-registered gates are untouched):
+
+- CALL 1 (scope): first-token PP latency IS in scope, BOUNDED - one 4k mutex hold
+  with the pre-registered Q rules unchanged; the conditional 50k/200k holds stay
+  owner-invoked per length. The charter tension (the ~1.9 s one-off is 50.7% of the
+  4k pass-1 wall but 1.4% at 200k) is exactly why the ladder is not pre-authorized;
+  a negative A3 closes the block charter-correct ("overlappable only at short
+  shapes" is a decision-useful result).
+- CALL 2 (timing authority): A2's narrowed form RATIFIED - paced issuance from the
+  existing call site (p1-pace) plus the incremental-with-prebuild fallback
+  (p1-overlap, only if p1-early shows contention) are the authorized mechanisms;
+  tensor-layout span derivation is DEAD per A2's negative finding; registration
+  DURING the model load is explicitly FORBIDDEN (unmeasured loader interaction).
+  p1-early stays as the pre-measured negative control (66.4 ms, a designed FAIL of
+  the 250 ms margin). Status: draft -> ready. No arm has run; the next step is
+  implementing the pace mode behind the default-off flag (A3's implementation
+  steps), host-validated, then the one 4k session.
+
+## 2026-09-22: ESCALATION - the >= 70% band is stated on a quantity that cannot reach it (host-only, no GPU, no arm re-run)
+
+Decision-ready for the Planner; five pages of it in the T-GPLR-53 block. The A4 driver states its band on
+pass-1 WALL (`:11-15`), measures the falsifier against the EXCESS (`:25-27`) and tests the WALL (`:246-264`),
+so the 13:10Z run printed `FALSIFIER SURVIVED ... 47.2%` while that arm's excess removal is 93.0%.
+
+- **Measured - the wall band is unreachable at every shape by construction** (generous formulation: pass-2 wall
+  is the floor, since pass 1 is the same work plus the one-off): **4k 56.2%** (13:10Z; 57.2% in the archived
+  12:44Z run), **50k 10.5%**, **200k 0.86%**; on the excess-share formulation 50.7/51.9/9.9/1.4%. The ceiling
+  FALLS with prompt length because the one-off is shape-invariant (~1.8-2.0 s) while the wall grows - so the
+  band is worst exactly at the long-context shape the charter prioritises. The driver's own printed
+  `pw1/pw2/pw3 = 50.3/50.6/50.8%` already shows the walk, the arm branch (i) is defined by, failing its own band.
+- **What each branch can test:** (i) and (ii) are testable on the excess only; on the wall both are unreachable,
+  so the `neither -> escalate` branch is hit by EVERY arm including one clearing 99.3% of the excess - the wall
+  band carries no information. The wall's legitimate role is the RELOCATION sum (pre-pay + pass-1 wall,
+  3.70-3.76 s, spread 0.06 s), never a removal fraction.
+- **Nothing is reversed:** A3's CHUNK0_SPIKE rests on the per-chunk excess (chunk-0 share 0.9997/0.9987,
+  2001.91/1871.71 ms vs a 0.63-0.64 ms warm median) and A4's H1/H3 reading on the excess table (walk 99.3/99.3%,
+  delay 92.7/93.0%, wrongtouch 91.9/86.2%, pin 99.9%, control repeat ~0). Only the impression that the printed
+  `FALSIFIER` line IS the evidence is retracted; the excess table is.
+- **Zero-cost reporting fix - specified, NOT applied:** print wall and excess removal on one line per arm, print
+  the ceiling once, and print `NOT EVALUABLE on the wall (ceiling {c}% < 70%)` instead of `SURVIVED` when the
+  ceiling is below the band. Threshold, branches and gates byte-identical; past runs re-scored = no.
+- **The decision is the Planner's/owner's:** (A) bind the band to the embed excess - recommended, the only
+  quantity that can express the branches at every shape; (B) keep the wall but make the band shape-relative to
+  its own ceiling; (C) drop the band, report both quantities and the ceiling. No GPU, no mutex, no arm re-run,
+  no threshold retuning; retention state and the T-GPLR-55 shapes untouched.
+- **Successor drafted (2026-09-22, plan only, no code):** `### T-GPLR-56 (draft)` - take the registered-span
+  commit off the first prefill's critical path (start it earlier / overlap it / shard it / shrink the span).
+  It pre-registers `Q = pass1_end_ts - proc_start_ts` with a >250 ms margin and a both-conditions PASS rule, so
+  a relocation cannot satisfy it, and it explicitly does NOT inherit the band above; two owner calls gate it
+  (is first-token PP latency in scope, and is earlier registration acceptable given the spans must be known).
+- **T-GPLR-56 A1 real-trace confirmation RAN, PASS - Q is a measured baseline and the rebase is clean on a real
+  rebased trace (2026-09-22, one mutex hold, 4k control, `--pp-recon 1`).** Card cleared at 13:43:26Z with the
+  mutex free, so the single control arm ran under `tools/with-gpu-lock.ps1`: wrapper exit 0, `PASS`,
+  `gpu_pre=clean gpu_post=clean`, mutex released, arm duration 19.1 s. Trace
+  `build/llama-cuda/gplr56-p1off-4k.jsonl` carries **1,930 events** vs the 13:10Z control's 1,927 - exactly the
+  three markers, and they are the file's **lines 1-3 in call order** (`proc_start` seq 0 / `pre_run` 1 / NO
+  `run_id` / t_us 3, `load_begin` t_us 197,673 with the model path, `load_end` t_us 5,471,465 `ok`), ahead of
+  `pkg_member` on line 4 and `run_start` now on **line 46**. **Q baseline = 9,370.7 ms** (pass-1 wall 3,762.9 ms),
+  of which pre-load 197.7 ms and model load **5,273.8 ms**. Gates on the new base: `--check-telemetry` 0,
+  `check-gplr53-embed-chunks.py --join` 0, `analyze-gplr53-decay.py` 0 with CHUNK0_SPIKE, pass-1 file-backed WS
+  19.03 GiB; `check-gplr56-q.py --trace` exit 0 and with the older 13:10Z control **exit 2 refusal** as
+  pre-registered. So the clock rebase (old base `t0_us` 2,974,883 -> this base's `proc_start` at t_us 3) breaks
+  no existing gate in production, and P1 comparisons must be same-base. **Uncontrolled, not explained away:**
+  the 5,273.8 ms load is not comparable with the 13:10Z run's implied shorter one - different bases and an
+  uncontrolled Windows file cache (a run after ten minutes of a foreign process's GPU work cannot be assumed
+  warm). **Superseded claim, corrected 2026-09-22:** an earlier entry here said `tools/with-gpu-lock.ps1`
+  "prints `gpu_pre/gpu_post` but persists neither (nor a tag) into its verdict json". That is wrong,
+  and the artifact says so: `gplr56-p1off.verdict.json` carries `fields = {gpu_pre_run: clean,
+  gpu_post_run: clean, mutex_acquired: true, timeout_seconds: 7200}` and `arm` IS the tag - the
+  wrapper has recorded that since `001bf65`, and `tools/test-arm-verdict.ps1` asserts
+  `fields.mutex_acquired` on a wrapped run. The real gap underneath it is fixed below.
+- **Wrapper verdict evidence landed (2026-09-22, host-only, no GPU, no CUDA, no arm re-run).** The
+  measured defect: a probe that ANSWERED with nonempty unparseable output (a dropped `--format`
+  flag, a driver banner) fell through `Get-GpuComputeApps` to an EMPTY list and was persisted by
+  `Format-GpuBusy` as **`clean`** - a probe that never answered recorded as an idle card, in every
+  wrapped arm's verdict. Before/after on one fixture: `clean` -> `probe-unavailable`. Landed
+  additively: nonempty-unparseable now returns `$null` (UNVERIFIED); the wrapper's `fields` gains
+  `tag` / `tag_source` (explicit vs derived) / `gpu_probe_source` (`nvidia-smi` vs `stub`) and
+  `gpu_pre_status` / `gpu_post_status` = `clean|busy|unavailable|not-probed`; the pre-existing
+  fields keep their names, values and meanings (the mutex-timeout and exit-125 absence is now
+  readable as `not-probed`). Proof: `tools/test-arm-verdict.ps1` section 12 - **70 checks PASS,
+  0 FAIL** (`build/tav-fast.log`), covering (a) the fields are persisted, (b) a consumer reading
+  only the old fields is unaffected, (c) busy / unavailable / unparseable / never-taken are each
+  distinguishable from clean (`not-probed` produced end-to-end via a private mutex held in another
+  process and `-TimeoutSeconds 0`, exit 124), plus an audit of the in-repo consumers: every verdict
+  read in `tools/*.ps1` is a pre-existing key, and field-bag comparisons are `-contains`-guarded.
+  Both card states on disk: section 6 SKIP with exit 0
+  while another project held the lock on three consecutive runs (`build/tav-clean-1..3.log`), and
+  real lock + `clean` probe on a free card (`build/tav-run3.log` - produced by the revision before
+  two harness-efficiency edits that do not touch section 6; a bounded re-probe 13:57:15Z-14:00:48Z
+  found the lock held by `deepseek_v4.exe` pid 21208 in all 8 samples, so no fresh free-card run).
+  Registered in the host suite as
+  `[gpu-lock]`; `tools/run-tests.ps1 -Suite host` exit 0, 42/42 CTest (`build/host-suite-gpulock.log`).
+  **Not re-run:** `build/gpu-gate-tests/run-gate-cases.ps1` (six gate branches) - it takes the REAL
+  shared lock with a 7200 s default timeout and that lock is held by another project, so re-running
+  it would block; its branch conditions are untouched by this change but have no fresh evidence
+  today. No performance claim; A4's band and saved scoring, the retention state and T-GPLR-55's
+  shapes untouched.
+- **T-GPLR-56 A1 real-trace arm, FIRST ATTEMPT: BLOCKED (2026-09-22).** The 4k control that would prove
+  `proc_start`/`load_begin`/`load_end` in a REAL trace did not run: a foreign process (pid **22436**,
+  `deepseek_v4.exe`) was visible in nine samples from 13:34:08Z to 13:40:23Z, so no mutex was taken, no CUDA
+  process started, no `--AllowBusy`, and no trace exists - the arm is NOT STARTED, not failed, and its exact
+  command is recorded in the T-GPLR-56 block for the next clean window. Because the base change is the kind of
+  thing that breaks a green gate silently, the rebase was modelled host-only instead: every `t_us`/`t0_us`/
+  `run_id` in the recorded 13:10Z control shifted down by a constant 2,000,000 us, then re-checked. Measured
+  identical on original vs rebased: `--check-telemetry` 0/0, `check-gplr53-embed-chunks.py --join` 0/0,
+  `analyze-gplr53-decay.py` 0/0 with CHUNK0_SPIKE both, `analyze-gplr53-gap.py` 2/2 (its own refusal, not
+  rebase-sensitive); no python tool gates on an absolute `t_us`. Related code fact: `t0_us` is captured at
+  `llama_layer_streaming::init` (the sink-open site), which is why `run_start` sits at LINE 43 behind 40
+  `pkg_member` lines, and why the markers will be the trace's first three lines.
+- **T-GPLR-56 A1 telemetry LANDED (2026-09-22, host-only, no GPU): Q is now computable and refuses when it is not.**
+  `llama_ls_tel_mark()` / `llama_ls_tel_flush_early()` buffer markers taken before the sink exists (the
+  sink is `fopen(...,"w")` in `llama_layer_streaming::init`) and flush them as the trace's first lines;
+  `main.cpp` marks `proc_start` at entry and `load_begin`/`load_end` around the load, default-on, no
+  behaviour change. **A measured trap that would have killed every run:** `ggml_time_us()` divides by
+  `timer_freq`, which only `ggml_time_init()` sets, so a marker at the top of `main()` died with
+  `0xC0000094` (integer divide by zero, exit `-1073741676`) - caught by the new host test on its first
+  run; fixed by calling `ggml_time_init()` at main entry and defensively inside the marker (InitOnce, so
+  `llama_backend_init()`'s call stays a no-op). Consequence: P1 traces measure `t_us` from process entry,
+  so they are not comparable to older traces on absolute `t_us` (checkers use differences). Host proof,
+  measured: new CTest `test-layer-streaming-tel-mark` PASS, `tools/check-gplr56-q.py --selftest` 7/7 (incl. a
+  relocation pair that must FAIL and four refusals, and it refuses the 13:10Z trace with exit 2 because that
+  trace predates `proc_start`), `tools/run-tests.ps1 -Suite host` 42/42. The marker shape in a REAL trace is
+  still an arm (`p1-off` at the next clean card); no latency or throughput win is claimed.
+- **T-GPLR-56 A2 landed host-only (2026-09-22, no GPU, no code change, no arm run) - CORRECTS the draft.**
+  A1: Q is NOT derivable at the pre-registered precision, because the trace begins at `run_start`
+  (`t0_us` 2,974,883 is its first timestamp) so the load/init window is invisible and only a ~2.3 s bound
+  exists; a `proc_start` event plus `load_begin`/`load_end` are required, and A1's criterion is recorded UNMET
+  rather than met. A2: `pkg_cache` is built in `llama_layer_streaming::init`
+  (`llama-layer-streaming.cpp:1862`, enumeration `:1936-1950`) from mapped tensor addresses (`:671`), so
+  nothing can be registered before the load returns - "earlier" is worth a measured **66.4 ms** (3.4% of the
+  1.9 s commit), and `p1-shard`+`p1-span` were merged into `p1-pace` because layer-major visits all 40 layers, so
+  "the first chunk's packages" is all 40 groups. Geometry: 40 single-layer groups of ~462 MB, all queued in
+  1,363 us, commit 9.70 GB/s, first stall 1,814.3 ms; one group ~47.7 ms. No latency or throughput win claimed.
+
+## 2026-09-22: DRIVER CAPTURE PRODUCTION-PROVEN (one mutex hold, 13/13 arms PASS) - and the captured lines expose a pre-registered band that is unreachable by construction
+
+The launcher change below was exercised end-to-end by a real A4 session at 13:10Z, because it cannot be
+exercised host-side (it needs real drivers). `SESSION VERDICT: PASS (13/13 arms)`, driver `exit 0`, arms
+13:10:07Z-13:13:33Z, binary `exe 1BDE9D5AFF326CB7` / `llama.dll BE55C90F0A5D796E` (the same pair the 12:44Z dose
+run used, per its archived verdicts, so the comparison is same-binary).
+
+- **Durable now:** `build/llama-cuda/a4-driver-a4.out` (3782 B, 67 lines) and `.err` (9265 B). The stdout holds
+  what was previously thrown away - exe/dll identity, `mutex held`, every arm's `pass1 wall / excess`, the
+  removal list, the `FALSIFIER` line, the dose table, the conserved sum, `gpu_post_run = clean`, `mutex
+  released`, `VERDICT PASS`. `gpu_post_run` is also persisted per arm in all 13 verdicts.
+- **Archive pick-up proven in production:** `-ArchiveOnly` (host-only, no clearing) archived the live files to
+  `runs/20260922T131541Z` - 67 entries, 2 of them driver logs, copy and source `sha256_16` identical
+  (`3A3230F71F5BE161`, `FADC9B6F9A1BA3B4`), sources untouched.
+- **One run, not two:** one launch line, one predecessor archive (13:10:06Z), one monotone 13-arm verdict
+  sequence, one driver log. The operator's Stop killed the POLLING command; the session finished at 13:13:38Z.
+  No `llama-layer-streaming.exe` survived, `Global\AI-GPU-EXCLUSIVE-v1` has no live holder, card clean.
+- **Reproduces on the same binary:** walk/dummy/both/pin 99.3-99.9% both runs, `delay` 92.7% -> 93.0%,
+  `wrongtouch` 91.9% -> 86.2%, control repeat ~0; the control's own excess moved 1906.0 -> 1804.6 ms and the
+  dose arms +110.5 to +312.5 ms, so the run-to-run floor here is ~+-110-130 ms (~6-7%). The dose law holds:
+  1.00/0.95/0.96/0.98 absorbed per ms waited, conserved sum 3.70-3.76 s (spread 0.06 s).
+- **OPEN DEFECT (recorded, not fixed - the band is pre-registered):** the driver states its band on pass-1
+  WALL (`run-gplr53-a4-arm.ps1:11-15`) but its FALSIFIER paragraph and this record's conclusion use the
+  EXCESS. The wall band is unreachable by construction - pass 1 has a ~1.75 s floor, so even the walk (99.3%
+  excess removal) scores 50.3% on the wall, and the driver prints `pw1/pw2/pw3 = 50.3/50.6/50.8%`, below its own
+  70% gate. On this run it printed `FALSIFIER SURVIVED ... 47.2% (< 70%)` (delay's wall) while that same arm's
+  excess removal is 93.0% (126.2 ms vs 1804.6 ms). Escalates to the Planner; nothing was retuned.
+
+## 2026-09-22: THE SESSION LAUNCHER NOW CAPTURES THE ARM DRIVERS' OUTPUT AND EXIT CODES (host-only change; no GPU spent)
+
+`run-gplr53-session.ps1` used to start each arm driver with `Start-Process -WindowStyle Hidden` and no
+redirection, so everything a driver printed was discarded and its exit code was never read - the driver's own
+computed verdict lines (removal table, `FALSIFIER` line, dose curve) existed nowhere on disk, and a driver
+that threw after writing PASS verdicts looked identical to a clean run.
+
+- **Now:** `<session>-driver-<a3|a4>.out` / `.err` are written in `build/llama-cuda/`, the last 20 non-empty
+  lines are echoed into the session log, both files are copied into the run's archived evidence (so the
+  previous run's driver output survives), and the driver's exit code is reported, tabulated and folded into
+  the session verdict - non-zero OR never-exited FAILS the session even when every arm says PASS.
+- **A measured trap that would have failed every clean run:** with `-RedirectStandardOutput/Error`, a
+  `Start-Process -PassThru` object reports `HasExited` but returns NULL `ExitCode` after a bounded
+  `WaitForExit`, and `$null -ne 0` is true. Fix (probed, not guessed): retain the handle with
+  `EnableRaisingEvents = $true` before the wait. `-Wait` also yields the code but blocks unbounded, which
+  repeats the exact hazard this block already recorded and fixed elsewhere.
+- **Host-only proof (no GPU, no mutex):** capture harness `[1]` exit=7 with stdout+stderr files and the
+  driver's `FALSIFIER` line preserved, `[2]` clean exit=0, `[3]` still-running -> `not-exited` (live code
+  never read), `[4]` negative control - the old shape captures nothing, `[5]` fold -> badDrivers=3 over
+  `[7,0,not-exited,5]`; and `-ArchiveOnly` now archives the driver files (bytes matching, source hash
+  unchanged), with the test cleaning up the run dir it created.
+- **Limits:** the proof scripts live in `build/` (gitignored), the already-recorded tooling-location gap. The
+  in-launcher capture itself is now production-proven (see the entry above). No arm behavior, tags, timeouts,
+  rules or retention state changed.
+
+## 2026-09-22: THE PASS-1 ONE-OFF IS ATTRIBUTED (host-only, from recorded traces) - it is the driver-side commit of the 17.23 GiB registered mapping, absorbed by chunk 0's embed step BEFORE any staging copy
+
+No GPU, no mutex, no new arm, nothing rebuilt: this comes out of `host_mem` + `embed_chunk` in the traces
+already on disk, and it corrects the framing of the whole T-GPLR-53 block.
+
+- **Where it lives:** chunk 0's `embed_chunk` in pass 1 ONLY - 1907.1 ms at 4k, 2002.7 ms at 50k,
+  1875.4 ms at 200k, against 0.63-0.9 ms for every other chunk and `host_ledger` pass-0 `embed_us`
+  1911.8 ms with a -1912.3 ms `loop_us` residue.
+- **The staging copies are NOT serialized.** The sweep's first `copy_complete` is 31.6 ms in the control,
+  31.5 ms in the 1700 ms delay arm and 31.5 ms in the walk arm (median 31.4-31.5 ms over 240 copies in
+  each). The one-off is paid before the first staging copy, by the embed step.
+- **Its magnitude is the un-committed part of the mapped span.** File-backed working set runs
+  1.95 GiB -> 19.03 GiB (+17.08 GiB) across pass 1 in EVERY arm and shape, and chunk 0's embed time is the
+  outstanding remainder at 8.7-10.3 GiB/s (17.30 GiB -> 1907 ms; 1.52 GiB -> 132 ms; 0.24 GiB -> 15 ms);
+  `sys_free` drops 50.61 -> 33.19 GiB to match.
+- **Not our code doing it:** with mode 4 the process only sleeps and the prefetch worker is not even created,
+  yet the file working set still grows ~10 GiB/s (2.00 GiB/200 ms, 15.78 GiB/1700 ms). Registration is 1.6 ms
+  for all 17.23 GiB and `commit_bytes` stays 5.58 GiB - it enqueues the work, it does not do it.
+- **Inferred (labelled):** the CUDA driver's page-lock/residency commit for the span registered by
+  `ggml_backend_cuda_register_host_range` (T-GPLR-37; probe: 0.16 ms per 452 MiB window, then a pinned-ceiling
+  14.44 GB/s DMA). Driver-internal vs OS servicing of the lock is NOT separated; that no runner thread touches
+  the pages IS excluded.
+- **`pin` proves the source path is the cause:** `eng_bytes` 1.46 GiB, chunk-0 embed 2.2 ms, but it reads the
+  same file to build its mirror, so its pass-1 wall is 5.39 s instead.
+- **Consequence:** the commit starts when the span is registered, which is AFTER model load and after the
+  graph prebuild (+65.6 ms on a post-load t0), so pass 1 absorbs the remainder. Moving registration to the
+  earliest point where the package spans are known would let the commit overlap work the run already does -
+  the first candidate fix the dose curve points at, and the only shape of a win left. Its risk (host RAM
+  bandwidth contention with load I/O) is to be measured, not assumed. No performance claim is made here.
+
+## 2026-09-22: T-GPLR-53 A4 DOSE CURVE - PASS 13/13: absorption of the pass-1 excess is ~1:1 in the wait, the wall is CONSERVED, so pre-warm cannot be a wall-time win at any length
+
+One mutex hold (preflight clean, 12:44:13-12:47:35Z), 13 arms all PASS with `gpu_post_run` clean on
+every one. The mode-4 no-touch delay now takes its duration from a new opt-in flag
+`--pp-prewarm-delay-ms N` (0..60000, default 1700 = the compiled control, refused unless mode 4 is set).
+
+| dose | pre-pay ms | excess ms | absorbed | pass-1 s | total arm s | pre-pay + pass-1 s |
+|---|---|---|---|---|---|---|
+| `pw0` off control | 0.0 | 1905.95 | - | 3.67 | 14.5 | 3.67 |
+| `d000` | 0.0 | 1834.11 | 3.8% | 3.60 | 14.8 | 3.60 |
+| `d200` | 208.4 | 1622.54 | 14.9% | 3.39 | 14.7 | 3.60 |
+| `d600` | 606.6 | 1054.58 | 44.7% | 2.82 | 14.6 | 3.43 |
+| `d1200` | 1206.9 | 634.56 | 66.7% | 2.40 | 15.2 | 3.61 |
+| `d1700` | 1713.0 | 131.35 | 93.1% | 1.90 | 14.8 | 3.61 |
+| `delay` flag absent | 1701.5 | 139.04 | 92.7% | 1.91 | 15.2 | 3.61 |
+| `pw1` walk | 1693.8 | 14.18 | 99.3% | 1.78 | 15.2 | 3.47 |
+| `pw2` dummy | 1856.0 | 1.10 | 99.9% | 1.76 | 14.7 | 3.62 |
+| `pin` no wait | 0.0 | 1.37 | 99.9% | 5.39 | 17.3 | 5.39 |
+| `r2` | 0.0 | 1833.56 | 3.8% | 3.70 | 13.7 | 3.70 |
+
+- **No step, a ramp:** 200/600/1200/1700 ms of waiting absorbs 283/851/1271/1775 ms of the excess
+  (1.42, 1.42, 1.06, 1.04 ms per ms). Nothing "finishes" at a characteristic duration; the
+  residual tracks (one-off - wait), so full absorption would need ~1.8-2.0 s of pre-pay.
+- **The wall is conserved, which answers the shortening question:** pre-pay + pass-1 wall is
+  3.43-3.70 s at every dose and the arm totals are flat (14.5 vs 14.6-15.2 s, no trend). The
+  pre-pay can be made arbitrarily short, but only by leaving exactly that much excess behind - a
+  1:1 purchase, never a rebate. No dose buys net wall time.
+- **The most favourable point is inside the noise floor:** 200 ms costs 0.21 s and absorbs 0.28 s
+  (0.07 s), while `d000` (sleeps nothing) differs from the control by 3.8% and `r2` by 3.8% -
+  the metric's run-to-run floor is ~±4%, larger than any apparent gain on the curve.
+- **Modality adds only a small term on top of duration:** `pw2`'s cleaner residual than `d1700`
+  (1.10 vs 131.35 ms) is explained by its 143 ms longer pre-pay, which the ramp predicts as
+  +143 ms absorbed (observed +130 ms). The source walk keeps a real ~117 ms page-side term
+  (14.18 vs 131.35 ms; run 4 gave ~113 ms) - reproducible, and the whole surviving page signal.
+- **`pin` still avoids the wait and is still worse overall:** 1.37 ms residual with no pre-pay,
+  but pass-1 wall 5.39 s and total 17.3 s against the control's 14.5 s. Nothing removes the work.
+- Reads as: the one-off is irreducible pending work that pass 1 pays serially unless something
+  waits it out first, and the exchange rate is 1:1. It CONFIRMS the falsifier run's reading, so
+  the withdrawn H1 section stays withdrawn and unchanged. **No performance claim**; the
+  pre-registered contract and thresholds were not edited.
+- n basis: each dose ran ONCE (`exe 72C6DFE1C5F5FA6B` / `llama.dll 2D2EA6B41E0A22E9`); the off
+  control has five runs across four holds with excess 1866.72-1905.95 ms - the noise the curve is
+  read against. Flags verified from the `.started` commands (five dose arms carry the flag;
+  `delay` carries mode 4 with the flag absent = compiled default, 1701.5 vs 1713.0 ms).
+- Host-validated before the GPU was touched: flag range refused, flag refused for modes 0/1/3/8
+  and accepted for mode 4, off-state byte-identical, both drivers parse, dry run shows 13 arms
+  with exactly the five dose values.
+- Durability fired a third time: the falsifier run's evidence archived to
+  `build/llama-cuda/runs/20260922T124413Z/` before this run overwrote those paths.
+
+## 2026-09-22: T-GPLR-53 A4 FALSIFIER RUN - PASS 8/8, and the no-touch delay CLEARS 93.2% of the pass-1 excess, so the page-residency reading of the one-off COLLAPSES
+
+Third A4 attempt, one mutex hold (preflight 12:37:19Z clean, 12:37:33-12:39:42Z), same shape
+and gate regime as before; each arm's `gpu_post_run` is now recorded and **all 8 are clean**.
+Two control modes were added for this run (engine `pp_prewarm` is a bitfield 0..15): 4 =
+duration-matched no-touch delay, 8 = duration-matched wrong-region touch (64 MiB scratch).
+
+| arm | mode | pre-pay ms | excess ms | removal vs control | pass-1 wall s |
+|---|---|---|---|---|---|
+| `pw0` | 0 off | - | 1866.72 | - | 3.62 |
+| `pw1` | 1 source walk | 1691.1 | 13.69 | 99.3% | 1.78 |
+| `pw2` | 2 dummy launch | 1845.2 | 1.42 | 99.9% | 1.77 |
+| `pw3` | 3 both | 1690.3 | 1.51 | 99.9% | 1.77 |
+| `delay` | **4 no-touch delay** | 1710.7 | 126.85 | **93.2%** | 1.90 |
+| `wrongtouch` | **8 wrong-region touch** | 1706.1 | 125.57 | **93.3%** | 1.89 |
+| `pin` | 0, pinned source | - | 1.71 | 99.9% | 5.34 |
+| `r2` | 0, repeat 2 | - | 1834.68 | 1.7% | 3.63 |
+
+- **FALSIFIER FIRED: the mechanism claim collapses.** A control that touches ZERO pages
+  (`no-touch delay 1700 ms / 0 pages touched in 1710.6 ms`) removes 93.2% of the excess.
+  The one-off is therefore NOT the first read of the 17.23 GiB source span; it is something
+  that completes on its own given ~1.7 s. The wrong-region touch agrees within 1.3 ms, so
+  page touching in any region buys nothing. Mode 1's 99.3% is explained by its own ~1.69 s
+  DURATION, which the delay matches within 1.1%.
+- **What survives is small:** the walk leaves 13.69 ms where the delay leaves 126.85 ms - a
+  ~113 ms page-side residue (~6% of the 1.87 s). `pin` is still the only arm clean with no
+  wait at all (1.71 ms) while paying ~1.7 s elsewhere (pass-1 wall 5.34 s).
+- **The payer is neither the source read nor the submission** - a sleep pays it - so the
+  contract's ESCALATE branch applies (hypothesis set incomplete; do not tune). Pre-warm is
+  NOT adopted; no mode is recommended; no performance claim (pre-pay equals the excess it
+  removes and arm walls are flat, so it is relocation at best).
+- **Contract defect recorded, not edited:** the pre-registered comparison quantity is the
+  pass-1 WALL with a ">= 70%" branch, but the one-off is only 1.84 s of a 3.62 s wall, so
+  every real mode lands at ~51% and branch (i) could never fire on it. The second attempt's
+  "branch (i) fires (H1)" used the corroborating excess term instead; that section now
+  carries an explicit WITHDRAWN pointer.
+- **n basis, explicit:** each mode has now run twice (12:28Z and 12:37Z) but on DIFFERENT
+  binaries (`llama.dll 8A9F3D83F24D0FEC` then `5DE4FCD26921E6E8`), so it is a shape
+  reproduction across builds, not a same-binary repeat; the off control agrees within 0.8%
+  and modes 1-3 within 1.6%, which is what licenses reading them together.
+- **Provenance fixes landed:** `gpu_post_run` is now persisted per arm in both GPLR-53
+  drivers (it had been printed only), verified present in all 8 verdicts of this run; and
+  the n=1 (now n=2) basis is stated in the record instead of implied.
+- **Host-validated before the GPU was touched:** `--pp-prewarm 16` refused (exit 2), modes
+  4/8 accepted and reaching the same refusal table as 1-3, off-state byte-identical again,
+  and the driver dry run prints 8 arms with exactly `--pp-prewarm 1/2/3/4/8`.
+- Durability fired again: the second attempt's 8-arm evidence is archived intact at
+  `build/llama-cuda/runs/20260922T123732Z/` (30 manifest entries) beside the older
+  `runs/20260922T122800Z/` and the accepted A3 evidence.
+- Recorded gap, not fixed: the session launcher does not persist its child driver's stdout,
+  so the driver's own `FALSIFIER` line is not in `session4.out`; the table above is
+  recomputed from the per-arm verdict artifacts.
+
+## 2026-09-22: T-GPLR-53 A4 CLOSES - PASS 6/6 in one mutex hold, and the modality evidence points at HOST PAGE RESIDENCY (H1), not per-submission overhead (H3)
+
+> SUPERSEDED the same day by the FALSIFIER RUN entry above: the H1 reading below is withdrawn
+> (a no-touch delay removes 93.2% of the same excess), and so is "H3 is refuted". The raw
+> per-arm numbers, the size-insensitivity and the pinned-source observation still stand.
+
+Second A4 attempt, one mutex hold, card clean at 12:27:53Z and again on `gpu_post_run`,
+same binary pair as A3 (exe FE3B0A108C1D9BC9 / llama.dll 8A9F3D83F24D0FEC). All six arms
+PASS all three gates (`--check-telemetry` exit 0, `--join` exit 0, decay exit 0 =
+CHUNK0_SPIKE), and the `r2` arm's route parity is clean (160 events, 80 distinct, paired x2).
+
+- **Measured, the decisive number:** mode 1 (a read-only CPU page walk, `17.068 GiB /
+  4474368 pages in 1673.5 ms`) removes 99.3% of the pass-1 chunk-0 excess (1881.94 ->
+  13.52 ms, pass-1 wall 3.65 -> 1.79 s) with NO GPU submission at all. Mode 2 (one dummy
+  H2D + event sync) removes 99.9%, but costs 1832.1 ms ITSELF; in mode 3 the walk costs
+  1673.7 ms and the dummy that follows costs only 18.2 ms. One shared one-off, not two
+  costs. Registration is NOT it: `18500517888 B (17.23 GiB) pinned in 1.5-1.6 ms` in every
+  mmap arm.
+- **`pin` (mode 0, pinned source, no pre-warm) removes it from the embed bracket** (excess
+  1.34 ms) - but its pass-1 wall is 5.44 s, 1.79 s WORSE than the off control, so the cost
+  is RELOCATED into pass-1 setup, not eliminated. Warm state is untouched everywhere
+  (passes 2/3 1.57-1.58 s; warm median 0.632-0.663 ms across all six arms).
+- **No performance claim; pre-warm is relocation, not a saving.** Pre-pay (1673-1832 ms)
+  is the same magnitude as the excess removed (1831-1882 ms) and arm wall times are flat to
+  worse (14.7 s -> 15.3 / 15.3 / 15.1 s).
+- **The pre-registered A4 rule does not discriminate here, and is not being reinterpreted:**
+  its branch (i) "removes >= 70% -> page-side (H1)" AND branch (ii) "removes it ->
+  submission-side (H3)" both fire, because the modalities turned out not to be mutually
+  exclusive. A3's rule maps CHUNK0_SPIKE -> H3; A4's branch (i) points to H1. Both were
+  pre-registered; neither rule, threshold nor accepted A3 verdict was changed. **This is
+  the task's remaining open item and it is a Planner adjudication, not an arm.**
+- Evidence durability proven in production: the launcher archived the earlier shape-bug
+  attempt's six FAIL artifacts into `build/llama-cuda/runs/20260922T122800Z/` (with a
+  manifest of source, size and truncated SHA-256) before overwriting them; the accepted A3
+  traces, verdicts and their mtimes are untouched. Mode-0-equals-off is now verified at run
+  time as well (off arms log no `pp-prewarm(` line, `prewarm_engaged: false`).
+
+## 2026-09-22: T-GPLR-53 A3 CLOSES ON REAL ARM VERDICTS - PASS 2/2, CHUNK0_SPIKE reproduced on a second run; A4 half BLOCKED by a foreign process and refused in 394 ms
+
+(A4's blocker below was cleared later the same day: see the entry at the top.)
+
+Second A3 session (one mutex hold, card clean before and after, same binary pair
+exe FE3B0A108C1D9BC9 / llama.dll 8A9F3D83F24D0FEC as the first run, so this is a
+genuine repeat).
+
+- **Both arms PASS** and all three gates are green on each: `--check-telemetry`
+  exit 0, `check-gplr53-embed-chunks --join` exit 0 (`CHK-join ok`), decay exit 0.
+  50k: CHUNK0_SPIKE, chunk-0 share 0.9997, excess 2001.91 ms, walls
+  20.25/18.12/18.16 s, 67.6 s. 200k: CHUNK0_SPIKE, chunk-0 share 0.9987, excess
+  1871.71 ms, walls 135.84/134.67/135.54 s, 484.9 s. `gpu_pre_run` clean on both.
+- **CHUNK0_SPIKE is now the verdict of four independent arm-runs** (both shapes,
+  twice) and the excess stays size-insensitive in the repeat (2001.91 ms at 50k vs
+  1871.71 ms at 200k). Nuance the repeat exposes: the DECIDING statistics are stable
+  (~0.999 in all four runs) while `rho` is not (+0.315 / +0.0159 at 50k; +0.110 /
+  +0.2924 at 200k) - consistent with the recorded limit that the verdict rests on
+  the chunk-0 concentration and warm tail, not on the trend statistic.
+- **A4 NOT RUN.** Blocked by pid **21092**
+  (`colibri\pf06-wt\c\deepseek_v4.exe`, 18.3-18.7 GiB, 51-91%) resident and active
+  across a 4-sample re-probe 12:12:20Z -> 12:14:50Z and still resident at
+  12:15:25Z. The attempt stopped rather than waiting; `-AllowBusy` not passed, no
+  CUDA process started. The new preflight refused the A4 half with **exit 125 in
+  394 ms**, naming the PID - the recorded one-hour `WaitOne` hazard did not
+  materialise. All six A4 arms (`pw0/pw1/pw2/pw3/pin/r2`) have no artifact of any
+  kind.
+- **H1 vs H3 remains UNDISTINGUISHED.** A3's rule maps CHUNK0_SPIKE to H3, and
+  size-insensitivity is consistent with a fixed one-off completion rather than a
+  page-proportional cost, but A4 (mode 1 = CPU read-touch, H1's page-side
+  candidate; mode 2 = dummy launch + sync, H3's submission-side candidate) is what
+  separates them, and it did not run.
+- **Mode-0 vs off default: host-verified byte-identical** runner output and zero
+  pre-warm chatter, matching the code path (`pp_prewarm == 0` returns before
+  touching anything); the driver's run-time assertion still needs the A4 run.
+- **Evidence durability landed (host-only, no GPU).** The fixed arm tags meant a
+  re-run overwrote the previous run's trace and verdict triple (the original A3 FAIL
+  artifacts are gone; only the record prose and `gplr53-a3-session.out` remain).
+  `tools/run-gplr53-session.ps1` now copies the artifacts it is about to replace
+  into `build/llama-cuda/runs/<utc-stamp>/` with a hashed `manifest.json`, AFTER the
+  busy preflight and BEFORE `Clear-ArmVerdict`, so a refused run writes nothing and
+  a real run cannot lose its predecessor. New `-ArchiveOnly` snapshots and exits
+  without launching. Proof: 10 artifacts archived, `python build/check-archive.py`
+  = **ARCHIVE PROOF: PASS** (copies byte-identical, sources intact), source hashes
+  unchanged before/after, `-ValidateOnly` still exit 0 and `-PreflightOnly` still
+  exit 125 on a busy card. Tooling only: no arm action, tag, rule, engine or runner
+  change.
+- No performance claim is made anywhere above; the numbers quoted are trace and
+  verdict contents.
+
+## 2026-09-22: T-GPLR-54 A3 EXECUTED (owner-invoked) - VERDICT: BENIGN (H1); the u4096 escape at index 41 was a near-tie tie-break; one A2 wiring defect found and fixed by the session itself
+
+The owner invoked the parked A3 discriminator session (one GPU mutex hold,
+`tools/run-gplr54-a3-session.ps1` + detached launcher `tools/run-gplr54-a3-launch.ps1`;
+wrapper verdict PASS, gpu_pre/post both clean). This DISCHARGES the neutrality-pair
+obligation A2 had pre-registered and decides H1 vs H2 by the archived block's
+pre-registered rule - now with measured evidence instead of the closure's stated prior.
+
+- VERDICT (tools/analyze-gplr54-a3-verdict.py, written before the run, selftest 10/10):
+  **BENIGN (H1)**, exit 0. `margin_u4096(step 40) = 1.281971 <= M_band + 1.0 = 21.539429`
+  (M_band = 20.539429, max over 123 multi-chunk rows in the derived window 0..40,
+  window derived from the ID-CHECK's verified D=41, not assumed). CONTEXT (not the
+  rule): at the flip step itself the u4096 margin was **0.138065** vs the u512
+  reference's **0.0127** - both near-ties over the same top-2 pair {248045, 846}; the
+  1-chunk shape tipped a coin-flip decision the other way. The escape was NOT a
+  confident different choice.
+- ALL PRE-REGISTERED GATES GREEN: neutrality (ids(u512-on) == ids(u512-off)
+  byte-identical, 96 ids), C4 (both repeats byte-identical), ID-CHECK (u2048-on
+  IDENTICAL K=0; u4096-on reproduces the recorded shape EXACTLY: D=41, K=7, the same
+  7-id inserted sequence, tail realigned, template-only), instrument integrity
+  (depth>=96 declared, rows contiguous, top1==pick, margin arithmetic).
+- A2 WIRING DEFECT (found by run 1's own integrity gate, fixed before run 2):
+  the engine's run_start setter embedded `tg_logit_margin` into the run_start
+  string but NEVER assigned the member the emitter gates on - run_start claimed
+  the readout was on while the trace stayed silent (0 rows). Run 1 = pilot that
+  falsified the A2 coverage claim; traces preserved as
+  `build/llama-cuda/gplr54-a3-run1-*.jsonl`. Fix: one-line member assignment in
+  the setter (`llama-layer-streaming.cpp`); validated by run 2 (96 real rows per
+  margin arm, A2 checker PASS on all 6 real traces for the first time) and by
+  CROSS-BINARY determinism: run-1 (pre-fix binary) ids == run-2 (post-fix binary)
+  ids on all 4 distinct arms - the telemetry-only fix provably did not perturb
+  the pick, and D=41/K=7 reproduced across two binaries.
+- CHECKER BRING-UP (both bugs were analyzer-side, caught by the gates as
+  designed): (1) the off-arm invariant wrongly demanded the run_start key be
+  ABSENT; the engine's real off shape declares `tg_logit_margin: 0` (explicit
+  provenance) - invariant is zero rows under absent-or-zero depth, with two new
+  selftest cases. (2) the session-surprise gate compared agreement POSITIONALLY
+  across all six arms, which the insertion offset makes meaningless after D; the
+  rule's own text ("of the multi-chunk arms", indices 0..40) is now implemented
+  verbatim, window derived from verified D.
+- SUITE CLASSIFICATION (zero task-owned failures): with `Q38LS_MODEL_PATH`
+  restored, the ctest layer family is 72/74 and QA smoke PASSES (5/5 answers,
+  negative control fails as designed, MoE model). The two real failures are
+  PRE-EXISTING stale test definitions, not from this session: #53
+  qwen38-layer-boundary and #54 layer-slot-lifecycle run `--layer-slots 1`
+  without `--pp-async-feed 0`, and the async-feed default flipped to 1 in the
+  T-GPLR-25 commit (68cd1726d, long in HEAD) whose one-slot reuse gate refuses
+  exactly that shape. Recorded, not applied: the fix is adding
+  `--pp-async-feed 0` to those two CTest definitions - a vendored-tree test
+  change outside this task's contract, awaiting owner authorization. All other
+  failures this session were the env-var class (the Freebuff restart dropped
+  `Q38LS_MODEL_PATH`; `tools/run-gplr54-suite.ps1` now sets it for detached
+  suite runs). Guards: doc-size PASS, resplit --verify PASS, nested
+  `git diff --check` clean; one pre-existing trailing-whitespace complaint at
+  plan line 982 (T-GPLR-53 block, another thread's edit, left alone).
+- Evidence: `build/llama-cuda/gplr54-a3-*.jsonl` (run 2) + `-run1-*` (pilot),
+  `build/llama-cuda/verdicts/gplr54-a3{,-run1}.verdict.json`;
+  `build/llama-cuda/verdicts/` wrapper verdicts PASS with clean GPU probes.
+  NOT claimed: anything about timing (never the task), any u>=4096 config's
+  fitness (soft gates), or that other prompts cannot flip differently - the
+  rule (AGENT_ENVIRONMENT.md, "Greedy identity at u >= 4096") remains the
+  standing arm gate; its benign reading is now measured, not assumed.
+
+## 2026-09-22: T-GPLR-53 A3 MECHANISM VERDICT PRODUCED - the pass-1 embed excess is a chunk-0 spike (pre-registered mapping -> H3), decided from the traces already recorded, zero new GPU time
+
+The A3 arms ran earlier today on a clean card (one mutex hold) and BOTH FAILed their
+tool checks. The blocker turned out to be a defect in the rule's own loader, not
+missing telemetry: `tools/analyze-gplr53-decay.py` bucketed passes by an event
+`phase` field, which in this format means PP-vs-TG and does not exist on
+`embed_chunk` at all, so every chunk landed in pass 0 and the rule refused its own
+input (exit 2 = never a pass).
+
+- FIX (tool-only, no emitter change, no runner change): bucketing is now by
+  chunk-sequence reset, with ambiguity refused rather than guessed (blocks must be
+  `0..n-1`, equal length, and agree with the `host_ledger` boundary count when one is
+  present; `pp_pass` is advisory because it fires at pass transitions and is measured
+  at n-1). Fixtures moved to the recorded trace shape - the old ones carried a
+  `phase` field, which is why the defect survived them - and the bucketing now has
+  its own controls: `--selftest` 10/10 including three refusals and a 3-pass
+  positive control.
+- VERDICT from the recorded traces, no second mutex hold: **CHUNK0_SPIKE at both
+  shapes (exit 0)**. Pass totals 1937.01/63.40/63.41 ms at 50k and
+  2040.50/254.62/255.26 ms at 200k; excess at chunk 0 = 1872.39 / 1785.27 ms; largest
+  excess EXCLUDING chunk 0 = 0.114 / 0.263 ms; chunk-0 share 0.9991 / 0.9965. The
+  pass-1 excess is ~1.8 s at BOTH shapes while the prompt grew 4x (and while the
+  warm per-pass embed grew 63.4 -> 254.6 ms), i.e. size-insensitive - consistent
+  with a fixed one-off completion (F5's 18.5 GB registered span) rather than a
+  page-proportional cost. Labeled telemetry-only: no performance claim follows.
+- Honest limit: rho is POSITIVE (+0.315 / +0.110), so the FLAT branch would have
+  fired on 200k had CHUNK0_SPIKE not taken precedence; the verdict rests on the
+  chunk-0 concentration plus the warm tail, not on the trend statistic. H1-vs-H3
+  remains A4's modality question.
+- A2's stamp fix is CONFIRMED by the same traces: the `-1` drift class present in
+  every pre-A2 trace (`-1 x85..119`) is gone (`+0 x118`).
+- RESOLVED (same day, host-only, no GPU): the 6-sample layer-38/39 "boundary stamp"
+  is a CHECKER KEYING artifact, not a stale stamp. `recon_flush_all()` writes a
+  sample's `ubatch` from the LIVE `n_ubatches` at flush time while its
+  `(layer, generation)` come from the ring entry that describes the measured copy
+  (`llama-layer-streaming.cpp:1323-1325` vs `e.il`/`e.gen` at `:1291-1292`), so the
+  old `(layer, ubatch)` key reported a phantom one-pass-stride drift on exactly the
+  samples flushed across a pass boundary. Re-keyed `CHK-join` to
+  `(layer, generation)` plus two ordering conditions; matching is now 124/124 on
+  both A3 traces (0 flushed before their copy, `copy.t_us <= sample.t_us` for all
+  124), and the pre-A2 traces still fail **100%** (0/89, 0/125, 0/125, 0/85), so the
+  rider kept its teeth. Checker `--selftest` 20/20, including a control that was
+  RE-SPECIFIED (the old -14 case lands on a real copy and is the flush-later shape
+  the corrected keying must accept) and two new hard controls. A3's three gates are
+  now GREEN on the traces already on disk: check-telemetry 0, CHK-join ok, decay
+  CHUNK0_SPIKE. The bucketing the verdict rests on uses the `embed_chunk` stream
+  only, so this does NOT invalidate it; the pre-registered rule was not touched.
+  RESOLVED (2026-09-22, owner-authorized one-liner): the emitter fix is LANDED -
+  `ls_recon_ev` carries `ubatch` captured at ENQUEUE time and the emitter prints the
+  entry's own label; proven on a fresh 4k `--pp-repeat 2 --pp-recon 1` arm where all
+  77 samples join exactly at their own (layer, ubatch) key - zero stale-label
+  outliers (the old code produced the -14/-15 class on the same shape family).
+- Evidence: `build/llama-cuda/gplr53-a3-{50k,200k}.{jsonl,log}`,
+  `build/llama-cuda/verdicts/gplr53-a3-*.verdict.json`; full write-up in
+  `docs/plans/generic-prefill-layer-residency-plan.md` (T-GPLR-53). T-GPLR-19/26
+  retention state and T-GPLR-55's drafted shapes were not touched.
+
+## 2026-09-22: T-GPLR-54 CLOSED ON THE ARM RULE (owner decision) - id-equivalence at u >= 4096 is unavailable by design; the enforced ID-CHECK replaces it; A2 parked ready, A3/A4 not run, zero GPU time spent
+
+The owner took the third option the block left open: close T-GPLR-54 without
+the A3 GPU session. Documents only; no engine, runner, or default change.
+
+- THE DECISION: the mechanism question (near-tie tie-break vs confidently
+  different distribution) stays deliberately open, and the discriminator's
+  arm rule becomes the standing equivalence contract: at u >= 4096 (and any
+  future arm that changes prefill chunk shape, KV type, or the prefill
+  path), 96-id identity is NEVER the bar - the enforced A1 ID-CHECK is
+  (`python tools/analyze-gplr54-ubatch-identity.py <candidate> <reference>`;
+  PASS = IDENTICAL or BOUNDED-INSERTION with answer span intact; FAIL =
+  escalate before recording timings; cannot-evaluate = exit 2, never a pass).
+  The rule is now a permanent environment fact in
+  `docs/AGENT_ENVIRONMENT.md` ("Greedy identity at u >= 4096").
+- WHY THIS IS SAFE: the divergence is one bounded template-region insertion
+  with byte-exact re-synchronization, PAST the graded answer span (needle
+  grading 5/5 at u4096), H1 (batch-shape numerics) stays the stated prior,
+  and every session's own reference pair still verifies K = 0 - so a REAL
+  derailment (content tokens, no realignment, inside the answer span,
+  non-repeating) still fails the check loudly. What is given up: the
+  margin-band evidence that would decide H1 vs H2, and per-step logit
+  visibility, until someone re-opens it.
+- DISPOSITION OF THE ARMS: A1 done (enforced tool, selftest 7/7, wired as
+  [t54-a1]); A2 LANDED AND PARKED READY - `--tg-logit-margin` is default-off,
+  host-validated (41/41 CTest, checker 11/11, [t54-a2] in the host suite),
+  and its one self-named obligation (the on/off neutrality pair) remains
+  pre-registered as the first arm of any future A3; A3/A4 not run by design.
+  The plan block carries the full RESULT and the unchanged pre-registered
+  A3 rule for whoever re-opens the question.
+- LIVE BACKLOG: T-GPLR-53 only (in-progress; A1 + A2 done; A3/A4 mutex
+  session is the only GPU spend in the family). T-GPLR-54 is done; the resplit
+  moves it to the archive.
+
+## 2026-09-21: T-GPLR-54 A2 EXECUTED - the default-off --tg-logit-margin readout lands (runner + engine, host-validated); the on/off neutrality pair is pre-registered as A3's first arm
+
+- WHAT: `--tg-logit-margin N` (<= 0 = off, the default) records one
+  `tg_logits {step, top1_id, top1_logit, top2_id, top2_logit, margin, t_us}`
+  per greedy TG step for the first N steps, carrying the SAME penalized top-2
+  values the pick consumed (the T-GPLR-06 stderr line, now in the trace).
+  This is the instrument A3's margin-band decision rule consumes; without it
+  the benign-tie-break vs shape-defect question has no input.
+- DEFAULT-OFF INVARIANT, machine-checked: `run_start` carries
+  `tg_logit_margin` only when the flag is passed (pre-A2 recordings
+  byte-unchanged), and `tools/check-gplr54-logits.py` CHK-gate fails any
+  trace with rows under an undeclared key. `--selftest` 11/11 (3 positives,
+  6 firing negative controls, 2 exit-2 refusals).
+- HOST VALIDATION: fixture `tests/gplr54-tg-logits.jsonl` (from the recorded
+  gplr38-u512 shape + the recorded stderr margins of bare-default-k.log;
+  fixture top-1 ids ARE the gold ids, so top1==pick holds by construction);
+  both validators exit 0 (new CTest pair
+  `layer-streaming-{check,validate}-gplr54-tg-logits`; host suite **41/41**,
+  was 39; `[t54-a2]` wired into every host-only suite). The first fixture
+  draft failed 3 strict-validator invariants and was repaired to the minimal
+  valid shape - recorded because it re-proves the validators bite.
+- HONEST CAVEAT: the AC's same-session on/off sampler-neutrality pair needs
+  one GPU arm (a host cannot execute the sampler); structural neutrality is
+  host-proven (read-only tap before sampler-state advance, no added sampler
+  call) and the pair is PRE-REGISTERED as A3's first arm (u512 x2, flag off
+  vs on, ids must be identical) - A3's verdict is void without it.
+- NOT CLAIMED: any timing, any mechanism verdict, any default change. Next:
+  A3 (one owner-invoked mutex session: the neutrality pair, the u-arms with
+  `--tg-logit-margin 96`, the pre-registered margin-band rule).
+
+## 2026-09-21: +12 x2 RECON-JOIN ANOMALY RESOLVED - not a second join defect: the checker's positional pairing mispaired across passes; the keyed (layer, ubatch) join removes the phantom, and one real label artifact is exposed and characterized instead
+
+Host-only (traces + code reading), no GPU. Question: is the +12 x2 drift on
+`gplr50-ctl-4k-f16` a real second stamp defect or an artifact? Answer: an
+ARTIFACT of the checker's pairing, plus one real (harmless) telemetry-label
+artifact underneath.
+
+- The two +12 pairs both paired a PASS-2 sample (ub 16) against the same
+  layer's PASS-1 submit (ub 8), because layers 17 and 34 were sampled only in
+  pass 2 and the checker's per-layer positional index landed on their first
+  (pass-1) submit. Measured inter-pass generation stride on the same layers:
+  13. 13 - 1 (the known pre-fix stamp) = +12. The phantom is arithmetic, not a
+  second defect.
+- Keyed (layer, ubatch) pairing over ALL 65 samples: -1 x64, -15 x1, 0
+  unpaired - the +12s vanish. The same pairing on `gplr52-a2-50k`: -1 x119,
+  -14 x3, -15 x3 (0 unpaired). (layer, ubatch) identifies exactly one submit
+  on both traces (max 1 per key over 4,185 submits), so the key is
+  well-defined.
+- The residual -14/-15 class is the lazy recon ring's LABEL artifact: a pass's
+  last sampled banks sit in the ring until the next pass's first bank flushes
+  them, and the emitter prints the CURRENT `n_ubatches` as the sample's ubatch
+  label (src/llama-layer-streaming.cpp:1220 prints the global, not the sampled
+  event's). Proof: each outlier's GENERATION sits at exactly -1 from its true
+  earlier-pass copy (verified per-sample in both traces), and the outliers
+  cluster on the last sampled layers at pass boundaries (lay 39 in gplr50;
+  lays 38/39 in gplr52) - the stale-ring fingerprint. No arithmetic claim in
+  any A1/A2/A3 result depends on the ubatch label of a recon_attr sample;
+  the COPY-ATTRIBUTION numbers (copy_gpu_ms, lag_ms) belong to the stamped
+  generation, which is correct everywhere on these traces.
+- Checker hardened so A3's drift-0 gate cannot see phantoms:
+  `tools/check-gplr53-embed-chunks.py --join` now keys on (layer, ubatch),
+  refuses events missing the key (exit 2, not guessed), and its `--selftest`
+  grew 15/15 -> **18/18** with the measured gplr50 shape encoded as negative
+  controls (a TG-burst layer pairing positionally onto its pass-1 copy must
+  FAIL at the TRUE drift -1, not the phantom +12; a genuinely wrong stamp
+  fails; a missing-ubatch event is REFUSED). Re-measured: gplr50 --join now
+  FAILs naming "-15 x1, -1 x64" (the true pre-fix signal), gplr52-a2-50k
+  names "-15 x3, -14 x3, -1 x119". Selftest re-run 18/18; both validators
+  unaffected (no engine change).
+- What remains genuinely open from this: nothing for the join itself (A3's
+  drift-0 expectation stands, on the keyed checker). The recon emitter's
+  ubatch label is a known cosmetic defect (one-line engine fix, defer unless a
+  future analysis needs per-ubatch sample attribution).
+
+## 2026-09-21: T-GPLR-54 A1 EXECUTED - the ID-CHECK is now a checked tool; D = 41 / K = 7 reproduced host-only, no GPU
+
+`tools/analyze-gplr54-ubatch-identity.py` landed: the pre-registered ID-CHECK
+(C1 prefix D >= 41, C2 one bounded insertion with byte-exact tail realignment,
+C3 template-only ids, C4 `--repeat` determinism gate for A3's x2 arms), with
+`--selftest` 7/7 (two positives, three negative controls that fire, the
+recorded-shape check, the missing-trace refusal) and the verified exit contract
+(PASS 0 / FAIL 1 / no-`tg_tokens` refusal 2 - `gplr38-100k-*` refuses, exit 2,
+NOT a pass). On the recorded arms (no GPU): u1024 and u2048 are IDENTICAL to
+u512 over all 96 ids; u4096 is BOUNDED-INSERTION D = 41, K = 7, inserted
+`[248045, 248045, 248045, 248045, 248046, 198, 248045]`, tail realigned,
+template-only - the draft's F1-F3 reproduce exactly, and the corrected wording
+below is now enforced by CHK expectations instead of being prose.
+One honest root-cause fix during validation: the first C2 form hardcoded the
+equal-length realignment (passes these arms, rejects a true insertion at any
+other stream length); the general form (g = len(cand)-len(ref)) covers both and
+still rejects substitutions - caught by the pre-registered fixture discipline.
+Wired as `[t54-a1]` into every host-only suite: `-Suite host` observed SELFTEST
+PASS, 39/39 CTest, doc-size + plan-split PASS, suite SUCCESS. A2 (the
+default-off `--tg-logit-margin` instrument) is next; A3 needs an owner-invoked
+mutex session.
+
+## 2026-09-21: T-GPLR-54 DRAFTED - the last ownerless correctness observation is now a task, and its shape is measurably sharper than the record said
+
+The u4096 greedy stream is not a "repeat loop": a host-only re-read of the four
+recorded 4k arms (`gplr38-u512/u1024/u2048/u4096.jsonl`, same binary era, 4096-token
+prompt, handoff auto-on, 3 slots, 96 greedy ids each) shows that u1024 and u2048 are
+ID-IDENTICAL to u512 for all 96 ids, while u4096 equals u512 with exactly ONE
+contiguous 7-id insertion at index 41
+(`248045, 248045, 248045, 248045, 248046, 198, 248045`) and is byte-identical after
+realignment (`u4096[48:96] == u512[41:89]`). One argmax flip at the first decision
+after the template region both arms enter at index 35, then exact
+re-synchronization - not a derailment region, and not a truncation (the needle answer
+is complete and ends before index 41). The 2026-09-21 Oddity 2 entry is corrected
+above accordingly.
+
+T-GPLR-54 (draft) turns that into a falsifiable task: a named ID-CHECK (prefix
+identity with D >= 41, exactly one bounded insertion with byte-exact realignment,
+template-only inserted ids, and repeat determinism) plus one default-off runner-side
+instrument (`--tg-logit-margin N`, top1/top2 margin per TG step) that decides whether
+the flip is an ordinary near-tie (benign; the u>=4096 arm rule becomes "prefix +
+single-insertion realignment, never 96-id identity") or a confidently different
+distribution at the 1-chunk prefill shape (escalate with a minimal reproducer).
+Negative controls must fire (content-token insertion, non-realigning tail,
+divergence inside the answer region). No GPU time used and none needed for A1; A3 is
+one owner-invoked mutex session at 4k. Live backlog is now T-GPLR-53 (in-progress) +
+T-GPLR-54 (draft).
+
+## 2026-09-21: T-GPLR-53 A2 EXECUTED (host-validated, no GPU) - the recon-gated `embed_chunk` event lands, the recon generation off-by-one is fixed, and the pass-1 profile is now measurable on a real first pass
+
+- Engine (telemetry only): `tel_embed_chunk(chunk, n_tokens, setup_us, compute_us,
+  span_us)` in `llama-layer-streaming.{h,cpp}`, called from the step-1 loop of
+  `llama_context::layer_major_pp`; the event is self-gated on `pp_recon`, so a
+  non-recon run emits nothing (no new flag, no ledger field, no arithmetic,
+  routing or package change). `span_us` is the chunk's whole wall, so a pass's
+  sum reproduces `host_ledger.embed_us` instead of estimating it.
+  `tools/analyze-gplr53-gap.py` was re-run after the change and still PASSES on
+  the record (F1 1.0014 on gplr52-a3-mmap, F6 0.86 ms, F1b 1.3%).
+- RECON GENERATION JOIN FIXED (the rider the A2 gate needed): `stage_members` now
+  receives the generation its copies will be tagged with and hands THAT to
+  `recon_begin_bank`, instead of reading `slot.generation` before the increment.
+  Measured host-only on the pre-fix recordings: the drift is **-1 on all 85
+  paired samples** of `gplr52-a3-mmap` (and -1 x63 with +12 x2 on
+  `gplr50-ctl-4k-f16` - RESOLVED 2026-09-21: it was the checker's positional
+  pairing landing on a foreign pass's submit, not a second stamp defect; the
+  keyed (layer, ubatch) join puts every one of its samples at the expected
+  drift, and the residual -15 x1 is the lazy-ring ubatch-label artifact with a
+correct generation stamp - see the plan's A2 addendum). A
+  (layer, generation) join therefore matched nothing before; it is exact by
+  construction now, and A3 must re-prove it with drift 0 on a post-fix trace.
+- FIXTURE + BOTH VALIDATORS (measured, not assumed):
+  `tools/layer-streaming/gen-gplr53-fixtures.py` builds
+  `tests/gplr53-embed-chunk.jsonl` from the recorded `gplr52-a2-50k` metadata and
+  ledger (4 chunks, front-loaded 0.62/0.18/0.13/0.07 of the measured 2,246,290 us
+  pass-1 embed, `loop_us = -(embed + output)` kept). Two new CTest targets run
+  `--check-telemetry` and `--validate-telemetry` on a build-dir copy: both exit 0,
+  so the validators tolerate the new event. One pass only: the validator allows a
+  single `phase_summary` per phase and a multi-pass run emits one per pass
+  (measured - a second pp summary is rejected as a duplicate).
+- CHECKER: `tools/check-gplr53-embed-chunks.py` (CHK-shape, CHK-order, CHK-cover,
+  CHK-sum with the 1 ms tolerance, CHK-gate, plus `--join` for the generation
+  join). `--selftest` 15/15 with seven negative controls firing and four exit-2
+  refusals ("pairing is refused, never guessed"); on the checked-in fixture
+  `CHK-sum` diff is **0.0 us**. Wired into `tools/run-tests.ps1` as `[t53-a2]`
+  for every host-only suite; the two CTest targets joined the `host` include list.
+- VALIDATION: build `cmake --build build/llama-cuda --config Release --target
+  llama-layer-streaming` exit 0; `ctest -R gplr53-embed-chunk` 2/2 pass; host
+  suite `SUCCESS` with **39/39** CTest (was 37) plus doc-size PASS, plan-split
+  PASS `[plan-split]`, `[t53-a1]` and `[t53-a2]` selftests PASS. `git diff --check`
+  clean in both trees.
+- RESPLIT HYGIENE: the 2026-09-21 apply left the archive ending on a blank line
+  (each block chunk carries its separator), which `git diff --check` flags as
+  "new blank line at EOF". Stripped, and `--apply` now strips it itself
+  (`archive_terminator_stripped`, which `--verify` restores before its span
+  checks). Recorded as a third manifest correction; archive body hash re-recorded
+  (6b60b61f... -> 2b8b1c3a...); `--verify` PASS with all three corrections printed.
+- NOT CLAIMED: any timing, any mechanism, any default change. A3 (the decay
+  discriminator, 200k/50k, `--copy-source mmap-registered`, `--pp-repeat 3`,
+  `--pp-recon 1`) and A4 (the pre-warm modality arms at 4k) remain the only GPU
+  spend, and A3 must also run the new `--join` check and expect drift 0.
+
+## 2026-09-21: PLAN CLOSE-OUT SWEEP - T-GPLR-52 closed (AC5), T-GPLR-37 status fixed, resplit applied; ONLY T-GPLR-53 stays live, and the resplit tool's header bug (which silently ate the live index) is fixed + guarded
+
+Host-only, no GPU, no mutex, no engine change.
+
+- T-GPLR-52 AC5 CLOSED: `Status: done (2026-09-21)` + the `#### RESULT` block are
+  in the block, and the block moved to the archive in this resplit (verify
+  PASS). The closure commit is NOT made - no commit is authorized yet, so the
+  block's `Commit:` field lists only the substantive commits (nested 23e5d1b6e;
+  outer 59a0266, 0b42781, 25c5581, 828ef2f, 48e8901, 8f648fb, f5ed99c).
+- T-GPLR-37's stale `Status: in-progress (2026-09-17)` line (contradicting its own
+  PROMOTED-TO-DEFAULT RESULT, and the reason the last resplit kept it live) now
+  reads `Status: CLOSED (2026-09-20) - PROMOTED TO DEFAULT by owner decision`
+  with the earlier reading preserved verbatim; the block is archived.
+- RESPLIT APPLIED: T-GPLR-37 + T-GPLR-52 moved to the archive (block spans
+  byte-identical, 322514 B body, archive 4990 lines). Live file = **1 block,
+  T-GPLR-53 only** (257 lines, apply-time span 257). Dry run confirms nothing
+  else is movable; the live block's T-53 A1 work is untouched by the split.
+- DEFECT FOUND AND FIXED (would otherwise have repeated on every future split):
+  `main_apply` split the header at the first `"### "` occurrence, which sits
+  INSIDE index line 1 (`- ### T-GPLR-25: ...`). The apply therefore dropped the
+  whole 21-entry index AND the rules paragraph, glued the preamble's trailing
+  `-` onto index line 1, and indented the surviving block heading - and the
+  follow-up `--verify` died with StopIteration instead of reporting it.
+  Repairs: (a) the index is now DERIVED from the archive's block order (never
+  carried forward) and the rules paragraph is a constant; (b) `--verify` fails
+  loudly on index drift or a missing rules paragraph, and exits 2
+  (cannot-evaluate) when the live file has no column-0 block heading instead of
+  crashing; (c) new `--refresh-header` mode rebuilds ONLY the header. The live
+  header is restored byte-identical to the pre-apply header except the two added
+  index entries (git diff: one 2-line hunk in the index, rules hunk unchanged).
+- NEGATIVE CONTROL MEASURED: deleting one index line makes `--verify` FAIL
+  (exit 1) with `header index drift: 22 live vs 23 archive entries` and the exact
+  repair command; restoring the file returns PASS.
+- TWO IN-PLACE ARCHIVE CORRECTIONS (both from the AC5 close-out edits, both
+  recorded in the manifest's new `corrections` array and printed by `--verify`):
+  T-GPLR-37's preserved sentence had been relabelled V1 (it is V2,
+  register-once/churn-free); T-GPLR-52's status carried the garbled sentence
+  "Members (T-A) moved to the archive on the next resplit" (now states that the
+  block moved in the 2026-09-21 resplit). The frozen
+  `archive_body_sha256_lf` was re-recorded in the same change
+  (c422b10e... -> 6b60b61f...); no block was moved, reordered or resized.
+- GUARDS: a `[plan-split]` step is wired into `tools/run-tests.ps1` beside
+  `[doc-size]` and `[t53-a1]` for every host-only suite (exit 2 counts as a
+  suite failure - a plan that cannot be checked is not a soft pass). Observed:
+  `[doc-size]` PASS, `[plan-split]` PASS, `[t53-a1]` SELFTEST PASS,
+  **37/37 CTest**, suite `host` SUCCESS. Doc-size WARN stands for the archive
+  itself (320.1 KiB, 68.3% of the 468.8 KiB FAIL band) - watch it, per
+  AGENT_ENVIRONMENT.md, before the next split.
+- LIVE BACKLOG NOW: T-GPLR-53 (in-progress; A1 + A2 done) only.
+  T-GPLR-54 CLOSED 2026-09-22 on the owner's arm-rule decision (see top
+  entry). Unowned residue corrected here: the recon `generation` off-by-one
+  join was FIXED by T-GPLR-53 A2; "u4096 TG output truncation" and
+  "pw-vs-non-pw last-chunk route difference" were both RESOLVED on
+  2026-09-21; the +12 x2 recon-join samples on `gplr50-ctl-4k-f16` were
+  RESOLVED 2026-09-21 (checker pairing artifact + a benign label artifact,
+  see that entry). Nothing unowned remains in the correctness ledger except
+  the recon emitter's cosmetic ubatch label (deferred by T-GPLR-53's A2
+  addendum).
+
+## 2026-09-21: T-GPLR-53 A1 EXECUTED (host-only, no GPU) - F1-F6 reproduced as CHECKED expectations; the pass-1 gap is the embed step at every shape and BOTH sources
+
+- Tool `tools/analyze-gplr53-gap.py` (`--selftest` 8/8 with the negative controls
+  firing, `--placement`, `--json`), table `build/llama-cuda/gplr53-a1-gap-table.txt`,
+  14 traces, tool exit 0. Exit-2 refusals verified on real inputs (pre-ledger
+  `gplr35-slot3`; a missing tag): "cannot evaluate" is never a pass.
+- F6 EXACT: |loop + embed + output| <= 0.86 ms on all 11 traces whose ledger
+  carries `loop_us`; the four `gplr37c-*` traces predate the field, so the tool
+  SKIPS the check there - a refinement of the drafting wording ("four traces"),
+  not a failure, and the skip is fixture-covered.
+- F1: embed share of the pass1->pass2 gap excess 0.9915-1.0014 on current
+  binaries (a2-200k 0.9969, a2-50k 0.9974, a3-mmap 1.0014, gplr50-200k-on
+  0.9958, off 0.9974, s2-2slot 0.9915, 4k-mmap 0.9998); 0.971/1.026 on the
+  T-37-era ron pair (T-44-era patch/slot work still inside `rest`). The worded
+  claim is tightened to "the gap excess IS the embed step to >= 95%".
+- F3 pinned CONFIRMED and sharpened: embed share 0.0015 (a3-pinned), 0.0247 /
+  -0.0008 (gplr37c-pin s2/s3), 0.0004 (4k pinned); slot+preload carry +1710.0 ms
+  of a3-pinned's +1710.8 ms and +3280.8 ms of the 4k pinned +3215.7. BOTH sources
+  pay a ~1.7-3.3 s per-run first-pass one-off - the bucket differs, not the cost.
+- F1b: rest drift <= 5.2% on every mmap trace (a2-200k 1.7%, a2-50k 4.7%).
+- H4 (host-IO starvation) DISFAVORED by its own pre-registered test (host buckets
+  flat, the excess isolated to the embed step's sync-bounded span) and now
+  enforced as an expectation; H1/H2/H3 stay open - the decay needs A2's
+  `embed_chunk`, the page-vs-submission split needs A4's modality arms. H2's
+  host-inflation prediction is already disconfirmed (setup flat to 0.77 ms across
+  391 embed launches).
+- F7 re-derived from the code by `--placement` (main.cpp:3559/3567/3575,
+  llama-layer-streaming.cpp:6676/7059): the embed step reads no host-mapped model
+  page, so the delayed completion of the 18.5 GB registered span remains the
+  candidate.
+- gplr36-remeasure-200k stays CONFOUNDED (pass 2 = the T-46/T-47 regression,
+  wall 206 s); its 1.087 embed share is NOT an F1 falsification.
+- The selftest is wired into `tools/run-tests.ps1` for every host-only suite,
+  beside the doc-size guard. Next: A2 (recon-gated `embed_chunk`), then A3/A4 in
+  one owner-invoked mutex hold.
+
+## 2026-09-21: T-GPLR-53 DRAFTED - the sweep's pass-1 "unattributed" gap is attributed host-only (it is the EMBED STEP; the T-36 ledger double-books it), and the mechanism probe is pre-registered with the decay discriminator
+
+Host-only re-decomposition of the recorded traces (no GPU, no code change),
+drafted into the plan as T-GPLR-53:
+
+- The sweep's item 5 (wall - summed layer compute - summed layer wait = 2.35 s
+  at 50k pass 1, 2.83-2.88 s at 200k pass 1, ~0.16/0.64 s later) is the EMBED
+  STEP, not a missing bucket: `host_ledger.embed_us` 2246.3 -> 62.5 (50k a2),
+  2482.8 -> 249.2 (200k a2), 2438.2 -> 251.0 (200k a3-mmap), 1774.1 -> 5.6
+  (4k gplr51-4k-mmap) accounts for 99.7-100% of the pass-1 excess at every mmap
+  shape; the leftover `rest` is pass-invariant (200k 372.0/367.4/373.6).
+- The excess is inside the embed graphs' SYNC-BOUNDED execution, not host prep:
+  the ledger's setup/patch/graph_call/slot buckets are flat pass 1 vs 2
+  (193.75/192.98, 18.78/18.53, 16.34/15.89, 70.37/70.35 at 200k a2) while
+  ledger-compute minus phase-compute (the embed step's own launch+execute+sync)
+  is 2498.7/265.0; pass_begin -> first copy_submit is 2.60 s vs 0.37 s
+  (a2-200k) and 2.56 vs 0.37 (a3-mmap).
+- Source contrast, adjacent same-binary arms (a3-mmap/a3-pinned, 200k/3 slots):
+  pinned has NO embed excess (251.1/248.6) and pays its first-pass cost in the
+  copy path instead (slot 1827.8/322.4, preload 327.8/123.2, host_submit p50
+  110.0/42.6 ms per bank; the mmap arm's is 0.124/0.100). Per-run excess over
+  pass 2: mmap +2184 ms, pinned +1711 ms - both sources pay a one-off of the
+  same order, in different buckets (pinned 4k pays ~3.0 s the same way: slot
+  3667.4/581.9).
+- Per-run and shape-flat in chunk count (4k 1.77 s / 50k 2.18 / 200k
+  2.19-2.23), re-paid by every mmap arm including ones that ran minutes after
+  another mmap arm had read the whole file. Registration is deferred:
+  mmap_register_init reports 18,500,517,888 B in 2345 us pre-timed, the
+  file-backed working set moves 2.10 -> 20.43 GB during pass 1 (the pinned arm
+  the same, via its memcpy) and is flat afterwards, while no DMA stalls
+  (recon_attr copy_gpu_ms p50 31.5 / max 36.3 ms in both passes).
+- INSTRUMENT CORRECTION: the T-36 ledger's other_us/loop_us are algebraically
+  inclusive of embed+output, because the per-launch buckets are accumulated by
+  the embed and output steps too while sweep_us starts after the embed step.
+  Measured `loop_us + embed_us + output_us` = +0.10/+0.16/+0.13 ms (50k a2
+  p1/p2/p3) and +0.73/+0.73/+0.70 ms (200k a2) - an exact identity. T-36's
+  "closes exactly" reading was made while route telemetry's +4.5 s `other`
+  masked it; since T-39/T-45 the same algebra reads other ~= -embed.
+- CODE FACT that removes the obvious page-in story: the runner loads with
+  n_gpu_layers = -1 and overrides only the pageable class to the CPU buffer
+  (tools/layer-streaming/main.cpp:9-11, 3559-3578), so token_embd/output are
+  CUDA-resident and the embed step reads no host-mapped model page; the delayed
+  completion of the 18.5 GB REGISTERED SPAN is what is left as the candidate.
+- T-GPLR-53 drafted with pre-registered H1 (front-loaded deferred-registration
+  completion) / H2 (background pinning contention, smooth decay) / H3
+  (submission-side one-time driver state, chunk-0 spike) / H4 (host-IO
+  starvation, already disfavored by the flat host buckets), arms A1 (host-only
+  gap tool `tools/analyze-gplr53-gap.py`, free; EXECUTED 2026-09-21, see the entry
+  above) / A2 (a new `--pp-recon`-gated
+  per-chunk `embed_chunk` event, host-validated first) / A3 (200k+50k
+  `--pp-repeat 3` decay arm with a rho/share decision rule recorded before the
+  run) / A4 (4k pre-warm modality discriminator: CPU touch vs dummy GPU launch,
+  plus the payoff measurement). Charter note: at 4k the excess is 1.77 s of a
+  3.55 s pass-1 wall, and a real single-prompt prefill IS pass 1.
+
 ## 2026-09-21: Anomaly sweep, host-only on existing traces: 4 of 5 explained, 1 open unknown (pass-1 exposed gap); recon gen off-by-one logged as a hygiene task
 
 Sweep over gplr52-a3-mmap/pinned, gplr52-a2-50k/200k, gplr50-200k-on (no GPU
@@ -29,7 +964,13 @@ time). Findings, each pinned to numbers:
    flat across passes, so it is neither; same order as the 4k first-touch
    submit transient (119->28 ms, A1). Candidate: first-touch
    registration/page-warming of the staging path. Draft T-GPLR-53 with the
-   decay-with-chunk-index discriminator (host-only first).
+   decay-with-chunk-index discriminator (host-only first). [SUPERSEDED
+   2026-09-21 by the T-GPLR-53 drafting recon above: the gap is the EMBED STEP
+   (`host_ledger.embed_us`, 99.7-100% of the excess at every mmap shape) and
+   the T-36 ledger double-books it, so it was never an unnamed bucket; the open
+   part is only the mechanism of the embed step's pass-1 sync-bounded excess,
+   which T-GPLR-53 pre-registers. The "neither staging nor compute" reading
+   holds for the LAYER SWEEP - the excess is before it.]
 
 Honest refinements vs the sweep as first reported: the pinned arm shows NO
 sub-100 ms host wait (layer-0 min 123.2 ms), so the collapse-to-DMA
@@ -393,7 +1334,14 @@ the answer region (TG index 41 of 96), u4096 drifts into a template-token repeat
 (`<|im_end|><|im_start|>...`) while u512/u1024/u2048 continue document echo. The 305
 vs 262 byte difference is the STRIPPED-SPECIALS decode of that tail difference, not a
 cut-off answer. The first 41 TG ids (the entire needle-answer span) are byte-identical
-at every ubatch. Classification: benign greedy tail drift under a 1-chunk prefill
+at every ubatch. **CORRECTED 2026-09-21 (host-only re-read of the four arm traces,
+see the T-GPLR-54 draft block): the tail difference is not a "repeat loop" but ONE
+bounded insertion.** u1024 and u2048 are id-identical to u512 for ALL 96 ids; the
+u4096 stream equals u512 with exactly one contiguous 7-id insertion at index 41
+(`248045, 248045, 248045, 248045, 248046, 198, 248045`) and is byte-identical to
+u512 after realignment (`u4096[48:96] == u512[41:89]`) - one argmax flip at the
+first decision after the template region both arms enter at index 35, followed by
+exact re-synchronization. Classification: benign greedy tail drift under a 1-chunk prefill
 (u4096 = 1 x 4096-token chunk vs 8/4/2 chunks elsewhere - a different graph shape,
 not a bigger version of the same shape), no identity or semantic gate impacted.
 Lifting the recorded "no arm at or above u4096 can be called output-equivalent"
