@@ -214,6 +214,31 @@ authoritative online sources before improvising:
   capacity-LRU or they will overstate the predictor margin by ~17%. Tool:
   `tools/analyze-tg-margin.py`, whose `--identify` prints all four models per trace.
 
+- A speculative fill is admitted ONLY while its layer has a free position beyond the demand
+  reserve (`n_free > top_k`), and the demand path keeps `cap = min(n_expert, K * top_k)` full by
+  evicting to place every later miss - so every post-warm-up miss is a net-zero swap and the
+  admittable stages are the WARM-UP ONLY. Measured 2026-09-23 over the eight recorded retention
+  legs: 3,405 of 69,120 layer-stages (4.93%) ever leave room (0.00% at K=2, then 1.77/4.03/6.62%
+  at K=4/6/8; 4.91/7.53% honest; 4.71/17.66% qa-depth). A predictor's demand-hit gain is therefore
+  ceilinged by CAPACITY, not by precision: an arm leg that reports little or no gain has falsified
+  nothing about prediction, and every arm session must be read with the fill-room datum beside
+  `share`/`margin_share`. Tool: `tools/analyze-gplr58-fill-room.py` (host-only, itemises the
+  per-leg `admittable` fraction and the stage at which each layer goes full).
+- The mode-2 flag surface is HOST-TESTABLE and every mode-2 gate sits after the metadata read and
+  BEFORE `llama_backend_init` (which this runner defers on purpose): the unsupported-arch fixture
+  drives all ten cases with no CUDA, no model and no mutex, and a legal shape is proven ACCEPTED by
+  reaching the adapter's architecture refusal, not by a green run. So a mode-2 checker must NOT use
+  a bogus model path - that dies at the arch read with exit 1 BEFORE any gate, which is why
+  `tools/check-gplr58-mode2.py` asserts the exact exit code AND message (a silent exit and a
+  model-missing exit 1 are both scored as FAILED, not as agreement).
+- The host suite's `revision digest` is the **ENGINE** tree's identity
+  (`Get-SourceRevision` scoped to `third_party/llama.cpp`), NOT the outer tree's: two different
+  outer guard states report the SAME digest, and an unchanged digest across an outer tooling edit
+  says only that the engine did not move. Measured 2026-09-23 (T-GPLR-58 mode 2): the intermediate
+  suite state registering only the `[tg58-fill-room]` guard and the final state registering both
+  new guards both reported `98A59B376F8E07DE`. Read it as the engine pin, never as "the tree is
+  unchanged".
+
 ## Validation and Evidence
 
 Run the narrowest meaningful validation first:

@@ -1,5 +1,53 @@
 # Current State
 
+## 2026-09-23: T-GPLR-58 MODE 2 LANDED - the engine CONSUMES the A1 proposer, and the fill-room bound says an arm's ceiling is CAPACITY, not precision (host-only, no GPU, no mutex, no arm run, no model loaded)
+
+**What changed.** Mode 2 was reserved and refused; it now runs. The engine's speculative-placement
+path calls a pure orchestration (`llama_ls_spec_propose`): observe the row the demand just served ->
+publish from the arm (or from the count-matched null) -> plan under the budget/pending/reserve rules
+-> issue. Mode 1 and mode 2 now share the whole downstream path and differ only in where proposals
+come from, so the A1 policy that was proven row-equal to the offline screen is what actually runs.
+The runner gains `--residency-tg-spec 2`, `--residency-tg-spec-arm <coact|bar09|fusion>` and
+`--residency-tg-spec-null <0|1>`, with five refusals that fire after the host-only metadata read and
+BEFORE `llama_backend_init` (so the whole flag surface is testable with no CUDA, no model, no mutex).
+The `spec` event carries `"prop"` and `"arm_count"` in mode 2 ONLY - a mode-0/1 event stays
+byte-identical to every earlier recording - and `run_start` echoes the resolved arm and
+`row_spec_null`, so a leg is identifiable from its trace alone.
+
+**The measured finding, and the Planner call it forces.** A fill is admitted only while its layer
+has a free position beyond the demand reserve (`n_free > top_k`); the demand path fills to
+`cap = min(n_expert, K * top_k)` and evicts to place later misses, so post-warm-up misses are
+net-zero swaps. Rebuilt from the eight recorded retention legs: **3,405 of 69,120 layer-stages
+(4.93%) ever leave room, all in each layer's warm-up** (0.00% at K=2; 1.77/4.03/6.62% at K=4/6/8;
+4.91/7.53% honest; 4.71/17.66% qa-depth K=4/8). **PLANNER CALL:** the demand-hit gain has a ceiling
+set by capacity, not by arm precision, so (a) every arm leg must report the fill-room datum with
+`share`/`margin_share`, and (b) a low-gain arm result must be read against that ceiling before any
+arm is called rejected. The `null` control is untouched by this - it controls the proposal source at
+equal budgets.
+
+**Validation.** `test-layer-streaming-tg-spec` PASS 68 checks (20 of them the new mode-2 scripted
+arm leg: proposals on a periodic stream, real plan accounting, a saturated cache that still
+proposes but issues nothing, a cache with room that DOES issue and holds the reserve, no peeking,
+determinism, null count-matching); `test-layer-streaming-tg-predict` PASS 28 checks;
+`tools/check-gplr58-mode2.py` PASS 10/10 cases + `--selftest` 7/7 (its negative controls include a
+silent exit scored as agreement, and a model-missing exit 1 that must not read as a refusal);
+`tools/analyze-gplr58-fill-room.py --selftest` PASS 8 checks; `tools/check-tg-predict-port.py`
+still EQUAL (8 legs, 483,840 row comparisons), so the wiring did not perturb the policy;
+`run-tests.ps1 -Suite host` SUCCESS 44/44, digest `4D08CFCD186C9074`, llama.dll `38386D5B495877F5`
+(record `20260923T171456Z-host`), with both new guards registered.
+
+**Known gaps / next.** No real `spec` event exists yet: the wiring is host-only-proven, and the
+fill-room table bounds the OPPORTUNITY from the incumbent's recorded occupancy rather than measuring
+a speculative run. The work is COMMITTED as a task-split series: nested `e3627d5f3` (the wiring, its
+fixture and the runner flags), then outer `db1366e` (fill-room analyzer + guard), `876ef83` (the
+mode-2 flag/refusal checker + guard), `db937e4` (pin bump to `e3627d5f3`) and this docs commit. Both
+outer intermediate states ran the host suite green (44/44, engine digest `98A59B376F8E07DE`, nested
+head `e3627d5f3`, llama.dll `38386D5B495877F5`); the earlier `4D08CFCD186C9074` in the validation
+paragraph above was the same engine digests one nested commit earlier. The next eligible step is
+A3's first mutex-held arm leg -
+which is also the first real `spec` record A2's checker will read.
+
+
 ## 2026-09-23: THE T-GPLR-58 WORK IS COMMITTED AS A TASK-SPLIT SERIES (four outer + two nested commits, no GPU time spent)
 
 **What was committed, and in what order.** Nested first, because the outer tree pins it: `c861ab0d4` (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, `tests/test-layer-streaming-tg-spec.cpp`, the runner flag surface) then `7480fb5b9` (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the `--dump` mode the comparator reads). Outer: `8e41a52` (the uncovered-margin instrument + its host guard), `8c01a96` (the A2 verdict-surface checker + guard), `10b0798` (the A1 port comparator + guard), `7a00d53` (pin bump to `7480fb5b9`), and this docs commit carrying the plan records, the M7 restatement, the AGENTS gotchas, the T-GPLR-59 draft and the predictor-frontier findings.

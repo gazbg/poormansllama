@@ -2034,11 +2034,10 @@ by this subsection: A3 decides, and A4's 50k/200k holds stay owner-invoked one l
 
 ### T-GPLR-58 (draft): wire the TG expert predictor into the row-set path - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), judged on a NULL-CORRECTED, VRAM-normalized miss share under the exact-demand-priority invariant
 
-Status: ready (2026-09-23) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer families, the count-matched null, the speculative planner and its port comparator) is IMPLEMENTED and host-validated the same day - see the A1 IMPLEMENTATION LANDED subsection below; the A3/A4 holds now stay gated on the ENGINE-CONSUMES-THE-PROPOSER WIRING (mode 2 is still reserved and refused), not on A1 itself.
+Status: ready (2026-09-23) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer families, the count-matched null, the speculative planner and its port comparator) is IMPLEMENTED and host-validated the same day - see the A1 IMPLEMENTATION LANDED subsection below; the A3/A4 holds are no longer gated on any unbuilt piece: the ENGINE-CONSUMES-THE-PROPOSER WIRING (mode 2) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A1 WIRING (MODE 2) LANDED subsection below - so the two pre-authorized holds need only a mutex window.
 in the DECIDED section below; both mutex-held sessions are PRE-AUTHORIZED (owner chose the
-"both up front" option, so A4 is not conditional on A3's share outcome). Nothing is
-implemented yet and no GPU time has been spent: A1/A2 are host-only and A3/A4 are the two
-holds. Nothing here re-opens T-GPLR-15 (closed DONE-falsified-by-evidence), T-GPLR-19 (closed
+"both up front" option, so A4 is not conditional on A3's share outcome). No GPU time has been spent and every piece landed so far is host-only: A0/A1/A2 and the
+mode-2 wiring are IMPLEMENTED and host-validated, while A3/A4 are the two holds. Nothing here re-opens T-GPLR-15 (closed DONE-falsified-by-evidence), T-GPLR-19 (closed
 on the K ladder) or T-GPLR-26 (closed ADVISORY: no gate binds on (b)). The offline screening this contract
 consumes is `docs/findings/predictor-screen-gplr.md` + `tools/predictor-screen-gplr.py`
 (2026-09-23, host-only, no engine change). Every number quoted below is labeled with where it
@@ -2052,7 +2051,7 @@ FIRST half of that sentence, not the second); T-GPLR-26 (gate 9's (b) reading is
 this block must carry its own quantities rather than inherit that gate); T-GPLR-53/T-GPLR-56
 (the pre-registration, falsifier and relocation discipline this contract copies). Not
 blocking: T-GPLR-54, T-GPLR-55 (their shapes are untouched).
-Commit: nested c861ab0d4 (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, tests/test-layer-streaming-tg-spec.cpp, the runner flag surface) + 7480fb5b9 (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the --dump port surface); outer 8e41a52 (uncovered-margin instrument + guard), 8c01a96 (A2 checker + guard), 10b0798 (A1 port comparator + guard), 7a00d53 (pin bump to 7480fb5b9); the docs commit carries the records in this block. A0/A1/A2 are LANDED and host-validated; the A3/A4 holds are still unbuilt and no arm has run, so there is NO verdict commit.
+Commit: nested c861ab0d4 (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, tests/test-layer-streaming-tg-spec.cpp, the runner flag surface) + 7480fb5b9 (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the --dump port surface) + e3627d5f3 (mode 2 - the engine CONSUMES the A1 proposer: arm/null source selection, the prop + arm_count telemetry in the spec event, the five runner refusals, and the scripted arm fixture); outer 8e41a52 (uncovered-margin instrument + guard), 8c01a96 (A2 checker + guard), 10b0798 (A1 port comparator + guard), db1366e (fill-room analyzer + guard), 876ef83 (mode-2 flag/refusal checker + guard), 7a00d53 + db937e4 (pin bumps, to 7480fb5b9 and then e3627d5f3); the docs commit carries the records in this block. A0/A1/A2 and the mode-2 wiring are LANDED and host-validated; the A3/A4 holds have not RUN, so there is NO verdict commit.
 
 Goal. Decide, on TWO pre-authorized mutex-held sessions (owner, 2026-09-23), whether a TG expert predictor that stages
 SPECULATIVE rows into the existing per-layer row cache produces a demand-hit gain that
@@ -2828,6 +2827,79 @@ dropped row, a short null row and a dropped candidate are each caught) and the r
 with no `rowset_init`, a leg out of `(ubatch, layer)` order, a missing dump binary); `python
 tools/check-tg-predict-port.py --tables` EQUAL; `run-tests.ps1 -Suite host` SUCCESS 44/44
 (revision digest `3FE379D5EE294043`, llama.dll `09437EE03CE61125`). Committed as nested 7480fb5b9 + outer 10b0798.
+#### A1 WIRING (MODE 2) LANDED (2026-09-23, host-only: no GPU, no mutex, no arm run, no model loaded)
+
+**What landed.** Mode 2 is IMPLEMENTED. Until now the policy existed and was proven row-equal
+to the offline screen, but nothing consumed it - mode 2 was reserved and refused - which is
+exactly why A3 could not start. The engine now asks the arm itself for the rows to guess.
+
+| piece | where | what it does |
+|---|---|---|
+| the orchestration | `src/llama-layer-streaming.{h,cpp}` (`llama_ls_spec_propose`, pure) | one call per layer-stage: OBSERVE the row the demand just served -> publish from the arm (or from the null, count-matched to it) -> PLAN under the budget/pending/reserve rules -> ISSUE. It is the SAME downstream path mode 1 lands in: the two modes differ only in where the proposals come from |
+| the bring-up and members | same (`set_row_set_spec_arm`, arm / null / proposer state, the per-stage counters) | the arm's learning state is allocated BEFORE `begin_row_cache()`, so every refusal is loud before a context or graph exists |
+| the telemetry | the `spec` event and `run_start` | mode 2 adds `"prop"` (what the SOURCE published this stage) and `"arm_count"` (the arm's own count the null was matched to, emitted so the count match is checkable from the trace alone). Both are guarded by `row_set_spec_mode == 2`, so a mode-0/1 event stays byte-identical to every recording made before this change. `run_start` echoes the resolved arm and `row_spec_null` |
+| the runner | `tools/layer-streaming/main.cpp` | `--residency-tg-spec 2` (now implemented, was a refusal), `--residency-tg-spec-arm <coact|bar09|fusion>`, `--residency-tg-spec-null <0|1>`, and FIVE new refusals: mode 2 with no arm; mode 2 with a script (mode 1's source); an arm outside mode 2; a null outside mode 2; an unknown arm name |
+| the scripted arm leg | `tests/test-layer-streaming-tg-spec.cpp` +20 checks (68 total) | the host fixture that drives the wiring: arm proposes on a periodic stream, the plan's accounting is real (already-resident proposals skipped, the cache refuses the rest), a saturated cache still PROPOSES but issues nothing, a cache with room DOES issue and holds the reserve back, no peeking, determinism, and the null publishing exactly the arm's count with ids that are not the arm's |
+| the refusal contract checker | `tools/check-gplr58-mode2.py` (new, `[tg58-mode2]` host guard) | runs the REAL binary on the unsupported-arch fixture and asserts the exact exit code AND message for all ten cases; its selftest is hermetic stub runners |
+| the fill-room analyzer | `tools/analyze-gplr58-fill-room.py` (new, `[tg58-fill-room]` host guard) | bounds the opportunity BEFORE a mutex hold is spent: how many layer-stages ever leave a free position beyond the demand reserve |
+
+**Why the gates are testable without a GPU, stated once.** Every mode-2 gate sits AFTER the
+host-only metadata read (`llama_ls_model_arch`) and BEFORE `llama_backend_init`, which this
+runner defers deliberately. So the unsupported-arch fixture (1,280 bytes) drives the whole flag
+surface with no CUDA, no model load and no mutex - verified by `nvidia-smi --query-compute-apps`
+being empty before and after a full checker run. A legal shape is proven ACCEPTED by REACHING the
+next stable refusal (the adapter's architecture gate), not by a green run.
+
+**The finding that decides how the arms must be read (measured 2026-09-23, host-only).** A fill is
+admitted only while its layer has a free position beyond the demand reserve, and the demand path
+fills the cache to `cap = min(n_expert, K * top_k)` and evicts to place every later miss - so
+every post-warm-up miss is a net-zero swap. Rebuilt from the eight recorded retention legs
+(capacity-LRU over the demanded unions, the retention model the bounding pass identified):
+
+| leg | K | cap | stages | admittable | % | mean free | full by stage |
+|---|---|---|---|---|---|---|---|
+| `gplr19-k2-ab` | 2 | 16 | 10240 | 0 | 0.00 | 0.05 | 4 |
+| `gplr19-k4-ab` | 4 | 32 | 10240 | 181 | 1.77 | 0.35 | 12 |
+| `gplr19-k6-ab` | 6 | 48 | 10240 | 413 | 4.03 | 1.01 | 20 |
+| `gplr19-k8-ab` | 8 | 64 | 10240 | 678 | 6.62 | 2.09 | 30 |
+| `gplr19-honest-k6-ab` | 6 | 48 | 10240 | 503 | 4.91 | 1.18 | 29 |
+| `gplr19-honest-k8-ab` | 8 | 64 | 10240 | 771 | 7.53 | 2.41 | 37 |
+| `qa-depth-k4.jsonl` | 4 | 32 | 3840 | 181 | 4.71 | 0.94 | 12 |
+| `qa-depth-k8.jsonl` | 8 | 64 | 3840 | 678 | 17.66 | 5.58 | 30 |
+
+**3,405 of 69,120 layer-stages (4.93%) ever leave room for a fill, and every one of them is in
+the layer's WARM-UP** (the cache reaches full occupancy by stage ~K and keeps it). **PLANNER CALL
+(recorded here, not left as a footnote):** a predictor's demand-hit gain therefore has a ceiling
+set by CAPACITY, not by the arm's precision - and an arm run that reports little or no gain has
+falsified nothing about prediction. Two consequences bind A3/A4: (1) every arm leg's session must
+report the fill-room datum alongside `share`/`margin_share`, and the tool that computes it now
+exists; (2) the pre-registered M-bands keep their meaning, but a null result must be read against
+this ceiling before any arm is called rejected. The `null` control is unaffected - it is a
+PROPOSAL-source control at the same budgets, not a claim about capacity.
+
+**What is NOT proven, stated plainly.** (1) No real `spec` event has been emitted from a GPU run:
+the wiring is exercised host-only, by a scripted demand leg and by fixtures, so nothing here says
+an arm wins anything or that the mechanism behaves under a real router. (2) The fill-room table is
+reconstructed from the INCUMBENT's recorded occupancy (the admission decision read after each
+stage's placement); it is a bound on the opportunity, not a measurement of a speculative run,
+because no speculative run exists yet. (3) The starvation the fixture found (a saturated cache
+admits nothing) is a property of the incumbent's capacity rule, so mode 2 cannot lift it - only an
+admitted fill in the warm-up window can have any effect at all.
+
+**Validation (all of it host-only, no GPU, no mutex).** Both nested tests PASS
+(`test-layer-streaming-tg-spec` 68 checks, `test-layer-streaming-tg-predict` 28 checks);
+`python tools/check-gplr58-mode2.py` PASS 10/10 cases and `--selftest` PASS 7/7 - the selftest's
+negative controls include a wrong exit code, a wrong message, a SILENT exit scored as agreement,
+and a broken binary's model-missing exit 1 which must never read as a refusal match;
+`python tools/analyze-gplr58-fill-room.py --selftest` PASS 8 checks;
+`python tools/check-tg-predict-port.py` still **EQUAL on the wired binary** - 8 legs, 483,840 row
+comparisons, so the mode-2 work did not perturb the policy; `run-tests.ps1 -Suite host` SUCCESS
+44/44 with both new guards registered (revision digest `4D08CFCD186C9074`, llama.dll
+`38386D5B495877F5`, record `20260923T171456Z-host`).
+Committed as a task-split series: nested `e3627d5f3` (the wiring, its scripted arm fixture and the
+runner flags), then outer `db1366e` (fill-room analyzer + guard), `876ef83` (mode-2 flag/refusal
+checker + guard), `db937e4` (pin bump to `e3627d5f3`), and the docs commit carrying these records.
+
 ### T-GPLR-59 (draft): the two predictor source classes T-GPLR-58 excludes - an MTP draft-preview source (PROPOSED FUTURES at zero learned weights) and a hidden-state probe head (measured offline against its OWN ceiling gate) - each with its own pre-registered gate
 
 Status: draft (2026-09-23) - NOT ready: the three owner calls below are unanswered, and two of
