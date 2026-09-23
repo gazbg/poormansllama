@@ -1026,7 +1026,7 @@ CHUNK0_SPIKE) on the same binary pair as A3 (`exe FE3B0A108C1D9BC9` / `llama.dll
   accepted A3 evidence was untouched by this session (its traces and verdict files keep their 14:04 / 14:10
   mtimes and their `PASS 0` contents).
 - **Mode-0 vs the off default: now verified at run time as well as by host diff.** The off arms (`pw0`, `pin`)
-  carry no `pp-prewarm(` line at all and `prewarm_engaged: false`, while modes 1-3 each carry their own line 
+  carry no `pp-prewarm(` line at all and `prewarm_engaged: false`, while modes 1-3 each carry their own line
   and `prewarm_engaged: true` - the driver's own "mode set but no pre-warm line" assertion passed for both
   classes, closing the run-time half of the assertion left open in the durability section above.
 
