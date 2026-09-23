@@ -2812,7 +2812,9 @@ implementation detail, not of the screen's method.
 
 **What is NOT proven, stated plainly.** (1) The engine does not CONSUME the proposer yet: mode 2
 is still reserved and refused, so no arm can run and A3 cannot start - that wiring is the
-remaining A1 work and the next step in this block. (2) No real `spec` event has ever been emitted,
+remaining A1 work and the next step in this block. **[SUPERSEDED the same day: that wiring
+LANDED - see the A1 WIRING (MODE 2) LANDED subsection below, which this clause predates; the
+remaining work is the hold RUN, not a code gap.]** (2) No real `spec` event has ever been emitted,
 so nothing here says any arm wins anything; M7b's 0.5 and every M-band remain pre-registrations.
 (3) The doc's fusion row (29.6/29.6 held-out vote fusion) is a tune/held quantity over a 4-source
 pool and is deliberately NOT gated by `--tables`; the port's equivalence is exact because both
