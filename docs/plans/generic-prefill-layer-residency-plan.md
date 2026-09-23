@@ -64,7 +64,7 @@ describes the LAYER sweep only - the pass-1 excess lives before it); T-GPLR-37 (
 mmap-registered default is the probed mode, and its promoted flip is why every real
 first prefill now pays this); T-GPLR-36 (the ledger found double-booked here); the
 2026-09-21 anomaly sweep (currentstate item 5 is the input this task adjudicates).
-Commit: nested 043fceedc (instruments: A4 pre-warm modes, recon-gated embed_chunk, recon generation join) + 36f0ae090 (whitespace fixup); outer 050f8f9 (analyzers, checker, A3/A4 arm drivers), ea1ab5d (host-suite registrations + plan-split guard), f2c385f (plan/env/state records), b716289 (plan whitespace)
+Commit:
 
 Goal. Name what the "unaccounted" pass-1 gap is (wall - sum layer compute - sum layer
 wait = 2.35 s at 50k pass 1, 2.83-2.88 s at 200k pass 1, 0.16/0.64 s later), explain
@@ -1489,7 +1489,7 @@ marking it ready (both change product intent, neither is an implementer choice):
 Dependencies: T-GPLR-37 (the mmap-registered source whose commit this pays); T-GPLR-53
 (the attribution and dose curve - this block's premise); T-GPLR-52 (the copy-path laws the
 span arm must not disturb). Not blocking: T-GPLR-54/T-GPLR-55 (their shapes stay untouched).
-Commit: nested 8633f8099 (pre-sink process-life markers + tel-mark test); outer 19d7e33 (acceptance-quantity Q checker), ea1ab5d (host-suite registration), f2c385f (records)
+Commit:
 
 Goal. Make the first prefill stop paying the ~1.9 s commit of the 18,500,517,888 B
 registered span IN ITS CRITICAL PATH - by issuing registration earlier and overlapping the
@@ -1923,3 +1923,821 @@ deliberately free of it) and whether the SDD's copy-source ownership is worth am
 1 is unchanged and still gates the block's value. No latency or throughput win is claimed
 anywhere in this result: the numbers are mechanism and geometry, and the win is what the arms
 would have to demonstrate.
+
+### T-GPLR-16 (CLOSED 2026-09-22 — the option (a) revert LANDED): the `--handoff-partial` MIN_BATCH=1 override is out of the tree, and a host-only guard keeps it out
+
+T-GPLR-16 was the mixed-placement TG mode (partial handoff: the first N layers' expert banks
+stay host-resident). Its numeric fix forced `GGML_OP_OFFLOAD_MIN_BATCH=1` so CUDA's `MUL_MAT_ID`
+would keep taking those host banks, with an env-var bypass for value probes. The 2026-09-12
+characterization showed that route deadlocks the device stream on the third TG token whichever
+way it is reached, and the owner closed the task with **option (a): revert to the pre-fix partial
+TG**, accepting the known step-1 gold flip. That decision was recorded then
+(`docs/currentstate/2026-09-12..2026-09-13.md`); the revert itself had not been landed. It is now.
+
+**What changed (vendored tree, one site).** `tools/layer-streaming/main.cpp`: the
+`_putenv_s`/`setenv` force, the `bypass_minbatch_probe` static, the `gplr16:` stderr announce line
+and the explanatory block around them are gone, replaced by a short comment that records the
+revert, the deadlock and the accepted mixed-arithmetic cost, so the idea is not retried blindly.
+`--handoff-partial` itself is untouched: the mode, its help text and all four compatibility
+refusals stay. Nothing else in the tree referenced either string.
+
+**Closure evidence, all host-only (no GPU time was spent).**
+
+| check | result |
+|---|---|
+| `python tools/check-gplr16-revert.py` | **PASS**: 0 setters across 10 set-patterns (C `_putenv_s`/`setenv`/`putenv`, Win32, python, powershell, shell, cmd), the bypass flag **absent from source entirely**, no `gplr16:` announce line |
+| reader allowlist | 5 reads of the variable, **all upstream** (`ggml-cuda.cu:5645`, `ggml-vulkan.cpp:18704`, `ggml-sycl.cpp:6733`, `ggml-cann.cpp:2996`, `ggml-metal-device.m:883`, each the `? atoi(getenv(...)) : 32` default); a new read on this project's own path FAILS the check |
+| `--selftest` | **10/10** — a negative control for every way the revert can be undone (override back, bypass back, announce back, launcher `$env:` set, python `os.environ` set, read outside the upstream backends, mode surface removed) plus two refusals (mode file absent, empty tree) |
+| host suite | `[t16-revert]` registered (selftest + real scan); `tools/run-tests.ps1 -Suite host` exit 0, `build/host-suite-t16.log` |
+| compiles | `cmake --build build/llama-cuda --config Release --target llama-layer-streaming` exit 0 |
+| mode behaviour | the mode's own refusal tests pass on the reverted binary: `ctest -R refuse-partial` -> `layer-streaming-refuse-partial-dense` and `-zero` both **Passed** (0.19 s total, so neither initialises CUDA). They are NOT in the host suite's CTest Include filter, so they were run explicitly - a suite-run-only report would have missed them |
+
+**New binary identity, recorded because a rebuild makes earlier A/B controls a different
+binary:** `llama-layer-streaming.exe 38B39C06229BF15B`, `llama.dll 2930A7D0B30F967E`,
+`ggml-cuda.dll C04D744E9A4213F1` (2026-09-22 16:07Z). **SUPERSEDED (16:32Z, and this is the
+finding the arm-provenance block below exists for):** a concurrent edit landed on
+`src/llama-layer-streaming.{h,cpp}` at **16:31:13** and the tree was rebuilt at **16:31:58 /
+16:32:01**, so this identity - and any claim leaning on it - describes a revision that no longer
+exists. The current tree is `llama-layer-streaming.exe D01874A4235542A8` / `llama.dll
+46628B7CDA8FAFA1` (`ggml-cuda.dll` unchanged since 09-17). Nothing in the record noticed at the
+time, which is why evidence binding is now mechanical rather than editorial.
+
+**The guard caught its own registration on first use (measured).** The host-suite comment that
+named the bypass string made the real scan FAIL with 1 reference until the comment was
+paraphrased — `tools/` is in scope, so a mention there is a surface. That is the check working,
+and it is recorded because it also shows the rule's strength: it does not care that a comment is
+harmless.
+
+**Smoke regression RAN, PASS (2026-09-22 14:28:28Z-14:28:47Z, one mutex hold).** Four bounded probe
+windows were refused first - 13:57:15Z-14:00:48Z, 14:10:13Z-14:13:15Z, 14:14:58Z-14:16:19Z and
+14:22:54Z-14:26:41Z, 22 samples in all, the shared lock held by `deepseek_v4.exe` (pids 21208, 23744
+then 17352) in every one - and the fifth cleared at **14:28:20Z** (`lock_free=True`, no compute app),
+which is the fail-fast preflight the rule asks for before a window is spent.
+
+| item | measured |
+|---|---|
+| chain verdict | `build/llama-cuda/gpu-smoke-ctxshell.verdict.json` **PASS**, exit 0, 17.9 s, `fetch_events 320`, `tg_text_bytes 21`, `checker_exit 0` |
+| arm verdict | `build/llama-cuda/gpu-smoke-arm.verdict.json` **PASS**, exit 0, 13.4 s, `gpu_pre_run`/`gpu_post_run` clean, `mutex_acquired true` |
+| arm log | `build/llama-cuda/gpu-smoke-ctxshell.log`: arm exit 0 after 16.0 s, `check-telemetry: OK (1049 events, 4 slots)`, `RESULT: CHAIN OK (ctx_shell -> mutex -> CUDA, no CUDA_PATH)` |
+| arm command | `--residency moe-expert-bank --residency-tg --pp-schedule batch-major --pp-tokens 64 --ubatch 512 --tg-tokens 8 --layer-slots 4 --kv-cache q8 --greedy --no-mtp --pp-no-logits --allow-full-residency` on the 512-token anchor - **no `--handoff-partial`**, i.e. the default path the revert had to leave alone |
+| binary | `llama-layer-streaming.exe 38B39C06229BF15B` (16:07Z), `llama.dll 2930A7D0B30F967E` (15:32Z), `ggml-cuda.dll C04D744E9A4213F1` (10:14Z) - unchanged since the revert's rebuild, so this smoke is same-binary with the reverted tree **as of 16:07. CORRECTED by the arm-provenance block below:** the engine sources were edited at 16:31:13 and the tree rebuilt at 16:31:58/16:32:01, so this holds for the 16:07 revision only. The exe hash is also the weaker anchor - the streaming code lands in `llama.dll` - and no saved verdict records the sources, so the claim cannot be re-certified without a re-run |
+| after | card clean, `lock_free=True`, no stray process |
+
+**What the smoke proves, and what it does not.** It proves the chain still runs on the reverted binary:
+mutex, CUDA init, the residency path, telemetry, and the strict checker. It does **not** exercise
+`--handoff-partial`, and it is not a measurement - its own header calls it a connectivity check, so the
+PP/TG rates in its summary (129.7 / 15.3 tok/s over a 64-token PP and an 8-step TG) are context only,
+never a result. One incidental finding: `gpu-smoke-arm.verdict.json` is the **first real arm verdict
+carrying the wrapper's new provenance fields** (`tag_source: explicit`, `gpu_probe_source: nvidia-smi`,
+both probe statuses `clean`), so the previous pass's wrapper work is now exercised in production, not
+only by stubs. Also noted, not claimed: `cuda_path_empty: false` - this shell had CUDA_PATH set, so the
+smoke's original "works without CUDA_PATH" property is not what this run tested.
+
+**Out of scope, named:** the other T-GPLR-16-era probe guards (`GGML_CUDA_NO_GRAPHS_PROBE` and
+friends) are untouched — this closure is the forced variable and its bypass. `tools/gplr16-dump.cpp`
+(the hang stack-dumper) stays: it is a diagnostic and sets no flag. The historical narrative in the
+dated currentstate files keeps its original text; the 2026-09-12 disposition carries a pointer that
+the revert landed. **No latency or throughput win is claimed**, and nothing here re-opens the
+option (a) decision.
+
+### Arm provenance: a verdict must name the SOURCE TREE and the BINARY it describes (mechanism landed 2026-09-22; host-only, no GPU spent)
+
+**The defect, measured.** This thread's own 4k control arm passed at **16:28** against the **16:07**
+build. At **16:31:13** a concurrent edit landed on `third_party/llama.cpp/src/llama-layer-streaming.{h,cpp}`
+and the tree was rebuilt at **16:31:58 / 16:32:01**. The verdict named only an exe hash, no consumer
+compared that hash to anything, and the record's "same-binary with the reverted tree" claim stopped
+being true with nobody touching it. Two weaker variants of the same hole are in this tree as well:
+`tools/layer-streaming/main.cpp` was modified at **16:17**, after the 16:07 build, so that smoke ran a
+binary which cannot have contained it; and the exe hash is the wrong anchor anyway, since the streaming
+code lands in **`llama.dll`** and a relink churns the exe hash while the engine is unchanged.
+
+**What a verdict now carries** (`fields.provenance`, plus `provenance_post` and `provenance_delta` from a
+wrapped run). The mechanism lives in `tools/source-revision.ps1` (digest + the decision rule) and
+`tools/arm-verdict.ps1` (`Write-ArmVerdict` attaches it), **not** in the wrapper alone:
+
+| field / group | meaning |
+|---|---|
+| `source_scope`, `source_root`, `source_head` | which tree, and its nested HEAD (`third_party/llama.cpp` at `23e5d1b6e617`) |
+| `source_digest` | 16-hex SHA-256 over HEAD + the full content diff of tracked changes + the CONTENT of untracked files. Content, not mtimes - reverting an edit returns the earlier digest, which is the correct reading |
+| `source_changed_tracked` / `_untracked`, `source_newest_change_path/_utc` | what moved, and the newest change |
+| `source_changed_paths` (+ `_truncated`) | a bounded manifest (50) of the changed and untracked paths, so a drill can be NAMED: "something changed" is a lead, "these paths appeared" is a decision |
+| `binary_exe`, `binary_exe_sha`, `streaming_lib_sha`, `modules`, `binary_dir`, `binary_built_utc` | the binary the command actually names (its exe plus `llama.dll` and the `ggml*.dll` beside it) |
+| `sources_newer_than_binary` + `sources_newer_detail` | the newest changed source vs the NEWEST artifact of the build - the flag that catches "edited but not rebuilt" |
+| `origin` | `launch` (wrapper, before the command) / `post-run` (wrapper, after) / `verdict-write` (any other writer) |
+| `provenance_delta.source_changed_during_run` / `binary_changed_during_run` | the tree or the binary moved WHILE the arm ran - the same defect class, caught mid-flight |
+
+**Placement is the finding.** The wrapper is not the only writer: the arm drivers write their own verdicts
+for their own tags - measured, `gplr53-a4-pin.verdict.json` carries none of the wrapper's fields - and
+those ARE the arm verdicts the record cites. So the capture sits in `Write-ArmVerdict`, and the arms'
+binaries are found from the run's own `.started` marker, which already records the arm's command. **No
+driver needed a change.** A writer that names no binary records `binary_state=not-supplied`: absence is a
+state, never a guess. Nothing here blocks an arm: a capture that cannot be taken is recorded as data
+(`source_state=not-a-repo` / `git-missing` / `missing` / `error` + text) and the run proceeds unchanged.
+
+**The checker refuses instead of passing silently.** `tools/check-arm-provenance.ps1` re-derives the digest
+from the tree now and re-hashes the recorded modules, then applies `Compare-ArmProvenance`:
+
+| exit | verdicts | meaning |
+|---|---|---|
+| 0 | `CURRENT` | this arm still describes this tree, and the binary it ran is unchanged |
+| 1 | `STALE-SOURCES`, `SOURCES-NEWER-THAN-BINARY`, `SOURCES-CHANGED-DURING-RUN`, `BINARY-CHANGED-DURING-RUN`, `STALE-BINARY` | do not quote this arm as current evidence |
+| 2 | `NO-PROVENANCE`, `NO-VERDICT`, `CANNOT-EVALUATE`, `BINARY-UNKNOWN` | **NOT A PASS** - cannot certify is not "fine" |
+
+**Proof, host-only, two layers (no GPU, no mutex, no model).**
+
+| layer | evidence |
+|---|---|
+| `tools/check-arm-provenance.ps1 -Selftest` | **22/22** over throwaway git repos and throwaway binaries; the real tree is never mutated. The measured failure is the central case: build, save a verdict, **edit a source -> STALE-SOURCES (exit 1)**; revert the edit -> `CURRENT` again (content, not mtimes); a NEW untracked source -> STALE; rebuild the engine dll -> STALE-BINARY; a source edited after the build -> SOURCES-NEWER-THAN-BINARY; a mid-run change -> SOURCES-CHANGED-DURING-RUN; a pre-provenance verdict -> `NO-PROVENANCE` exit 2 labelled "NOT A PASS"; a non-repo tree -> CANNOT-EVALUATE |
+| `tools/test-arm-verdict.ps1` section 13 | the real-tree half: the arm command resolves to its exe + 5 modules; a verdict written through the shared writer carries the real digest (equal to an independent capture) and `llama.dll 46628B7CDA8FAFA1`; the checker CLI certifies it (**exit 0**); a wrapped stub run records `origin=launch`, a post-run capture and a delta agreeing with both captures; a command naming no binary records `binary_state=not-supplied` |
+| host suite | `[arm-provenance]` registered; `tools/run-tests.ps1 -Suite host` exit 0 (`build/suite-provenance.log`) |
+| **the mechanism caught a REAL drift while this pass was being written** | the nested tree's digest moved twice inside one hour - `CE58F2F7DCB62B67` -> `C33A0E40BC23F9BF` -> `BC5E1BBE8D0B30A0` - the second and third because another actor's scratch files appeared under a new `.tmp-split/` at 16:48:11. Re-running the rule against the pre-drift digest returned `STALE-SOURCES` and **named them**: `now changed: .tmp-split/n.ccm.diff, .tmp-split/n.cpp.diff, .tmp-split/n.h.diff, ...`. That is the defect the block was written for, observed live and correctly classified |
+
+**The boundary, measured - and what it means for the evidence this record already holds.** Of the **101**
+saved verdicts in `build/llama-cuda/verdicts/`: **0 certify (exit 0), 101 cannot-certify (exit 2), 0
+stale.** None was written after the mechanism landed, so no saved arm - including the accepted A3/A4 arms
+and the 16:28 smoke - can be retro-certified. They are not wrong; they are **uncertifiable**, and the
+two claims above that leaned on a binary identity now carry that correction. A re-run is what produces a
+certifiable verdict.
+
+**Limits, named.** The digest covers the nested engine tree, which is what produces the binary - the
+outer repo's tooling is not hashed, so a driver edit does not invalidate an arm. The mtime relation is
+sensitive by design (any artifact rewritten after a source edit flags); the digest relation is not
+(mtimes never enter it). A long arm's source state is captured at its start and its end but not
+continuously, so an edit that lands and reverts entirely inside one arm leaves the digest unchanged.
+**Whole-tree sensitivity cuts both ways, measured:** ANY new file in the nested tree reads as drift,
+including scratch - the live `.tmp-split/` event above is exactly that, and it is why the path manifest
+exists (a reader can see the drift is scratch in one line). Narrowing the untracked set to
+build-relevant paths is a real refinement, but WHICH paths are build inputs is a judgement about this
+tree, not a mechanical choice, so it is flagged here for the Planner rather than taken.
+
+**Owner/Planner call, not an implementer's:** nothing wires the checker into an existing gate yet. Its
+natural enforcement points are (a) quoting any arm's numbers into this record, and (b) the session
+launchers' own post-run summary - both are process decisions, so they are named here rather than taken.
+One hygiene item rides along: `docs/currentstate.md` is at 254,486 B (WARN band, 53% of FAIL) and the
+convention's split is due before more evidence lands.
+
+**BINDING AT THE LAUNCHERS (same day, 2026-09-22).** A capture nothing requires is a suggestion, so the
+requirement now sits where this program's own arms launch. `Assert-ArmProvenance`
+(`tools/arm-verdict.ps1`, beside the verdict convention) requires per arm: a `provenance` capture,
+`source_state=git` with a 16-hex digest, `binary_state=hashed`, and none of the capture's own anomalies
+(`sources_newer_than_binary`, `sources_changed_during_run`, `binary_changed_during_run`). Freshness
+against the current tree stays the CHECKER's verdict - printed as a `NOTE` at session end, never a
+reason to fail a run whose evidence was sound when it was written. An empty selection REFUSES: a gate
+that shrugs there is the silent pass the mechanism exists to remove.
+
+| where | what happens |
+|---|---|
+| `run-gplr53-a3-arm.ps1`, `run-gplr53-a4-arm.ps1` | gate their own arms at exit; an uncertifiable arm sets **exit 10** (distinct from an arm FAIL `1` and from mutex/busy `124`/`125`). A4's band and every arm field are untouched - the gate re-scores nothing |
+| `run-gplr53-session.ps1` | gates each step's tags, passes `-AllowUnprovenanced` through to the drivers, and fails the session with the same `10` before the roll-up's PASS line |
+| `tools/smoke-gpu-lock-ctxshell.ps1` | gates its arm BEFORE writing its chain verdict, and carries `arm_source_head` / `arm_source_digest` / `arm_streaming_lib_sha` / `arm_binary_exe_sha` / `arm_provenance_complete` INTO it, so the smoke's result is self-describing |
+| escape | `-AllowUnprovenanced`: the run continues and `WAIVED label=... arms=... note=...` is appended to `<verdictDir>/provenance-waivers.log`. Explicit and recorded, never implied by a missing check. **No escape has been taken** (no such file exists) |
+| host proof of the refusal path | `tools/test-arm-verdict.ps1` section 14, 16 cases, all PASS: complete verdict passes; capture STRIPPED is refused and named; no binary identity refused; binary-predates-sources refused; a tag with no verdict refused; empty selection refused; the waiver returns true AND writes the log; and a **static** guard asserts all four call sites still contain the gate call, so the wiring cannot be deleted silently (labelled static - a driver cannot be run host-only) |
+
+**A mechanism correction this required, measured.** The staleness flag compared the newest changed file of
+ANY kind, so the other actor's scratch `.tmp-split/n.*.diff` (written 16:48:11, later than the 16:32
+build) made every arm read `sources_newer_than_binary` and would have refused a smoke that was in fact
+fine. The DIGEST keeps whole-tree coverage (nothing hides); the MTIME relation now uses only
+compile-relevant paths (`.c .cc .cpp .cxx .cu .cuh .h .hh .hpp .hxx .m .mm .s .asm .inc .cmake .def .rc`,
+`CMakeLists.txt`, `Makefile`), recorded as `source_newest_input_path/_utc` beside the informational
+`source_newest_change_path/_utc`. That list is the mechanism's one judgement call: a Planner who
+disagrees with the boundary changes it and nothing else.
+
+**ONE REAL ARM IS NOW CERTIFIED (2026-09-22, one mutex hold).** The boundary above (0 of 101 verdicts
+certifiable) moved by exactly one, on real hardware, through the wrapper and the driver-side capture
+path rather than through stubs.
+
+| item | measured |
+|---|---|
+| window | card held by `deepseek_v4.exe` pid **24104** from 14:56:26Z with the mutex FREE (non-conforming); bounded probe, cleared **15:06:18Z** (sample 14, ~10 min of 45 s samples) |
+| run | `tools/smoke-gpu-lock-ctxshell.ps1` **15:06:23Z-15:06:45Z**, one mutex hold, `arm exit 0 after 19.2 s` |
+| chain verdict | `build/llama-cuda/gpu-smoke-ctxshell.verdict.json` **PASS** (exit 0): `check-telemetry: OK (1049 events, 4 slots)`, 8 rowset rounds, 320 fetch events, TG text 21 bytes, probes clean |
+| arm verdict | `build/llama-cuda/gpu-smoke-arm.verdict.json` **PASS** |
+| **gate** | `PROVENANCE GATE: 1 smoke arm verdict(s) checked - 1 complete, 0 refused` - the first real arm to pass it |
+| **capture** | `origin=launch`, head **23e5d1b6e617**, digest **BC5E1BBE8D0B30A0** (5 tracked / 7 untracked), `llama-layer-streaming.exe D01874A4235542A8`, `llama.dll 46628B7CDA8FAFA1`; post-capture `origin=post-run`; both deltas false |
+| **checker** | `tools/check-arm-provenance.ps1 -Dir build/llama-cuda -Tag gpu-smoke-arm` -> **CURRENT, exit 0**. The first arm on disk whose evidence is tied to a revision |
+| rates | PP 133.957 tok/s, TG 15.280 tok/s at 512/8 - the smoke's own header calls it a connectivity check, so these are context only, never a result |
+| after | card clean, lock free, no waiver file, no stray process |
+
+**Not done, named:** no historical verdict was retro-certified (forbidden by the task, and the 101 remain
+uncertifiable - only a re-run produces a certifiable verdict); the P1 arm set was not started; the gate is
+NOT yet wired into any analysis or quoting path, so "don't quote an uncertified arm" remains a process
+convention rather than a mechanical one. That last item is now the highest-value next step in this block.
+
+### T-GPLR-57 (P3 host half, LANDED 2026-09-22 - the never-taken/zero distinction for per-part TG timings, and what the recorded traces can actually attribute)
+
+**Status:** landed (host half). **Dependencies:** T-GPLR-13 (row-set TG + its ladder), the F3/H8 emitter
+(2026-09-14). **Commit:** unassigned. **GPU half:** named as arms below, not run - the card was held by a
+foreign compute process at every probe.
+
+**Goal.** T-GPLR-55's transport attribution needs per-part TG timings as its input. This block establishes
+what actually exists for that input, and removes the class of defect that made the ladder's `0/120` read as
+"TG compute is free": a timing that was never TAKEN was indistinguishable from a real ZERO.
+
+**Premise correction, measured (the request's premise was half right).** The per-part TG telemetry was
+**already landed** - F3/H8, `docs/gplr13-bottlenecks-hypotheses.md` section 3.6, 2026-09-14: the row-set TG
+executor (`third_party/llama.cpp/src/llama-layer-streaming.cpp:3327-3406`) times each graph part around the
+staging and `tel_layer_compute` (line 5316) appends `attn_compute_us`/`attn_setup_us` (part A = attention +
+residual + post-norm + router) and `ffn_compute_us`/`ffn_setup_us` (part B = FFN + shared experts on the
+staged rows), with `compute_us`/`setup_us` keeping their exact prior meaning (the A+B sums). So the missing
+piece is **not** the emitter. It is that (a) nothing mechanically distinguishes an absent timing from a zero
+one, and (b) the ladder rungs the record cites were recorded BEFORE that fix.
+
+**Measured over every trace on disk** (`python tools/check-tg-part-timings.py --census`, 444 traces carrying
+`layer_compute`; log `build/tg-parts-census.log`):
+
+| classification | traces | meaning |
+|---|---|---|
+| phase-1 MEASURED | **31** | the split is live and usable as attribution input |
+| phase-1 NOT-TAKEN | **353** | part fields ABSENT: a batch-major TG path (no split by construction) or a pre-2026-09-14 binary |
+| PARTS-ALL-ZERO defects | **0** | no trace claims a split and reports nothing - the emitter is correct today |
+
+The row-set-path traces split **31 MEASURED / 64 NOT-TAKEN**: every one of the 64 is pre-fix, including all
+four `gplr13-ladder` rungs (`50/512/4k/200k`, mtime 2026-09-13T13:38) - which is exactly the recorded
+`0/120`. The first producer of the split is `gplr21-f3-parts/rowset-pp64-tg3-parts.jsonl` (120/120 measured,
+2026-09-14T17:30); the newest is `gpu-smoke-ctxshell.jsonl` (320/320, 2026-09-22). **No re-run of the ladder
+rungs with the split has ever been recorded.**
+
+**What landed (host-only, telemetry-only, NO engine change).** `tools/check-tg-part-timings.py` derives the
+path from the trace's own signals (a trace carrying `rowset_fetch` events ran the two-part row-set
+executor), classifies each `(trace, phase)` group as MEASURED / NOT-TAKEN / PARTS-ALL-ZERO / MIXED, and
+refuses rather than guessing.
+
+| exit | verdict | meaning |
+|---|---|---|
+| 0 | MEASURED, or NOT-TAKEN on a path with no split by construction | classified; a batch-major trace says so instead of saying `compute = 0` |
+| 1 | PARTS-ALL-ZERO | a defect on ANY path: a group that claims a split and reports all zero. Checked BEFORE the requirement, so a defect is never downgraded to "cannot certify" |
+| 2 | a required group is NOT-TAKEN or MIXED | **NOT A PASS** - cannot evaluate is never "fine" |
+
+No engine edit was made, deliberately: the split already exists on the row-set path, and the batch-major TG
+path runs ONE fused layer graph, so it has no attn/FFN boundary to time at all - adding a "parts not
+measurable" marker field to that record would have broken the byte-identity the F3 amendment preserved on
+every non-row-set path (its own note: "Event cardinality is unchanged, so no consumer of the old fields
+moves"). The distinction is therefore carried by the CHECKER, from signals the trace already has.
+
+**Validation, all host-only (no GPU, no mutex, no model).** `--selftest` **10/10** on hermetic fixtures: the
+recorded ladder shape (120 phase-1 events, `compute_us=0`, part fields absent) reads **NOT-TAKEN** and
+refuses; the same 120 events WITH all-zero part fields reads **PARTS-ALL-ZERO** - the two are asserted to
+differ, and that assertion is the point of the block; a MEASURED group containing one legitimately zero part
+stays MEASURED (a real zero is not a defect); a batch-major trace classifies NOT-TAKEN at exit 0 and refuses
+under `--require-parts`; a half-parted group reads MIXED and refuses; and the all-zero defect is exercised on both a row-set and a batch-major trace, so exit 1 is reachable rather than a documented-only code. Registered as `[tg-parts]` in
+`tools/run-tests.ps1`; `-Suite host` green (42/42 CTest plus the new block). On the real tree,
+`gplr13-ladder/{50,200k}/rowset-*.jsonl` -> REFUSED exit 2, `gplr21-f3-parts/*` and `gpu-smoke-ctxshell` ->
+MEASURED exit 0, and `gplr53-a4-pw0` / `gplr56-p1off-4k` -> REFUSED exit 2 (batch-major, no split).
+
+**A1, as far as the traces on disk allow (measured; no performance claim).** Distinct runs: **27** - 4 of
+the 31 traces are duplicate copies of another trace (same `run_id` under `tmp-verdict-test/k6` and
+`gplr19-honest-k6-ab`). Four TG-stream shapes exist: 120 / 320 / 3840 / 10240 fetches, i.e. 3 / 8 / 96 / 256
+TG tokens. Transport (submit + ready-wait) is the majority at every one of them: transfer share **72.9%**
+(n=1), **68.5-70.7%** (n=3), **55.5-89.4%** (n=9), **64.6-82.8%** (n=14); part A 5.0-28.3%, part B
+2.3-12.0%, setup <= 4%. That spread is the first honesty statement: **a shape is not a measurement** - only a
+within-session pair is.
+
+The only same-session, same-shape pair that carries the split is the honest K=6 A/B
+(`gplr19-honest-k6-ab` and its `-repro`: 256 TG tokens, 40 layers, 4 slots; A = reactive, B = retained K=6
+per the 2026-09-18 entry), four runs per group, expressed per TG token:
+
+| term | A (reactive) | B (retained K=6) | reading |
+|---|---|---|---|
+| submit | ~30.0 ms | ~23.1 ms | the host-side staging loop is still paid |
+| ready-wait (consumer blocking) | **~42.1 ms** | **~7.7 ms** | the fault-driven wait is what retention removes |
+| transport total | ~72.1 ms | ~30.8 ms | -57% |
+| compute, part A (attn+router) | ~8.4 ms | ~8.0 ms | unchanged within the run spread |
+| compute, part B (FFN) | ~5.2 ms | ~4.2 ms | unchanged within the run spread |
+| setup (both parts) | ~1.6 ms | ~1.6 ms | unchanged |
+
+So the gain in that pair is a TRANSPORT attribution, not a compute change: ~41 ms/token is removed, and
+~34 of those 41 ms come out of the ready-wait. **Cannot be concluded from disk, named rather than implied:**
+(i) nothing at any ladder rung - all four are NOT-TAKEN, so no per-part timing exists at 50/512/4k/200k;
+(ii) nothing for the transport stack's own arm shapes - `gplr52-a2-{50k,200k}`, every `gplr53-a4-*` arm and
+`gplr56-p1off-4k` run batch-major TG, where no split exists by construction, so no attribution is possible
+there on any binary; (iii) `gplr24-ha-4096-retention-ARCHIVE.jsonl` is an unexplained outlier at 89.4%
+transfer / 18.76 s submit and must not be pooled with its shape; (iv) the smoke's 8-token shape shows the
+OPPOSITE signature (ready 344.1 ms vs submit 6.4 ms) and is n=1 - a lead for the first-touch work, not
+evidence; (v) these numbers are a re-attribution of arms already banked for a tok/s result, so they do not
+add a second independent performance reading.
+
+**Named, not inferred:** `T-GPLR-55` has **no block anywhere in this repository** (the id appears only in
+sentences forbidding edits to its shapes - 7 occurrences across the plan and currentstate), so its A1
+wording, its arms and its thresholds could not be read and none were invented or altered here. **GPU arms
+that would close the gap, both blocked on the shared card** (`nvidia-smi --query-compute-apps` showed
+`deepseek_v4.exe` pid 14016 holding compute with the mutex FREE at 15:16:33Z, after probes at 13:57, 14:00,
+14:10, 14:13, 14:22, 14:26 and 14:28): **A1-ladder** - re-run each ladder rung at its recorded shape
+(`--residency moe-expert-bank --residency-tg --pp-tokens {50,512,4096,200000} --ubatch 64 --tg-tokens 3
+--layer-slots 4 --allow-full-residency`; the split-producing producer of that same shape is
+`gplr21-f3-parts/rowset-pp64-tg3-parts.jsonl`), which would produce the first per-part TG timings at ladder
+lengths; **A2-shape** - one row-set retention/reactive pair at 200k, since the only clean pair on disk is at
+256 TG tokens. Neither is claimed as run.
+
+**Escalation.** If the Planner wants the attribution extended to the transport arms themselves (mmap vs
+pinned, pre-warm vs not), that is a SHAPE decision, not a telemetry one: those arms must be row-set-shaped,
+or a two-graph TG path has to be built for them - a behavior change, and the Planner's call.
+### T-GPLR-57 A1-ladder + the marker-after-sink silent loss (same pass, 2026-09-22; the arms were blocked all through the window, THEN RAN once the card cleared - see the addendum at the end of this block)
+
+**The two sessions the task calls for did not run in the window this pass spent first - blocker, measured (they ran later the same day; see the addendum at the end of this block).** A1-ladder's rungs are 512 and
+200k, one mutex hold each. The card was held by a foreign compute process at every probe today:
+`nvidia-smi --query-compute-apps` showed `deepseek_v4.exe` pid 21208 -> 23744 -> 17352 -> 14016 (13:57,
+14:00, 14:10, 14:13, 14:22, 14:26, 14:28, 15:16:33Z) and then pid **5420** for the whole bounded window this
+pass (**15:29:42Z** preflight, then 8 samples 15:31:17Z-15:37:17Z, every one `5420
+C:\Development\AI\colibri\deepseek-v4-baseline\c\deepseek_v4.exe`, mutex FREE - a non-conforming holder).
+No arm was launched, no `-AllowBusy` was passed, and **no result is inferred for either rung**. A separate
+`llama-layer-streaming` arm did run in this shared checkout at **15:21-15:23Z** (verdict
+`build/llama-cuda/verdicts/llama-layer-streaming.verdict.json`, PASS, 133.7 s, batch-major `gplr07-qa-512`
+shape, `gpu_pre_run`/`gpu_post_run` clean) - **not this pass's run**; its `fields` carry only the four
+pre-provenance keys, so it was written by an older tools revision than the one on disk now, and it is
+recorded here only so nobody reads it as this session's evidence.
+
+**The launcher is landed and host-proven** (`tools/run-gplr57-a1-ladder.ps1`), so the sessions cost one
+command and ~3 minutes of holds when the card frees: recorded walls for these very rungs are **512 = 12 s
+and 200k = 2.6 min** (`build/llama-cuda/gplr13-ladder/driver.log`), against lock timeouts of 2400 s and
+7600 s. It takes ONE rung per invocation (one hold), re-runs the rung at its RECORDED shape and reuses the
+recorded anchor prompt byte-for-byte (`gplr13-ladder/{512/anchor-512.txt,
+200k/anchor-200000.txt}`, sha256 recorded in the chain verdict), writes into a per-run directory
+(`build/llama-cuda/runs/<utc>-gplr57-a1-<rung>/`) so a re-run cannot overwrite the previous evidence, gates
+its own arm with `Assert-ArmProvenance` (exit 10; `-AllowUnprovenanced` is the only escape and it writes a
+`provenance-waivers.log` line), and then requires BOTH `--check-telemetry` and
+`check-tg-part-timings.py --require-parts` to exit 0 before it can report PASS.
+
+| host proof | result |
+|---|---|
+| parse | OK |
+| `-PreflightOnly` against the BUSY card | **refuses in <1 s with exit 125**, naming `5420 deepseek_v4.exe`; starts no arm |
+| `-PreflightOnly` with `GPU_BUSY_PROBE_CMD` stubbed clean | exit 0, "nothing launched" (the clean path, exercised without touching the card) |
+
+**The audit's remaining correctness gap is fixed: a marker emitted after the sink opened was silently lost.**
+`llama_ls_tel_mark` pushed such a marker into `g_tel_early`, and the only production flush is the one at
+sink-open (`llama-layer-streaming.cpp:2267`), so nothing ever reached it again: no error, no flag, no line.
+Fixed telemetry-only, with **no stashed `FILE*`** - the first design I wrote did stash the sink and write
+late markers live, and the shared host test's own first case (open a sink, flush it, `fclose`, then mark)
+would then have written to a CLOSED FILE, which is undefined behaviour; the test caught that, and the
+design was replaced by one emission path:
+
+| change | why |
+|---|---|
+| the three close sites (`teardown:1879`, `run_end:4721`, `refused:4764`) now call `llama_ls_tel_flush_early(tel_out)` right BEFORE their `fclose` | a marker taken after the sink opened is written at close instead of dying in the buffer; this is the whole fix |
+| `tel_early_rec.late` + `g_tel_early_sink_seen` | a late line must say so, or it is indistinguishable from a second emission of the same event name (`load_end` twice) |
+| `seq` continues across flushes | call order stays provable across both phases |
+| shape of every other line is UNCHANGED (`pre_run:1`, no `run_id`, same field set/order) | the documented pre-sink shape and the F3-style byte-identity are preserved; `late:1` is additive and appears only on a line that did not exist before |
+
+**Validation, host-only (no GPU, no mutex, no model).** `test-layer-streaming-tel-mark` extended with the
+post-flush case: **ALL CHECKS PASSED**, `ctest -C Release -R layer-streaming-tel-mark` PASS. The new case
+asserts a marker taken after a flushed sink is WRITTEN (not lost), carries `late:1`, keeps `pre_run` and
+carries no `run_id`, and that a mark taken with no sink is still buffered and emitted by the next flush.
+The four pre-existing cases (null-flush drop, the three-marker shape and order, the empty/NULL-name
+refusal) still pass unchanged - which is what makes the addition additive rather than a redefinition.
+
+**This pass rebuilt the engine, and the provenance mechanism said so - measured.** `llama.dll`
+**46628B7CDA8FAFA1 -> 261AA683E10E97AA** (exe unchanged, `D01874A4235542A8`).
+`check-arm-provenance.ps1 -Verdict build/llama-cuda/gpu-smoke-arm.verdict.json` now reports
+**STALE-SOURCES (exit 1)**: digest recorded `BC5E1BBE8D0B30A0` vs now `9399BF96289C63E1`, and "module
+llama.dll was REBUILT since this arm". So the one certified arm on disk is **no longer quotable as current
+evidence** - the exact class this mechanism exists to catch, catching this pass's own change.
+
+**Limits, stated rather than implied.** (i) A late marker is written by the NEXT flush, i.e. at the close
+of the sink, so its LINE POSITION is not chronological - its `t_us` is, and that is what a reader must use;
+whether to emit late markers at their point of occurrence is a design question this fix does not take.
+(ii) With no sink at all there is no telemetry file to write to, so those markers are still buffer-only.
+(iii) The rungs were blocked for the whole window this pass tried and then ran once the card cleared, so
+**A1 now has per-part input at two ladder lengths - see the addendum below**, which is the ladder-length
+attribution; the earlier T-GPLR-57 block's reading (banked arms, one same-session pair) stands as a separate
+re-attribution and is still the only same-session transport-lever comparison on disk. No latency or
+throughput claim is made anywhere in this block.
+**Addendum (same day, the card cleared at ~15:42Z): BOTH RUNGS RAN - this is the A1-ladder evidence, and it
+supersedes the "not run" status above.**
+
+The bounded window this pass spent first was refused as recorded (8 samples 15:31:17Z-15:37:17Z, every one
+pid **5420**, mutex FREE). The card then cleared, and both rungs were launched - one mutex hold each, at
+their recorded shapes with their recorded anchor prompts, each into its own per-run directory.
+
+| rung | run dir (UTC) | arm | chain | provenance | waiver | per-part guard |
+|---|---|---|---|---|---|---|
+| 512 | `runs/20260922T154620Z-gplr57-a1-512` | PASS, 10 s | **PASS exit 0** | digest `9399BF96289C63E1`, `llama.dll` `261AA683E10E97AA`, exe `D01874A4235542A8`, `sources_newer_than_binary=false` | **none taken** | `--require-parts` exit 0 -> **MEASURED** |
+| 200k | `runs/20260922T154633Z-gplr57-a1-200k` | PASS, 147.7 s | **PASS exit 0** | same digest / same `llama.dll` / same exe; `provenance_delta` = no source or binary change DURING the run | **none taken** | `--require-parts` exit 0 -> **MEASURED** |
+
+Re-verified from the artifacts rather than from the drivers' own output, because this record has carried
+false claims before: `check-arm-provenance.ps1` reports **CURRENT (exit 0)** on all four verdicts (both arms
+and both chains) against the tree as it stands now; `--check-telemetry` exits 0 on both traces; 120/120
+phase-1 `layer_compute` events carry the part split; the wrapper fields read `gpu_pre_run=gpu_post_run=clean`
+with `mutex_acquired=true` and `gpu_probe_source=nvidia-smi`; and **no waiver log exists at any level** (no
+`provenance-waivers.log` in the repo root or in any run directory). The recorded rungs these replace measure
+`phase1=120, with-parts=0, compute_us_sum=0.0 ms` - the recorded `0/120` reproduced exactly - so these two
+runs are the first ladder-rung per-part input that exists.
+
+**A1's reading at these two shapes (measured; no performance claim; 3 TG tokens per rung = a COLD window).**
+
+| rung | PP wall | TG wall | TG tok/s | transfer | ready-latency | compute | part A (attn+router) | part B (FFN on staged rows) |
+|---|---|---|---|---|---|---|---|---|
+| 512 | 3,423.5 ms (149.56 tok/s) | **212.7 ms** | 14.10 | 131.8 ms (**62.0%** of TG wall) | 129.4 ms | 67.1 ms (31.5%) | 43.6 ms (20.5%) | 23.4 ms (11.0%) |
+| 200k | 139,463.9 ms (1434.06 tok/s) | **243.5 ms** | 12.32 | 132.6 ms (**54.5%** of TG wall) | 130.1 ms | 95.1 ms (39.1%) | 71.9 ms (29.5%) | 23.2 ms (9.5%) |
+
+Per TG token: ready-latency **43.1 vs 43.4 ms**, part A **14.55 -> 23.96 ms**, part B **7.81 vs 7.74 ms**.
+`total_compute_us` equals part A plus part B exactly (67.074 ms vs 43.6 + 23.4), so the compute term is
+internally consistent rather than assembled from two sources. Transport is **131.8 vs 132.6 ms - flat across
+a 390x longer prefill**: 120 fetches of the same 8 experts x 1.77 MB = 14.16 MB per fetch, i.e. 573 MB/token
+at **~13.0 GB/s** effective.
+
+**What it supports.** The TG transport term is context-invariant, and the context-dependent growth is
+**COMPUTE, entirely inside part A** (attention + router): across 512 -> 200k, part A gains **+9.4 ms/token**
+while part B - the FFN consuming the freshly staged expert rows - is flat to 0.07 ms/token and holds ~10% of
+the wall. The transport SHARE falls (62.0% -> 54.5%) only because part A grows. In the PP leg the same
+transfer is overlapped (transfer 4610 ms against a 3423 ms wall at 512; 379,687 ms against 139,464 ms at
+200k), whereas the TG leg's ready-latency is 98% of its transfer time - so the blocking is a TG-leg property,
+not a staging-cost property. **QUALIFIED by the T-GPLR-55 decision below:** these rungs are the ONLY row-set
+arms on disk whose row fetches are SERIALIZED (`ready_latency/transfer_us` = 0.982); the banked row-set arms
+overlap theirs (0.067-0.598) and their per-token transport is 4-10x smaller, so the 62% share is a property
+of the rungs' reactive / no-prefetch configuration, NOT of the path. What survives unqualified is the copy
+rate itself: 13.03 GB/s (512) vs 12.96 GB/s (200k), a 0.5% spread.
+
+**What the pair cannot distinguish.** (i) Three TG tokens is the first tokens after a cold prefill, and no
+ladder shape on disk carries a token-index trend, so **no per-token TG rate at ladder lengths may be quoted
+from this** - it is a shape attribution, not a rate. (ii) It therefore cannot separate a context-length
+effect on transport from a warmup effect. (iii) It says nothing about any transport lever: no
+mmap/pinned/pre-warm arm exists at ladder shapes, and the batch-major shapes those arms run on cannot carry
+the split at all (the guard refuses them, by design). (iv) The 512-vs-200k part-A difference is confounded
+with KV length AND with sample size, so no attention cost model is claimed from it. (v) No comparison against
+the pre-fix rungs is made: those carried no compute term to compare against, and today's binary also differs
+(the marker fix landed this pass).
+
+**Two defects in this pass's OWN launcher, found and fixed in-pass - both the class the audits keep finding.**
+(1) The gate step used `& exe *> file`, and PowerShell 5.1 turns a native command's STDERR into a
+TERMINATING error under `ErrorActionPreference='Stop'` - the engine prints `rowset_round` to stderr, so the
+FIRST rung PASSED and the launcher then died inside its own gate step, writing no chain verdict at all. Both
+gate calls now run under `cmd.exe /d /s /c`, with cmd owning the redirection. (2)
+`Write-ArmVerdict -ExitCode ([int]($status -eq 'PASS'))` records **1** for a PASSING run, and the writer
+derives status FROM the exit code, so two chain verdicts read **FAIL while their own arms read PASS**; the
+integer is now passed rather than the truth value. Superseded run directories, named so nobody cites them:
+`runs/20260922T154241Z-gplr57-a1-512` (no chain verdict - died in the gate step),
+`runs/20260922T154311Z-gplr57-a1-512` and `runs/20260922T154328Z-gplr57-a1-200k` (complete arms, chain
+verdict mislabelled FAIL by the inverted exit code). Because the rung directories are per-run by
+construction, this cost no other arm's evidence.
+### T-GPLR-55 (decision, 2026-09-22, host-only, no GPU spent): the transport-remainder premise is REFUTED
+
+**The premise as drafted:** the row-set transport ships at **7.3-7.4 GB/s** and there is a residual to
+attribute to it. Decided from the traces and verdicts already on disk - 453 traces carry `copy_complete`,
+450 usable, plus all 100 row-set traces with at least 20 `rowset_fetch` events. No arm was run, no mutex was
+taken, and no threshold or drafted shape was touched.
+
+**Finding 1, and it decides most of the question: `transfer_us` is a LATENCY, not a duration.** For a copy
+event, `transfer_us` is exactly `copy_complete.t_us - copy_submit.t_us`, and `ready_latency_us` records how
+much of that any consumer waited for. So `bytes / transfer_us` is a copy's **speed** only when the copy is
+**serialized** (`ready_latency / transfer_us ~ 1`); when many copies are in flight it is a **queue-inclusive
+latency** and it understates the speed. `ready_latency / transfer_us` is therefore the discriminator, and it
+is available on every arm.
+
+**Finding 2: every "transport GB/s" in this repository is one of FOUR different quantities.** They have been
+read as one number, and that is what produced the premise.
+
+| quantity | how it is formed | measured | arms |
+|---|---|---|---|
+| **copy link rate** (serialized) | bytes / latency, ready/transfer ~1 | **13.03 GB/s** (512 rung) and **12.96 GB/s** (200k rung), 13.65 MiB per fetch; **14.34 GB/s** for ONE 347.2 MiB full-bank copy at ratio **0.999** | `runs/20260922T154620Z-...`, `runs/20260922T154633Z-...`, `q38ls-lm-boundary.jsonl` |
+| **queued copies** | bytes / latency, ready/transfer 0.004-0.62 | 9.6-9.8 GB/s (`direct`, 3880-19480 copies at ratio ~0.005), **7.37** (`gplr10-mem-m1`), **7.58** (`gplr24-hd-ab/hd-pinned`) | the batch-major arms - **this is where 7.3-7.4 GB/s came from** |
+| **first-touch mmap-registered copies** | bytes / latency, ratio 1.000 but ~3.3 s per 436.95 MiB copy | **0.07-0.14 GB/s** | `gplr37-*`, `gplr41-*`, `gplr42-*`, `gplr48-a2-*` - the page-lock/residency commit P0 already closed |
+| **wall rate** | bytes / WALL | 4.4-5.8 GB/s (row-set), 3.2-3.3 GB/s (whole-bank) | `docs/gplr13-bottlenecks-hypotheses.md` sections 3.7, H5, and the H1 estimate |
+
+**Verdict: the premise is REFUTED, and no residual is left to attribute at that level.** On the only path
+where a clean (serialized) copy measurement exists, the staged expert rows move at **13.0 GB/s, identical at
+512 and 200k** (13.03 vs 12.96 - a 0.5% spread across a 390x longer prefill), and a serialized full-bank copy
+of 347.2 MiB measures **14.34 GB/s**. Those are one link class, ~13-14 GB/s. There is no 7.4 GB/s transport
+ceiling with a recoverable remainder above it: the 7.3-7.4 family is a **queue-inclusive latency on queued
+copies**, the 4.4-5.8 family is a **wall rate**, and the 0.07-0.14 family is the **page-commit** already
+attributed by P0. The context-dependent TG growth is not staging at all - it is attention + router (part A),
+as the A1-ladder addendum above measures.
+
+**Withdrawn, marked in place so a reader cannot be misled.** (i) `docs/gplr13-bottlenecks-hypotheses.md`
+sections 3.7 / H5 / H1 carry a superseding note: their 4.4-5.8 and 5.4-5.8 GB/s are WALL rates and must not
+be read as transport speeds. (ii) The A1-ladder addendum's transport share (62% of TG wall) is qualified: the
+gplr57 rungs are the ONLY row-set arms on disk whose row copies are serialized (ready/transfer 0.98), while
+the banked row-set arms overlap them (0.067-0.598, and their per-token transport is 4-10x smaller) - so that
+share is a property of the rungs' reactive/no-prefetch configuration, not of the path. A row-set trace with
+`ready/transfer < 0.9` has no per-copy speed in it at all.
+
+**What genuinely remains (the re-scoped task).** The copy speed itself is answered. What is not answered is
+the **source** effect on the row-set path: identical 13.65 MiB row fetches measure 13.03 GB/s
+(`mmap-registered`, the rungs), 9.16 (`direct`, `gplr07-qa-4096-reactive`) and 7.85 (`pinned`,
+`gplr19-honest-k6-ab/arm-A1`) - but those arms DIFFER in overlap ratio (0.982 / 0.067 / 0.578) and in
+retention/prefetch configuration, so the three numbers are confounded and none of the three may be credited
+as a source comparison.
+
+- **The single arm that would settle it:** one row-set TG arm at ONE ladder shape, in the rungs' serialized
+  configuration (reactive, no prefetch window, so `ready/transfer ~ 1` by construction), run once per
+  `--copy-source` value - `mmap-registered` (already have: 13.03 GB/s) vs `pinned` vs `direct`. That puts all
+  three sources on the same quantity for the first time, at the same fetch size, with no queue in the way. It
+  is 2 runs and settles whether the source is worth a lever. Its precondition is the same as the rungs'
+  (`--pp-recon 1`), and it names its own quantity (serialized copy rate) rather than inheriting A4's band.
+- **Named tooling gap, not built here:** nothing on disk refuses to call a queued copy set a "rate". A guard
+  that reports a rate ONLY when `ready_latency / transfer_us >= 0.9` (and otherwise says `QUEUED-LOWER-BOUND`)
+  would have prevented this premise from being drafted. Recorded as a candidate; it is a new tool, so it is
+  the Planner's call, not an implementer's.
+
+**Evidence:** `build/llama-cuda/runs/20260922T154620Z-gplr57-a1-512/`, `...154633Z-gplr57-a1-200k/`,
+`build/llama-cuda/q38ls-lm-boundary.jsonl`, `build/llama-cuda/gplr10-mem-m1.jsonl`,
+`build/llama-cuda/gplr24-hd-ab/hd-pinned.jsonl`, `build/llama-cuda/gplr07-qa-4096-reactive.jsonl`,
+`build/llama-cuda/gplr19-honest-k6-ab/arm-A1.jsonl`, `build/llama-cuda/gplr37-a4-b1-default.jsonl`, and the
+census over all 450 rate-bearing traces. No latency or throughput win is claimed from any of it.
+### T-GPLR-55 re-scope RUN (2026-09-22, one mutex hold per arm): the copy-source A/B is DECIDED - the source is NOT a bandwidth lever, it selects the submission mode, so only ONE of the three rates is a rate
+
+**What was run.** The re-scoped question had one arm: same shape, same config, one run per remaining
+`--copy-source` value, so the three sources sit on the same quantity at the same fetch size. Two arms, one
+mutex hold each, at the rung's recorded shape (`-Rung 512 -CopySource pinned` 15:57:38Z-15:57:53Z and
+`-CopySource direct` 15:57:57Z-15:58:12Z; the mmap-registered rung 15:46:20Z is the third).
+
+| arm | run dir (UTC) | arm | chain | provenance | waiver | per-part |
+|---|---|---|---|---|---|---|
+| 512 **pinned** | `runs/20260922T155738Z-gplr57-a1-512` | PASS exit 0 | **PASS exit 0** | **CURRENT exit 0** - digest `9399BF96289C63E1`, `llama.dll` `261AA683E10E97AA`, exe `D01874A4235542A8` | **none taken** | MEASURED |
+| 512 **direct** | `runs/20260922T155757Z-gplr57-a1-512` | PASS exit 0 | **PASS exit 0** | **CURRENT exit 0** - same digest / lib / exe | **none taken** | MEASURED |
+
+Both traces read `gpu_pre_run=gpu_post_run=clean`, `copy_source`/`staging_source` matched the request
+(`staging_source_match=1`), and the shape is identical across all three: 120 fetches of **13.65 MiB**, and TG
+compute **67.1 / 68.2 / 68.0 ms** (mmap-registered / pinned / direct) - so the model work did not move and the
+comparison is at the same fetch size. **No waiver log exists anywhere**, and the card was left free.
+
+**The result, and it is not the expected one: the source changes the CONCURRENCY, not just the bytes.**
+
+| source | `ready_latency/transfer_us` | bytes / transfer_us | is that a copy RATE? |
+|---|---|---|---|
+| **mmap-registered** | **0.982** (consumer waits the whole copy) | **13.03 GB/s** (per-fetch median 13.06; range 12.54-13.37) | **YES - the only one** |
+| pinned | 0.597 | 8.14 GB/s | **no** - queue-inclusive lower bound |
+| direct | 0.067 | 8.91 GB/s | **no** - queue-inclusive lower bound |
+
+The mechanism is visible in the event census: `--copy-source mmap-registered` is the only value that
+**registers the mapping** (40 `mmap_register` + 1 `mmap_register_init`; pinned and direct emit **0/0**) and the
+only one whose consumer waits for the copy to land. Pinned and direct run the same 40 `copy_submit` /
+`copy_complete` and the same 36x3 `async_feed_*` pairs but overlap the row copies instead of blocking on them.
+So the field selects a staging PATH (registered/synchronous vs unregistered/async), and bytes/latency is a
+rate only on the first.
+
+**Verdict: the three sources are NOT distinguishable as bandwidth at the same fetch size - and they never
+were.** The earlier figures reproduce under the new arms and are explained by them:
+
+| source | earlier arm (recorded) | its ratio | new arm, source forced, same config | its ratio |
+|---|---|---|---|---|
+| direct | 9.16 GB/s (`gplr07-qa-4096-reactive`) | 0.067 | **8.91 GB/s** | **0.067** |
+| pinned | 7.85 GB/s (`gplr19-honest-k6-ab/arm-A1`) | 0.578 | **8.14 GB/s** | **0.597** |
+
+The ratio reproduces to three decimals and the value to 3-4%, on different arms and different days: those
+numbers are governed by the **overlap mode**, not by any intrinsic bandwidth of the source. The "confound"
+recorded in the decision block is therefore **not a nuisance to be controlled away - it is the mechanism**.
+`direct`'s 8.91 GB/s is a **lower bound** and may be at or above 13.03 GB/s: with copies overlapped in time,
+summing their latencies double-counts the same wall interval, which is exactly why a queued set cannot yield a
+rate. **The single genuinely measured transport quantity for this path remains 13.03 GB/s, for
+mmap-registered, serialized.** Nothing in this block credits 8.14 or 8.91 as a speed, and the earlier
+13.03/9.16/7.85 comparison is recorded as withdrawn rather than resolved.
+
+**What would actually settle a source comparison (named, NOT built - it is a different lever):** hold the
+overlap fixed and vary the source, i.e. a serialization / prefetch-depth control applied to the pinned and
+direct paths so they too reach `ready_latency/transfer_us ~ 1`. Copy-source alone cannot do it, because the
+source value IS what moves the ratio. That is a Planner call, as is the rate guard named in the decision block.
+
+**Launcher change (this pass, additive and default-neutral):** `tools/run-gplr57-a1-ladder.ps1` gained
+`-CopySource <mmap-registered|pinned|direct>`. The default is EMPTY, which reproduces the recorded rung
+exactly, so every existing tag, shape and piece of evidence is untouched; a source run gets a tag suffix
+(`gplr57-a1-512-pinned`) and its own per-run directory. Host-validated before spending a run: parse OK, an
+invalid value is refused by parameter validation with nothing launched, `-PreflightOnly` on a free card exits
+0 having launched nothing, and the arm's own `.started` marker and `run_start` record the requested source.
+
+**No performance claim.** The wall/tok-s spread across the three arms (212.7 / 274.9 / 294.7 ms; 14.10 / 10.91
+/ 10.18 tok/s) is **n=1 at 3 cold TG tokens**, differing in both overlap mode and staging path, and is
+recorded as context only - it is not a measurement of steady state and nothing is attributed to it.
+
+**Evidence:** `build/llama-cuda/runs/20260922T155738Z-gplr57-a1-512/`,
+`build/llama-cuda/runs/20260922T155757Z-gplr57-a1-512/`,
+`build/llama-cuda/runs/20260922T154620Z-gplr57-a1-512/`, `tools/run-gplr57-a1-ladder.ps1`.
+### Arm provenance: the gate moved to the CHOKE POINT, and a missing checker now FAILS the suite (2026-09-22, host-only, no GPU spent)
+
+**The defect, as the audit found it: a gate that was not a gate.** Capture was already systematic (the verdict
+writer records it on every path), but ENFORCEMENT lived in four callers - the A3 arm, the A4 arm, the GPLR-53
+session and the GPLR-57 ladder - plus the smoke. The wrapper that every arm actually runs under recorded a
+capture and asserted nothing, so a driver that forgot its own gate shipped unattestable evidence SILENTLY, and
+the previous block's phrase "binding at the launchers" was narrower than it read. The same shape appeared in
+the suite: all twelve host-suite blocks did `if (Test-Path <tool>) { run } else { WARNING ... skipped }`, so a
+renamed or deleted checker REDUCED COVERAGE while the suite printed SUCCESS.
+
+**Half 1 - the assertion is now inside `tools/with-gpu-lock.ps1`.**
+
+| property | how it is preserved |
+|---|---|
+| same rule as the callers | the wrapper calls the same `Assert-ArmProvenance` with the same failure taxonomy; an unattestable verdict is refused, never waved through |
+| same escape | `-AllowUnprovenanced` was ADDED to the wrapper and is FORWARDED by the ladder and the smoke, so the documented waiver reaches the gate instead of the caller and the wrapper disagreeing about one run (the waiver line is written by `Assert-ArmProvenance` itself) |
+| taxonomy preserved | 125 = GPU busy, 124 = mutex timeout, the command's own code = the command's result, and a NEW 10 = the run happened but cannot be attributed to a revision |
+| verdict agrees with the exit code | on refusal the verdict is REWRITTEN at exit 10 rather than left claiming PASS beside a refusal - the same contradiction class this repo recorded once before (an inverted exit code once made a chain verdict say FAIL while its arm said PASS); the command's own code is preserved as `command_exit` and the refusal is flagged `refused_unprovenanced` |
+| only runs that EXECUTED are gated | a busy refusal (125) and a mutex timeout (124) describe the WRAPPER's decision, not the arm. MEASURED DEFECT IN MY OWN FIRST VERSION: without that scope the gate rewrote 125 and 124 into 10, destroying the taxonomy the task told me to preserve - the harness caught it (10 cases turned red), and `$commandRan` now scopes the gate |
+
+**Half 2 - a missing checker FAILS the suite.** All twelve "not found; ... skipped" sites now print `FAILED ...
+this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if
+every guard RAN.` and `exit 1`.
+
+**Host-side proof, both halves, no GPU and no shared mutex** (private `...-selftest-*` mutex names; the fresh
+`[gpu-lock]` block runs the harness in every host suite).
+
+| proof | result |
+|---|---|
+| `test-arm-verdict.ps1` section 15 (new, 8 cases) - a throwaway copy of the three tools at a temp root with NO engine tree, so the capture cannot name a revision | **(a)** the WRAPPER refuses **exit 10** - not only its caller; **(b)** the verdict AGREES (`status=FAIL`); **(c)** `command_exit=0` is preserved, not lost; **(d)** the refusal is flagged in the verdict; **(e)** it NAMES what could not be attested; **(f)** `-AllowUnprovenanced` still passes AT THE WRAPPER (exit 0); **(g)** the waiver is RECORDED; **(h)** a waived run reads PASS and the waiver file names the arm |
+| a suite run with a checker deliberately HIDDEN (`check-doc-sizes.py` moved aside for one run, then restored with sha256 verified identical) | `[doc-size] FAILED: ... not found - this guard is REQUIRED` and **suite exit 1** - previously this printed a WARNING and the suite reported SUCCESS |
+| the whole harness after the change | **ALL ARM-VERDICT CASES PASS** (was 10 failing before the `$commandRan` scope was added) |
+| the normal path, all checkers present | `-Suite host` **exit 0, 42/42 CTest, all 12 blocks ran, none skipped** (`build/host-suite-after-gate.log`) |
+
+**One trap worth recording (measured, cost one red harness):** splatting a HASHTABLE onto a NATIVE command
+(`& powershell -File x.ps1 @a`) expands every entry as `-Key value`, so a switch entry becomes the literal
+positional argument `True` and the child fails to bind it. Splatting onto a SCRIPT binds switches correctly.
+Section 15 now uses an explicit argument array with a bare `-AllowUnprovenanced` token.
+
+**Contract change to note for future arms (not a defect):** because the gate now runs at the wrapper, a wrapper
+run whose command names NO binary (a bare `exit 0`, a shell fragment) is refused. Every real arm names its exe
+and is unaffected; the harness's own contrived stub cases carry the explicit recorded waiver, and section 15
+is where the refusal itself is proven.
+
+**Residual gap, stated rather than implied:** the A3/A4 drivers do NOT use the wrapper - they take the named
+mutex themselves - so "the choke point" is the wrapper for the ladder, the smoke and every older runner, while
+those two drivers enforce via their own `Assert-ArmProvenance` calls (verified by the harness's `[static]`
+cases). A FUTURE driver that takes the mutex itself and forgets the gate would bypass both. Making
+`Write-ArmVerdict` refuse to write an unattested PASS would close that last door, but it changes the writer's
+documented "a capture failure still writes a verdict" behaviour, so it is the Planner's call, not this pass's.
+
+**No verdict's evidence changed.** The refused-verdict rewrite and the new `command_exit`/
+`refused_unprovenanced` fields exist only for runs the gate refuses; the passing path writes the same fields it
+wrote before, and no arm's recorded evidence was touched. No latency or throughput claim is made.
+### Arm provenance: WHICH paths can still record evidence without a gate - inventory, per-path decision, and the rule that keeps the list from growing (2026-09-22, host-only, no GPU spent)
+
+**The inventory.** 28 files in `tools/` reference `Write-ArmVerdict`; four of them are tooling (the writer
+itself, the checker, the harness, and the wrapper - the last of which now calls the gate), leaving **24 arm
+runners**. Each was classified by whether it calls `Assert-ArmProvenance` - the stricter test than "does it
+invoke the wrapper", because a runner can use the wrapper and STILL write an ungated verdict of its own.
+
+| path | type | decision |
+|---|---|---|
+| `with-gpu-lock.ps1` | the shared wrapper | **GATED** this session - every arm that runs through it is asserted at the choke point (proven in section 15) |
+| `run-gplr53-a3-arm.ps1`, `run-gplr53-a4-arm.ps1` | live (P0/P3 arms; take the named mutex themselves) | **GATED** by their own `Assert-ArmProvenance` call, exit 10 propagated (harness `[static]` cases) |
+| `run-gplr53-session.ps1` | live (the documented session entry point) | **GATED** per step, forwards `-AllowUnprovenanced` to its drivers |
+| `run-gplr57-a1-ladder.ps1` | live (A1-ladder) | **GATED** at the wrapper (it forwards the waiver) and at its own gate |
+| `smoke-gpu-lock-ctxshell.ps1` | live (smoke regression) | **GATED** at the wrapper and at its own gate before writing its chain verdict |
+| **20 historical runners** (named below) | completed tasks T-GPLR-19..52 | **NAMED GAP, not rewritten** - see the reason |
+
+**The 20, by name, with the reason.** `run-gplr19-rowcache-ab`, `run-gplr36-remeasure-200k`, `run-gplr37-arm`,
+`run-gplr37-set`, `run-gplr39-arm`, `run-gplr44-ab-50k`, `run-gplr44-dump-50k`, `run-gplr45-arm`,
+`run-gplr46-rebuild-ab`, `run-gplr47-arm`, `run-gplr48-arm`, `run-gplr49-arm`, `run-gplr49b-echo-attrib`,
+`run-gplr50-200k-pair`, `run-gplr50-arm`, `run-gplr51-a2-pinned`, `run-gplr51-s2-arm`, `run-gplr51-tail-arm`,
+`run-gplr52-a2-arm`, `run-gplr52-a3-arm`.
+
+They are **historical reproducers for tasks that are closed**: none is referenced by the active plan or by
+`tools/run-tests.ps1` (checked: 0 hits for each sampled name), and 18 of the 20 take the shared mutex
+themselves, so the wrapper they do not use cannot gate them. Rewriting 20 completed runners is out of scope by
+instruction and would put churn through files whose evidence is already recorded. **The honest residual is
+therefore stated rather than fixed: these 20 can write a verdict that no gate ever checked** - and because the
+writer now captures provenance automatically, such a verdict would look certifiable. That is the gap.
+
+**Two of the 20 were found by the census and not by the first hand-scan** - `run-gplr19-rowcache-ab.ps1` and
+`run-gplr44-dump-50k.ps1` - precisely because they *do* invoke the wrapper while writing their own verdict, so
+"uses the wrapper" would have marked them gated when their own verdict is not. The census uses the stricter
+rule for that reason.
+
+**The rule that keeps the list from growing (durable, and in the suite).** `test-arm-verdict.ps1` section 16
+walks every `tools/*.ps1` that writes a verdict and requires it to call the gate, with the 20 historical names
+as an explicit dated allow-list plus three tooling exemptions (the writer, the checker whose verdict records a
+CHECK rather than an arm, and the harness). Four cases:
+
+| case | result |
+|---|---|
+| (a) no ungated verdict writer exists beyond the named historical set | PASS (unexpected: none) |
+| (b) the named set is not stale - a writer that becomes gated must leave the list | PASS (0 stale) |
+| (c) a NEW ungated writer is caught - proven hermetically on a temp dir containing a fake `run-gplr99-new.ps1` | PASS (caught: `run-gplr99-new.ps1`) |
+| (d) a gated writer and a no-evidence runner are both correctly ignored | PASS |
+
+So the 19th ungated runner cannot join silently: it fails the harness in every host suite run.
+
+**What the enforcement claim may now say, exactly.** Provenance is binding (i) at the wrapper, which every arm
+that uses it passes through, (ii) at the four live call sites that manage the mutex themselves
+(`run-gplr53-a3-arm`, `run-gplr53-a4-arm`, `run-gplr53-session`, and the smoke), and (iii) for the ladder, at
+both. It is **NOT binding for the 20 historical runners named above**, and that list is tested rather than
+assumed. Anything stronger than that - for instance "every arm in this repository is gated" - would be false.
+
+**Residual, and the structural fix if it is wanted:** making `Write-ArmVerdict` refuse to write an unattested
+PASS closes the last door for all 20 at once, but it changes the writer's documented behaviour that a capture
+failure still writes a verdict (the harness asserts that behaviour today). That is the Planner's call, and it
+is recorded here rather than taken.
+
+**Evidence:** `tools/test-arm-verdict.ps1` sections 15 and 16 (host-only, private mutex names, no GPU work),
+`tools/with-gpu-lock.ps1`, and the census over `tools/*.ps1`. No latency or throughput claim is made.
+### Arm provenance: the WRITER refuses to leave an unattested PASS (2026-09-22, host-only, no GPU spent)
+
+**What this closes, exactly.** The inventory left 20 historical runners that never call the gate. Because the
+verdict writer captures provenance automatically, a verdict from one of them could read PASS while naming a
+tree and binary - and, in the worse case the rule targets, could read PASS while naming *nothing usable*. The
+rule now lives at the one place every verdict is created:
+
+| property | how |
+|---|---|
+| one owner for the rule | the per-capture test moved into **`Get-AttestationFailure`**, used by BOTH the gate that refuses a run and the writer that records one, so the two can no longer disagree about what "can attest" means (the gate's inline copy is gone) |
+| an unattested PASS is never recorded | if the status would be PASS and the capture fails the test, the verdict is written **`UNCERTIFIED` with `exit_code` 10** - the SAME contract the live gates use - plus `uncertified=true`, `would_be_status='PASS'`, `attestation_reasons`, and the command's own code as `command_exit` |
+| the evidence is kept, not dropped | the files stay on disk with the capture intact; only the status changes. The `.done` sentinel is written from the same status/code, so a reader of either agrees |
+| one name for one condition | status derivation now maps exit 10 to **`UNCERTIFIED`**, so a refusal reads the same at the writer, at the wrapper and at a launcher instead of FAIL in one place and uncertified in another |
+| the escape, preserved and singular | `-AllowUnattested` is the writer-level opt-out, and the wrapper passes it FROM the operator's existing `-AllowUnprovenanced` - one escape at the CLI, honoured by both layers, or a waived run would still be recorded uncertified and the documented escape would be half a lie |
+| runs with nothing to attest still work | a tool's own bookkeeping verdict or a harness fixture opts out explicitly; nothing was weakened to accommodate them |
+
+**Proof - `test-arm-verdict.ps1` section 17, nine cases, host-only, no GPU, no shared mutex**
+
+| case | result |
+|---|---|
+| (a) an unattested run that WOULD end PASS | **recorded `UNCERTIFIED`, not PASS** |
+| (b) the same exit contract the live gates use | **exit 10** |
+| (c) preserved | `would_be_status=PASS` and `command_exit=0` |
+| (d) reasons named | `no binary identity was captured (binary_state=not-supplied)` |
+| (e) a genuine CAPTURE FAILURE still produces a verdict that says so | the verdict exists, the capture is present, and the reason names the failure - evidence kept, degraded, named |
+| (f) the sentinel agrees | `UNCERTIFIED 10 <ts> unattested` |
+| (g)/(h) an ATTESTABLE run | still written **PASS**, no uncertified marker - no collateral damage |
+| (i) the explicit opt-out | `-AllowUnattested` -> PASS |
+
+**And the rule caught a subtler real condition while proving itself.** Case (g) first failed, correctly: passing
+the exe ALONE made the capture read *"the binary PREDATES its sources"* (`src/llama-layer-streaming.cpp` edited
+15:40:46Z; newest artifact of that set, the exe, built 14:32:01Z) - because the engine code lands in
+**`llama.dll`** (15:41:00Z) while the exe relinks on its own schedule. That is this repository's own documented
+gotcha, detected here by the rule rather than by a reader. The fixture now passes the real artifact set.
+
+**Deliberate harness updates, not deletions.** Two fixtures whose subjects are NOT attestation (section 1's
+status-derivation case and section 7's run-state case) now carry `-AllowUnattested` with the reason written
+beside them; the wrapper cases in sections 6/10/11/12 keep their subjects unchanged because the waiver now
+forwards to the writer. The whole harness is **ALL ARM-VERDICT CASES PASS**, and `-Suite host` is **exit 0,
+42/42 CTest, all 12 blocks ran, none skipped** (`build/host-suite-writer-rule.log` - that log PREDATES the suite-revision binding, so it is a TIMESTAMP claim, not a revision claim; see the suite-revision block). **No historical runner
+needed rewriting** - the rule reaches all 20 from the writer.
+
+**The enforcement claim, restated to exactly what is true now.** (i) **No verdict on disk can read PASS unless
+its capture attests the tree and the binary it ran** - writer-enforced, on every path, including the 20. (ii)
+The GATE - refusing the run - binds at the wrapper and at the four live call sites that manage the mutex
+themselves. (iii) The 20 historical runners still write verdicts without a gate, so their residue is now
+*"recorded, attributable, but never gate-checked"* rather than *"recorded while unable to attest"*. That
+supersedes the "would look certifiable" sentence in the inventory block above. Anything stronger - "every arm
+is gate-checked" - remains false, and is not claimed.
+
+**No latency or throughput claim.** Nothing in the retention state, A4's band or T-GPLR-55's shapes was
+touched, and no historical runner was modified. Evidence: `tools/arm-verdict.ps1` (`Get-AttestationFailure`,
+the writer rule), `tools/with-gpu-lock.ps1` (waiver forwarding), `tools/test-arm-verdict.ps1` section 17.
+### Suite results bound to a revision (2026-09-22, host-only, no GPU spent)
+
+**What was wrong.** The audit's last evidence gap. An ARM's evidence is bound to the source tree and the
+binary it ran - a content digest plus the `llama.dll` hash - while a SUITE-GREEN claim was bound to nothing.
+The suite's own log demonstrated the failure: the newest one on disk (14:09:57Z) described a revision that
+no longer existed, so "42/42" was a statement about a tree nobody had named.
+
+**How it works, reusing the arm convention rather than growing a second one.** `tools/run-tests.ps1` now
+dot-sources `tools/source-revision.ps1` and captures, at suite START and again at suite END, the engine tree
+(`third_party/llama.cpp`: nested HEAD, the whole tracked diff, every non-ignored untracked file by content)
+and the binaries the suite exercises (runner + `llama.dll` + `ggml*.dll`, via `Get-ProvenanceArtifacts`).
+Both captures plus the delta go to `build/llama-cuda/suite-runs/<UTC>-<suite>/revision.json`
+(`schema: suite-revision/1`), and the result line NAMES the digest, so a suite-green claim is a claim about
+a revision. The comparison is not re-implemented either: `-VerifyRevision <record>` re-derives the tree now
+and settles a saved record with the SAME `Compare-ArmProvenance` rule the arm checker uses - exit 0 CURRENT,
+1 stale, 2 cannot-evaluate - and it runs no suite.
+
+**A result the tree moved under is not reported green.** `Complete-Suite` is the ONE place a suite result is
+stated, so no caller can print a green the revision binding then undercuts:
+
+| condition | result |
+|---|---|
+| tree digest and module hashes unchanged across the run | `SUCCESS: suite 'X' passed. revision digest <d> (nested head <h>, <n> tracked / <m> untracked changed), llama.dll <sha> - record <path>` (exit = the suite's own code) |
+| sources or the binary moved WHILE it ran, tests passed | **`SUITE RESULT FLAGGED`**, exit **10** - the same contract the arm gates use - with the digest pair printed: the tests passed, but the result is not attributable to ONE revision |
+| the tree could not be digested at all | also flagged (exit 10): a green that cannot name a revision is not a green |
+| tests failed | `FAILED` with the suite's own exit code, revision line printed beside it |
+
+The record carries `result` (`green` / `flagged` / `failed`), `tests_passed`, the effective `exit_code`, the
+`flags`, and both captures - so the file and the process exit code agree, and a reader can tell "the tests
+passed" from "the result is attributable".
+
+**A defect found while proving it, not after.** The first version wrote `result=green, exit_code=0` into the
+record of a run it then flagged at exit 10 - the artifact contradicted the process. It was caught by reading
+the written record instead of the printed line, and fixed by computing the flag and the effective exit code
+BEFORE the record is built. The same pass also fixed a cosmetic mis-keying (`changed_tracked` vs the flat
+record's `source_changed_tracked`), which had printed the changed counts as blanks.
+
+**Proofs - host-only, no GPU, no shared mutex, no arm re-run** (logs: `build/host-suite-revision-bind.log`,
+`build/host-suite-revision-bind2.log`, `build/host-suite-inrun-drift2.log`, `build/suite-telemetry-revbind.log`)
+
+| case | result |
+|---|---|
+| a stable tree | `-Suite host` **exit 0**: `SUCCESS: suite 'host' passed. revision digest 9399BF96289C63E1 (nested head 23e5d1b6e617, 5 tracked / 7 untracked changed), llama.dll 261AA683E10E97AA - record .../20260922T164140Z-host/revision.json`; the record reads `result=green, tests_passed=true, exit_code=0, flags=0`, delta clean, 6 module hashes |
+| a source changes AFTER the run | `-VerifyRevision` -> **STALE-SOURCES exit 1**, naming `recorded digest 9399BF96289C63E1 (head 23e5d1b6e617, 5 tracked / 7 untracked changed) but the tree now digests to CB614B0FBCA7FA8D` and `now changed: suite-revision-probe.probe` |
+| and it is residue-free | the probe deleted -> `-VerifyRevision` -> **CURRENT exit 0**: the digest is content-based, so a reverted tree returns to its earlier value and the record is again a description of it |
+| the tree moves DURING the run | a probe file created 14 s into a real `-Suite host` -> **`SUITE RESULT FLAGGED`, exit 10**, `digest 9399BF96289C63E1 -> CB614B0FBCA7FA8D`; the record reads `result=flagged, tests_passed=true, exit_code=10`, `provenance_delta.source_changed_during_run=true`; and verifying THAT record reads **SOURCES-CHANGED-DURING-RUN exit 1** even though the tree now matches its start capture |
+| a record with no revision | `-VerifyRevision build/nope.json` -> **CANNOT-EVALUATE exit 2**: an absent record is never a pass |
+| the other finisher | `-Suite telemetry` **exit 0** with the same revision line and its own record - the suite's tail path and the telemetry branch both route through `Complete-Suite` (the `qa-smoke` green exit does too), so no branch can print an unbound green |
+
+The probe was an untracked, uniquely named, non-ignored file inside the nested tree, present for seconds and
+deleted in the same command; `git status` in the nested repo shows no trace of it afterwards and the digest
+returns to `9399BF96289C63E1`. (Note for anyone repeating this: a `*.tmp` probe is SILENTLY NOT digested -
+the nested `.gitignore` line 22 ignores `*.tmp`, and the digest covers non-ignored untracked files by design.
+The first attempt used a `.tmp` name and correctly reported no drift, which is what exposed the distinction.)
+
+**Scope: what this rebinds, and what it cannot.** Suite-green claims made BEFORE this landing name no digest
+and are therefore **timestamp claims, not revision claims** - including `build/host-suite-writer-rule.log`
+(18:22:28Z) and `build/host-suite-after-gate.log`, both cited in the blocks above, and the audit's own
+14:09Z note. They are not retracted - each described the tree at the moment it ran - but none of them can be
+verified against a tree now, and the two citations above are qualified in place so a reader cannot read them
+as revision-bound. From this landing, every suite run writes a record and any later reader can settle it with
+`-VerifyRevision`.
+
+**Limits, stated rather than implied.** The binding is a claim about the ENGINE tree and the exercised
+binaries, not about the whole repo: edits outside `third_party/llama.cpp` (a checker, a doc, a launcher) do
+not move the digest, so a suite green can be "current" while the tooling around it has moved. Ignored files
+are excluded by design (they are not sources), which is why a `.tmp` probe does not register. The capture is
+a point-in-time reading: a source edited between the END capture and the record write is not seen by that
+run (it is seen by any later `-VerifyRevision`). Nothing here changes what any suite RUNS - `Complete-Suite`
+replaces the old print-and-exit pair and adds no work to the test path. **No latency or throughput claim.**
+The nested sources under concurrent edit by another thread were not touched; the only writes inside that tree
+were the probe files, created and removed inside this pass.

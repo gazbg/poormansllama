@@ -828,8 +828,132 @@ follows:
   `clean`, `probe-unavailable` (nvidia-smi missing/errored - the run proceeds
   UNVERIFIED rather than blocking), or `"<pid> <exe-name>; ..."`; `refused_busy`
   is set on the exit-125 path.
+- **Provenance fields (added 2026-09-22, additive - the fields above keep their
+  names, values and meanings):** `tag` and `tag_source` (`explicit` when the
+  caller passed `-VerdictTag`, `derived` when the wrapper derived it from the
+  command), `gpu_probe_source` (`nvidia-smi` for a real query, `stub` when
+  `GPU_BUSY_PROBE_CMD` drove it - a stubbed probe is NOT evidence about the
+  card), and `gpu_pre_status` / `gpu_post_status`, which spell the same evidence
+  as a fixed vocabulary: `clean` | `busy` | `unavailable` | `not-probed`.
+  `not-probed` is what a run that ended before the probe (mutex timeout, busy
+  refusal) records: ABSENCE, never a default of `clean`.
+- **A probe that cannot be TAKEN is never recorded as `clean`:** a non-zero
+  nvidia-smi exit OR output that is nonempty but carries no parseable row (a
+  dropped `--format` flag, a driver banner, a changed output shape) both mean
+  `probe-unavailable` / `unavailable`, and the run proceeds UNVERIFIED rather
+  than blocking. Until 2026-09-22 the unparseable case was reported as `clean`,
+  which made a probe that answered nothing indistinguishable from an idle card
+  in every wrapped arm's verdict.
 - **Exit code 125** is reserved for the busy refusal (PASS/FAIL/TIMEOUT are
   unchanged).
+
+### Which TREE and which BINARY a verdict describes (`fields.provenance`)
+
+Every verdict written through `tools/arm-verdict.ps1` (dot-source it) carries
+`fields.provenance`, because a verdict that cannot name the revision its binary
+was built from stops describing anything the moment someone edits a source.
+Measured 2026-09-22: a control arm passed at 16:28 against the 16:07 build, the
+engine sources were edited at 16:31:13, the tree was rebuilt at 16:31:58, and
+nothing in the record noticed - the verdict held an exe hash and no consumer
+compared it to anything. Note the exe hash is the WEAKER anchor of the two: the
+streaming code lands in `llama.dll`, and a relink churns the exe hash while the
+engine is unchanged.
+
+| field | meaning |
+|---|---|
+| `source_scope`, `source_root`, `source_head` | which engine tree, and its nested HEAD |
+| `source_digest` | SHA-256 prefix over HEAD + the full content diff of tracked changes + the CONTENT of untracked files. Content, not mtimes: reverting an edit returns the earlier digest |
+| `source_changed_tracked` / `_untracked`, `source_newest_change_path/_utc` | what moved, and the newest change |
+| `source_changed_paths` (+ `_truncated`) | a bounded manifest (50) of the changed / untracked paths, so the checker can NAME what drifted instead of only reporting that something did |
+| `binary_exe`, `binary_exe_sha`, `streaming_lib_sha`, `modules`, `binary_dir`, `binary_built_utc` | the binary the command names - its exe plus the `llama.dll` / `ggml*.dll` beside it |
+| `sources_newer_than_binary`, `sources_newer_detail` | newest changed source vs the NEWEST artifact of the build: catches "edited but not rebuilt" |
+| `origin` | `launch` / `post-run` (the wrapper, before and after the command) or `verdict-write` (any other writer) |
+| `provenance_delta.source_changed_during_run` / `binary_changed_during_run` | the tree or the binary moved WHILE the arm ran |
+
+- **Where it is captured** is not only the wrapper: the arm drivers write their
+own verdicts for their own tags (measured: `gplr53-a4-pin.verdict.json` carries
+none of the wrapper's fields), and those are the arm verdicts the record cites.
+The capture therefore lives in `Write-ArmVerdict`, and an arm's binary is found
+from the run's own `<tag>.started` marker - which already records the arm's
+command - so **no driver needed a change**. A writer that names no binary
+records `binary_state=not-supplied`: absence, never a guess.
+- **Nothing here blocks a run.** A capture that cannot be taken is recorded as
+data (`source_state` = `not-a-repo` | `git-missing` | `missing` | `error`, with
+`source_error` text), and the arm proceeds exactly as before.
+- **`tools/source-revision.ps1`** owns the digest and the decision rule
+(`Get-ArmProvenance`, `Format-ArmProvenance`, `Compare-ArmProvenance`);
+`. tools/source-revision.ps1` to use them. It neutralises
+`$ErrorActionPreference` around its git calls on purpose: PowerShell 5.1 turns a
+native command's stderr into a TERMINATING error under `Stop`, which made
+`git rev-parse` outside a repository abort the capture instead of reporting
+`not-a-repo`.
+- **`tools/check-arm-provenance.ps1`** is the reader: `-Dir <dir> -Tag <tag>` or
+`-Verdict <file>`, `-Json` for machine output, `-Selftest` for the host-only
+fixtures (registered in the host suite as `[arm-provenance]`).
+
+| exit | verdicts | meaning |
+|---|---|---|
+| 0 | `CURRENT` | the arm still describes this tree, and the binary it ran is unchanged |
+| 1 | `STALE-SOURCES`, `SOURCES-NEWER-THAN-BINARY`, `SOURCES-CHANGED-DURING-RUN`, `BINARY-CHANGED-DURING-RUN`, `STALE-BINARY` | do not quote this arm as current evidence |
+| 2 | `NO-PROVENANCE`, `NO-VERDICT`, `CANNOT-EVALUATE`, `BINARY-UNKNOWN` | **NOT A PASS** - cannot certify is not "fine" |
+
+Measured boundary: of the **101** verdicts saved in `build/llama-cuda/verdicts/`
+before the mechanism landed, **0 certify (exit 0), 101 cannot-certify (exit 2),
+0 stale** - nothing already recorded is retro-certifiable; a re-run is what
+produces a certifiable verdict. As of 2026-09-22 one arm on hardware is
+certifiable: the smoke's (`build/llama-cuda/gpu-smoke-arm.verdict.json`, head
+`23e5d1b6e617`, digest `BC5E1BBE8D0B30A0`, `llama.dll 46628B7CDA8FAFA1`).
+
+### The provenance GATE: binding at the launchers
+
+A capture nothing requires is a suggestion, so the requirement lives where this
+program's own arms launch. `Assert-ArmProvenance` (in `tools/arm-verdict.ps1`,
+beside the verdict convention) takes `-Dir`, `-Tags` or `-SinceUtc`, `-Label`,
+`-AllowUnprovenanced` and returns `$true` when the run may pass. Per arm it
+requires: a `provenance` capture, `source_state=git` with a 16-hex digest,
+`binary_state=hashed`, and none of the capture's own anomalies
+(`sources_newer_than_binary`, `sources_changed_during_run`,
+`binary_changed_during_run`).
+
+- **Freshness vs the current tree is NOT this gate's business.** It stays the
+checker's verdict and is printed here as a `NOTE`, because failing a run whose
+evidence was sound when it was written would make an arm's exit code depend on a
+concurrent actor.
+- **An empty selection REFUSES.** A launcher that asks the gate about arms and
+finds no verdicts has no evidence to certify; a gate that shrugs there is exactly
+the silent pass the mechanism exists to remove.
+- **Wired in:** both GPLR-53 drivers gate their own arms at exit and set exit
+**10** on refusal (distinct from an arm FAIL `1` and from `124`/`125`); the
+session launcher gates each step's tags, forwards `-AllowUnprovenanced` to the
+drivers, and fails with the same `10`; the GPU smoke gates its arm before
+writing its chain verdict and copies `arm_source_head` / `arm_source_digest` /
+`arm_streaming_lib_sha` / `arm_binary_exe_sha` / `arm_provenance_complete` into
+it. The gate re-scores nothing: an A4 arm's band and fields are untouched.
+- **The escape is explicit and recorded:** `-AllowUnprovenanced` continues the run
+and appends `WAIVED label=... arms=... note=...` to
+`<verdictDir>/provenance-waivers.log`. It is never implied by a missing check.
+- **The refusal path is proven host-only** in `tools/test-arm-verdict.ps1`
+section 14 (16 cases): capture stripped -> refused; no binary identity ->
+refused; binary predates sources -> refused; no verdict for a tag -> refused;
+empty selection -> refused; waiver -> returns true AND writes the log; plus a
+STATIC guard that all four call sites still contain the gate call (static on
+purpose - a driver cannot be run host-only).
+- **Sensitivity, measured and bounded:** the digest covers the whole nested tree,
+while the staleness MTIME relation uses only compile-relevant paths
+(`.c .cc .cpp .cxx .cu .cuh .h .hh .hpp .hxx .m .mm .s .asm .inc .cmake .def .rc`,
+`CMakeLists.txt`, `Makefile`). Without that split, another actor's scratch
+`.tmp-split/*.diff` read as "the binary predates its sources" for every arm. The
+list is the one judgement call in the mechanism; change it and nothing else.
+
+One measured caveat about sensitivity: the digest covers the WHOLE nested tree,
+so any new file in it - including scratch - reads as drift. Observed live on
+2026-09-22 while this mechanism was being written: the digest moved twice in an
+hour and the rule correctly returned `STALE-SOURCES` naming
+`.tmp-split/n.*.diff`, another actor's scratch files. That is the intended
+error direction (refuse, then explain), and the path manifest is what makes the
+explanation one line. If the noise becomes a problem, the refinement is to scope
+the untracked set to build-relevant paths - a judgement about this tree, not a
+mechanical edit.
 
 Tests can stub the probe for host-only branch testing by setting
 `GPU_BUSY_PROBE_CMD` to a command that prints nvidia-smi-compatible CSV
@@ -838,6 +962,14 @@ probe-unavailable. The six branches (clean / busy-refuse / busy-allow /
 probe-unavailable / busy-clears-in-grace / busy-appeared-post-run) are
 validated under `build/gpu-gate-tests/` (`run-gate-cases.ps1` covers five;
 the appeared-post-run case runs the real wrapper against a flipping stub).
+`tools/test-arm-verdict.ps1` is the TRACKED and always-runnable form of this
+coverage (the `build/gpu-gate-tests/` harness is the historical one): stubbed
+probes, private per-case mutex names, and a verdict-contract section that fails
+if the wrapper stops persisting the evidence it prints, if a pre-existing field
+changes shape under a consumer, or if an untaken probe is recorded as clean. Its
+single section that needs the REAL shared lock reports a SKIP - never a failure -
+when another project holds it, so it is safe on a shared machine, and
+`tools/run-tests.ps1 -Suite host` runs it as `[gpu-lock]`.
 ## Detached runs and waiting (convention, 2026-09-18)
 
 How to start long work and how to find out what happened to it, without
@@ -1141,6 +1273,31 @@ cannot evaluate (no tg_tokens) is exit 2, never a pass. Same discipline for
 any model change that moves the prefill path: re-run the tool, never assume
 the old divergence shape. The needle-answer grader stays the answer gate; the
 ID-CHECK grades ids only.
+
+## Per-part TG timings: never-taken is not a zero (T-GPLR-57, 2026-09-22)
+
+The row-set TG executor emits one `layer_compute` per layer/round with `compute_us`/`setup_us` (the A+B
+sums, unchanged) plus, since F3/H8 (2026-09-14), `attn_compute_us`/`attn_setup_us` (part A = attention +
+residual + post-norm + router) and `ffn_compute_us`/`ffn_setup_us` (part B = FFN + shared experts on the
+staged rows). Two consumers must not confuse two different things:
+
+- **NOT-TAKEN** - the part fields are ABSENT because the path never measured them. The batch-major TG path
+  runs ONE fused layer graph, so it has no attn/FFN boundary at all: `gplr52-a2-*`, every `gplr53-a4-*` arm
+  and `gplr56-p1off-4k` are in this class on every binary. `e.get("attn_compute_us", 0.0)` reads this as a
+  zero-cost part, which is the defect the guard exists to stop; write `attn_compute_us` only when the key is
+  present, and treat absence as "not measured".
+- **MEASURED** - present, with at least one part nonzero. A zero INSIDE a measured group is a real measured
+  zero (a part under a microsecond) and is not a defect. PARTS-ALL-ZERO (fields present, all four zero) is
+  the defect pattern: a group that claims a split and reports nothing.
+
+`python tools/check-tg-part-timings.py --trace <t.jsonl> [--require-parts]` classifies one trace (the path
+is derived from the trace's own `rowset_fetch` events, never from its filename); `--census [--root ...]`
+classifies every trace under a root; `--selftest` runs the hermetic fixtures. Exit 0 = classified, 1 = a
+PARTS-ALL-ZERO defect on any path (checked before the requirement), **2 = refused (a required group is not
+measurable) - NOT A PASS**. Registered as
+`[tg-parts]` in `tools/run-tests.ps1`; selftest 10/10. Census on 2026-09-22: 444 traces with `layer_compute`
+-> **31 MEASURED, 353 NOT-TAKEN, 0 defects**; the 64 row-set NOT-TAKEN traces are all pre-2026-09-14,
+including every `gplr13-ladder` rung - so the recorded `0/120` was an unmeasured path, not a free one.
 
 ## Process-life markers (`proc_start`/`load_begin`/`load_end`): the pre-sink buffer and `late` (2026-09-22)
 

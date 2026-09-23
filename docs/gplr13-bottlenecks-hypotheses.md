@@ -271,6 +271,13 @@ vs PP's 3.2-3.3 GB/s whole-bank pipeline, consistent with the row-set's
 smaller, deeper-pipelined copies vs 453 MB whole-bank copies with one slot
 of lookahead.
 
+> **SUPERSEDED READING (2026-09-22, T-GPLR-55 decision).** The 4.4-5.8 GB/s above is a **WALL rate**
+> (bytes / wall), **not a transport speed**, and it must not be read as one. The copy itself, measured on the
+> only serialized row-set arms on disk (`ready_latency/transfer_us` = 0.98), moves **13.0 GB/s** - identical
+> at 512 and 200k - and a serialized 347.2 MiB full-bank copy measures 14.34 GB/s. The 7.3-7.4 GB/s family is
+> a queue-inclusive latency, not a rate. See the T-GPLR-55 block in
+> `docs/plans/generic-prefill-layer-residency-plan.md`.
+
 ### 3.8 New: the off-path (batch-major, full-bank TG) contrast quantifies the row-set win on this shape
 
 qa-smoke-512 (row-set off, 96 TG tokens) stages 1,759.4 GB in TG
@@ -361,6 +368,11 @@ against call overhead; needs the probe).
 
 Observation: PP wall floor ~5.5 s for 18.33 GB (3.2-3.3 GB/s wall) while TG
 row staging sustains 4.4-5.8 GB/s (3.7); PP tok/s at 50/512 is 9-90.
+
+> **Both figures are WALL rates**, not transport speeds, and neither is a copy rate - superseded reading
+> recorded in section 3.7 above (T-GPLR-55 decision, 2026-09-22). The candidate cause below ("latency-bound",
+> 74.6-78.1% ready latency) is still a real observation: the same trace field
+> (`ready_latency_us / transfer_us`) is what shows a copy set is QUEUED rather than fast.
 Candidate cause: 453 MB whole-bank copies with one-slot lookahead are
 latency-bound (74.6-78.1% of transfer-phase is ready latency) vs the row
 path's small deep-pipelined copies.

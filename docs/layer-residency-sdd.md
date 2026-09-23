@@ -346,8 +346,9 @@ outside it.
   the T-GPLR-16 MIN_BATCH=1 route deadlocked the device on the 3rd TG token
   whenever CUDA `MUL_MAT_ID` at token batch consumed scheduler-staged
   host-bank weights — regardless of CUDA graphs or rowcopy
-  (docs/currentstate.md, 2026-09-12). This constraint keeps the row-set path
-  in the proven full-handoff execution shape.
+  (docs/currentstate.md, 2026-09-12; that route was reverted out of the tree on
+  2026-09-22, so it is no longer an available execution shape). This constraint
+  keeps the row-set path in the proven full-handoff execution shape.
 - **Loud under-coverage.** The staged row set must be a superset of the
   router's exact selected IDs for W. A missing row refuses loudly (exit 2,
   structured telemetry, stable reason) and never substitutes or drops an
