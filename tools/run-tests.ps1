@@ -155,7 +155,11 @@ $suites = @{
         # T-GPLR-22: the run_refused PRE-WORK refusal-trace fixtures (1 positive /
         # 4 WILL_FAIL negatives, incl. the pre-event shape that must stay
         # rejected) join the host suite.
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal)(-|$)|test-layer-streaming-(layout|model-inspect)'
+        # T-GPLR-53 A2: check-gplr53-embed-chunk + validate-gplr53-embed-chunk join
+        # here (both validators must accept a trace carrying the new event).
+        # T-GPLR-56 A1: tel-mark added here so the pre-sink marker emitter's shape
+        # proof runs in the host-only suite (no GPU, no model).
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -250,6 +254,151 @@ if (-not $spec.Gpu) {
         }
     } else {
         Write-Host "[doc-size] WARNING: $docGuard not found; guard skipped." -ForegroundColor Yellow
+    }
+}
+
+# --- plan split integrity (host-only, ~1s, no GPU, no mutex) -----------------
+# The live plan's header index is DERIVED from the archive, so a stale index or a
+# lost rules paragraph is a mechanical, checkable defect -- it happened once
+# (2026-09-21: the resplit tool's header split dropped both, and the follow-up
+# --verify died with StopIteration instead of failing loudly). The same guard
+# re-proves the archive body byte-exact and every block span. Exit 2
+# (cannot-evaluate) fails this suite too: a plan that cannot be checked is not a
+# soft pass.
+if (-not $spec.Gpu) {
+    $splitTool = Join-Path $PSScriptRoot 'resplit-gplr-plan.py'
+    if (Test-Path -LiteralPath $splitTool) {
+        Write-Host "[plan-split] verifying the live/archive plan split..."
+        & python $splitTool --verify
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: resplit-gplr-plan.py --verify exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[plan-split] FAILED: $splitTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-53 A2 checker selftest (host-only, ~1s, no GPU, no mutex) ---------
+# The embed_chunk timeline checker's own controls: the per-pass span/embed
+# reconciliation, the chunk-index contiguity, the off-run gate, the recon
+# generation join, plus its exit-2 refusals (no event, no ledger, no
+# run_start, group/ledger mismatch). Cheap enough for every host-only suite.
+if (-not $spec.Gpu) {
+    $a2Tool = Join-Path $PSScriptRoot 'check-gplr53-embed-chunks.py'
+    if (Test-Path -LiteralPath $a2Tool) {
+        Write-Host "[t53-a2] embed_chunk checker selftest (host-only fixtures)..."
+        & python $a2Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr53-embed-chunks.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t53-a2] FAILED: $a2Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-53 A1 analyzer selftest (host-only, ~1s, no GPU, no mutex) --------
+# The pass-1 gap attribution tool's own negative controls: the mmap and pinned
+# expectation bands, the F6 ledger identity, the no-host_ledger exit-2 refusal
+# and the pre-T-GPLR-39 skip. Cheap enough to run on every host-only suite, in
+# the same spirit as the doc-size guard above.
+if (-not $spec.Gpu) {
+    $a1Tool = Join-Path $PSScriptRoot 'analyze-gplr53-gap.py'
+    if (Test-Path -LiteralPath $a1Tool) {
+        Write-Host "[t53-a1] analyzer selftest (host-only pass-1 gap attribution fixtures)..."
+        & python $a1Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: analyze-gplr53-gap.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t53-a1] FAILED: $a1Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-56 A1 Q tool selftest (host-only, ~1s, no GPU, no mutex) ----------
+# The acceptance quantity's own negative controls: a same-session pair that
+# passes only when Q AND the wall both fall, a relocation pair that must FAIL,
+# a legacy trace with no proc_start, a trace with no pass-1 pass_end, broken
+# marker order, and a legacy control - the refusals exist because the T-GPLR-53
+# decay rule once refused its own input, and Q must never read an absent marker
+# as a zero. Cheap enough for every host-only suite, like [t53-a1] above.
+if (-not $spec.Gpu) {
+    $qTool = Join-Path $PSScriptRoot 'check-gplr56-q.py'
+    if (Test-Path -LiteralPath $qTool) {
+        Write-Host "[t56-a1] Q tool selftest (host-only acceptance-quantity fixtures)..."
+        & python $qTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr56-q.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t56-a1] FAILED: $qTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-53 A3 decay discriminator selftest (host-only, ~1s, no GPU, no -----
+# mutex). The pre-registered decision rule's own negative controls: the
+# front-loaded / uniform / chunk-0-only profiles, the no-excess case, and the
+# exit-2 refusals (a single pass, a trace with no `embed_chunk`) that must never
+# be read as a pass. Cheap enough for every host-only suite, in the same spirit
+# as the [t53-a1] block above.
+if (-not $spec.Gpu) {
+    $a3Tool = Join-Path $PSScriptRoot 'analyze-gplr53-decay.py'
+    if (Test-Path -LiteralPath $a3Tool) {
+        Write-Host "[t53-a3] decay discriminator selftest (host-only per-chunk fixtures)..."
+        & python $a3Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: analyze-gplr53-decay.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t53-a3] FAILED: $a3Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-54 A1 identity selftest (host-only, ~1s, no GPU, no mutex) --------
+# The single-chunk prefill ID-CHECK's own negative controls: identical pair,
+# the recorded 7-id template insertion, content-token insertion, torn tail,
+# early divergence, and the no-tg_tokens refusal. Cheap enough for every
+# host-only suite, in the same spirit as the [t53-a1] block above.
+if (-not $spec.Gpu) {
+    $a54Tool = Join-Path $PSScriptRoot 'analyze-gplr54-ubatch-identity.py'
+    if (Test-Path -LiteralPath $a54Tool) {
+        Write-Host "[t54-a1] identity selftest (single-chunk prefill ID-CHECK fixtures)..."
+        & python $a54Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: analyze-gplr54-ubatch-identity.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t54-a1] FAILED: $a54Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-54 A2 logits-readout selftest (host-only, ~1s, no GPU, no mutex) --
+# The default-off tg_logits checker's own negative controls: the default-off
+# invariant (no key -> no rows; explicit 0 -> no rows), the count/pairing/shape
+# checks, and the two exit-2 refusals. Cheap enough for every host-only suite.
+if (-not $spec.Gpu) {
+    $a2Tool = Join-Path $PSScriptRoot 'check-gplr54-logits.py'
+    if (Test-Path -LiteralPath $a2Tool) {
+        Write-Host "[t54-a2] logits-readout checker selftest (host-only fixtures)..."
+        & python $a2Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr54-logits.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t54-a2] FAILED: $a2Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
     }
 }
 
