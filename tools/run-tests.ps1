@@ -19,6 +19,13 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k   # 20K-token PP + 3-token TG experiment (~10-20 min, GPU)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -Suite pp20k-layer-major # 20K layer-major PP (T-Q38LM-03, ~10-20 min, GPU)
 #
+# Every suite run records the engine revision it ran against (digest + exe/llama.dll/ggml
+# hashes, captured at start and end) to build\llama-cuda\suite-runs\<UTC>-<suite>\revision.json,
+# names it in the result line, and FLAGS (exit 10) instead of reporting green if the tree moved
+# under it. Re-check a saved record against the tree now:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-tests.ps1 -VerifyRevision <record>
+#   (exit 0 CURRENT / 1 stale / 2 cannot-evaluate; no suite is run)
+#
 # Suites:
 #   all               - all layer-streaming / lifecycle / boundary / telemetry targets
 #                       (includes the T-Q38CTX-01 tail runs: tail513 lm/bm, lm-tiny1, lm511)
@@ -93,7 +100,15 @@ param(
     # A non-default mode tags the trace/tg-text/log names with the mode so arms
     # cannot overwrite each other or the recorded rung artifacts.
     [ValidateSet('streaming', 'reactive', 'retention', 'handoff')]
-    [string] $SmokeMode = 'streaming'
+    [string] $SmokeMode = 'streaming',
+
+    # Suite-revision binding (2026-09-22). `-VerifyRevision <record>` runs NO
+    # suite: it re-derives the engine digest and the module hashes NOW and
+    # compares them to a saved build\llama-cuda\suite-runs\<UTC>-<suite>\revision.json,
+    # so a later reader can tell whether a green still describes this tree.
+    # Exit 0 CURRENT / 1 stale / 2 cannot-evaluate -- the arm convention, from
+    # the shared decision rule in tools/source-revision.ps1.
+    [string] $VerifyRevision = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,6 +122,139 @@ if (-not $BuildDir) {
 $cTest = "ctest --test-dir $BuildDir -C $Config --verbose"
 $lock = Join-Path (Split-Path $PSCommandPath -Parent) 'with-gpu-lock.ps1'
 $buildDirResolved = (Resolve-Path -LiteralPath $BuildDir).Path
+
+# --- suite-revision binding (2026-09-22) ------------------------------------
+# A suite-green claim used to be bound to NO revision: the suite's own log was
+# found describing a tree that no longer existed two minutes later (audit,
+# 2026-09-22). Arms already solve this, so this reuses the SAME convention --
+# tools/source-revision.ps1's content digest and exe/llama.dll/ggml module
+# hashes -- rather than growing a second one, which keeps a suite claim and an
+# arm claim directly comparable:
+#   * the engine tree and the binaries the suite exercises are captured at suite
+#     START and again at suite END;
+#   * both captures plus the delta are written to
+#     build\llama-cuda\suite-runs\<UTC>-<suite>\revision.json, and the result
+#     line names the digest, so "suite green" is a claim about a revision;
+#   * a run whose sources or binary moved WHILE it ran is FLAGGED (exit 10 -
+#     the same contract the arm gates use) instead of reported green: the tests
+#     passed, but their result is not attributable to one revision;
+#   * `-VerifyRevision <record>` re-checks a SAVED record against the tree now.
+# The digest and the comparison rule are NOT re-implemented here: the capture is
+# Get-ArmProvenance/Format-ArmProvenance and the comparison is
+# Compare-ArmProvenance, the same pair the arm checker uses.
+. (Join-Path $PSScriptRoot 'source-revision.ps1')
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+function Get-SuiteRevision {
+    # The binaries a suite exercises: the runner plus the streaming library and
+    # the ggml backends beside it (Get-ProvenanceArtifacts). A missing exe reads
+    # as binary_state=not-supplied rather than being guessed at.
+    param([string] $Origin)
+    $exe = Join-Path $buildDirResolved "bin\$Config\llama-layer-streaming.exe"
+    return (Format-ArmProvenance -Origin $Origin -Provenance (Get-ArmProvenance `
+        -SourceRoot (Join-Path $repoRoot 'third_party\llama.cpp') -RepoRoot $repoRoot `
+        -ArtifactPaths (Get-ProvenanceArtifacts -Command $exe)))
+}
+
+if ($VerifyRevision) {
+    if (-not (Test-Path -LiteralPath $VerifyRevision -PathType Leaf)) {
+        Write-Host "CANNOT-EVALUATE: no suite record at $VerifyRevision" -ForegroundColor Red
+        exit 2
+    }
+    $rec = Get-Content -LiteralPath $VerifyRevision -Raw | ConvertFrom-Json
+    # Carry the run's OWN in-run drift evidence into the record the shared rule
+    # reads, so a saved green that moved mid-run verifies as drifted rather than
+    # as current.
+    $recorded = $rec.provenance
+    if ($rec.provenance_delta) {
+        $recorded | Add-Member -NotePropertyName sources_changed_during_run -NotePropertyValue ([bool]$rec.provenance_delta.source_changed_during_run) -Force
+        $recorded | Add-Member -NotePropertyName binary_changed_during_run -NotePropertyValue ([bool]$rec.provenance_delta.binary_changed_during_run) -Force
+    }
+    $cmp = Compare-ArmProvenance -Recorded $recorded -Current (Get-SuiteRevision 'verify') -RepoRoot $repoRoot
+    Write-Host ("SUITE REVISION: {0} (exit {1}) - record {2} (suite '{3}', result {4})" -f `
+        $cmp.verdict, $cmp.exit, $VerifyRevision, $rec.suite, $rec.result)
+    foreach ($r in $cmp.reasons) { Write-Host ("  - {0}" -f $r) }
+    if ($cmp.exit -eq 0) {
+        Write-Host '  The record still describes this tree: its suite-green claim is about the revision on disk now.' -ForegroundColor Green
+    } else {
+        Write-Host '  NOT A PASS: this record does not describe the tree on disk now.' -ForegroundColor Red
+    }
+    exit $cmp.exit
+}
+
+$revStartedUtc = (Get-Date).ToUniversalTime().ToString('o')
+$revStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss') + 'Z'
+$revPre = Get-SuiteRevision 'suite-start'
+Write-Host ("Revision: engine digest {0} (nested head {1}, {2} tracked / {3} untracked changed), llama.dll {4}" -f `
+    $revPre.source_digest, (Short-Sha $revPre.source_head), $revPre.source_changed_tracked,
+    $revPre.source_changed_untracked, $revPre.streaming_lib_sha)
+
+# The ONE place a suite result is stated, so no caller can print a green that the
+# revision binding then undercuts.
+function Complete-Suite {
+    param([int] $ExitCode, [string] $RunCommand = $ctestCommand)
+    $revPost = Get-SuiteRevision 'suite-end'
+    $delta = @{
+        source_changed_during_run = ("$($revPre.source_digest)" -ne "$($revPost.source_digest)")
+        binary_changed_during_run = (($revPre.modules | ConvertTo-Json -Compress) -ne ($revPost.modules | ConvertTo-Json -Compress))
+    }
+    $flags = @()
+    if ("$($revPre.source_state)" -ne 'git') {
+        $flags += ("the engine tree could not be digested at suite start (source_state={0}{1}) - the result is not bound to a revision" -f `
+            $revPre.source_state, $(if ($revPre.source_error) { ": $($revPre.source_error)" } else { '' }))
+    } elseif ($delta.source_changed_during_run) {
+        $flags += ("the engine SOURCES changed WHILE the suite ran: digest {0} -> {1}" -f $revPre.source_digest, $revPost.source_digest)
+    }
+    if ($delta.binary_changed_during_run) {
+        $flags += 'the BINARY changed WHILE the suite ran (a module hash differs between the start and end captures)'
+    }
+
+    # A green run the tree moved under is its own status, not "green": the tests
+    # passed (tests_passed) but the result is not attributable to one revision,
+    # and the record must say the same thing the process exit code does.
+    $flagged = ($ExitCode -eq 0 -and $flags.Count -gt 0)
+    $effExit = if ($flagged) { 10 } else { $ExitCode }
+    $dir = Join-Path $buildDirResolved "suite-runs\$revStamp-$Suite"
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $recPath = Join-Path $dir 'revision.json'
+    $rec = [ordered]@{
+        schema = 'suite-revision/1'
+        suite = $Suite
+        result = $(if ($flagged) { 'flagged' } elseif ($ExitCode -eq 0) { 'green' } else { 'failed' })
+        tests_passed = ($ExitCode -eq 0)
+        exit_code = $effExit
+        started_utc = $revStartedUtc
+        ended_utc = (Get-Date).ToUniversalTime().ToString('o')
+        command = $RunCommand
+        flags = @($flags)
+        provenance = $revPre
+        provenance_post = $revPost
+        provenance_delta = $delta
+    }
+    [System.IO.File]::WriteAllText($recPath, ($rec | ConvertTo-Json -Depth 8),
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    $revLine = if ("$($revPre.source_state)" -eq 'git') {
+        ("revision digest {0} (nested head {1}, {2} tracked / {3} untracked changed), llama.dll {4} - record {5}" -f `
+            $revPre.source_digest, (Short-Sha $revPre.source_head), $revPre.source_changed_tracked,
+            $revPre.source_changed_untracked, $revPre.streaming_lib_sha, $recPath)
+    } else {
+        ("revision NOT captured (source_state={0}) - record {1}" -f $revPre.source_state, $recPath)
+    }
+    if ($flagged) {
+        Write-Host ("SUITE RESULT FLAGGED: suite '{0}' ran green, but the tree moved under it." -f $Suite) -ForegroundColor Red
+        foreach ($f in $flags) { Write-Host ("  - {0}" -f $f) -ForegroundColor Red }
+        Write-Host '  The tests passed; the result is not attributable to ONE revision, so it is not reported as green.'
+        Write-Host ("  {0}" -f $revLine)
+        exit $effExit
+    }
+    if ($ExitCode -eq 0) {
+        Write-Host ("SUCCESS: suite '{0}' passed. {1}" -f $Suite, $revLine) -ForegroundColor Green
+    } else {
+        Write-Host ("FAILED: suite '{0}' exited with code {1}." -f $Suite, $ExitCode) -ForegroundColor Red
+        Write-Host ("  {0}" -f $revLine)
+    }
+    exit $effExit
+}
 
 $suites = @{
     'all' = @{
@@ -253,7 +401,8 @@ if (-not $spec.Gpu) {
             exit $LASTEXITCODE
         }
     } else {
-        Write-Host "[doc-size] WARNING: $docGuard not found; guard skipped." -ForegroundColor Yellow
+        Write-Host "[doc-size] FAILED: $docGuard not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
     }
 }
 
@@ -342,6 +491,87 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- GPU-lock wrapper verdict contract (host-only, ~8s, no GPU, no CUDA) -----
+# tools/test-arm-verdict.ps1 drives tools/with-gpu-lock.ps1 through STUBBED probes
+# (GPU_BUSY_PROBE_CMD) and private mutex names. What it guards, because every arm
+# in this repo is launched through that wrapper and inherits whatever its verdict
+# fails to record: the verdict must carry the evidence the wrapper prints
+# (`gpu_pre_run`/`gpu_post_run` plus the `clean|busy|unavailable|not-probed`
+# status vocabulary, the tag and how it was chosen, and what produced the probe);
+# a consumer reading ONLY the pre-existing fields must see them unchanged; and a
+# probe that could not be taken -- including one that answered with unparseable
+# output, measured 2026-09-22 as previously recorded `clean` -- must never be
+# persisted as a clean card. Its single section that needs the REAL shared lock
+# reports a SKIP rather than a failure when another project holds it, so this
+# stays runnable on a shared machine.
+if (-not $spec.Gpu) {
+    $wrapTest = Join-Path $PSScriptRoot 'test-arm-verdict.ps1'
+    if (Test-Path -LiteralPath $wrapTest) {
+        Write-Host "[gpu-lock] wrapper verdict contract (stubbed probe; no GPU, no CUDA)..."
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapTest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: test-arm-verdict.ps1 exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[gpu-lock] FAILED: $wrapTest not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-16 revert guard (host-only, ~2s, no GPU, no CUDA, no mutex) -------
+# The runner used to force GGML_OP_OFFLOAD_MIN_BATCH=1 under --handoff-partial, with an
+# env-var bypass beside it. That route deadlocked the device stream on
+# the third TG token, so T-GPLR-16 was closed with option (a): revert to the pre-fix
+# partial TG. Both halves run here - the checker's own negative controls (each way the
+# revert can be undone, plus a refusal on no input) and the real scan over the source
+# tree - so "the flag is gone" is enforced on every host run instead of asserted once
+# by grep. A read of the variable remains legal upstream only (the ggml backend
+# default of 32); a NEW read on this project's own path fails.
+if (-not $spec.Gpu) {
+    $t16Tool = Join-Path $PSScriptRoot 'check-gplr16-revert.py'
+    if (Test-Path -LiteralPath $t16Tool) {
+        Write-Host "[t16-revert] revert checker selftest (host-only fixtures, incl. the ways it can be undone)..."
+        & python $t16Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr16-revert.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+        Write-Host "[t16-revert] revert scan (nothing sets the variable; the bypass flag is gone)..."
+        & python $t16Tool
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr16-revert.py exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t16-revert] FAILED: $t16Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- arm provenance: which tree and which binary a verdict describes ----------
+# Host-only, ~5s, no GPU, no CUDA, no mutex: throwaway git trees and throwaway
+# binaries, never the real source tree. The central negative control is the
+# failure of 2026-09-22 -- a control arm passed at 16:28 against the 16:07 build,
+# the engine sources were edited at 16:31, the tree was rebuilt at 16:32, and no
+# consumer noticed because no verdict recorded which SOURCES it was built from.
+# A source edit after a build must read STALE here, and absence must read as
+# NOT CERTIFIABLE rather than as unchanged.
+if (-not $spec.Gpu) {
+    $provTool = Join-Path $PSScriptRoot 'check-arm-provenance.ps1'
+    if (Test-Path -LiteralPath $provTool) {
+        Write-Host "[arm-provenance] source-revision / binary-identity rule selftest (host-only fixtures)..."
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $provTool -Selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-arm-provenance.ps1 -Selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[arm-provenance] FAILED: $provTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- T-GPLR-53 A3 decay discriminator selftest (host-only, ~1s, no GPU, no -----
 # mutex). The pre-registered decision rule's own negative controls: the
 # front-loaded / uniform / chunk-0-only profiles, the no-excess case, and the
@@ -402,6 +632,28 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- per-part TG timings: never-taken is not a zero (host-only, ~2s, no GPU) --
+# The F3 debt class: the row-set ladder recorded 0/120 nonzero TG layer_compute
+# timings because the executor emitted a timing it never took, and that reading was
+# indistinguishable from "TG compute is free". The emitter has been fixed since
+# 2026-09-14; this guard keeps the reader honest -- part fields ABSENT is NOT-TAKEN,
+# not zero, and a required attribution input that is absent refuses (exit 2).
+# Hermetic fixtures only; no trace under build/ is read.
+if (-not $spec.Gpu) {
+    $tgPartsTool = Join-Path $PSScriptRoot 'check-tg-part-timings.py'
+    if (Test-Path -LiteralPath $tgPartsTool) {
+        Write-Host "[tg-parts] per-part TG timing classification selftest (never-taken vs real zero)..."
+        & python $tgPartsTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-tg-part-timings.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg-parts] FAILED: $tgPartsTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 if ($spec.Host) {
     # Replicates the CTest telemetry targets without ctest fixtures:
     #  - positive: validate the transition trace (must exit 0, write summary)
@@ -430,8 +682,7 @@ if ($spec.Host) {
     }
     Write-Host "Negative correctly rejected (exit $negExit)." -ForegroundColor Green
 
-    Write-Host "SUCCESS: suite '$Suite' passed." -ForegroundColor Green
-    exit 0
+    Complete-Suite -ExitCode 0
 }
 elseif ($spec.Direct) {
     $exe = Join-Path $buildDirResolved "bin\$Config\llama-layer-streaming.exe"
@@ -565,8 +816,7 @@ elseif ($spec.QaSmoke) {
         Write-Host "FAILED: suite 'qa-smoke' failed." -ForegroundColor Red
         exit 1
     }
-    Write-Host "SUCCESS: suite 'qa-smoke' passed." -ForegroundColor Green
-    exit 0
+    Complete-Suite -ExitCode 0 -RunCommand "qa-smoke rung(s): mode=$SmokeMode, lengths=$($SmokeLengths -join ',')"
 }
 elseif ($spec.Gpu) {
     Write-Host "Running under GPU mutex (waits if another process holds it)..."
@@ -579,9 +829,4 @@ elseif ($spec.Gpu) {
     $exitCode = $LASTEXITCODE
 }
 
-if ($exitCode -eq 0) {
-    Write-Host "SUCCESS: suite '$Suite' passed." -ForegroundColor Green
-} else {
-    Write-Host "FAILED: suite '$Suite' exited with code $exitCode." -ForegroundColor Red
-}
-exit $exitCode
+Complete-Suite -ExitCode $exitCode
