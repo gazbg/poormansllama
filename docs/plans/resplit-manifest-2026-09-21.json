@@ -1,48 +1,26 @@
 {
-  "archive_body_sha256_lf": "cdac349a421c0792162a1b93472ae836f7a4d03d532203049652c24c1b786ba0",
+  "archive_body_sha256_lf": "d6e17333fc2a155e1b631a495f0381e314f16f24a2ff55d772ba16495cf60542",
   "archive_header_lines": 6,
-  "archive_terminator_stripped": true,
+  "archive_terminator_stripped": false,
   "blocks": [
     {
       "dest": "live",
-      "orig_line_end": 303,
-      "orig_line_start": 32,
-      "title": "### T-GPLR-37: direct mmap-sourced staging \u2014 remove the CPU hop from bank staging"
+      "orig_line_end": 406,
+      "orig_line_start": 42,
+      "title": "### T-GPLR-53 (draft): attribute the pass-1 embed-step excess - the whole of the sweep's \"unattributed\" gap - and pre-register the first-touch decay discriminator (host-only first)"
     },
     {
       "dest": "archive",
-      "orig_line_end": 912,
-      "orig_line_start": 304,
-      "title": "### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent \u2014 the residue that grows with ubatch size"
-    },
-    {
-      "dest": "archive",
-      "orig_line_end": 1092,
-      "orig_line_start": 913,
-      "title": "### T-GPLR-50 (draft): make the f16 rebuild default follow the charter shape \u2014 ON where the pass-2 excess is measured (flip the T-GPLR-48 f16 default back to ON)"
-    },
-    {
-      "dest": "archive",
-      "orig_line_end": 1292,
-      "orig_line_start": 1093,
-      "title": "### T-GPLR-51 (draft): attack the EXPOSED transfer at the charter shape - copy-tail and hiding robustness at 200k"
-    },
-    {
-      "dest": "live",
-      "orig_line_end": 1397,
-      "orig_line_start": 1293,
-      "title": "### T-GPLR-52 (draft): attribute the shape-dependent per-copy staging cost (identical bytes, 18x wall) and correct the T-GPLR-51 copy-tail framing"
+      "orig_line_end": 771,
+      "orig_line_start": 407,
+      "title": "### T-GPLR-54: single-chunk prefill identity - is the u4096 7-id tail insertion a numerics tie-break or a 1-chunk shape defect? (falsifiable ID-CHECK + a logit-margin discriminator)"
     }
   ],
-  "live_header_rule": "live body = everything from the first '### ' heading",
+  "live_terminator_stripped": true,
   "moved_titles": [
-    "### T-GPLR-39 (draft): make the `other` ledger bucket chunk-independent \u2014 the residue that grows with ubatch size",
-    "### T-GPLR-50 (draft): make the f16 rebuild default follow the charter shape \u2014 ON where the pass-2 excess is measured (flip the T-GPLR-48 f16 default back to ON)",
-    "### T-GPLR-51 (draft): attack the EXPOSED transfer at the charter shape - copy-tail and hiding robustness at 200k"
+    "### T-GPLR-54: single-chunk prefill identity - is the u4096 7-id tail insertion a numerics tie-break or a 1-chunk shape defect? (falsifiable ID-CHECK + a logit-margin discriminator)"
   ],
-  "pre_resplit_blocks_sha256_lf": "3c69c21169156e8bcbe82424fcced8625e83d7b2aa93aa9873f6697139ca5a2b",
-  "pre_resplit_live_bytes": 94030,
-  "pre_resplit_live_sha256_lf": "cb0d12e0e8f541df883784e3c5c106e71bf60a1d7b5c44e4e4d46eae3f505f00",
+  "pre_resplit_live_sha256_lf": "2738e90a68fb1d61919231bb5fae8245fd330edb0aa6a600672626b69a612cd7",
   "resplit_date": "2026-09-21",
   "tool": "tools/resplit-gplr-plan.py",
   "verify_command": "python tools/resplit-gplr-plan.py --verify"

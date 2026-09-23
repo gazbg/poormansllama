@@ -4403,3 +4403,952 @@ TG copy events, and are shown for shape comparability only.)
 
 Verdict: build/llama-cuda/verdicts/gplr51-s2-2slot.verdict.json; trace
 build/llama-cuda/gplr51-s2-2slot.jsonl (check-telemetry OK, 2 slots).
+### T-GPLR-37: direct mmap-sourced staging — remove the CPU hop from bank staging
+
+Status: CLOSED (2026-09-20) — PROMOTED TO DEFAULT by owner decision; the earlier
+in-progress (2026-09-17) reading is preserved below (PROBE FEASIBLE; V1 per-bank
+churn FALSIFIED AT 4k). The flip, its evidence and its price are in the RESULT at
+the END of this block. Later arms re-ran both sources on the new default and found
+source parity at 200k (T-GPLR-51 A2, T-GPLR-52 A3), consistent with this closure.
+Historical detail, preserved verbatim: V2
+(churn-free, register once at init — see addendum 2 below) **CONFIRMS the churn
+mechanism and WINS at 4k at both depths** (warm -23.3% at 2 slots, -15.4% at 3,
+paired against adjacent pinned controls), at a measured cost of 17.23 GiB of
+pinned file pages. PROMOTED TO DEFAULT 2026-09-20 by owner decision (verbatim in the RESULT at the end of this block).
+
+V1 detail (kept as the falsified half of the family) The hop was removed from the accounting (host submit 1587.8 ->
+1222.3 ms/pass at 2 slots; `slot` bucket 1315.6 -> 1153.3) but per-launch host
+windows grew more (`setup` 11.2 -> 227.8 ms at 2 slots; `compute` 1329.5 ->
+1845.1 / 1581.4 -> 2441.7 ms), with bank DMA windows unchanged (31.48 ms pure)
+and no starvation (3-slot wait 36.5 ms). Indicated mechanism: per-bank
+register/unregister churn over ~111k pages x 80 registrations (34.46 GiB
+cumulative). Cold passes look 17-23% better but are CONFOUNDED by arm order
+(file cache warmed by the earlier arms) and are not claimed as a result. Next
+and last test of the family: register ONCE at init (whole mapping / all exec
+spans, ~17 GiB pinned, T-GPLR-31 proved 18 GiB grantable) so there is no churn;
+falsifier = the `setup` inflation persists without churn, which closes the
+family.
+Depends on: T-GPLR-29/30/31 (pinned staging + pool), T-GPLR-33 (shared
+`stage_members` submission helper), T-GPLR-35 (the recon that measured the hop),
+T-GPLR-36 (the ledger that showed no host bucket contains the hop, because it
+runs on the async-feed worker)
+Commit: nested 7bcbd7a75 (cudaHostRegister host-range API) + 8e14abd36
+(register-once staging + ledger sub-buckets) + 1e72d62c7 (runner wiring); outer
+4b13ac3 (evidence/tooling, gitlink bump); 2026-09-20 default flip: nested 8ab3f1f00
+(default + copy_source_source provenance + --pp-pool refusal), outer 63bfaa6 (harness +
+gitlink), plus this verdict commit
+
+
+
+Goal
+: Remove the CPU hop from bank staging without giving up pinned transfer speed.
+  Today every member is `memcpy`'d into a pinned staging buffer and the DMA reads
+  that copy; `--copy-source direct` skips the copy but DMAs from pageable memory
+  at 9.59 GB/s. The third option does not exist yet: page-lock the model's own
+  mapped source pages and DMA straight from the mapping.
+
+Probe evidence (measured, tools/gplr37-mmapreg-probe.cu, one mutex hold, 452.5
+MiB window of the real MoE GGUF at offset 1 GiB; every arm verified byte-for-byte
+against the file window)
+: * A pageable mmap DMA (= `--copy-source direct`): 49.47 ms, 9.59 GB/s
+  * B registered mmap DMA (`cudaHostRegister` on the FILE-BACKED mapping):
+    **32.86 ms, 14.44 GB/s = the pinned ceiling**, registration cost 0.16 ms
+  * C the current path: CPU hop 20.22 ms + DMA 32.86 ms = 53.08 ms per bank
+  So the hop is 20.22 ms/bank (~809 ms per 40-bank pass) and a registered source
+  both deletes it and lowers the transfer below the pageable path.
+
+Prediction (pre-registered before the A/B)
+: Mechanism: `copy_complete.host_submit_us` per bank collapses from ~39 ms to
+  ~0.2 ms, one `mmap_register` event fires per bank fill (~452 MB each), and the
+  bank DMA windows stay pure (~31.4 ms). Wall at **3 slots: no change beyond
+  noise (+-3%)** — the recorded 3-slot account already closes as wall 2843 ms ~
+  compute 1611 + pure DMA 1255 with consumer wait 225 ms, i.e. the hop is hidden
+  behind compute at that depth. Wall at 2 slots: staging (hop+DMA) exceeded the
+  per-bank compute there (consumer wait 734 ms), so the candidate may win up to
+  ~5%.
+  FALSIFIER: a >= 0.3 s (>=10%) warm-wall drop at 3 slots means the hop was on
+  the critical path after all and the "already hidden" reading is wrong; a >= 5%
+  REGRESSION at either depth means register/unregister churn per bank costs more
+  than the hop it removes.
+
+Scope
+: An experimental copy-source mode and its measurement. `--copy-source
+  mmap-registered` registers the page-aligned span covering a package's member
+  sources, caches it on the slot, unregisters it before that slot stages a
+  different package (safe: a slot is only re-staged after the previous
+  generation's consumer completed), and unregisters at slot teardown. The mode
+  allocates no staging buffers at all and is mutually exclusive with `--pp-pool`
+  (which requires the pinned path and refuses loudly).
+
+Non-goals
+: No default change; no removal of the pinned path; no change to routing,
+  arithmetic, quantization or KV handling; no attempt to keep whole-run
+  registrations alive (that would pin the full ~18 GB bank set permanently —
+  measured as grantable by T-GPLR-31 but a much larger RAM trade).
+
+Acceptance criteria
+: * Every arm's strict checker passes and the mmap-registered traces carry one
+  `mmap_register` event per bank fill with the expected bytes.
+* The hop collapses in the accounting (per-bank host submit window ~0.2 ms vs
+  ~39 ms) with bank DMA windows unchanged.
+* The warm-wall verdict at 2 and 3 slots is recorded against the pre-registered
+  prediction and falsifier, with the VRAM/RAM price stated (no staging buffers
+  in this mode; pinned file pages held instead, bounded by n_slots x ~452 MB).
+
+Validation commands
+: * `tools/run-gplr37-probe-locked.ps1` (stage-1 feasibility, ~10 s of GPU work)
+* `tools/run-gplr37.ps1` (four 4k arms, one mutex hold, ~12 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37-{pin,reg}-s{2,3}.jsonl`
+
+State/document updates
+: `docs/currentstate.md` entry with the probe table, the A/B verdict against the
+  prediction, and the RAM/RAM trade; this block's status and Commit field.
+
+Escalation condition
+: If registration fails on the real model (file-backed mapping refused, or the
+  span spans far-apart members and pinning explodes the footprint), record the
+  failure and stop — the pinned path stays the answer and the mode is withdrawn.
+
+#### T-GPLR-37 addendum 2 RESULT (2026-09-17): churn-free variant — mechanism CONFOUNDS CONFIRMED, large warm win, prediction wrong
+
+Measured verdict (four adjacent arms, one mutex hold, 4k anchor, ubatch 512,
+layer-major, kv q8, af=1, `--pp-repeat 2`; all four strict checkers OK; traces
+`build/llama-cuda/gplr37b-*.jsonl`; analyzer `tools/analyze-gplr37.py`)
+: * Warm pass: **pin-s2 3490.2 ms / 1173.6 tok/s -> ron-s2 2676.9 ms / 1530.1
+  tok/s (-813.3 ms, -23.3%, +30.4% tok/s)**; **pin-s3 2706.0 ms / 1513.7 ->
+  ron-s3 2290.6 ms / 1788.2 tok/s (-415.5 ms, -15.4%, +18.1%)**.
+  * FALSIFIER DID NOT FIRE: `setup` returned to the clean band (13.0 -> 8.2 ms at
+  2 slots, 12.1 -> 7.9 at 3, vs the churn arms' 227.8 / 134.7), `mmap_register`
+  fired 40x with `mode="init-once"` and **40/40 before the first
+  `layer_compute`** (churn: 80 events, 34.46 GiB, 2/80 before), and one
+  `mmap_register_init` reports 18,500,517,888 B (17.23 GiB) pinned in 1.6 ms
+  pre-timed. Churn was the whole cause of the V1 regression.
+  * Mechanism: PP hop median 45.24 -> 0.06 ms/bank (s2) and 23.43 -> 0.11 (s3);
+  `slot` bucket 1620.7 -> 991.2 ms (s2) and 582.3 -> 69.4 (s3); bank DMA windows
+  pure (31.38-31.48 ms = 1.00x); compute ~unchanged (1363.6 -> 1297.2 at s2); TG
+  unaffected (76.6 vs 76.75 tok/s). Greedy 96-token `--tg-text` byte-identical
+  between pinned and mmap-registered at both depths (identity sanity check only,
+  NOT the semantic-QA gate).
+  * **Prediction WRONG:** I pre-registered "within +-3%, gain <=5% at 2 slots";
+  measured -23.3% / -15.4%. The pre-registered reading that the hop is "already
+  hidden behind compute at 3 slots" was false at this shape.
+  * Headline vs history: ron-s3 2290.6 ms is the fastest warm 4k layer-major pass
+  recorded (previous best 2706 / 2811.9 / 2843.2), and **ron-s2 2676.9 ms matches
+  pin-s3 2706.0 ms with one slot fewer (-498 MiB VRAM)** — depth-3 pinning is not
+  needed for this shape under this mode.
+  * Price: 17.23 GiB of pinned file pages for the run (vs 0.9-1.4 GiB of pinned
+  staging buffers for the pinned path); no staging buffers allocated. The side RAM
+  monitor's window missed the arms (started before the ~26 min mutex wait, stopped
+  after ~74 s) — its CSV is NOT cited as evidence; the 17.23 GiB is the runner's
+  own pre-timed measurement.
+  * Cold-pass numbers remain CONFOUNDED in the candidates' favour (they page in
+  the whole model before the timed pass) and are not claimed.
+  * Gate change: `tools/check-gplr35-pipeline.py` paired mode was depth-only and
+  its absolute wait/wall fraction false-FAILed the faster arm; it now accepts a
+  same-depth pair with a different copy source, anchors wait (ms, <= control x
+  1.25 + 50) and exposure (<= control + 350) to the control, keeps the pure-DMA
+  window check, and FAILs an identical-configuration pair. Re-validated on six
+  controls (depth pair PASS 1.188x; reversed FAIL 0.842x; churn arms FAIL 0.846x;
+  ron pairs PASS 1.304x / 1.181x; identical FAIL).
+  * Not a default change and not a fitness claim: the owner decides whether a
+  17.23 GiB pinned-RAM trade for -23% warm 4k PP is acceptable, and whether the
+  next step is the crowded-VRAM (262k KV) shape where the charter's decisive case
+  lives.
+
+#### T-GPLR-37 addendum 2 (2026-09-17): churn-free variant — register every span ONCE at init
+
+Motivation (from the falsified V1)
+: V1's regression had exactly one measured candidate cause: 80 register/unregister
+  cycles over ~111k pages each (34.46 GiB of churn per run) landing inside the
+  per-launch host windows (`setup` 11.2 -> 227.8 ms at 2 slots; `compute` +0.5 to
+  +0.9 s). `mmap-registered` therefore becomes the churn-FREE mode: one
+  `register_all_pkg_sources` call runs after the prebuild and BEFORE the timed PP
+  (pre-timed, so its cost is setup and cannot pollute the pass wall), registering
+  the page-aligned source span of every executed layer once; staging then reads
+  the cached per-layer span and never touches page tables during the pass. The
+  falsified per-bank churn stays reproducible as `--copy-source
+  mmap-registered-churn` so the V1 evidence remains re-runnable.
+
+Pre-registered prediction (written before the run)
+: * Mechanism: 40 `mmap_register` events with `mode="init-once"`, ALL before the
+  first `layer_compute` of pass 1, plus one `mmap_register_init` carrying the
+  total bytes and the pre-timed cost; no registration inside a pass.
+  * Ledger: `setup` returns to the pinned control's band (~11-12 ms) and
+  `compute` returns to the control's band (1329 ms at 2 slots / 1581 at 3), with
+  bank DMA windows still pure (~31.4 ms).
+  * Wall: within +-3% of the pinned control at BOTH depths; a gain is expected
+  only at 2 slots (<= 5%), where the hop was partly exposed rather than hidden.
+  * FALSIFIER: if `setup` still reads 100-230 ms without churn, the cost is
+  inherent to file-backed registered pages rather than to churn, and the
+  mmap-registered family closes. A >= 5% warm regression at either depth
+  rejects the variant regardless of mechanism.
+  * Price to report: the pre-timed registration phase and the pinned footprint
+  (expected ~17 GiB of file pages held for the run — the RAM cost of removing
+  churn, and the reason this mode is opt-in).
+
+Known confound, stated up front
+: The candidate arms pin (and therefore page in) the whole model before their
+  timed pass, so any COLD-pass advantage is confounded in the candidate's favour
+  (V1 measured cold 17-23% better and that was not claimed either). The WARM
+  comparison in adjacent pin/ron pairs is the verdict target.
+
+Validation commands (addendum 2)
+: * `tools/run-gplr37b.ps1` (four adjacent arms + strict checkers + analyzer +
+  pipeline gate, one mutex hold, ~15-20 min)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37b-{pin,ron}-s{2,3}.jsonl`
+* `python tools/check-gplr35-pipeline.py <ron trace> --baseline <pin trace>`
+
+#### T-GPLR-37 addendum 3 RESULT (2026-09-17): crowded shape measured — prediction CONFIRMED, win does not transfer
+
+Measured verdict (four adjacent arms, one mutex hold, all strict checkers OK;
+traces `build/llama-cuda/gplr37c-*.jsonl`; analyzer `tools/analyze-gplr37.py`;
+pipeline gate s2/s3 both PASS paired)
+: * Warm pass: **pin-s2 142,165.5 ms / 1406.8 tok/s -> ron-s2 141,853.7 /
+  1409.9 (-311.8 ms, -0.22%)**; **pin-s3 141,666.6 / 1411.8 -> ron-s3 141,134.4 /
+  1417.1 (-532.2 ms, -0.38%)**. Both within the pre-registered <= ~1% noise band;
+  neither falsifier branch fired.
+  * Mechanism confirmed where it can be seen: per-bank hop 44.01 -> 0.08 ms (s2)
+  and 44.47 -> 0.13 ms (s3); `slot` bucket 1759.0 -> 1280.6 (s2) and
+  **637.3 -> 70.3 ms (s3)**; bank DMA windows pure (31.5-31.6 ms = 1.00x);
+  compute/patch/other/setup unchanged. The hop is deleted; the wall is 92.5%
+  compute and does not care.
+  * RAM (measured by the fixed monitor, whole-run window): min free system RAM
+  **19,447 MiB** of 61.7 GiB with 17.23 GiB pinned + ~5 GiB spilled KV; max
+  process WS 23,458 MiB. No pressure event; no eviction/trim observed.
+  * Consequence: the churn-free mmap-registered mode is a SHORT/AMORTIZED-CONTEXT
+  lever (staging on the critical path), not a long-context one; at 200k it costs
+  17.23 GiB pinned for ~0.3% wall. Default posture unchanged (pinned + depth for
+  long context; mmap-registered opt-in); a shape-aware mode switch is a possible
+  later owner decision, not made here.
+
+#### T-GPLR-37 addendum 3 (2026-09-17): the crowded-VRAM shape — 200k tokens on 262k F16 KV, pinned vs mmap-registered
+
+Motivation
+: The charter's decisive case is PP under VRAM/RAM crowding. Addendum 2 measured
+  the churn-free win at the 4k shape (-23.3% warm at 2 slots, -15.4% at 3) for
+  17.23 GiB of pinned file pages. This addendum tests whether that win survives
+  where staging is amortized differently: at 200k tokens each bank serves ~391
+  chunks, the 4k-measured depth effect had already collapsed to <=1% (T-GPLR-35
+  addendum 2), and the host-spilled KV (5.0 GiB f16, 10 full-attention layers at
+  262144 ctx) plus the 17.23 GiB pinning meet on the host for the first time
+  (61.7 GiB total system RAM).
+
+Shape (identical to the recorded 200k references, unchanged)
+: `--pp-tokens 262144`, `--ubatch 512`, `--kv-cache f16`, `--act-slab-dtype
+  bf16`, layer-major, af=1, `--pp-repeat 2`, `--tg-tokens 0`; control = pinned,
+  candidate = mmap-registered (churn-free), at 2 and 3 slots; four adjacent arms
+  in one mutex hold; ~10 min/pass x 2 passes x 4 arms ~ 80 min budget.
+
+Pre-registered prediction (written before the run)
+: * Mechanism: at this shape the wall is compute-dominated (91%+ measured;
+  T-GPLR-35 addendum 2: slots 2->3->4 moved the wall +0.8% total, wait 36.5 ms).
+  The hop that ron deletes is ~0.9-1.6 s per pass (T-GPLR-37 V1 ledger), i.e. ~1%
+  of the ~147 s wall, and af=1 already hides it behind compute. Expected: warm
+  walls within noise (<= ~1%) at BOTH depths; ron's advantage concentrated in
+  the `slot` ledger bucket and the per-bank host submit, not the wall.
+  * RAM: ron arms pin 17.23 GiB of file pages ON TOP of the ~5.0 GiB spilled KV
+  residency; pinned arms hold only n_slots x 452 MiB of staging buffers. Both
+  fit 61.7 GiB; the monitor's sys_free column records the actual floor.
+  * FALSIFIER: if ron still cuts the 200k warm wall by > 3% at either depth, the
+  "staging is already hidden at long context" reading is wrong and the mode is
+  a long-context win too. A warm-wall REGRESSION > 3% would instead indicate the
+  pinning interacts badly with the spilled-KV working set (page-cache pressure).
+
+Validation commands (addendum 3)
+: * `tools/run-gplr37c.ps1` (four adjacent 200k arms + strict checkers + analyzer
+  + paired gates, one mutex hold, ~80 min budget)
+* `python tools/analyze-gplr37.py build/llama-cuda/gplr37c-{pin,ron}-s{2,3}.jsonl`
+* RAM monitor `tools/monitor-mem-gplr36.ps1` (fixed: process-anchored window +
+  sys_free column) writes `build/llama-cuda/gplr37c-mem-monitor.csv`
+
+
+#### T-GPLR-37 RESULT (2026-09-20): PROMOTED TO DEFAULT by owner decision — the flip is behavioral, self-describing, and costed
+
+**Owner decision, verbatim: "Promote to default — you always pay 17 GiB of locked RAM, always get the speedup where it exists."** The churn-free register-once mode (`--copy-source mmap-registered`) is now the DEFAULT copy source; explicit `--copy-source` still overrides everything, so every recorded arm command stays reproducible. The change: the default literal, a stderr announcement emitted ONLY when the default decided (T-GPLR-48 pattern), a new `run_start` key `copy_source_source` (`explicit|default`) beside the already-recorded resolved `copy_source`, the strict checker validating the new key, an updated help entry, and one disclosed consequence — bare `--pp-pool` (a pinned staging structure) now refuses BEFORE model load with the one-flag fix in the message, where it previously only failed at pool configure under the pinned default.
+
+**One session, five arms + the smoke rung, all under the GPU mutex with started/verdict/done sentinels.** Control = `bin/gplr37-control` (exe `150B6351833DA150`, llama.dll `7EBB3803CDD67B41`), changed = `bin/gplr37-changed` (exe `A3EB9C3A32F1DA0E`, dll `89CE209871DA7DFB`). **The control-preserving lesson re-measured:** the first "control" copy was taken AFTER the build had already compiled the change into the live `bin/Release` — grep for the new key in the would-be control DLL exposed it — so the control was rebuilt from pristine nested HEAD (diff saved/reverted/built/pinned/restored, patch-identical restore verified) before anything ran.
+
+- **INV1 (control silence):** the control at bare default resolves `pinned`, carries NO `copy_source_source` key and NO announcement (C1); at explicit `--copy-source pinned` it behaves exactly as the pre-change tree did (A3).
+- **The new default, measured (A1, 4k/3 slots):** resolved `mmap-registered` with source `default`, announcement present, **40 init-once `mmap_register` events = 18,500,517,888 B (17.23 GiB) pinned in 2.66 ms, ALL before the first `layer_compute`** — the addendum-2 churn-free signature exactly; strict `--check-telemetry` OK; route parity clean (160 events, 0 singletons).
+- **Identity:** the 96 greedy ids are **byte-identical across ALL FOUR 4k arms** (control default, control pinned, changed default, changed pinned); first id 248046; graded decode **PASS 5/5** (`QX-7741 TR-2918 MK-5501 LD-8834 Paris`) in every arm.
+- **Timing (same session, same binary, warm pass-2 walls — recorded, NOT gated):** control pinned 2095.4 ms (A3), changed pinned 2121.7 ms (A2), changed **default 1953.5 ms (A1) = -6.8% vs the same binary pinned and -7.9% vs the control**. This is the honest current-tree number: addendum 2 measured -15.4% at 3 slots on the pre-T-45/47/48/49 tree, and the pinned path itself got faster since, so the same absolute win is now a smaller fraction. Single pair, one session, no replication — the delta is directional evidence, not a certified constant. A1's pass-1 compute (3.71 s vs 1.84 s pass 2) carries the expected first-touch page-in of the pinning itself; disclosed, not a regression claim.
+- **A4 (b1, 143k q8, the T-GPLR-43/47 reference shape):** resolved default, 40/17.23 GiB pre-compute, checker OK, parity clean (1200 events, 0 singletons), 154.4 s — the long quantized-KV shape works unchanged under the new default.
+- **Smoke rung (V2, 512 anchor, bare default, batch-major q8, repeat 2):** runner exit 0, strict checker 0, needle **PASS 5/5**, negative control FAILs as designed — the DEFAULT path answers the needle.
+- **Consumers:** every recorded script and CTest fixture passes `--copy-source` explicitly (all `pinned`), so no recorded command changes behavior; the only `--pp-pool` consumer pins it too. Host suite 37/37, telemetry suite pass, doc-size guard PASS.
+- **Limits, stated:** the 17.23 GiB pinned-RAM price is UNCONDITIONAL under this default (that is the owner's recorded choice); addendum 3 measured the crowded 200k shape wall-neutral (-0.22%/-0.38%, within noise) with no memory-pressure event at 61.7 GiB, and the default now applies there too. The -6.8% wall delta is one session, one pair. Host-RSS at rest is ~20.5 GB for a defaulted run (measured via the live process working set during A4), most of it the pinned mapping.
+- **Falsifiers: NONE fired** (no identity divergence anywhere, no parity failure, no refusal in any supported combination).
+**Evidence:** verdicts `build/llama-cuda/verdicts/gplr37-*.verdict.json` (+ `.started`/`.done`), traces `build/llama-cuda/gplr37-*.jsonl`, smoke `build/llama-cuda/gplr37-v2-qa-512.{jsonl,log,txt}`, harnesses `tools/run-gplr37-arm.ps1` / `tools/run-gplr37-set.ps1` / `tools/run-gplr37-qasmoke.ps1`, binaries `build/llama-cuda/bin/gplr37-{control,changed}`.
+
+### T-GPLR-52 (draft): attribute the shape-dependent per-copy staging cost (identical bytes, 18x wall) and correct the T-GPLR-51 copy-tail framing
+
+Status: done (2026-09-21) — all four acceptance criteria landed (AC1 re-audited, AC2,
+AC3, AC4 with in-trace proof) and AC5 closes the task here; the RESULT block is at the
+END of this block. This block moved to the archive in the 2026-09-21 resplit. Closing this
+case changes NO default and NO engine path beyond the nested telemetry assertion
+(traces carried staging identity before this task, they now carry it provably).
+Dependencies: T-GPLR-51 (closed; its A2/A3/A4 verdicts and framing are inputs and correction targets)
+Commit: nested 23e5d1b6e (engine-derived staging_source + match in run_start); outer
+59a0266 (A3 runner + gitlink bump), 0b42781 (AC1 re-audit fix), 25c5581 (A1 +
+tools/analyze-gplr52-a1.py), 828ef2f (A2 + runner/analyzer), 48e8901 (A3 verdict),
+8f648fb (AC3 doc + AGENT_ENVIRONMENT semantics), f5ed99c (the anomaly sweep that
+handed the pass-1 gap forward)
+
+Goal. Explain, with a named mechanism and pre-registered discriminators, why two
+whole-bank copies of the SAME ~460 MB routed-expert bank in the same binary show
+host-observed per-copy costs of 163 ms (4k prompt), 943 ms (50k), and 3003 ms
+(200k). Secondary: establish what copy_complete actually measures and put an
+instrument beside it that future staging claims can trust.
+
+Established facts (host-only re-decomposition of existing traces, 2026-09-21):
+
+- F1 - Staging granularity is shape-invariant: exactly 2 copy events per layer
+  per PP pass (one per whole routed-expert bank) in EVERY recent trace (200k,
+  144k, 50k, 4k, 512). The earlier "fractional copies per layer / chunking
+  differs by shape" reading lumped phase-1 (TG) copy events into phase-0 (PP)
+  stats. There is no 40-vs-160 chunking to explain.
+- F2 - Per-copy host cost scales with prompt length, not bytes: median PP copy
+  163 ms (4k) -> 943 ms (50k) -> 3003 ms (200k), an 18x swing for identical
+  bank bytes. At 4k, pass-2 halves vs pass-1 (109 vs 285 ms); at 200k it does
+  not (3003 vs 3007 ms).
+- F3 - Heavy-layer byte correlation (layers 24-39 vs 0-23) is ~1.15-1.16 in the
+  200k regime but ~1.06/1.01 at 4k - byte-proportionality exists only when
+  copies are slow.
+- F4 - copy_complete is a HOST-side event wait (wait_slot_ready):
+  transfer_us = host_submit_us + ready_latency_us = enqueue + sync time, NOT
+  DMA duration. It legitimately includes waiting behind concurrent compute and
+  other queued copies. Every T-51 tail statistic (p50/max) is therefore
+  host-observed cost, not transfer time; the A2/A3/A4 "exposed wait" numbers
+  remain valid (they measure the same wait) but the "copy tail" framing is
+  instrument-limited.
+- F5 - A2's pinned arm shows mmap-identical 3.0 s medians at 200k, but its log
+  retains the mmap banner ("expert banks in host mmap", load_mode = mmap) and
+  the trace carries only copy_source=pinned, no in-trace proof the pinned pool
+  was active. The engine has separate pinned machinery (--pp-set-pp-pool
+  REQUIRES --copy-source pinned), which the A2 arm did not pass. If pinned
+  silently fell back to the registered-mmap pool, the A2 "source-independent
+  tail" attribution is unfounded.
+
+Hypotheses (pre-registered; state which prediction each arm tests BEFORE it runs):
+
+- H1 (queue-wait behind compute): the host wait grows because per-ubatch
+  compute grows with prompt length and the copy event fires only after the
+  copy engine gets the bus. Prediction: per-copy transfer_us correlates with
+  concurrently-overlapping compute, not with bytes; true DMA duration would be
+  near the 4k regime at all shapes.
+- H2 (file-cache eviction on the registered mapping): pass-1 copies fault
+  file pages at disk-class rate; effective 18.3 GB / ~250 s = ~73 MB/s matches
+  disk-class read throughput. Prediction: at shapes whose working set survives
+  in the Windows file cache (4k), later passes halve; at 200k the far-ahead
+  pages are evicted before use, so every pass stays slow regardless of pass
+  index or copy source reading the file.
+- H3 (pinned never engaged): A2's arm exercised the mmap path. Prediction:
+  with in-trace proof of an active pinned pool, 200k per-copy cost collapses
+  toward the 4k regime (RAM-speed source), refuting the file-read component of
+  H2 and correcting the T-51 A2 verdict.
+
+Discriminating arms (each owner-invoked, GPU mutex, ~5 min; A1 first is
+host-only and free):
+
+- A1 (host-only): from existing traces, correlate per-copy transfer_us with
+  the compute window it overlaps (layer_compute rows inside the copy interval)
+  and with the copy queue's concurrent copy count. AC: a per-shape attribution
+  table; if transfer_us ~ overlapped compute, H1 is confirmed without any new
+  binary.
+- A2 (warm/eviction probe): run the charter shape with --pp-repeat 3 (200k and
+  50k) and build the pass-index vs median-copy table. H2 predicts pass-3
+  ~ pass-2 at 200k (evicted) but a drop at 50k if its working set survives.
+  AC: the table plus a verdict per H2's prediction.
+- A3 (proven-active pinned): add an in-trace pinned_active assertion (staging
+  pool address range check, or the set-pp-pool path) and rerun the 200k
+  copy-source A/B. AC: trace carries pinned_active=true; medians compared
+  against the mmap baseline settle H3 and correct the T-51 A2 addendum.
+
+Acceptance criteria:
+
+- AC1: the 40-vs-160 premise is corrected in the plan (this block) and
+  currentstate; tracked analyzers that report PP staging stats are verified to
+  split phase-0 (PP) from phase-1 (TG) copy events or to label the mixture.
+- AC2: a named mechanism explains the 163/943/3003 ms scaling, supported by at
+  least two independent discriminators from A1-A3, each prediction recorded
+  before its arm runs.
+- AC3: copy_complete's semantics (host-observed wait = enqueue + sync) are
+  documented in AGENT_ENVIRONMENT.md, and either a true-DMA field lands behind
+  the experimental gate or the doc states why it cannot be measured with the
+  current backend API.
+- AC4: the pinned-active question is settled with in-trace proof, and the
+  T-GPLR-51 A2 addendum is corrected if a fallback is confirmed.
+- AC5: closure follows the established pattern: plan RESULT block + commit
+  hashes, currentstate entry, doc-size guard PASS.
+
+Non-goals: no placement, routing, or package-content change; no performance
+tuning based on an unproven mechanism; no new dependency; TG-phase copy
+accounting is excluded from PP stats but not otherwise studied.
+
+Focused validation: the host-only decomposition script from the drafting
+session (AC1); owner-invoked mutex arms with the busy-gate verdict pattern
+(A1-A3); python tools/check-doc-sizes.py after doc edits.
+
+Escalation: if A1-A3 all fail to discriminate, present the three-way evidence
+table to the owner with the option of instrumenting backend-level copy timing
+(backend API dependency question) or closing the question as
+instrument-limited.
+
+#### A1 result (2026-09-21, host-only, no GPU): H1 CONFIRMED as the dominant mechanism - wait ~= overlapped compute at long context
+
+Per the contract (correlate transfer_us with overlapped compute and
+concurrent copies, no new binary). Traces: gplr50-4k/50k/200k + b1-q8 +
+a2-pinned; layer_compute rows are stride-10 SAMPLED (measured: sampled sums
+recover phase compute only to 1/3-1/10), so overlapped-compute sums are
+lower bounds and slopes carry the sampling factor.
+
+The contract's literal metric, per shape:
+
+| shape | r(wait, overlapped compute) | r(wait, concurrent copies) | r(wait, position) |
+| --- | --- | --- | --- |
+| 200k/512 | +0.998 | -0.001 | +0.07 |
+| 200k pinned | (same law) | - | - |
+| 144k q8 | high (sync-only profile) | - | - |
+| 50k/512 | +0.78 | +0.20 | -0.05 |
+| 4k/512 | +0.27 (pass-1 first-touch transient: r(wait,position) = -0.78) | +0.10 | -0.78 |
+
+* At 200k the relationship is essentially deterministic: wait ~= 1.03 x
+  overlapped compute (slope 10.017 x sampled rows; sampled rows cover
+  1/9.74 of compute at stride 10). The host wait for a whole-bank copy IS
+  the time the copy engine queues behind the compute stream; it scales
+  with how much compute runs during the copy window, which is exactly why
+  identical 460 MB banks cost 163 ms at 4k (little compute queued), 943 ms
+  at 50k, and 3003 ms at 200k. H2's eviction story is REFUTED for the
+  steady state: r(wait, position) ~ 0 at 200k/50k (no drift within a pass),
+  pinned matches mmap (no file-read component), and only 4k pass-1 shows
+  the first-touch decay H2 predicted - a warm-up transient, not the law.
+* submit/sync split corroborates: at 200k the median wait is 100% sync
+  (submit ~0.1 ms) - a queued-behind-compute signature; at 4k both
+  components are material and pass-1 submit (119 ms) exceeds pass-2
+  (28 ms), the first-touch registration cost.
+* Concurrency is NOT the driver (r ~ 0 at 200k, median 2 in flight, max 3)
+  - the A3 4-slot inflation was resource contention at 4-way concurrency,
+  not queueing order.
+* Consequence for AC2: the 18x per-copy scaling has a named, two-way
+  corroborated mechanism (H1), supported by discriminators A1 (this
+  analysis) + the F4 submit/sync split + the F5-adjacent pinned identity.
+  H2 stands refuted for steady state; H3 (pinned pool engagement) remains
+  the only open item and A3's arm can settle it.
+* AC1 discharged: all 8 tracked PP analyzers filter copy stats by phase
+  (audit 2026-09-21); run-gplr51-tail-arm.ps1's quantile block was the one
+  tool mixing TG copy events into PP stats - fixed in this commit;
+  run-gplr44-dump-50k.ps1 counts events only (phase-agnostic by design,
+  noted, no fix needed).
+
+#### A2 result (2026-09-21, --pp-repeat 3 arms under the GPU mutex)
+
+Both arms PASS on the baseline binary (exe 1B08B382ACA4694D / dll B540024042E8B1F2,
+matches-A1 true), gpu_pre/post_run = clean, check-telemetry OK, 120 phase-0 copies
+verified in-trace, copy_source mmap-registered EXPLICIT at both shapes (the recorded
+50k baseline ran pinned, which F5 flags as possibly-never-engaged - A2 had to
+exercise the file-read path to test H2 at all).
+
+| shape | pass-1 p50 | pass-2 p50 | pass-3 p50 | 1->2 | 2->3 | tok/s (p1/p2/p3) |
+|-------|-----------|-----------|-----------|------|------|------------------|
+| 200k  | 3002.9 ms | 2996.2 ms | 3007.7 ms | +0.2% | -0.4% | 1458/1483/1480 |
+| 50k   |  771.2 ms |  758.5 ms |  760.3 ms | +1.6% | -0.2% | 2420/2741/2738 |
+
+Verdict per the pre-registered bands:
+- 200k: pass-3 ~ pass-2 (0.4%) -> band CONFIRMED. BUT this arm does not
+  discriminate: H1 predicts pass-3 ~ pass-2 here too (per-pass compute is flat
+  134.2/134.2/134.4 s and A1's r = +0.998 law makes copy waits track it). A
+  confirmed H2 prediction that H1 also makes is not H2 evidence.
+- 50k: pass-3 ~ pass-2 (0.2%) -> the survivor prediction FALSIFIED. This is the
+  discriminating datum: H2 predicted pass-3 <= 0.85 x pass-2 if the ~18 s pass's
+  working set survives in the file cache; H1 predicts flat (per-pass compute
+  flat ~17.6 s after the pass-1 first-touch). Measured flat. With 4k's pass-2
+  halving already re-explained by A1 as a first-touch submit transient
+  (119 -> 28 ms), H2 retains NO discriminating evidence at any tested shape:
+  not at 4k (first-touch), not at 50k (falsified), not at 200k
+  (non-discriminating).
+- H2 (file-cache eviction as the mechanism behind per-copy cost) is CLOSED as
+  refuted for the steady state and unnecessary elsewhere; H1 stands as the
+  single surviving mechanism, pending only A3's pinned-engagement proof (H3),
+  which can only ADD corroboration to the source-independence H1 already
+  showed.
+
+Artifacts: build/llama-cuda/gplr52-a2-200k.jsonl + .verdict.json,
+gplr52-a2-50k.jsonl + .verdict.json; tools/run-gplr52-a2-arm.ps1 (in-trace band
+evaluation), tools/analyze-gplr52-a2.py (host-only table re-derivation; self-test
+PASS on 4 synthetic bands + loud count refusal).
+
+AC1 re-audit (2026-09-21, post-A2): re-ran the phase-separation audit over all
+16 copy_complete-consuming tools after the A2 tools landed. 10 Python
+analyzers filter phase == 0 explicitly; the T-51 tail-arm/S2 arms and both A2
+tools filter correctly; run-gplr44-dump-50k.ps1 counts events only
+(phase-agnostic by design, noted). ONE violation found and fixed:
+run-gplr51-a2-pinned.ps1 collected transfer_us/ready_latency_us unfiltered.
+Demonstrated cost of the bug on the 200k baseline: the mixed reading reports
+copy p50 = 31.5 ms (120 TG micro-copies dominate) where the true PP median is
+3003.2 ms - a 95x understatement of typical copy cost, the exact mechanism
+behind the T-51 tail-stat contamination (F1). AC1 remains discharged with the
+tooling now provably clean; any future copy stat must cite a phase filter.
+
+#### A3 result (2026-09-21, proven-active pinned A/B under the GPU mutex)
+
+Mechanism first: run_start now emits ENGINE-DERIVED staging_source (from the
+init state flags copy_src_reg_churn / copy_src_registered / use_pinned_staging,
+not an argv echo) plus staging_source_match vs the declared copy_source; both
+validators treat a mismatch or missing pair as FATAL, legacy traces stay
+admissible (nested commit 23e5d1b6e, gitlink 59a0266). Fixture-proven both
+ways before any GPU time: injected match=0 refused by --check-telemetry AND
+--validate-telemetry with the exact invariant message.
+
+Both arms PASS on the new binary, gpu_pre/post clean, 80 phase-0 copies,
+check-telemetry OK:
+
+| arm | engine staging_source | match | copy p50 | p90 | max | ready_wait | tok/s |
+|-----|----------------------|-------|----------|-----|-----|-----------|-------|
+| mmap-registered | mmap-registered | 1 | 2984.4 ms | 10734 ms | 10.80 s | 3.67 s | 1462/1485 |
+| pinned | pinned | 1 | 3062.7 ms | 10798 ms | 11.01 s | 3.61 s | 1459/1476 |
+
+H3 verdict (pre-registered bands): the collapse prediction (pinned p50 <=
+0.50 x mmap) is FALSIFIED - pinned was engaged (in-trace proof, match=1) and
+per-copy cost held at parity (1.03x). F5 is RESOLVED: no silent fallback
+exists in the staging path; the T-51 A2 pinned arm genuinely ran pinned, its
+mmap banner was the model loader's message, and the T-51 A2 addendum needs NO
+correction. AC4 discharged with in-trace proof instead of the assumed
+conclusion. The new binary reproduces the baseline numbers (p50 ~2984-3003 ms,
+ready_wait 3.67 s) - the one-field telemetry addition is performance-neutral.
+The staging_source assertion is now permanent: every future trace carries
+engine-proven staging identity, checker-enforced.
+
+Artifacts: build/llama-cuda/gplr52-a3-mmap.jsonl + .verdict.json,
+gplr52-a3-pinned.jsonl + .verdict.json; tools/run-gplr52-a3-arm.ps1.
+
+#### AC3 result (2026-09-21, host-only; the AC's either/or resolved as "possible - and already built")
+
+The AC asked for documentation of copy_complete's host-wait semantics PLUS
+either a true-DMA field behind the gate or a documented impossibility. The
+code read found a third, better branch: the vendored tree ALREADY carries the
+instrument. T-GPLR-35's recon (--pp-recon 1, default in every recorded arm)
+brackets each bank's DMA with TIMING-ENABLED CUDA events
+(ggml_backend_cuda_timing_event_* on the stream that carries the DMA; regular
+ggml events are cudaEventDisableTiming and cannot measure) and emits
+recon_attr events with copy_gpu_ms.
+
+The answer from data that already existed (gplr52-a3 A/B traces, no new GPU
+time): true DMA of a ~460 MB bank is copy_gpu_ms p50 = 31.5 ms (~14.6 GB/s
+PCIe), IDENTICAL for mmap-registered and pinned sources, heavy layers 36.3 ms
+= exactly the byte ratio (522/453 x 31.5). The DMA is ~1.0-1.1% of the
+host-observed copy_complete cost (2984-3063 ms): ~99% is queueing behind
+compute, corroborating H1 from the GPU clock side and retroactively
+explaining the T-51 "10.9 s copy tail" as host-wait queueing, not transfer.
+
+Discharged: the semantics section is now in AGENT_ENVIRONMENT.md
+("copy_complete host-wait semantics", incl. the phase-split discipline and
+the A3 staging_source assertion), with the rule: copy_gpu_ms for wire time,
+transfer_us for host cost, never mixed in one statistic. T-51's tail
+attribution now carries the correction pointer: those numbers were host-wait
+distributions all along.
+
+#### RESULT (2026-09-21): T-GPLR-52 CLOSED - the 18x per-copy scaling has ONE named mechanism (queueing behind compute), the pinned-fallback question is settled with proof, and the T-51 copy-tail framing is corrected
+
+- F1 CORRECTED: 2 whole-bank copies per layer per pass in every trace (200k, 144k,
+  50k, 4k, 512); the "40 vs 160 fractional copies" reading was phase-1 TG events
+  bleeding into phase-0 stats (AC1).
+- H1 CONFIRMED (A1, host-only, no GPU): r(copy wait, overlapped compute) = **+0.998**
+  at 200k (wait ~= 1.03x overlapped compute after the stride-10 sampling correction),
+  +0.78 at 50k, +0.27 at 4k; concurrent copies are NOT the driver (r ~ 0, median 2 in
+  flight); submit/sync split corroborates (200k waits 100% sync; 4k pass-1 is a
+  first-touch transient - wait decays with pass position at r = -0.78, submit
+  119 -> 28 ms pass-over-pass).
+- H2 REFUTED (A2, `--pp-repeat 3` arms, one mutex hold, clean gpu_pre/post_run): 200k
+  copy p50 3002.9 / 2996.2 / 3007.7 ms and 50k 771.2 / 758.5 / 760.3 ms - flat. The
+  50k survivor prediction (pass-3 <= 0.85x pass-2) is the discriminating falsification;
+  the 200k band is NON-discriminating because H1 predicts flat there too.
+- H3 FALSIFIED with in-trace proof (A3, same binary, engine-derived
+  `staging_source_match` = 1 in both arms): mmap p50 **2984.4 ms** vs pinned
+  **3062.7 ms** (parity 1.03x) - pinned WAS engaged (its mmap banner is the model
+  loader's message) and the staging path has no silent fallback. The T-51 A2 addendum
+  needed no correction; F5 is resolved.
+- AC3: `copy_complete` host-wait semantics documented in AGENT_ENVIRONMENT.md, and the
+  "true-DMA field or impossibility" either/or resolved as "already built": recon
+  `copy_gpu_ms` p50 = **31.5 ms** (~14.6 GB/s) IDENTICAL for both sources, heavy layers
+  36.3 ms = the byte ratio. The DMA is 1.0-1.1% of the host-observed cost; ~99% is
+  queueing behind compute (H1 corroborated from the GPU clock side; the T-51 "10.9 s
+  copy tail" was a host-wait distribution all along).
+- AC1 re-audit: 16 copy_complete consumers audited; ONE violation found and fixed
+  (tools/run-gplr51-a2-pinned.ps1 collected TG micro-copies unfiltered - 31.5 ms
+  mixed vs the true 3003.2 ms PP p50, a 95x understatement of typical copy cost).
+- AC5 (this closure): status, commit field, RESULT, evidence. NO default change, no
+  arithmetic/routing/package change anywhere in the task; the only engine delta is the
+  nested staging-identity assertion, which is performance-neutral (the new binary
+  reproduces the baseline medians).
+- Handed forward, not lost: the pass-1 gap the same sweep found is NOT this task's - it
+  is now T-GPLR-53 (drafted 2026-09-21, A1 executed host-only: the gap is the embed
+  step); the recon `generation` off-by-one join remains an unowned hygiene item.
+- Evidence: traces `build/llama-cuda/gplr52-a2-50k.jsonl` + `-a2-200k.jsonl` +
+  `gplr52-a3-mmap.jsonl` + `gplr52-a3-pinned.jsonl` (verdicts + `.started`/`.done` in
+  `build/llama-cuda/verdicts/`), analyzers `tools/analyze-gplr52-a1.py` /
+  `-a2.py`, arm runners `tools/run-gplr52-a2-arm.ps1` / `-a3-arm.ps1`; the T-51 pinned
+  runner fix `tools/run-gplr51-a2-pinned.ps1`.
+### T-GPLR-54: single-chunk prefill identity - is the u4096 7-id tail insertion a numerics tie-break or a 1-chunk shape defect? (falsifiable ID-CHECK + a logit-margin discriminator)
+
+Status: done (2026-09-22, owner decision) - closed on the arm rule WITHOUT the A3
+GPU session; A1 delivered the enforced ID-CHECK, A2's instrument is landed and
+parked ready, A3/A4 intentionally not run (see RESULT)
+Dependencies: T-GPLR-38 (closed; the ubatch sweep that produced the u-arms, and the
+"no arm at or above u4096 can be called output-equivalent" caution this block
+adjudicates); the 2026-09-21 oddity resolution in `docs/currentstate.md` (the needle
+answer at u4096 is COMPLETE; greedy-id equivalence at u4096 was explicitly deferred
+to "its own investigation - single-chunk shape vs multi-chunk shape", which is this
+block); T-GPLR-47 (the recorded u-arms are PRE-T-47 binaries, so every number here
+must be re-measured on the current tree, with the resolved flags read from
+`run_start` and never from command history); T-GPLR-49 (a new telemetry event must
+be proved tolerated by both validators, not assumed); T-GPLR-53 (same discipline:
+host-only attribution first, one default-off instrument, no default change).
+Commit:
+
+Goal. Decide, with a pre-registered falsifiable identity check and one numeric
+discriminator, whether the single-chunk (ubatch >= prompt) prefill shape is
+ARITHMETICALLY indistinguishable from the multi-chunk shape up to greedy-id level -
+and if it is not, whether the difference is an ordinary near-tie tie-break (benign,
+close with an arm rule) or a confidently different next-token distribution (a real
+1-chunk-shape defect, escalate). The block exists because a 2026-09-21 host-only
+re-read of the recorded u-arms found the divergence is NOT the "repeat loop" the
+record describes: it is ONE insertion of 7 template ids at index 41, after which the
+single-chunk stream rejoins the multi-chunk stream byte-exactly. That is one argmax
+flip 41 steps into TG, not a derailment region, and it is testable exactly.
+
+Scope. Attribution + classification of the u4096 divergence; one host-only identity
+tool; one default-off runner-side logits instrument; one owner-invoked GPU session
+at the 4k shape; an arm rule for future u>=4096 identity arms. Non-goals: no fix to
+the 1-chunk shape and no engine arithmetic change; no sampler, KV, routing, package
+or placement change; no default flip (the instrument is default-off); no timing work
+and no re-run of the ubatch sweep's speed claims; no quality or equivalence claim -
+this block grades greedy ids and logit margins only, and the needle grader stays the
+gate for answers; no new dependency; no multi-GPU, no other model.
+
+Established facts (host-only, from the recorded 4k arms; no GPU, 2026-09-21; all four
+arms are one binary era, `--pp-tokens 4096`, handoff `auto-on`, 3 slots, 96 greedy
+TG ids; `pp_n_chunks` 8/4/2/1 for u512/u1024/u2048/u4096):
+
+- F1 - The multi-chunk arms are id-identical and the single-chunk arm diverges at
+  ONE index: u1024 vs u512 and u2048 vs u512 are byte-identical for ALL 96 ids;
+  u4096 vs u512 first differ at index 41 (u512 emits 846, u4096 emits 248045).
+- F2 - The u4096 stream is the u512 stream with exactly ONE contiguous 7-id
+  insertion at index 41 - `[248045, 248045, 248045, 248045, 248046, 198, 248045]` -
+  and is byte-identical after realignment (`u4096[48:96] == u512[41:89]`). All 53
+differing indices are explained by that single insertion; there is no second
+divergence point. This SHARPENS the 2026-09-21 record, which called the tail a
+  "template-token repeat loop": it is a bounded 7-id detour followed by exact
+  re-synchronization.
+- F3 - The flip happens at the first decision after a template region BOTH arms
+  enter: at indices 35..40 both emit 248045; at 41 u512 escapes to 846 (a content
+  token) while u4096 lingers 7 more template ids. The divergence is one argmax flip,
+  not a region, and both continuations are plausible text continuations.
+- F4 - The divergence is AFTER the needle answer: ids 0..40 are identical across all
+  four arms, and the decoded u4096 answer is complete (2026-09-21 grading: 5/5
+  needles). So no graded gate is at risk either way; only id-equivalence is.
+- F5 - All four arms ran the SAME post-handoff TG path (handoff `auto-on`, 3
+  `handoff` events each), so the only differing input between them is the PREFILL
+  shape (n_chunks 8/4/2/1) and the KV/recurrent state it writes. The TG schedule and
+  the sampler are common, so a sampler or TG-scheduling story is already disfavored.
+- F6 - No recorded artifact carries logits or margins: the decode artifacts
+  (`gplr38-u{512,4096}-dec.json`) carry only `first_ids` (16 ids) plus the text, and
+  the traces carry `tg_tokens.ids` only. The tie-break question therefore needs one
+  new instrument (A2).
+- F7 - The recorded arms are pre-T-47 binaries (traces dated 2026-09-17; T-47 landed
+  2026-09-20), and T-47/T-48/T-49/T-50 changed the rebuild path, the f16 rebuild
+  default and the slab offsets; the 100k arms (`gplr38-100k-u1024/u2048`) carry no
+  `tg_tokens` at all, so no long-shape id comparison exists. Both facts bound what
+  may be carried forward: F1-F4 are re-measured on the current tree in A3 before any
+  conclusion is recorded.
+- F8 - Batch-shape numerics are an EXPECTED effect in llama.cpp (different ubatch
+  splits change kernel shapes and reduction order, hence the last bits of the
+  logits), and qwen35moe is a hybrid whose chunk boundaries also reorder the Gated
+  DeltaNet state updates. That is the prior for H1 - stated as prior, not as a
+  result, and the whole point of A3 is that the prior is not evidence.
+
+ID-CHECK (the falsifiable identity check this block is built around; pre-registered,
+programmatic, host-runnable on any recorded pair of arms from the same session).
+Given a REFERENCE stream (multi-chunk arm) and a CANDIDATE stream (single-chunk arm),
+let D = the first index where they differ, K = the candidate's insertion length:
+
+- C1 (prefix): candidate[:D] == reference[:D] and D >= 41 (the recorded answer-span
+  end; falsified by any divergence inside the answer region).
+- C2 (single bounded insertion): candidate[D+K:] == reference[D:len(reference)-K] with
+  K >= 1, i.e. the candidate is the reference plus exactly ONE contiguous insertion -
+  a realignment, not a divergence region - and K <= 8 (one short detour).
+- C3 (inserted ids are template ids only): every id in candidate[D:D+K] belongs to
+  the tokenizer's template/turn-marker set (measured: {248045, 248046} plus 198, the
+  newline). A content-token insertion fails C3.
+- C4 (repeatability): a second arm at the same shape reproduces (D, K, the inserted
+  id sequence) EXACTLY, and the multi-chunk pair in the same session still has K = 0.
+The check FAILS (= escalation, H2 territory) if D < 41, K > 8, the tail does not
+realign byte-exactly, the inserted ids are not template-only, or repeats disagree.
+It is asserted by A1's tool for recorded traces and by the A3 harness for new ones,
+and its teeth are proved by a negative fixture that MUST fail (a content-token
+insertion and a non-realigning tail), not by the passing case alone.
+
+Hypotheses (pre-registered; each arm states which prediction it tests BEFORE it
+runs):
+
+- H1 (chunk-shape numerics, benign tie-break): the prefill shape perturbs the state
+  in the last bits only, and index 41 is a near-tied argmax. Predictions: (a) at the
+  step that PRODUCES index 41 the u4096 top1-top2 margin is small, and comparable to
+  the margins seen at agreeing steps of the same session (the calibrated band in A3);
+  (b) the flip is a single event with exact re-synchronization (ID-CHECK C2 holds);
+  (c) repeating the arm reproduces D = 41 and the same 7 inserted ids (determinism);
+  (d) the multi-chunk pair stays id-identical (K = 0) in the same session.
+- H2 (1-chunk shape defect): the single-chunk prefill writes state that is wrong
+  beyond float noise. Predictions: (a) the u4096 margin at the flip is LARGE (the
+  chosen template id is confidently ahead, beyond the calibrated band); (b) the
+  divergence is not a bounded single insertion (K > 8, a second divergence point, or
+  no byte-exact realignment); (c) it reproduces at a second prompt or shape. Any of
+  (a)-(c) is a finding to escalate, NOT to fix here.
+- H3 (sampler / TG plumbing), kept as a falsifier target only: predicts the flip
+  comes from the runner's sampler state or the handoff TG setup rather than the
+  prefill. Already disfavored by F5 (identical post-handoff TG path, identical
+  sampler, ids identical for 41 steps and realigned after) - revisit only if A3's
+  margins are equal in BOTH arms while the streams still diverge (which would point
+  at sampling rather than logits).
+
+Discriminating arms (A1 host-only and free; A2 host-validated before any GPU time;
+A3 owner-invoked under the GPU mutex, one session; A4 conditional):
+
+- A1 (host-only, no GPU): `tools/analyze-gplr54-ubatch-identity.py` - the ID-CHECK as
+  a checked tool over any pair of recorded arm traces (default set: the four
+  `gplr38-u512/u1024/u2048/u4096` arms), printing [pair, D, K, inserted ids, tail
+  realigned?, answer-span intact?] and enforcing C1-C4, with `--selftest` fixtures
+  and exit 2 (NOT a pass) when a trace carries no `tg_tokens`. AC: the recorded
+  results reproduce EXACTLY (u1024/u2048 K = 0 over 96 ids; u4096 D = 41, K = 7, the
+  inserted sequence above, tail realigned, C3 template-only), the negative controls
+  fire (content-token insertion -> FAIL; non-realigning tail -> FAIL; divergence
+  inside the answer region -> FAIL), and the tool is wired into the host suite.
+  Deliverable also: the corrected F2/F3 wording handed to `docs/currentstate.md`.
+
+  #### A1 result (2026-09-21, host-only, no GPU): ID-CHECK REPRODUCED - D = 41,
+  K = 7, exact realignment, template-only, and the two intermediate arms are
+  id-identical; one C2 root-cause fix made during validation
+
+  Tool: `tools/analyze-gplr54-ubatch-identity.py` (`--selftest`, a pair mode
+  `TAG REF`, the recorded default set with CHK-* expectations, and `--repeat A B`
+  = the C4 determinism gate for A3's x2 arms: two same-shape arms must be
+  id-identical to each other, exit 1 when they disagree). Exit contract verified
+  on real inputs: PASS = 0 (default set + clean pair), FAIL = 1 (a repeat pair
+  that disagrees), cannot-evaluate = 2 (no `tg_tokens`: `gplr38-100k-u1024` vs
+  `gplr38-100k-u2048` refuses with "no tg_tokens in trace", as does a missing
+  trace). Selftest 7/7: identical pair, the recorded 7-id template insertion
+  with exact realignment, content-token insertion FAIL, torn-tail FAIL,
+  early-divergence (D = 12 < 41) FAIL, recorded-shape (D, K, seq) ok, and the
+  missing-trace refusal.
+
+  Reproduction on the record (no GPU): u1024 vs u512 and u2048 vs u512
+  IDENTICAL over all 96 ids (F1); u4096 vs u512 BOUNDED-INSERTION D = 41,
+  K = 7, inserted `[248045, 248045, 248045, 248045, 248046, 198, 248045]`,
+  tail realigned, template-only (F2/F3). The table is deterministic (pure id
+  arithmetic on recorded traces) and re-runs in about a second.
+
+  One root-cause fix during validation, recorded for honesty: the first C2
+  implementation hardcoded the equal-length form of the realignment
+  (`cand[D+k:] == ref[D:len(ref)-k]`), which passes the recorded arms (both 96
+  ids) but rejects a TRUE insertion of the same shape on any other stream
+  length - the recorded-insertion selftest fixture FAILED against it. The
+  general form (g = len(cand) - len(ref); realignment requires
+  cand[D+k:] == ref[D:len(ref)-(k-g)] for some 1 <= k <= K_MAX, k >= g) covers
+  both the fixed-window arms (g = 0) and natural-length insertions (g = k) and
+  still rejects substitutions/deletions (the reference's ids from D must all be
+  preserved). Caught by the pre-registered negative-control discipline, not by
+  luck: the fixture exists because the plan required it.
+
+  Validation: `[t54-a1]` wired into `tools/run-tests.ps1` (every host-only
+  suite, beside `[t53-a1]`); observed `-Suite host`: `[t54-a1]` SELFTEST PASS,
+  doc-size PASS, plan-split PASS, `[t53-a1]`/`[t53-a2]` PASS, 39/39 CTest,
+  suite SUCCESS. AC1's remaining deliverable (the corrected wording in
+  `docs/currentstate.md`) was applied at draft time and is enforced by the CHK
+  expectations from here on.
+- A2 (instrument, host-validated first): a runner-side, DEFAULT-OFF logits readout -
+  `--tg-logit-margin N` (0 = off, the default) recording one
+  `tg_logits {step, top1_id, top1_logit, top2_id, top2_logit, margin}` event for the
+  first N TG steps, read from the existing public logits row after each TG decode
+  (no engine arithmetic change, no sampler change: the sampler's decision must be
+  byte-identical with the flag on and off). Concrete steps: the runner's TG loop
+  beside its existing telemetry; no new engine event type unless the recon gate is
+  cleaner; keep the default off so a plain run's trace stays byte-identical (the
+  T-GPLR-49 lesson). AC: both validators accept a fixture carrying `tg_logits` (a
+  CTest pair, the A2 pattern); the fixture's margins reconcile with its recorded
+  ids (the top1 id of each step equals the recorded greedy id - a self-check with a
+  negative fixture); a same-session identity pair proves the flag sampler-neutral
+  (greedy ids identical, flag on vs off); host CTest suite green; no arithmetic,
+  routing or package change.
+
+  #### A2 result (2026-09-21, host-validated): the default-off `tg_logits`
+  readout lands in the runner and the engine; both validators accept it; the
+  host gate is green. The sampler-neutrality SAME-SESSION pair needs one GPU
+  arm and moves to A3 (see the honest caveat below).
+
+  What landed. Engine (nested tree): `llama_layer_streaming::tg_logit_margin`
+  (int, default 0 = off), `tel_tg_logits(step, top1_id, top1_logit, top2_id,
+  top2_logit)` emitting `tg_logits {step, top1_id, top1_logit, top2_id,
+  top2_logit, margin, t_us}` (self-gated: `tg_logit_margin <= 0 || step >=
+  N` returns before any write), and `run_start` carries the resolved depth
+  `tg_logit_margin` + `tg_logit_margin_source` ONLY when the caller passes it
+  (the route_telemetry pattern, so pre-A2 recordings are byte-unchanged).
+  Runner: `--tg-logit-margin N` (<= 0 = off, default 0), help text, and ONE
+  tap line in the serial greedy TG loop at the existing T-GPLR-06 margin
+  computation - the event carries the SAME penalized top-1/top-2 values the
+  pick consumed, read BEFORE the sampler state advances (rep_ring.accept),
+  with the MTP branch untouched (recorded arms are non-MTP; parity there is
+  out of scope). No arithmetic, routing, package or placement byte changed.
+
+  Host validation. Fixture `tests/gplr54-tg-logits.jsonl`, built by
+  `gen-gplr54-fixtures.py` from the recorded `gplr38-u512` shape and the
+  recorded T-GPLR-06 stderr margins (bare-default-k.log steps 0..7: 0.44,
+  16.41, 16.12, 0.97, 0.30, 19.28, 11.99, 6.54; the fixture's first 8 tg ids
+  ARE those gold ids, so the top1-vs-pick check holds by construction). Both
+  validators measured on it: `--check-telemetry` and `--validate-telemetry`
+  exit 0 (CTest targets `layer-streaming-{check,validate}-gplr54-tg-logits`
+  joined the host suite include; 41/41 CTest, was 39). The journey recorded
+  for honesty: the first fixture draft failed 3 validator invariants (handoff
+  declared but no handoff events; phase_summary missing the 5 streaming
+  fields; chunk manifest declared without binds) and was repaired to the
+  minimal valid shape the passing gplr53 fixture uses - the validators are
+  strict, which is exactly why the CTest pair matters. Checker
+  `tools/check-gplr54-logits.py`: CHK-gate (the default-off INVARIANT on
+  traces: no positive `tg_logit_margin` key => zero tg_logits rows;
+  declared N => exactly min(N, n_generated) rows), CHK-ids (steps 0..k-1
+  contiguous; every top1_id equals that step's greedy pick from tg_tokens),
+  CHK-shape (fields, margin > 0, band [1e-4, 60] from the recorded stderr
+  spread, printed margin == top1-top2 within 1e-3). `--selftest` == 11/11:
+  3 positives (clean; default-off with no key; explicit 0) and 6 negative
+  controls firing (bad row count, foreign top1 id, step gap, margin !=
+  top1-top2, rows under an undeclared key, out-of-band margin) plus 2 exit-2
+  refusals (no run_start, no tg_tokens). Wired as `[t54-a2]` into every
+  host-only suite.
+
+  HONEST CAVEAT (an AC partially moved, not silently dropped): the AC's
+  same-session on/off neutrality pair needs one GPU run and CANNOT be
+  host-validated - a host machine cannot execute the sampler. What IS
+  host-proven: (a) structural neutrality - the tap reads values the pick
+  already computed, adds no sampler call, and advances no state (the only
+  interleaved code is a self-gated emit); (b) the default-off invariant is
+  now machine-checked on any trace. The on/off id-identity pair is therefore
+  PRE-REGISTERED as the first arm of the A3 session (u512 x2: flag off vs
+  flag on, ids must be identical), and A3's verdict stays void without it.
+  Not claimed here: any timing, any mechanism verdict, any default change.
+
+  Evidence: `src/llama-layer-streaming.{h,cpp}`, `tools/layer-streaming/
+  main.cpp`, `tools/layer-streaming/gen-gplr54-fixtures.py`,
+  `tools/layer-streaming/tests/gplr54-tg-logits.jsonl` (+ .summary.json),
+  `tools/layer-streaming/CMakeLists.txt` (2 CTest targets),
+  `tools/check-gplr54-logits.py`, `tools/run-tests.ps1` (`[t54-a2]` + host
+  include). Commit: pending (no commit authorized).
+
+  #### RESULT (2026-09-22, owner decision): CLOSED ON THE ARM RULE - id-equivalence
+  at u >= 4096 is unavailable BY DESIGN, and the enforced A1 ID-CHECK is what an
+  identity arm at u >= 4096 may assert from now on. A3/A4 not run; nothing was
+  decided about the flip's mechanism.
+
+  The owner decision, applied: rather than spend the one A3 mutex session to
+  decide WHY the u4096 stream diverges by one bounded insertion, the owner
+  accepts the question staying open and adopts the discriminator's arm rule as
+  the standing equivalence contract. From this decision:
+
+  - The ARM RULE (operational, machine-checked - `docs/AGENT_ENVIRONMENT.md`
+    carries it): any future arm that changes the prefill chunk shape (ubatch,
+    pp_tokens, chunk layout), KV type, or the prefill execution path must run
+    `python tools/analyze-gplr54-ubatch-identity.py <candidate> <reference>`
+    against a same-session multi-chunk reference. PASS = IDENTICAL or
+    BOUNDED-INSERTION with the answer span intact (C1-D >= answer span, C2
+    single insertion K <= 8 byte-exact realignment, C3 template-only inserted
+    ids, C4 repeats id-identical); FAIL = escalate before any timing number
+    from that session is recorded. 96-ID IDENTITY IS NEVER THE BAR at
+    u >= 4096: demanding it would fail honest measurements and hide real
+    defects behind an impossible expectation.
+  - What this PRESERVES from A1: the shape is a measured, falsifiable,
+    tool-enforced contract (selftest 7/7, negative controls, exit contract
+    0/1/2), not a caution paragraph. AC1/AC4 discharged host-only.
+  - What is PARKED, not abandoned: A2's `--tg-logit-margin N` instrument is
+    LANDED and host-validated (default-off, both validators green, checker
+    11/11, [t54-a2] in the host suite). It carries one open obligation it
+    named itself: the same-session on/off neutrality pair is pre-registered
+    as A3's first arm and A3's verdict is void without it. If any future task
+    re-opens the mechanism question, A2 is ready and A3's pre-registered rule
+    (margin band + ID-CHECK + C4 repeats) stands in this block unchanged.
+  - What is explicitly NOT DECIDED: whether the flip is a near-tie tie-break
+    (H1) or a confidently different distribution (H2). H1 stays the prior
+    (batch-shape numerics are expected in llama.cpp; the divergence is one
+    template-region argmax flip with byte-exact re-synchronization, past the
+    graded answer span; the needle grader is 5/5 at u4096). No mechanism,
+    equivalence, or quality claim is made or implied by this closure.
+  - Not run, by design: A3 (the margin discriminator session), A4 (the
+    conditional reproducer). The `--tg-logit-margin` flag stays default-off;
+    the default path is untouched. This closure is documents-only.
+
+  Gates: this is a soft gate by charter - the arm rule is evidence discipline,
+  not a certification that any u >= 4096 configuration is fit for use. Final
+  acceptance remains the owner's.
+
+  Deliverable: this RESULT block; the arm rule in `docs/AGENT_ENVIRONMENT.md`
+  ("Greedy identity at u >= 4096: the arm rule", a permanent environment
+  fact); the `docs/currentstate.md` decision entry; Status -> done. Commit:
+  pending (no commit authorized).
+- A3 (the discriminator + identity session, GPU mutex, owner-invoked, one session):
+  4096-token anchor prompt, 3 slots, kv f16, handoff auto (record the resolved mode
+  from `run_start`), `--tg-tokens 96`, `--greedy`, `--tg-logit-margin 96`, arms:
+  u512 (8 chunks) x2, u2048 (2 chunks), u4096 (1 chunk) x2 - the repeats are the
+  determinism arm (C4). Pre-registered decision rule, computed from the session's own
+  margins: let M_band = max margin over the agreeing steps (indices 0..40) of the
+  multi-chunk arms. Benign iff ID-CHECK passes AND margin_u4096(step 40) <= M_band +
+  1.0 logit; escalate iff ID-CHECK fails OR margin_u4096(step 40) > M_band + 1.0
+  logit. Artifacts: traces + verdicts as usual, gpu_pre/post_run recorded, strict
+  `--check-telemetry` on every arm, and the A1 tool run on each new pair.
+- A4 (conditional, only if H2 fires): the minimal reproducer - the 4096-token prompt,
+  u4096, the id streams and the margin rows around step 40, plus a chunk-count
+  bisect (u4096 vs u2048 vs u1024) at the same prompt - handed to the Planner. This
+  block does NOT attempt a fix.
+
+Acceptance criteria:
+
+- AC1 (identity, host-only): A1's tool and table land; the recorded pair reproduces
+  D = 41 / K = 7 / exact realignment and the K = 0 multi-chunk pairs, with the
+  negative controls firing; the corrected divergence wording replaces the "repeat
+  loop" phrasing in `docs/currentstate.md`.
+- AC2 (instrument): A2's flag is default-off, sampler-neutral (proved by a
+  same-session greedy-id identity pair), tolerated by BOTH validators (fixture +
+  CTest), and its top1 ids self-check against the recorded greedy ids.
+- AC3 (the verdict): A3's margins decide H1 vs H2 against the pre-registered rule,
+  with the repeats reproducing (D, K) exactly, and the outcome is stated as one of:
+  "benign bounded tie-break - id-equivalence at u>=4096 is not available by design,
+  but the ID-CHECK is; the u4096 caution becomes an arm rule" or "confidently
+  different at the 1-chunk shape - escalate with the reproducer". Either outcome is
+  a result; a confounded or non-repeating session is not (re-run, do not interpret).
+- AC4 (no behavior change): no default flip, no engine arithmetic/routing/package
+  change; strict checker on every arm; host CTest suite + doc-size + plan-split
+  guards green; every recorded command's resolved flags read from `run_start`.
+- AC5 (closure): RESULT block with the margin table and the ID-CHECK verdict, commit
+  hashes, a currentstate entry, the arm rule in `docs/AGENT_ENVIRONMENT.md` (what an
+  identity arm may assert at u>=4096: prefix + single-insertion realignment, never
+  96-id identity), and the usual resplit hygiene if a block is archived.
+
+Focused validation:
+: * `python tools/analyze-gplr54-ubatch-identity.py --selftest` (fixtures: an
+  identical pair -> PASS, a 7-id template insertion with exact realignment -> PASS,
+  a content-token insertion -> FAIL, a non-realigning tail -> FAIL, a divergence at
+  index 12 -> FAIL, a trace without `tg_tokens` -> exit 2, not a pass)
+* `python tools/analyze-gplr54-ubatch-identity.py gplr38-u512 gplr38-u4096 ...` -
+  reproduces F1-F3 on the record
+* `cmake --build build/llama-cuda --config Release --target llama-layer-streaming`
+  then the A2 CTest pair and the host suite after the instrument lands
+* A3 through the standard arm harness under `tools/with-gpu-lock.ps1` (verdict files
+  with gpu_pre/post_run, started/done sentinels, strict `--check-telemetry`)
+
+State/document updates:
+: `docs/currentstate.md` (the corrected divergence wording + the A3 verdict);
+`docs/AGENT_ENVIRONMENT.md` (the u>=4096 identity-arm rule); `docs/AGENTS.md` if the
+oracle needs the tokenizer's template-token set named for C3; this block's Status and
+Commit fields; plan status only - no default changes are proposed by this task.
+
+Escalation condition:
+: If ID-CHECK fails, or the A3 margin exceeds the calibrated band by more than 1.0
+logit, or the repeats disagree, stop and present the id table + margin table to the
+owner: the question becomes whether the 1-chunk prefill shape is a correctness
+boundary that needs its own defect task (out of scope here). Do not tune the band,
+the prompt or the arm set to make H1 fit, and do not re-open the 2026-09-21 answer
+finding - the needle answer is complete at u4096 and this block does not question it.

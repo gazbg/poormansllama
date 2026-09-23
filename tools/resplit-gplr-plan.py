@@ -4,13 +4,25 @@ The 2026-09-20 splitter (tools/split-gplr-plan.py) is one-shot: its --verify
 hashes the original pre-split file, so it necessarily fails once the live
 file grows with new closures. This tool performs the NEXT and future splits.
 
-    python tools/resplit-gplr-plan.py            (dry-run: classify blocks)
-    python tools/resplit-gplr-plan.py --apply    (move closed blocks to the archive)
-    python tools/resplit-gplr-plan.py --verify   (re-prove the current state)
+    python tools/resplit-gplr-plan.py                  (dry-run: classify blocks)
+    python tools/resplit-gplr-plan.py --apply          (move closed blocks to the archive)
+    python tools/resplit-gplr-plan.py --refresh-header (rebuild ONLY the live header)
+    python tools/resplit-gplr-plan.py --verify         (re-prove the current state)
+
+Header rule (2026-09-21 repair): the live index is DERIVED from the archive's
+block order, never carried forward, and the rules paragraph is a constant.
+The first version split the header at the first "### " occurrence - which sits
+inside the first index line ("- ### T-GPLR-25: ...") - so --apply silently
+dropped the whole index and the rules paragraph and glued the preamble's tail
+onto index line 1 (measured 2026-09-21: mangled live header, and --verify then
+died with StopIteration). --verify now fails loudly on index drift or a
+missing rules paragraph instead of trusting the header.
 
 Verify invariant (final form; corrected twice by measurement):
 - The ARCHIVE body is the frozen record: byte-exact vs archive_body_sha256_lf
-  (recorded at apply time, LF form).
+  (recorded at apply time, LF form). A deliberate in-place correction re-records
+  that hash in the SAME change and adds a manifest `corrections` entry, which
+  --verify prints (2026-09-21: the T-GPLR-37 status-label fix).
 - LIVE blocks legitimately grow as work continues, so they get presence and
   no-shrink checks only; their apply-time spans are historical records.
 - The apply-time EOF terminator strip (git diff --check convention) removes
@@ -34,6 +46,23 @@ LIVE = "docs/plans/generic-prefill-layer-residency-plan.md"
 ARCHIVE = "docs/plans/generic-prefill-layer-residency-archive.md"
 MANIFEST = "docs/plans/resplit-manifest-2026-09-21.json"
 ARCHIVE_HEADER_LINES = 6
+
+INDEX_MARKER = "blocks (original order preserved in the archive):"
+
+# The rules paragraph is a constant: it is rewritten, never carried forward, so
+# a damaged header cannot propagate (2026-09-21 repair).
+RULES_TEXT = """\
+Rules (same convention as the currentstate split, AGENT_ENVIRONMENT.md):
+- Closed tasks are archived, never edited in place; a new closure appends its RESULT
+  in the live file first, and the block moves to the archive on the NEXT split
+  (python tools/resplit-gplr-plan.py --apply, which also refreshes the index).
+- The archive's 6-line header is not original bytes; strip it when reconstructing."""
+
+# Only used when a header that predates the first resplit is rebuilt.
+RESPLIT_NOTE = """\
+RESPLIT 2026-09-21: blocks closed since the first split moved to the archive via
+tools/resplit-gplr-plan.py (manifest: docs/plans/resplit-manifest-2026-09-21.json;
+--verify re-proves the CURRENT state; the 2026-09-20 tool's --verify is historical)."""
 
 
 def load(p):
@@ -88,6 +117,52 @@ def chunk_bounds(live, rec):
     return a, b
 
 
+def archive_index_lines(arch):
+    """The header index, DERIVED from the archive body: one "- ### <title>"
+    line per archived block, in archive order (which preserves original order)."""
+    body = "\n".join(arch.split("\n")[ARCHIVE_HEADER_LINES:])
+    return ["- " + body[s:body.find("\n", s)].rstrip("\r")
+            for s in [m.start() for m in re.finditer(r"(?m)^### ", body)]]
+
+
+def build_header(header, arch):
+    """Rebuild the live header: preamble through the index marker, then the
+    index derived from `arch`, then the rules constant. Everything else in the
+    old header (index run, stray remnants) is discarded."""
+    lines = header.split("\n")
+    marker = next((i for i, ln in enumerate(lines) if INDEX_MARKER in ln), None)
+    if marker is None:
+        print("ABORT: live header has no index marker (%r)." % INDEX_MARKER)
+        print("       Restore the header (git) or add the marker before applying.")
+        sys.exit(1)
+    head = "\n".join(lines[:marker + 1])
+    if "RESPLIT 2026-09-21" not in head:
+        head = head.replace("This file holds ONLY live work",
+                            RESPLIT_NOTE + "\nThis file holds ONLY live work")
+    return head + "\n" + "\n".join(archive_index_lines(arch)) + "\n\n" + RULES_TEXT + "\n"
+
+
+def main_refresh_header():
+    """Rewrite ONLY the live header from the archive (index + rules).
+    Block bodies are untouched; --verify re-proves that independently (the
+    archive body hash and the block spans do not depend on the header)."""
+    live = load(LIVE).replace("\r\n", "\n")
+    m = re.search(r"(?m)^### ", live)
+    if not m:
+        print("ABORT: live file has no '### ' block heading at column 0.")
+        print("       A damaged (e.g. indented) heading is not a block; fix it first.")
+        sys.exit(1)
+    arch = load(ARCHIVE).replace("\r\n", "\n")
+    new_live = build_header(live[:m.start()], arch) + live[m.start():]
+    if new_live == live:
+        print("header already current; nothing written")
+        sys.exit(0)
+    save(LIVE, new_live.replace("\n", "\r\n"))
+    print("refreshed live header: %d archived block(s) indexed from the archive"
+          % len(archive_index_lines(arch)))
+    print("block bodies untouched; run --verify to re-prove")
+
+
 def main_apply():
     live_crlf = load(LIVE)
     if not live_crlf.lstrip().startswith("# "):
@@ -111,27 +186,20 @@ def main_apply():
     new_arch_body = arch_body_old + "".join(moving_chunks)
     hdr = "\n".join(arch.split("\n")[:ARCHIVE_HEADER_LINES])
     new_arch = hdr + "\n" + new_arch_body
+    # git diff --check convention: the block tiling gives every chunk a trailing
+    # blank separator, so the archive would end on a blank line. Strip it; verify
+    # restores it before the span checks (archive_terminator_stripped).
+    arch_terminator_stripped = False
+    if new_arch.endswith("\n\n"):
+        new_arch = new_arch[:-1]
+        arch_terminator_stripped = True
 
-    # live header: keep preamble, refresh index with moved titles (prefixed)
-    header = live[:live.find("### ")]
-    rules_start = header.find("Rules (same convention")
-    preamble, rules = header[:rules_start], header[rules_start:]
-    if "RESPLIT 2026-09-21" not in preamble:
-        preamble = preamble.replace(
-            "This file holds ONLY live work",
-            "RESPLIT 2026-09-21: blocks closed since the first split (T-GPLR-39,\n"
-            "T-GPLR-50, T-GPLR-51) moved to the archive via tools/resplit-gplr-plan.py\n"
-            "(manifest: docs/plans/resplit-manifest-2026-09-21.json; --verify re-proves\n"
-            "the CURRENT state; the 2026-09-20 tool's --verify is historical).\n"
-            "This file holds ONLY live work")
-    new_header = preamble
-    seen = set()
-    for ln in [x for x in header.split("\n") if x.startswith("- ### ")] + \
-              ["- " + r["title"] for r in moving]:
-        if ln not in seen:
-            seen.add(ln)
-            new_header += ln + "\n"
-    new_header += "\n" + rules
+    # live header: preamble + index derived from the NEW archive + rules
+    m = re.search(r"(?m)^### ", live)
+    if not m:
+        print("ABORT: live file has no '### ' block heading at column 0")
+        sys.exit(1)
+    new_header = build_header(live[:m.start()], new_arch)
 
     live_parts = [live[slice(*chunk_bounds(live, r))] for r in recs if r["live"]]
     new_live = new_header + "".join(live_parts)
@@ -146,6 +214,8 @@ def main_apply():
         "pre_resplit_live_sha256_lf": pre_sha,
         "archive_body_sha256_lf": sha256(new_arch_body),
         "archive_header_lines": ARCHIVE_HEADER_LINES,
+        "archive_terminator_stripped": arch_terminator_stripped,
+        "live_terminator_stripped": terminator_stripped,
         "blocks": [
             {"title": r["title"], "orig_line_start": r["orig_line_start"],
              "orig_line_end": r["orig_line_end"],
@@ -170,8 +240,14 @@ def main_verify():
     arch = load(ARCHIVE).replace("\r\n", "\n")
 
     arch_body = "\n".join(arch.split("\n")[man["archive_header_lines"]:])
-    first_head = next(i for i, ln in enumerate(live.split("\n")) if ln.startswith("### "))
+    first_head = next((i for i, ln in enumerate(live.split("\n"))
+                       if ln.startswith("### ")), None)
+    if first_head is None:
+        print("cannot evaluate: the live file has no '### ' block heading at column 0")
+        print("RESULT: CANNOT-EVALUATE (repair the heading/header, then re-run)")
+        sys.exit(2)
     live_body = "\n".join(live.split("\n")[first_head:])
+    header_txt = "\n".join(live.split("\n")[:first_head])
 
     def chunks_by_title(body, titles):
         out = {}
@@ -199,12 +275,39 @@ def main_verify():
             print("RESULT: FAIL")
             sys.exit(1)
         print("archive body: byte-exact vs apply-time record (%d B)" % len(arch_body.encode("utf-8")))
+        for c in man.get("corrections", []):
+            print("recorded correction %s (%s): %s"
+                  % (c.get("date", "?"), c.get("block", "?"), c.get("note", "")[:120]))
     else:
         print("(manifest predates the archive-body invariant; span checks only)")
 
+    # Header integrity: the index is derived from the archive, so it must list
+    # every archived block in archive order, and the rules must be present.
+    idx_arch = archive_index_lines(arch)
+    idx_live = [ln for ln in header_txt.split("\n") if ln.startswith("- ### ")]
+    if idx_live != idx_arch:
+        print("header index drift: %d live vs %d archive entries"
+              % (len(idx_live), len(idx_arch)))
+        for a, b in zip(idx_live, idx_arch):
+            if a != b:
+                print("  first divergence:\n    live:    %r\n    archive: %r"
+                      % (a[:90], b[:90]))
+                break
+        print("RESULT: FAIL (run: python tools/resplit-gplr-plan.py --refresh-header)")
+        sys.exit(1)
+    if "Rules (same convention" not in header_txt:
+        print("header is missing the rules paragraph")
+        print("RESULT: FAIL (run: python tools/resplit-gplr-plan.py --refresh-header)")
+        sys.exit(1)
+    print("header: index lists all %d archived block(s) in archive order; rules present"
+          % len(idx_arch))
+
     # apply-time EOF strip removes one newline from the ARCHIVE-FINAL chunk
-    # (measured: not from the orig-order-last chunk); restore before spans
-    if man.get("archive_terminator_stripped") or not arch.endswith("\n\n"):
+    # (measured: not from the orig-order-last chunk); restore before spans.
+    # FLAG-ONLY (2026-09-22): the earlier "or not endswith(\"\\n\\\n\")" fallback
+    # fired even when apply stripped nothing, over-restoring the last archived
+    # chunk and tripping its own frozen-span assert.
+    if man.get("archive_terminator_stripped"):
         arch_titles = []
         for m in re.finditer(r"(?m)^### ", arch_body):
             s = m.start()
@@ -213,6 +316,16 @@ def main_verify():
                 arch_titles.append(t)
         if arch_titles and got[arch_titles[-1]].endswith("\n"):
             got[arch_titles[-1]] += "\n"
+
+    # apply-time EOF strip removes one newline from the LIVE-FINAL chunk too
+    # (the trailing blank separator before EOF; measured 2026-09-22 when the
+    # first single-live-block apply tripped "live block SHRANK"). Symmetric to
+    # the archive restore above and FLAG-ONLY for the same reason.
+    live_blocks = [b for b in wanted.values() if b["dest"] == "live"]
+    if live_blocks and man.get("live_terminator_stripped"):
+        last_live_title = max(live_blocks, key=lambda b: b["orig_line_start"])["title"]
+        if got[last_live_title].endswith("\n"):
+            got[last_live_title] += "\n"
 
     ordered = sorted(wanted.values(), key=lambda b: b["orig_line_start"])
     for b in ordered:
@@ -234,6 +347,8 @@ def main_verify():
 if __name__ == "__main__":
     if "--verify" in sys.argv:
         main_verify()
+    elif "--refresh-header" in sys.argv:
+        main_refresh_header()
     elif "--apply" in sys.argv:
         main_apply()
     else:
