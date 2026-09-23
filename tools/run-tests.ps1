@@ -311,7 +311,7 @@ $suites = @{
         # (P2 readiness, P3 demand barrier, P4 cancellation) and the mode-0
         # differential against the pre-A0 retention algorithm must run
         # host-only, with no GPU and no model.
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec)'
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -559,6 +559,31 @@ if (-not $spec.Gpu) {
         }
     } else {
         Write-Host "[tg-predict] FAILED: $predictTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-58 A1: predictor policy + port equivalence (host-only, no GPU, no model) ---
+# tools/check-tg-predict-port.py compares the engine-side POLICY (the A1 nested test's
+# `--dump` mode) against the OFFLINE SCREEN's own candidate classes, row by row, on the
+# eight recorded retention legs, and re-derives the findings doc's recorded rows from
+# that same reference. It IMPORTS tools/predictor-screen-gplr.py instead of restating
+# it, so the reference cannot drift away from the tool the A1 result pins by hash; its
+# fixtures include a NEGATIVE control (one flipped id must be CAUGHT, not tolerated)
+# and the refusals (a trace with no rowset_init, an out-of-order leg, a missing dump
+# binary). A guard whose subject was never built has not passed, so a missing tool or a
+# missing binary fails HERE rather than silently skipping the comparison.
+if (-not $spec.Gpu) {
+    $portTool = Join-Path $PSScriptRoot 'check-tg-predict-port.py'
+    if (Test-Path -LiteralPath $portTool) {
+        Write-Host "[tg-predict-port] predictor port-equivalence selftest (host-only fixtures)..."
+        & python $portTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-tg-predict-port.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg-predict-port] FAILED: $portTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
         exit 1
     }
 }
