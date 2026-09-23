@@ -1672,6 +1672,153 @@ LLAMA_API int llama_ls_spec_lead(int32_t consume_ord, int32_t issue_ord);
 // keeps exactly 8 counters, so the emitted distribution always has this shape.
 LLAMA_API int llama_ls_spec_lead_bucket(int lead);
 
+// ---------------------------------------------------------------------------
+// T-GPLR-58 A1 - the PROPOSER and its PLANNER: POLICY, not mechanism.
+//
+// A0 owns the staging mechanism (whether a fill is admitted, what a completion
+// means, what a cancellation does). A1 owns WHICH rows are guessed, IN WHAT
+// ORDER, and WHEN a cancel is needed ahead of a demand stage, and this section
+// is that policy as pure functions over caller-owned state: no globals, no
+// clock, no I/O, no engine members. The engine and
+// tests/test-layer-streaming-tg-predict.cpp call exactly these functions.
+//
+// Why the learning state is a PARAMETER and not a member: the policy has to be
+// provable host-side, and the offline screen it is ported from
+// (tools/predictor-screen-gplr.py, pinned by file hash in the A1 result) is a
+// library of stateful candidates driven predict()-then-observe() over one
+// demand row at a time. Making the state explicit is what lets a test hold two
+// copies of the same stream and prove that the families are deterministic and
+// that the null control is demand-blind.
+//
+// Faithfulness rules, inherited from the screen verbatim:
+//   * predict() BEFORE observe() for every (token, layer) row;
+//   * a row may only see rows of tokens < t (all layers) and of token t at
+//     layers < L -- which is what the engine's demand order gives it;
+//   * ranking ties break on the SMALLER expert id (the screen's (-score, id));
+//   * integer family counts are compared as DOUBLE, so their sums are exact,
+//     and the two float-scored families add one term per source expert in the
+//     observed order -- the port therefore reproduces the screen's ids exactly,
+//     not approximately (the comparator proves it per row).
+//
+// The count-matched structure-free NULL is here too, and it is deliberately
+// NOT a family: it reads only the ARM's published COUNT for the row (a scalar)
+// and publishes that many ids from a fixed-seed xorshift over [0, n_expert),
+// duplicates rejected. It consults no ids, no demand and no router output,
+// which is why its sequence is invariant under a reordered demand stream - and
+// why it cannot be confused with a predictor that merely proposes fewer rows.
+// ---------------------------------------------------------------------------
+
+enum llama_ls_pred_family : uint8_t {
+    LLAMA_LS_PRED_HISTORY  = 0, // the K=1 retention baseline: previous token's set, same layer
+    LLAMA_LS_PRED_MARKOV1  = 1, // per-layer id-bigram transitions
+    LLAMA_LS_PRED_COACT    = 2, // normalized per-layer co-activation
+    LLAMA_LS_PRED_COUPLING = 3, // cross-layer, lift-weighted (same token, previous layer)
+};
+
+#define LLAMA_LS_PRED_BIT_HISTORY  (1u << LLAMA_LS_PRED_HISTORY)
+#define LLAMA_LS_PRED_BIT_MARKOV1  (1u << LLAMA_LS_PRED_MARKOV1)
+#define LLAMA_LS_PRED_BIT_COACT    (1u << LLAMA_LS_PRED_COACT)
+#define LLAMA_LS_PRED_BIT_COUPLING (1u << LLAMA_LS_PRED_COUPLING)
+#define LLAMA_LS_PRED_BIT_ALL      (LLAMA_LS_PRED_BIT_HISTORY | LLAMA_LS_PRED_BIT_MARKOV1 | \
+                                    LLAMA_LS_PRED_BIT_COACT   | LLAMA_LS_PRED_BIT_COUPLING)
+
+// The three arms T-GPLR-58 pre-registered, as the port expresses them. `bar09`
+// wraps MARKOV-1, not coact: the block quotes the markov-1@bar0.9 row
+// (25.1/29.0 honest, +0.5 recall and +4.3 ppb over history) as the safety
+// point, while coact@bar0.9 is the stronger but equally barred row
+// (25.8/29.8). Switching the arm to coact is a Planner call, not a port
+// detail, so the port implements the row the contract quotes.
+enum llama_ls_pred_arm : uint8_t {
+    LLAMA_LS_ARM_COACT  = 0, // unbarred co-activation, top-B
+    LLAMA_LS_ARM_BAR09  = 1, // markov-1 ranked, published while 0.9^rank >= 0.5
+    LLAMA_LS_ARM_FUSION = 2, // vote fusion over {history, markov-1, coact, coupling-copula}
+};
+
+#define LLAMA_LS_PRED_MAX_OUT 64   // arms are never allowed to publish more than this
+
+// The proposer's learning state. Every table is allocated only for the families
+// the caller asks for, so an arm pays for what it uses (markov-1, coact and
+// coupling are each n_layer * n_expert^2 ints at the real 40 x 256 shape).
+struct llama_ls_pred_state {
+    int      n_layer  = 0;
+    int      n_expert = 0;
+    uint32_t families = 0;                    // bitmask of LLAMA_LS_PRED_BIT_*
+    std::vector<std::vector<int32_t>> prev;   // per layer: last observed ids, in demand order
+    std::vector<int32_t> trans;               // markov-1: [layer][e][nxt]
+    std::vector<int32_t> pair;                // coact:    [layer][e][nxt]
+    std::vector<int32_t> unit;                // coact:    [layer][e]
+    std::vector<int32_t> joint;               // coupling: [layer-1][e][nxt]
+    std::vector<int32_t> marg;                // coupling: [layer][nxt]
+};
+
+// Allocate and zero the state for the requested families. Call once per stream.
+LLAMA_API void llama_ls_pred_init(llama_ls_pred_state * st, int n_layer, int n_expert, uint32_t families);
+
+// One family's proposal for one demand row, BEFORE that row is observed: at most
+// `b` ids in rank order, written to `out`, returning how many. Pure over (st,
+// family, layer, b) -- calling it twice on the same state returns the same ids.
+LLAMA_API int llama_ls_pred_predict(const llama_ls_pred_state * st, int family, int layer, int b,
+                                    int32_t * out, int max_out);
+
+// The ARM-level proposal: the bar and the merge operator that the pre-registered
+// arms declare, over the same pure state. VOTE fusion (param-free, equal weights,
+// in-source dedup, rank-decay tiebreak) is what `arm-fusion` means here.
+LLAMA_API int llama_ls_pred_arm_predict(const llama_ls_pred_state * st, int arm, int layer, int b,
+                                        int32_t * out, int max_out);
+
+// Fold one observed demand row into the state. Call AFTER predict() for it.
+LLAMA_API void llama_ls_pred_observe(llama_ls_pred_state * st, int layer, const int32_t * ids, int n_ids);
+
+// The structure-free null's fixed seed and its fill primitive: publish `count`
+// distinct ids from a xorshift32 over [0, n_expert). Returns how many were
+// written (fewer only when max_out or n_expert cannot supply `count`). It takes
+// no ids and no demand, so its output depends on the RNG and `count` alone.
+LLAMA_API uint32_t llama_ls_pred_null_seed(void);
+LLAMA_API int llama_ls_pred_null_fill(uint32_t * rng, int n_expert, int count,
+                                      int32_t * out, int max_out);
+
+// Why the planner stopped issuing fills for one demand stage.
+enum llama_ls_plan_stop : uint8_t {
+    LLAMA_LS_STOP_PROPOSALS = 0, // the proposal list was exhausted
+    LLAMA_LS_STOP_BUDGET    = 1, // the per-row budget is spent
+    LLAMA_LS_STOP_PENDING   = 2, // max_pending fills already outstanding for this layer
+    LLAMA_LS_STOP_RESERVE   = 3, // admitting would leave fewer than `reserve` positions FREE
+    LLAMA_LS_STOP_NO_FREE   = 4, // no FREE position at all
+};
+
+// The planner's plan for ONE demand stage: the fills to issue, in issue order,
+// plus what it declined and why. It is a pure counting plan equivalent to asking
+// llama_ls_spec_admit for each proposal in rank order (each admission consumes
+// exactly one FREE position and one pending slot), which is what makes the
+// engine's use of it and the host test's assertion of it the same thing.
+struct llama_ls_plan {
+    int32_t issue[LLAMA_LS_PRED_MAX_OUT];  // experts to stage, issue order
+    int     n_issue          = 0;
+    int     stop             = LLAMA_LS_STOP_PROPOSALS;
+    int     skipped_present  = 0;  // already READY or PENDING: no duplicate fill
+    int     skipped_dup      = 0;  // repeated inside the proposal list
+    int     refused_capacity = 0;  // admissible in principle, refused by the barrier
+};
+
+LLAMA_API llama_ls_plan llama_ls_spec_plan(const int32_t * experts, const uint8_t * states, int cap,
+                                           int reserve, int max_pending, int n_pending, int budget,
+                                           const int32_t * proposals, int n_proposals);
+
+// The cancellation POINT, as policy: a demand that wants `n_want` rows must be
+// able to place them without waiting. The reserve is what normally makes that
+// true, so a cancel is planned only when the demand cannot be placed from the
+// FREE positions at all; `used_reserve` reports the legal-but-notable case where
+// the demand is spending the positions the barrier had held for it.
+struct llama_ls_cancel_policy {
+    bool         cancel       = false;
+    int          need         = 0;      // pending fills to cancel, oldest-first
+    bool         used_reserve = false;
+    const char * reason       = "";
+};
+
+LLAMA_API llama_ls_cancel_policy llama_ls_spec_cancel_policy(int n_free, int reserve, int n_want,
+                                                            int n_pending);
+
 // T-GPLR-36 follow-up (2026-09-18): HOST-memory instrument. The 200k ledger run
 // attributed the time residual but left one measured quantity unattributed: the
 // process's host resident set, observed climbing ~19 GB -> ~30 GB across a run,

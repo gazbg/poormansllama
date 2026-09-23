@@ -398,6 +398,12 @@ if (LLAMA_LAYER_STREAMING)
     llama_build_and_test(test-layer-streaming-tg-spec.cpp)
     target_compile_definitions(test-layer-streaming-tg-spec PRIVATE LLAMA_LAYER_STREAMING)
 
+    # T-GPLR-58 A1: host-only proof of the predictor POLICY (the proposer
+    # families, the bar and vote-fusion operators, the count-matched
+    # structure-free null and the speculative-fill planner) plus the `--dump`
+    # mode the outer port comparator reads. No CUDA, no model load.
+    llama_build_and_test(test-layer-streaming-tg-predict.cpp)
+    target_compile_definitions(test-layer-streaming-tg-predict PRIVATE LLAMA_LAYER_STREAMING)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

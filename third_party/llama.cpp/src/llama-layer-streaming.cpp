@@ -443,6 +443,471 @@ int llama_ls_spec_lead_bucket(int lead) {
     return lead >= 8 ? 7 : lead - 1;
 }
 
+// ---------------------------------------------------------------------------
+// T-GPLR-58 A1: the proposer families, the two merge operators, the
+// structure-free null and the planner. Pure policy -- the learning tables are
+// the caller's state, and nothing here touches the engine, a clock or a file.
+// Every matching rule is ported verbatim from tools/predictor-screen-gplr.py
+// (the reference is pinned by file hash in the A1 result); the comment on each
+// step names the screen's line it reproduces, because "looks equivalent" is
+// exactly the claim this port must not make.
+// ---------------------------------------------------------------------------
+
+void llama_ls_pred_init(llama_ls_pred_state * st, int n_layer, int n_expert, uint32_t families) {
+    if (st == nullptr) {
+        return;
+    }
+    st->n_layer  = n_layer > 0 ? n_layer : 0;
+    st->n_expert = n_expert > 0 ? n_expert : 0;
+    st->families = families;
+    const size_t n_l = (size_t) st->n_layer;
+    const size_t n_e = (size_t) st->n_expert;
+    st->prev.assign(n_l, std::vector<int32_t>());
+    st->trans.assign((families & LLAMA_LS_PRED_BIT_MARKOV1)  ? n_l * n_e * n_e : 0, 0);
+    st->pair.assign( (families & LLAMA_LS_PRED_BIT_COACT)    ? n_l * n_e * n_e : 0, 0);
+    st->unit.assign( (families & LLAMA_LS_PRED_BIT_COACT)    ? n_l * n_e       : 0, 0);
+    st->joint.assign((families & LLAMA_LS_PRED_BIT_COUPLING) ? n_l * n_e * n_e : 0, 0);
+    st->marg.assign( (families & LLAMA_LS_PRED_BIT_COUPLING) ? n_l * n_e       : 0, 0);
+}
+
+int llama_ls_pred_predict(const llama_ls_pred_state * st, int family, int layer, int b,
+                          int32_t * out, int max_out) {
+    if (st == nullptr || out == nullptr || b <= 0 || max_out <= 0) {
+        return 0;
+    }
+    if (layer < 0 || layer >= st->n_layer || st->n_expert <= 0) {
+        return 0;
+    }
+    if (family < 0 || family > (int) LLAMA_LS_PRED_COUPLING) {
+        return 0;
+    }
+    if ((st->families & (1u << family)) == 0) {
+        return 0; // that family's table was never allocated: refuse, never guess
+    }
+    const int n_e  = st->n_expert;
+    const int want = b < max_out ? b : max_out;
+
+    if (family == LLAMA_LS_PRED_HISTORY) {
+        // screen: History.predict -> list(self.prev.get(layer, ()))[:b]
+        const std::vector<int32_t> & pv = st->prev[(size_t) layer];
+        const int n = (int) pv.size() < want ? (int) pv.size() : want;
+        for (int i = 0; i < n; ++i) {
+            out[i] = pv[(size_t) i];
+        }
+        return n;
+    }
+
+    // The two scored families share one accumulation shape: one term per source
+    // expert, added in the OBSERVED order of that row's ids. Per candidate id
+    // that is one term per source, so the accumulation order -- and therefore
+    // every last bit of the score -- is identical to the screen's.
+    std::vector<double> score((size_t) n_e, 0.0);
+    std::vector<char>   has((size_t) n_e, 0);
+
+    if (family == LLAMA_LS_PRED_COUPLING) {
+        // screen: CouplingCopula.predict -> prev = prev.get(layer - 1); if not prev: []
+        if (layer < 1) {
+            return 0;
+        }
+        const std::vector<int32_t> & pv = st->prev[(size_t) (layer - 1)];
+        if (pv.empty()) {
+            return 0;
+        }
+        for (size_t i = 0; i < pv.size(); ++i) {
+            const int32_t e = pv[i];
+            if (e < 0 || e >= n_e) {
+                continue;
+            }
+            const int32_t * row = st->joint.data() +
+                                  (((size_t) (layer - 1) * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+            for (int nxt = 0; nxt < n_e; ++nxt) {
+                if (row[nxt] == 0) {
+                    continue; // screen skips absent dict entries
+                }
+                const int32_t mg = st->marg[(size_t) layer * (size_t) n_e + (size_t) nxt];
+                if (mg == 0) {
+                    continue; // screen: if marg_e:
+                }
+                score[(size_t) nxt] += (double) row[nxt] / (double) mg;
+                has[(size_t) nxt] = 1;
+            }
+        }
+    } else {
+        const std::vector<int32_t> & pv = st->prev[(size_t) layer];
+        if (pv.empty()) {
+            return 0; // screen: if not prev: return []
+        }
+        for (size_t i = 0; i < pv.size(); ++i) {
+            const int32_t e = pv[i];
+            if (e < 0 || e >= n_e) {
+                continue;
+            }
+            if (family == LLAMA_LS_PRED_MARKOV1) {
+                // screen: Markov1.predict -> scores[nxt] += c over trans[(layer, e)]
+                const int32_t * row = st->trans.data() +
+                                      (((size_t) layer * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+                for (int nxt = 0; nxt < n_e; ++nxt) {
+                    if (row[nxt] == 0) {
+                        continue;
+                    }
+                    score[(size_t) nxt] += (double) row[nxt]; // integer counts: exact
+                    has[(size_t) nxt] = 1;
+                }
+            } else {
+                // screen: Coact.predict -> scores[nxt] += c / (unit[(layer, e)] or 1)
+                const int32_t * row = st->pair.data() +
+                                      (((size_t) layer * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+                const double unit = (double) st->unit[(size_t) layer * (size_t) n_e + (size_t) e];
+                const double den  = unit > 0.0 ? unit : 1.0;
+                for (int nxt = 0; nxt < n_e; ++nxt) {
+                    if (row[nxt] == 0) {
+                        continue;
+                    }
+                    score[(size_t) nxt] += (double) row[nxt] / den;
+                    has[(size_t) nxt] = 1;
+                }
+            }
+        }
+    }
+
+    // screen: sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])) -- ties go
+    // to the SMALLER expert id, which is why the id is the second key here.
+    std::vector<int32_t> idx;
+    idx.reserve((size_t) n_e);
+    for (int e = 0; e < n_e; ++e) {
+        if (has[(size_t) e]) {
+            idx.push_back((int32_t) e);
+        }
+    }
+    std::sort(idx.begin(), idx.end(), [&score](int32_t a, int32_t c) {
+        const double sa = score[(size_t) a];
+        const double sc = score[(size_t) c];
+        if (sa != sc) {
+            return sa > sc;
+        }
+        return a < c;
+    });
+    const int n = (int) idx.size() < want ? (int) idx.size() : want;
+    for (int i = 0; i < n; ++i) {
+        out[i] = idx[(size_t) i];
+    }
+    return n;
+}
+
+// The bar-0.9 operator over markov-1: publish rank r while 0.9^r >= 0.5.
+// screen: Barred.predict -> out = [raw[0]]; while r < len(raw) and bar**r >= 0.5: ...
+static int ls_pred_bar09(const llama_ls_pred_state * st, int layer, int b, int32_t * out, int max_out) {
+    int32_t raw[LLAMA_LS_PRED_MAX_OUT];
+    const int n_raw = llama_ls_pred_predict(st, LLAMA_LS_PRED_MARKOV1, layer, b,
+                                            raw, LLAMA_LS_PRED_MAX_OUT);
+    if (n_raw <= 0) {
+        return 0;
+    }
+    int n = 0;
+    out[n++] = raw[0]; // the top candidate is always published
+    for (int r = 1; r < n_raw && n < max_out; ++r) {
+        if (std::pow(0.9, (double) r) < 0.5) {
+            break;
+        }
+        out[n++] = raw[r];
+    }
+    return n;
+}
+
+// screen: VoteFusion.predict -- agreement count first (deduped per source), then
+// the summed w*decay^r, then the smaller id. Param-free: every weight is 1.0 and
+// decay is 0.9, which is the operator arm-fusion declares.
+static int ls_pred_vote_fusion(const llama_ls_pred_state * st, int layer, int b, int32_t * out, int max_out) {
+    static const int kFams[4] = { LLAMA_LS_PRED_HISTORY, LLAMA_LS_PRED_MARKOV1,
+                                  LLAMA_LS_PRED_COACT,   LLAMA_LS_PRED_COUPLING };
+    const int n_e  = st->n_expert;
+    const int want = b < max_out ? b : max_out;
+    std::vector<double>  score((size_t) n_e, 0.0);
+    std::vector<int32_t> votes((size_t) n_e, 0);
+    std::vector<char>    has((size_t) n_e, 0);
+    int32_t ranked[LLAMA_LS_PRED_MAX_OUT];
+    for (int f = 0; f < 4; ++f) {
+        const int n = llama_ls_pred_predict(st, kFams[f], layer, b, ranked, LLAMA_LS_PRED_MAX_OUT);
+        std::vector<char> seen((size_t) n_e, 0); // in-source dedup (dict.fromkeys)
+        for (int i = 0; i < n; ++i) {
+            const int32_t e = ranked[i];
+            if (!seen[(size_t) e]) {
+                seen[(size_t) e] = 1;
+                votes[(size_t) e] += 1;
+            }
+        }
+        for (int r = 0; r < n; ++r) {
+            const int32_t e = ranked[r];
+            score[(size_t) e] += 1.0 * std::pow(0.9, (double) r);
+            has[(size_t) e] = 1;
+        }
+    }
+    std::vector<int32_t> idx;
+    idx.reserve((size_t) n_e);
+    for (int e = 0; e < n_e; ++e) {
+        if (has[(size_t) e]) {
+            idx.push_back((int32_t) e);
+        }
+    }
+    std::sort(idx.begin(), idx.end(), [&votes, &score](int32_t a, int32_t c) {
+        if (votes[(size_t) a] != votes[(size_t) c]) {
+            return votes[(size_t) a] > votes[(size_t) c];
+        }
+        const double sa = score[(size_t) a];
+        const double sc = score[(size_t) c];
+        if (sa != sc) {
+            return sa > sc;
+        }
+        return a < c;
+    });
+    const int n = (int) idx.size() < want ? (int) idx.size() : want;
+    for (int i = 0; i < n; ++i) {
+        out[i] = idx[(size_t) i];
+    }
+    return n;
+}
+
+int llama_ls_pred_arm_predict(const llama_ls_pred_state * st, int arm, int layer, int b,
+                              int32_t * out, int max_out) {
+    if (st == nullptr || out == nullptr) {
+        return 0;
+    }
+    switch (arm) {
+        case LLAMA_LS_ARM_COACT:
+            return llama_ls_pred_predict(st, LLAMA_LS_PRED_COACT, layer, b, out, max_out);
+        case LLAMA_LS_ARM_BAR09:
+            return ls_pred_bar09(st, layer, b, out, max_out);
+        case LLAMA_LS_ARM_FUSION:
+            return ls_pred_vote_fusion(st, layer, b, out, max_out);
+        default:
+            return 0;
+    }
+}
+
+void llama_ls_pred_observe(llama_ls_pred_state * st, int layer, const int32_t * ids, int n_ids) {
+    if (st == nullptr || layer < 0 || layer >= st->n_layer) {
+        return;
+    }
+    const int n_e = st->n_expert;
+
+    if (!st->trans.empty()) {
+        // screen: Markov1.observe -> trans[(layer, e)][nxt] += 1 for e in prev, nxt in ids
+        const std::vector<int32_t> & pv = st->prev[(size_t) layer];
+        for (size_t i = 0; i < pv.size(); ++i) {
+            const int32_t e = pv[i];
+            if (e < 0 || e >= n_e) {
+                continue;
+            }
+            int32_t * row = st->trans.data() +
+                            (((size_t) layer * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+            for (int j = 0; j < n_ids; ++j) {
+                if (ids[j] >= 0 && ids[j] < n_e) {
+                    row[ids[j]] += 1;
+                }
+            }
+        }
+    }
+
+    if (!st->pair.empty()) {
+        // screen: Coact.observe -> pair[(layer, e)][nxt] += 1 and unit[(layer, e)] += 1
+        const std::vector<int32_t> & pv = st->prev[(size_t) layer];
+        for (size_t i = 0; i < pv.size(); ++i) {
+            const int32_t e = pv[i];
+            if (e < 0 || e >= n_e) {
+                continue;
+            }
+            int32_t * row = st->pair.data() +
+                            (((size_t) layer * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+            for (int j = 0; j < n_ids; ++j) {
+                if (ids[j] >= 0 && ids[j] < n_e) {
+                    row[ids[j]] += 1;
+                }
+            }
+            st->unit[(size_t) layer * (size_t) n_e + (size_t) e] += 1;
+        }
+    }
+
+    if (!st->joint.empty()) {
+        // screen: CouplingCopula.observe -> joint[(layer-1, e)][nxt] += 1, marg[(layer, nxt)] += 1
+        if (layer >= 1) {
+            const std::vector<int32_t> & pv = st->prev[(size_t) (layer - 1)];
+            for (size_t i = 0; i < pv.size(); ++i) {
+                const int32_t e = pv[i];
+                if (e < 0 || e >= n_e) {
+                    continue;
+                }
+                int32_t * row = st->joint.data() +
+                                (((size_t) (layer - 1) * (size_t) n_e) + (size_t) e) * (size_t) n_e;
+                for (int j = 0; j < n_ids; ++j) {
+                    if (ids[j] >= 0 && ids[j] < n_e) {
+                        row[ids[j]] += 1;
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < n_ids; ++j) {
+            if (ids[j] >= 0 && ids[j] < n_e) {
+                st->marg[(size_t) layer * (size_t) n_e + (size_t) ids[j]] += 1;
+            }
+        }
+    }
+
+    // The observed row becomes "the previous row" for this layer, in the demand's
+    // own id order (the screen keeps the list verbatim: order matters to the bar
+    // and to the rank-decay merge).
+    std::vector<int32_t> & dst = st->prev[(size_t) layer];
+    dst.assign((size_t) (n_ids > 0 ? n_ids : 0), -1);
+    for (int j = 0; j < n_ids; ++j) {
+        dst[(size_t) j] = ids[j];
+    }
+}
+
+uint32_t llama_ls_pred_null_seed(void) {
+    return 0x9E3779B9u;
+}
+
+int llama_ls_pred_null_fill(uint32_t * rng, int n_expert, int count, int32_t * out, int max_out) {
+    if (rng == nullptr || out == nullptr || n_expert <= 0 || count <= 0 || max_out <= 0) {
+        return 0;
+    }
+    int n     = 0;
+    int guard = count * 64 + 64; // a bounded draw loop: the null must terminate
+    while (n < count && n < max_out && guard-- > 0) {
+        uint32_t x = *rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *rng = x;
+        const int32_t id = (int32_t) (x % (uint32_t) n_expert);
+        bool dup = false;
+        for (int i = 0; i < n; ++i) {
+            if (out[i] == id) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue; // duplicates rejected, as the contract says
+        }
+        out[n++] = id;
+    }
+    return n;
+}
+
+llama_ls_plan llama_ls_spec_plan(const int32_t * experts, const uint8_t * states, int cap,
+                                 int reserve, int max_pending, int n_pending, int budget,
+                                 const int32_t * proposals, int n_proposals) {
+    llama_ls_plan pl;
+    if (experts == nullptr || states == nullptr || proposals == nullptr ||
+        cap <= 0 || n_proposals <= 0) {
+        return pl;
+    }
+    if (reserve < 0) {
+        reserve = 0;
+    }
+    if (budget < 0) {
+        budget = 0;
+    }
+
+    int n_free = 0;
+    for (int p = 0; p < cap; ++p) {
+        const uint8_t st = states[p];
+        if (st == LLAMA_LS_SPEC_PENDING || st == LLAMA_LS_SPEC_CANCELLED ||
+            st == LLAMA_LS_SPEC_READY) {
+            continue; // occupied, in flight, or awaiting a reap
+        }
+        if (experts[p] >= 0) {
+            continue; // physically occupied
+        }
+        ++n_free;
+    }
+
+    int stop = LLAMA_LS_STOP_PROPOSALS;
+    for (int i = 0; i < n_proposals; ++i) {
+        const int32_t e = proposals[i];
+        if (e < 0) {
+            continue;
+        }
+        bool dup = false;
+        for (int k = 0; k < pl.n_issue; ++k) {
+            if (pl.issue[k] == e) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            ++pl.skipped_dup;
+            continue;
+        }
+        bool present = false;
+        for (int p = 0; p < cap; ++p) {
+            if (states[p] != LLAMA_LS_SPEC_FREE && experts[p] == e) {
+                present = true; // READY (resident) or PENDING/CANCELLED (a fill is already in flight)
+                break;
+            }
+        }
+        if (present) {
+            ++pl.skipped_present; // llama_ls_spec_admit's already_resident / already_pending
+            continue;
+        }
+        // The three limits llama_ls_spec_admit applies, in its own order: pending
+        // cap, a FREE position, then the demand reserve.
+        const char * why = nullptr;
+        if (n_pending + pl.n_issue >= max_pending) {
+            why  = "pending";
+            stop = LLAMA_LS_STOP_PENDING;
+        } else if (n_free - pl.n_issue <= 0) {
+            why  = "no_free";
+            stop = LLAMA_LS_STOP_NO_FREE;
+        } else if (n_free - pl.n_issue - 1 < reserve) {
+            why  = "reserve";
+            stop = LLAMA_LS_STOP_RESERVE;
+        } else if (pl.n_issue >= budget) {
+            why  = "budget";
+            stop = LLAMA_LS_STOP_BUDGET;
+        }
+        if (why != nullptr) {
+            ++pl.refused_capacity; // admissible in principle; the barrier refused it
+            continue;
+        }
+        pl.issue[pl.n_issue++] = e;
+        if (pl.n_issue >= (int) LLAMA_LS_PRED_MAX_OUT) {
+            stop = LLAMA_LS_STOP_BUDGET;
+            break;
+        }
+    }
+    pl.stop = stop;
+    return pl;
+}
+
+llama_ls_cancel_policy llama_ls_spec_cancel_policy(int n_free, int reserve, int n_want, int n_pending) {
+    llama_ls_cancel_policy c;
+    if (n_want <= 0) {
+        c.reason = "no_demand";
+        return c;
+    }
+    if (reserve < 0) {
+        reserve = 0;
+    }
+    if (n_free >= n_want) {
+        // The barrier did its job: the demand places its rows in FREE positions
+        // and no fill has to be abandoned. `used_reserve` still reports the case
+        // where the demand is spending what the reserve had held for it.
+        c.used_reserve = (n_free - n_want) < reserve;
+        c.reason       = c.used_reserve ? "reserve_spent" : "reserve_holds";
+        return c;
+    }
+    const int need = n_want - n_free;
+    if (n_pending <= 0) {
+        c.reason = "no_pending_to_cancel"; // nothing to reclaim: the caller must evict instead
+        return c;
+    }
+    c.cancel = true;
+    c.need   = need < n_pending ? need : n_pending;
+    c.reason = "demand_over_free";
+    return c;
+}
+
 // create one device tensor object with the same shape/type as the source (in
 static ggml_tensor * make_dev_tensor(ggml_context * ctx, const ggml_tensor * src) {
     return ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
