@@ -3591,30 +3591,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "residency-tg: handoff auto -> off (row-set TG is the requested TG policy)\n");
     }
 
-    // T-GPLR-16: with host-resident expert banks (partial handoff), the TG
-    // ubatch feeds ne[2]=1 token to each MUL_MAT_ID; CUDA's default op-offload
-    // threshold (GGML_OP_OFFLOAD_MIN_BATCH, default 32) then leaves the expert
-    // FFN on the CPU backend. The CPU Q4_K kernel is a different numeric path
-    // than CUDA's MMQ (validated 2026-09-11 with per-node runtime hashing:
-    // routing/expert IDs stay bit-exact, FFN outputs drift ~0.3% per host
-    // layer, and the drift accumulates until sampled text corrupts). Setting
-    // the threshold to 1 routes host-bank MUL_MAT_ID to CUDA, where the
-    // scheduler's expert row-copy stages only the used expert rows: same CUDA
-    // kernel, same quantized bytes -> bit-identical results to full handoff.
-    // Scoped to --handoff-partial (default-off and full handoff are untouched);
-    // an explicit GGML_OP_OFFLOAD_MIN_BATCH in the environment wins.
-    // T-GPLR-16 probe: LLAMA_LS_NO_MINBATCH_PROBE=1 bypasses this override to
-    // reproduce the pre-fix CPU-FFN TG configuration for value-level probes
-    // (reversible; remove after diagnosis).
-    static const bool bypass_minbatch_probe = getenv("LLAMA_LS_NO_MINBATCH_PROBE") != nullptr;
-    if (!forced_off && !bypass_minbatch_probe && handoff_partial_n >= 0 && getenv("GGML_OP_OFFLOAD_MIN_BATCH") == nullptr) {
-#ifdef _WIN32
-        _putenv_s("GGML_OP_OFFLOAD_MIN_BATCH", "1");
-#else
-        setenv("GGML_OP_OFFLOAD_MIN_BATCH", "1", 1);
-#endif
-        fprintf(stderr, "gplr16: GGML_OP_OFFLOAD_MIN_BATCH=1 (partial handoff keeps TG expert FFN on CUDA; scheduler row-copies used experts only)\n");
-    }
+    // T-GPLR-16 option (a), REVERTED 2026-09-22: this runner used to force
+    // GGML_OP_OFFLOAD_MIN_BATCH=1 under --handoff-partial so CUDA took the
+    // host-resident expert banks through the scheduler's expert row-copy. That
+    // route deadlocked the device stream on the third TG token (docs/currentstate,
+    // 2026-09-12), so --handoff-partial now runs the pre-fix configuration: with
+    // host-resident banks the expert FFN falls back to the CPU backend, whose
+    // arithmetic differs from CUDA's MMQ and flips the step-1 gold token. That
+    // mixed-arithmetic PP->TG result is the accepted, documented cost of option
+    // (a). Do not reinstate this override without a new owner call.
 
     llama_backend_init();
 
