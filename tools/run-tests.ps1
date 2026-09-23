@@ -540,6 +540,29 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- T-GPLR-58 A2: TG predictor verdict surface (host-only, no GPU, no model) ----------
+# tools/check-tg-predict.py reads an instrumented run's `spec` telemetry and either
+# scores the pre-registered bands or REFUSES the leg. Its fixtures pin the refusal
+# contract -- a non-instrumented trace, a leg with no retain_k, a `spec` lacking
+# `cancelled`, an arm leg with no `spec` at all, and a leg whose CANCELLATION hook
+# never fired (P4 is UNTESTED there, so the leg is refused rather than scored) -- and
+# the emitter/key cross-check reads the engine's own tel_spec(), so a key the checker
+# requires but the engine does not emit fails HERE, with no GPU.
+if (-not $spec.Gpu) {
+    $predictTool = Join-Path $PSScriptRoot 'check-tg-predict.py'
+    if (Test-Path -LiteralPath $predictTool) {
+        Write-Host "[tg-predict] predictor verdict-surface selftest (host-only fixtures)..."
+        & python $predictTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-tg-predict.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg-predict] FAILED: $predictTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- GPU-lock wrapper verdict contract (host-only, ~8s, no GPU, no CUDA) -----
 # tools/test-arm-verdict.ps1 drives tools/with-gpu-lock.ps1 through STUBBED probes
 # (GPU_BUSY_PROBE_CMD) and private mutex names. What it guards, because every arm
