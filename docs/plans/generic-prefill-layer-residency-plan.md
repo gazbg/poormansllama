@@ -1478,7 +1478,11 @@ and the original FAIL evidence survived only in this record's prose and in
 
 Status: ready (2026-09-22) - owner calls DECIDED below; A1 landed and A2 answered, both
 host-only, 2026-09-22; no GPU spent on this block, no arm run. A3 is ONE 4k mutex hold;
-its conditional 50k/200k follow-ups remain owner-invoked, one length at a time. A1 was first recorded as UNMET - Q could not be derived from any trace
+its conditional 50k/200k follow-ups remain owner-invoked, one length at a time. A3's
+MECHANISM and its reading tools are IMPLEMENTED and host-validated (2026-09-23, see the
+A3 implementation subsection at the end of this block); the hold itself is BLOCKED on a
+foreign process holding the shared card, with the probe evidence recorded there and the
+one command that takes it. A1 was first recorded as UNMET - Q could not be derived from any trace
 the block would produce - and the telemetry it needed is now WRITTEN: a `proc_start` marker at
 main entry plus `load_begin`/`load_end` around the model load, default-on, buffered until the
 telemetry sink opens. Q's read is host-proven (`test-layer-streaming-tel-mark` in CTest, and
@@ -1962,6 +1966,71 @@ deliberately free of it) and whether the SDD's copy-source ownership is worth am
 1 is unchanged and still gates the block's value. No latency or throughput win is claimed
 anywhere in this result: the numbers are mechanism and geometry, and the win is what the arms
 would have to demonstrate.
+
+#### A3 implementation landed (2026-09-23, host-only, no GPU spent): `p1-pace` exists behind three default-off flags, its reading has its own refusing analyzer, and the ONE 4k hold is BLOCKED on the card
+
+**What was asked.** A3: the mechanism that takes the registered-span commit off the first
+prefill's critical path, implemented and validated, then measured in ONE 4k mutex hold with the
+pre-registered Q gates.
+
+**What landed (all of it default-off; nothing on the default path changes).**
+
+| where | what |
+|---|---|
+| `src/llama-layer-streaming.{h,cpp}` | `set_pp_span_pace(mode, ahead)`, `register_paced_begin()`, `register_paced_ahead(il)`, and the read-only accounting `paced_reg_group_count()/bytes_total()/bytes_issued()`. The paced path derives the same page-rounded, address-coalesced spans the one-shot path registers, keeps them in GROUP order, pins the FIRST group before the pass and issues each later group from `stage_members()` when the sweep reaches `ahead` groups before it. Ownership convention is the one-shot path's (the group's first layer owns the registration, the rest are marked covered), so teardown reuses `unregister_all_pkg_sources()` unchanged. `register_all_pkg_sources()` itself is NOT modified: with `pp_span_pace == 0` nothing below the paced block is ever reached. |
+| telemetry | three new event names, so no existing parser sees a new shape: `span_pace_init` (once per paced run: mode, ahead, groups, bytes_total, head-start bytes), `span_pace` (one per group issued), `span_pace_stage` (one per layer at its FIRST staging copy: `covered` plus how many groups were already issued), `span_pace_end` (the commit is complete). |
+| `tools/layer-streaming/main.cpp` | `--pp-span-pace 0|1` (default 0), `--pp-span-pace-ahead 0..64` (default 1) and `--pp-register-site post-prebuild|early` (default post-prebuild = today's site) with help text. The flag-level preconditions are refused BEFORE the model load, so a misconfigured arm fails in seconds with no GPU and no trace: pace without `--copy-source mmap-registered`, pace combined with the early site, and `--pp-span-pace-ahead` without pace. The paced mode prints its own arming line (`PACED registration armed - X of Y B in N groups`), because a paced call returns only the FIRST group's bytes and the one-shot wording would understate the span; the off path's line is byte-identical to before. |
+| `tools/check-gplr56-pace.py` | NEW, host-only, no GPU: the paced reading and its refusals (below). |
+| `tools/layer-streaming/gen-gplr56-fixtures.py` (nested) | NEW: derives a paced trace from a RECORDED one, so the `span_pace_*` shapes are proved against real-shaped data (and a partial commit is derivable for the refusal path) instead of only against hand-made fixtures. |
+| `tools/run-gplr56-a3-arm.ps1` | NEW: the three arms (`off` = control at today's site, `early` = earliest legal site, `pace`) inside ONE mutex hold, each writing `quantity: q_procstart_pass1end` into its own verdict, with the Q rule applied by `check-gplr56-q.py` (its single owner) and the relocation falsifier printed explicitly. |
+| `tools/run-gplr56-session.ps1` | NEW: the one documented entry point (`-Session p1`, `-ValidateOnly`, `-PreflightOnly`, `-ArchiveOnly`), with the read-only busy preflight, evidence archiving and driver-output capture the T-GPLR-53 launcher established. |
+| `tools/run-tests.ps1` | the pace analyzer's selftest is registered as `[t56-a3]`, so a missing or broken reading tool is a FAILED suite, not a skipped check. |
+
+**Measured host evidence (no GPU, no mutex, no model).**
+
+| check | result |
+|---|---|
+| `python tools/check-gplr56-pace.py --selftest` | **13/13 PASS**: a clean paced run evaluated; the same run against a control; a layer staged with `covered = 0` -> INTEGRITY FAIL naming the layer; an unfinished commit -> REFUSED; groups left unissued -> REFUSED; a NON-paced trace -> REFUSED; a group record with no `bytes` -> REFUSED; `groups = 0` -> REFUSED; the refusal prints no reading; the pacing lead reads back exactly as the configured distance for `ahead` 1 and 3, and as 0 for `ahead` 0 |
+| the analyzer against the RECORDED A1 control trace | **exit 2, `p1-off` refused** - a real non-paced trace cannot be scored as paced |
+| a PACED VARIANT of that same real trace, reproducible with `python third_party/llama.cpp/tools/layer-streaming/gen-gplr56-fixtures.py --real build/llama-cuda/gplr56-p1off-4k.jsonl --out build/tmp-pace/synth-real-pace.jsonl --groups 40 --ahead 1` (one-shot event replaced by `span_pace_init`, 40 groups issued across the pass-1 window, one coverage record per layer, `span_pace_end` closing it; every other line of the recorded trace untouched) | runner `--check-telemetry` **exit 0** (the new names are inert to the scheduler-invariant validator), analyzer **EXIT 0 EVALUATED** printing the whole reading: 40/40 groups, lead min 0 / median 1 / max 1 of the configured 1, 40 layers covered at their first copy, 240 `copy_complete` events with per-pass transfer medians, the pass-1 stall proxy, and a control comparison |
+| the same fixture with only 20 of 40 groups issued (`--unfinished 20`, which also omits `span_pace_end`) -> `build/tmp-pace/synth-real-pace-partial.jsonl` | analyzer **exit 2** (`the paced commit is UNFINISHED - 20 of 40 groups`) - the refusal path is exercised on a real-shaped trace, not only on hand-made fixtures |
+| flag refusals, host-only (`--model <nonexistent>` so no load can run) | `--pp-span-pace 2` -> exit 2; pace + `--copy-source pinned` -> exit 2; pace + `--pp-register-site early` -> exit 2; `--pp-span-pace-ahead 3` without pace -> exit 2; `--pp-register-site bogus` -> exit 2. All five refuse before any CUDA work |
+| `tools/run-gplr56-a3-arm.ps1 -ValidateOnly` | exit 0, all three commands printed with the resolved flags (the dry run is the only arm artifact that exists) |
+| `tools/run-gplr56-session.ps1 -Session p1 -ValidateOnly` | exit 0 |
+| `tools/run-tests.ps1 -Suite host` | **SUCCESS 42/42 CTest**, digest `9E94BA192ABBA4C3`, nested head `3de21074f5b8`, `llama.dll A8DFF5ED2A451F83`; `[t56-a3]` green |
+| `python tools/check-doc-sizes.py`, `python tools/resplit-gplr-plan.py --verify` | PASS |
+
+**A MEASURED TRAP, recorded because it costs a suite failure to anyone who edits the engine
+header:** adding members to `llama_layer_streaming` changes that type's layout, so every test
+target linked against it must be rebuilt. The host suite's CTest step does not build, so with a
+stale `test-layer-streaming-layout.exe` the test printed every assertion `ok` and then died in
+teardown with `0xC0000409` (`Exit code 0xc0000409`), which reads exactly like a new defect in the
+change. Rebuilding the test targets (`cmake --build build/llama-cuda --config Release`) fixed it -
+measured, 3.65 s crash vs 0.08 s pass. A full build also fails on `test-unicode`
+(`LNK2019 unicode_regex_split`), which is pre-existing and unrelated.
+
+**The hold is BLOCKED on the shared card, and nothing was started.** The busy preflight refused
+with `GPU busy - 2312 deepseek_v4.exe` at 11:27Z, and bounded re-probes across the next
+ten minutes (11:31:57Z/11:32:05Z/11:32:13Z pid 18524; 11:35:59Z/11:36:09Z/11:36:20Z/11:36:30Z
+pid 2376; 11:40:54Z/11:41:01Z/11:41:08Z pid 9368 - the pid moves every window, so the foreign
+process is actively cycling) found `deepseek_v4.exe` in all ten samples. No driver was started, no mutex was acquired, no arm artifact was
+written, and `-AllowBusy` was never used. This is the same class of blockage A1's first attempt
+recorded, with the same handling.
+
+**The arm is one command, recorded here ready for the next clean window:**
+`powershell -File tools/run-gplr56-session.ps1 -Session p1` (it runs
+`tools/run-gplr56-a3-arm.ps1` under the shared mutex with `build/llama-cuda/p1-driver-a3.out`
+captured, preflights fast, archives the artifacts it is about to replace, and writes the arm
+verdicts plus the derived `*-qrule` and `gplr56-a3-control-stability` records).
+
+**What this does NOT prove.** No arm has run: the mechanism's effect on Q is UNMEASURED, the
+`span_pace_*` shapes are confirmed only against a synthesised paced variant of a real trace (the
+validator accepts them; no real emitter has produced them yet), and the early arm's trace-order
+property (registration events ahead of `run_start`) is argued from the call-site sequence, not
+observed. The pre-registered Q margin, the acceptance rule and the closure language are unchanged
+by this subsection: A3 decides, and A4's 50k/200k holds stay owner-invoked one length at a time.
+
+**A3's own status is unchanged in kind: implemented, host-validated, and awaiting the hold.**
 
 ### T-GPLR-16 (CLOSED 2026-09-22 — the option (a) revert LANDED): the `--handoff-partial` MIN_BATCH=1 override is out of the tree, and a host-only guard keeps it out
 

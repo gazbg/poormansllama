@@ -491,6 +491,31 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- T-GPLR-56 A3: paced-registration analyzer (host-only, no GPU, no model) ----
+# `p1-pace` issues the span commit one group ahead of the sweep instead of all 17.23
+# GiB up front, so its reading has to come from events that only that mode emits. The
+# fixtures cover the reading AND the refusals: a clean paced run (evaluated), the same
+# run against a control, a layer whose span was NOT locked when its first copy was
+# staged (INTEGRITY FAIL, named), an unfinished commit (no span_pace_end / groups left
+# unissued), a NON-paced trace (the p1-off / p1-early arms must be refused, not scored),
+# a malformed group record and a zero group count. The lead read-back is asserted
+# against the configured distance, because a tool that manufactures pacing the run did
+# not have would be worse than no tool.
+if (-not $spec.Gpu) {
+    $paceTool = Join-Path $PSScriptRoot 'check-gplr56-pace.py'
+    if (Test-Path -LiteralPath $paceTool) {
+        Write-Host "[t56-a3] paced-registration analyzer selftest (host-only fixtures)..."
+        & python $paceTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr56-pace.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[t56-a3] FAILED: $paceTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- GPU-lock wrapper verdict contract (host-only, ~8s, no GPU, no CUDA) -----
 # tools/test-arm-verdict.ps1 drives tools/with-gpu-lock.ps1 through STUBBED probes
 # (GPU_BUSY_PROBE_CMD) and private mutex names. What it guards, because every arm
