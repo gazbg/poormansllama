@@ -307,7 +307,11 @@ $suites = @{
         # here (both validators must accept a trace carrying the new event).
         # T-GPLR-56 A1: tel-mark added here so the pre-sink marker emitter's shape
         # proof runs in the host-only suite (no GPU, no model).
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark)'
+        # T-GPLR-58 A0: tg-spec added here -- the speculative-placement rules
+        # (P2 readiness, P3 demand barrier, P4 cancellation) and the mode-0
+        # differential against the pre-A0 retention algorithm must run
+        # host-only, with no GPU and no model.
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -512,6 +516,26 @@ if (-not $spec.Gpu) {
         }
     } else {
         Write-Host "[t56-a3] FAILED: $paceTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-58 bounding pass: row-cache margin analyzer (host-only, no GPU, no model) ----
+# The incumbent row cache's uncovered margin and the ceiling any id-stream predictor faces.
+# Its fixtures pin the retention semantics the tool is built on (capacity-LRU per layer, with
+# a deliberately unmodelable trace refused rather than scored), so a silent change to the
+# tool's model of the cache is a failed suite, not a quiet re-interpretation.
+if (-not $spec.Gpu) {
+    $marginTool = Join-Path $PSScriptRoot 'analyze-tg-margin.py'
+    if (Test-Path -LiteralPath $marginTool) {
+        Write-Host "[tg-margin] row-cache margin analyzer selftest (host-only fixtures)..."
+        & python $marginTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: analyze-tg-margin.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg-margin] FAILED: $marginTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
         exit 1
     }
 }
