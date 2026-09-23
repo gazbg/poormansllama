@@ -588,6 +588,29 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- T-GPLR-58 mode-2 wiring: speculative fill-room bound (host-only, no GPU) ---
+# The mode-2 wiring consumes the A1 proposer, but a speculative fill can only be
+# admitted when the row cache has room beyond the demand reserve. This analyzer
+# rebuilds that occupancy from the recorded traces and pins the RULE its fixture
+# suite relies on: a saturated cache admits nothing, a partial one admits only the
+# surplus, and the reserve is never spent on a guess. Its fixtures are hermetic, so
+# a silent change to the admission model fails HERE rather than quietly restating
+# what the engine does.
+if (-not $spec.Gpu) {
+    $fillTool = Join-Path $PSScriptRoot 'analyze-gplr58-fill-room.py'
+    if (Test-Path -LiteralPath $fillTool) {
+        Write-Host "[tg58-fill-room] speculative fill-room analyzer selftest (host-only fixtures)..."
+        & python $fillTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: analyze-gplr58-fill-room.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg58-fill-room] FAILED: $fillTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- GPU-lock wrapper verdict contract (host-only, ~8s, no GPU, no CUDA) -----
 # tools/test-arm-verdict.ps1 drives tools/with-gpu-lock.ps1 through STUBBED probes
 # (GPU_BUSY_PROBE_CMD) and private mutex names. What it guards, because every arm
