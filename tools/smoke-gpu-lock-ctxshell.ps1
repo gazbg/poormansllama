@@ -35,7 +35,13 @@ param(
 
     # Mutex wait. Short: if the shared GPU is busy, this test can wait for a
     # later window rather than hold a queue.
-    [int] $LockTimeoutSeconds = 300
+    [int] $LockTimeoutSeconds = 300,
+
+    # Provenance gate escape (2026-09-22). By default this smoke FAILS when the
+    # arm it launches cannot attest which source tree and which binary it ran -
+    # otherwise "the chain works" is a claim about a revision nobody can name.
+    # The waiver is appended to build/llama-cuda/provenance-waivers.log.
+    [switch] $AllowUnprovenanced
 )
 $ErrorActionPreference = 'Continue'
 $root   = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
@@ -130,7 +136,9 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 # The mutex hold for this smoke arm, via the repo's shared wrapper. Captured
 # first and piped second on purpose: piping the invocation in the same statement
 # risks reading $LASTEXITCODE after the pipeline, not after the script.
-$lockOut = & $lock -TimeoutSeconds $LockTimeoutSeconds -Command $cmd -VerdictDir $outDir -VerdictTag 'gpu-smoke-arm' 2>&1
+# -AllowUnprovenanced is FORWARDED to the wrapper, which now gates at the choke point
+# as well as this script gating its own arm below - one run, one verdict about it.
+$lockOut = & $lock -TimeoutSeconds $LockTimeoutSeconds -Command $cmd -VerdictDir $outDir -VerdictTag 'gpu-smoke-arm' -AllowUnprovenanced:$AllowUnprovenanced 2>&1
 $armExit = $LASTEXITCODE
 $lockOut | ForEach-Object { Log ('  | ' + $_) }
 $sw.Stop()
@@ -169,6 +177,30 @@ if (Test-Path -LiteralPath $txt) {
     if ($t.Length -eq 0) { Log 'FAIL: empty TG text'; $ok = $false }
 } else {
     Log 'FAIL: no TG text was produced'
+    $ok = $false
+}
+
+# --- provenance gate (2026-09-22) -------------------------------------------
+# The arm must attest the tree and the binary it ran. This is the FIRST REAL ARM
+# to be gated, and it is also the cheapest one: if a smoke cannot name its
+# revision, no longer run's verdict can either.
+$provGate = Assert-ArmProvenance -Dir $verdictDir -Tags @('gpu-smoke-arm') -Label 'smoke arm' `
+    -AllowUnprovenanced:$AllowUnprovenanced
+$verdictFields['arm_provenance_complete'] = $provGate
+# Carry the arm's own attribution into the CHAIN verdict, so the smoke's result
+# is readable without opening the arm's file beside it.
+$armV = Read-ArmVerdict -Dir $verdictDir -Tag 'gpu-smoke-arm'
+if ($null -ne $armV -and $null -ne $armV.fields.provenance) {
+    $verdictFields['arm_source_head']         = "$($armV.fields.provenance.source_head)"
+    $verdictFields['arm_source_digest']       = "$($armV.fields.provenance.source_digest)"
+    $verdictFields['arm_streaming_lib_sha']   = "$($armV.fields.provenance.streaming_lib_sha)"
+    $verdictFields['arm_binary_exe_sha']      = "$($armV.fields.provenance.binary_exe_sha)"
+    Log ('arm provenance: head {0} digest {1} llama.dll {2} exe {3}' -f `
+        $armV.fields.provenance.source_head, $armV.fields.provenance.source_digest,
+        $armV.fields.provenance.streaming_lib_sha, $armV.fields.provenance.binary_exe_sha)
+}
+if (-not $provGate) {
+    Log 'FAIL: the smoke arm carries no attributable provenance (see the gate lines above)'
     $ok = $false
 }
 
