@@ -2034,7 +2034,7 @@ by this subsection: A3 decides, and A4's 50k/200k holds stay owner-invoked one l
 
 ### T-GPLR-58 (draft): wire the TG expert predictor into the row-set path - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), judged on a NULL-CORRECTED, VRAM-normalized miss share under the exact-demand-priority invariant
 
-Status: ready (2026-09-23) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer and its port comparator) remains unbuilt, and the A3/A4 holds stay gated on it.
+Status: ready (2026-09-23) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer families, the count-matched null, the speculative planner and its port comparator) is IMPLEMENTED and host-validated the same day - see the A1 IMPLEMENTATION LANDED subsection below; the A3/A4 holds now stay gated on the ENGINE-CONSUMES-THE-PROPOSER WIRING (mode 2 is still reserved and refused), not on A1 itself.
 in the DECIDED section below; both mutex-held sessions are PRE-AUTHORIZED (owner chose the
 "both up front" option, so A4 is not conditional on A3's share outcome). Nothing is
 implemented yet and no GPU time has been spent: A1/A2 are host-only and A3/A4 are the two
