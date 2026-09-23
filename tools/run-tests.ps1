@@ -610,6 +610,37 @@ if (-not $spec.Gpu) {
         exit 1
     }
 }
+# --- T-GPLR-58 mode 2: the runner's flag/refusal contract (host-only, no GPU) ---
+# The mode-2 wiring consumes the A1 proposer, and its flags are where a leg declares
+# WHICH arm proposed and whether the proposals came from the count-matched null. Those
+# gates sit after the host-only metadata read and BEFORE llama_backend_init, so this
+# checker drives the REAL binary on the unsupported-arch fixture -- no model, no CUDA,
+# no mutex -- and asserts the exact exit code AND message for every refusal, plus the
+# legal shapes (proven accepted by reaching the next stable refusal, the adapter's
+# architecture gate). Its selftest is hermetic stub runners, so it catches its own
+# failure modes: a wrong exit code, a wrong message, a SILENT exit scored as agreement,
+# and the one that matters most -- a broken binary's model-missing exit 1, which must
+# never be read as a refusal match.
+if (-not $spec.Gpu) {
+    $m2Tool = Join-Path $PSScriptRoot 'check-gplr58-mode2.py'
+    if (Test-Path -LiteralPath $m2Tool) {
+        Write-Host "[tg58-mode2] runner flag/refusal contract selftest (host-only stub runners)..."
+        & python $m2Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr58-mode2.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+        Write-Host "[tg58-mode2] runner flag/refusal contract on the real binary (fixture, no model load)..."
+        & python $m2Tool
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-gplr58-mode2.py exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg58-mode2] FAILED: $m2Tool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
 
 # --- GPU-lock wrapper verdict contract (host-only, ~8s, no GPU, no CUDA) -----
 # tools/test-arm-verdict.ps1 drives tools/with-gpu-lock.ps1 through STUBBED probes
