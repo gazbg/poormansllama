@@ -908,6 +908,104 @@ llama_ls_cancel_policy llama_ls_spec_cancel_policy(int n_free, int reserve, int 
     return c;
 }
 
+// The arm's name as the pre-registered contract spells it. Used by the trace
+// (run_start) and by bring-up, so a leg is identifiable from its own recording
+// rather than from a filename or a command history.
+static const char * ls_pred_arm_name(int arm) {
+    switch (arm) {
+        case LLAMA_LS_ARM_COACT:  return "coact";
+        case LLAMA_LS_ARM_BAR09:  return "bar09";
+        case LLAMA_LS_ARM_FUSION: return "fusion";
+        default:                  return "none";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-GPLR-58 MODE 2: the ENGINE-CONSUMED proposer, as ONE pure call per demand
+// stage. Everything the engine does at the end of a demand stage when the mode
+// is 2 lives here -- observe the row the demand just placed, propose (the arm,
+// or the count-matched null), plan against the live placement state -- so that
+// tests/test-layer-streaming-tg-spec.cpp can drive the WIRING itself over a
+// scripted demand stream instead of re-implementing it, and the engine cannot
+// drift from the test. The engine's remaining job is to execute plan.issue[]
+// through spec_issue_one(), the same call the scripted source uses.
+//
+// The order is A1's faithfulness rule, and it is why the proposal is made HERE
+// rather than at the demand: the offline screen calls predict() before observe()
+// for every (token, layer) row, so its proposal for row k+1 is made from the state
+// observed through row k. Observing this row and THEN proposing is therefore the
+// same proposal the screen would make for the next row of this layer -- not an
+// approximation of it -- which is what lets the recorded offline recall figures be
+// read as this proposer's precision.
+//
+// What it does NOT do: decide the horizon. The fill it plans is issued at the end
+// of demand stage k of this layer, and A0/A2's measured reap ordering makes it
+// first consumable at stage k+2 while the proposal targets stage k+1's row, so an
+// id the k+1 demand wants is the MATCHED fallback (cancelled, its copy paid for
+// twice) and only ids that survive it can be consumed at k+2. That asymmetry is
+// what M7b's matched/(consumed+matched) band scores; moving the horizon or the
+// reap point is a mechanism change (A0/A2's settled territory), not a wiring one.
+// ---------------------------------------------------------------------------
+llama_ls_propose_result llama_ls_spec_propose(llama_ls_pred_state * st, int arm, bool null_source,
+                                              int layer, int b,
+                                              const int32_t * demand_ids, int n_demand,
+                                              const int32_t * experts, const uint8_t * states, int cap,
+                                              int reserve, int max_pending, int n_pending,
+                                              uint32_t * null_rng, int n_expert) {
+    llama_ls_propose_result r;
+    if (st == nullptr || experts == nullptr || states == nullptr) {
+        return r;
+    }
+
+    // 1. OBSERVE the row that was just served, deduplicated in the CALLER's order:
+    //    the screen observes the row as a SET, and the trace order is the order the
+    //    engine actually has, so this is the one order both sides can agree on.
+    int32_t obs[256];
+    int     n_obs = 0;
+    for (int i = 0; i < n_demand && n_obs < (int) (sizeof(obs) / sizeof(obs[0])); ++i) {
+        if (demand_ids == nullptr) {
+            break;
+        }
+        const int32_t e = demand_ids[i];
+        if (e < 0) {
+            continue;
+        }
+        bool dup = false;
+        for (int j = 0; j < n_obs; ++j) {
+            if (obs[j] == e) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            obs[n_obs++] = e;
+        }
+    }
+    llama_ls_pred_observe(st, layer, obs, n_obs);
+
+    // 2. PROPOSE. The null is COUNT-MATCHED to the arm, so the arm is computed in
+    //    BOTH cases: that is what makes "the same number of proposals, with no
+    //    signal in them" a controlled comparison instead of a smaller arm. A null
+    //    over an arm whose count is 0 is a null with nothing to match, and it
+    //    publishes nothing -- honestly, not as a zero that looks like a result.
+    int32_t cand[LLAMA_LS_PRED_MAX_OUT];
+    const int n_arm = llama_ls_pred_arm_predict(st, arm, layer, b, cand, LLAMA_LS_PRED_MAX_OUT);
+    r.n_arm_count = n_arm;
+    r.n_proposals = n_arm;
+    if (null_source) {
+        r.n_proposals = llama_ls_pred_null_fill(null_rng, n_expert, n_arm, cand, LLAMA_LS_PRED_MAX_OUT);
+    }
+    for (int i = 0; i < r.n_proposals && i < LLAMA_LS_PRED_MAX_OUT; ++i) {
+        r.published[i] = cand[i];
+    }
+
+    // 3. PLAN against the live placement state: P3's reserve, the per-row budget and
+    //    the pending cap decide how many proposals are admitted, and not one of them
+    //    may displace a resident row (P5).
+    r.plan = llama_ls_spec_plan(experts, states, cap, reserve, max_pending, n_pending, b, cand, r.n_proposals);
+    return r;
+}
+
 // create one device tensor object with the same shape/type as the source (in
 static ggml_tensor * make_dev_tensor(ggml_context * ctx, const ggml_tensor * src) {
     return ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
@@ -5608,6 +5706,14 @@ static std::string tel_run_start_head(uint64_t run_id, uint64_t t0_us) {
         spec_str = std::string(",\"row_spec_mode\":") + std::to_string(row_set_spec_mode) +
                    ",\"row_spec_budget\":" + std::to_string(row_set_spec_budget) +
                    ",\"row_spec_reserve\":" + std::to_string(row_set_spec_reserve);
+        if (row_set_spec_mode == 2) {
+            // MODE 2: the ARM is part of the RESOLVED configuration, not an argv echo,
+            // and the null source is named separately -- a null leg must be identifiable
+            // from its own trace, because a filename in this tree (arm-A1.jsonl /
+            // arm-B1.jsonl) names an A/B session, not a predictor arm.
+            spec_str += std::string(",\"row_spec_arm\":\"") + ls_pred_arm_name(row_set_spec_arm) +
+                        "\",\"row_spec_null\":" + (row_set_spec_null ? "true" : "false");
+        }
     }
 
     const std::string start_head = tel_run_start_head(run_id, t0_us);
@@ -7155,20 +7261,23 @@ int llama_layer_streaming::spec_ready_of(int il) const {
     return n;
 }
 
+
 bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::string & script_path) {
     if (mode == 0) {
         row_set_spec_mode = 0;
         row_set_spec_on   = false;
         row_set_spec_script.clear();
         spec_script.clear();
+        // mode 2's own configuration goes with it: a mode-0 run holds no proposer
+        // state, so a later arm() call cannot resurrect a half-configured predictor
+        row_set_spec_arm  = -1;
+        row_set_spec_null = false;
+        spec_pred.reset();
         return true;
     }
-    // Mode 2 exists so the A1 proposer has a reserved slot; it is REFUSED until
-    // that proposer exists, so a scripted run can never be read as a predictor
-    // run.
-    if (mode != 1) {
+    if (mode != 1 && mode != 2) {
         error_msg = "set_row_set_spec: mode " + std::to_string(mode) +
-                    " is reserved for the A1 proposer and is not implemented; only mode 1 (scripted) exists today";
+                    " is not a speculative-placement mode (0 = off, 1 = scripted, 2 = the arm's proposer)";
         return false;
     }
     if (model_ref == nullptr) {
@@ -7190,8 +7299,33 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
                     "] for K=" + std::to_string(K) + ", top_k=" + std::to_string(top_k);
         return false;
     }
+
+    if (mode == 2) {
+        // MODE 2: the proposal source is the ARM, configured by
+        // set_row_set_spec_arm() -- which needs the model's per-layer family tables,
+        // so it is a separate call. A script here would be a SECOND and conflicting
+        // proposal source, so it is refused rather than ignored.
+        if (!script_path.empty()) {
+            error_msg = "set_row_set_spec: mode 2 takes its proposals from the arm, not from a script (" +
+                        script_path + "); pass --residency-tg-spec-arm instead";
+            return false;
+        }
+        row_set_spec_mode    = 2;
+        row_set_spec_budget  = b;
+        row_set_spec_reserve = top_k;
+        row_set_spec_on      = true;
+        row_set_spec_script.clear();
+        spec_script.clear();
+        row_set_spec_arm  = -1;   // until set_row_set_spec_arm() names one (begin_row_cache refuses otherwise)
+        row_set_spec_null = false;
+        fprintf(stderr, "tg-spec (T-GPLR-58 A1): mode 2 (proposer arm) budget %d, reserve %d of cap %d; "
+                        "the arm itself is configured next, and begin_row_cache refuses a mode-2 run without one\n",
+                b, row_set_spec_reserve, cap);
+        return true;
+    }
+
     if (script_path.empty()) {
-        error_msg = "set_row_set_spec: mode 1 needs a proposal script (the A0 driver; A1 supplies the real proposer)";
+        error_msg = "set_row_set_spec: mode 1 needs a proposal script (the A0 driver; mode 2 is the arm)";
         return false;
     }
 
@@ -7271,6 +7405,48 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
     return true;
 }
 
+
+bool llama_layer_streaming::set_row_set_spec_arm(int arm, bool null_source) {
+    if (row_set_spec_mode != 2) {
+        error_msg = "set_row_set_spec_arm: only mode 2 has a proposer arm (mode is " +
+                    std::to_string(row_set_spec_mode) + ")";
+        return false;
+    }
+    if (model_ref == nullptr) {
+        error_msg = "set_row_set_spec_arm: called before the model is available";
+        return false;
+    }
+    if (arm < 0 || arm > LLAMA_LS_ARM_FUSION) {
+        error_msg = "set_row_set_spec_arm: arm " + std::to_string(arm) +
+                    " is not one of the three pre-registered arms (0 = coact, 1 = bar09, 2 = fusion)";
+        return false;
+    }
+    // Only the families the arm READS are allocated -- except under the null, which
+    // needs all of them: its count IS the arm's count, so the arm has to be computed
+    // for there to be a count to match.
+    uint32_t fam = LLAMA_LS_PRED_BIT_ALL;
+    if (!null_source) {
+        switch (arm) {
+            case LLAMA_LS_ARM_COACT:  fam = LLAMA_LS_PRED_BIT_COACT;   break;
+            case LLAMA_LS_ARM_BAR09:  fam = LLAMA_LS_PRED_BIT_MARKOV1; break;
+            default:                  fam = LLAMA_LS_PRED_BIT_ALL;     break;
+        }
+    }
+    const int n_exp = (int) model_ref->hparams.n_expert;
+    spec_pred = std::make_unique<llama_ls_pred_state>();
+    llama_ls_pred_init(spec_pred.get(), n_layer, n_exp, fam);
+    row_set_spec_arm    = arm;
+    row_set_spec_null   = null_source;
+    spec_null_rng       = llama_ls_pred_null_seed();
+    spec_prop_last      = 0;
+    spec_arm_count_last = 0;
+    fprintf(stderr, "tg-spec (T-GPLR-58 A1): proposer arm %s%s, families 0x%x, %d layers x %d experts%s\n",
+            ls_pred_arm_name(arm), null_source ? " with the COUNT-MATCHED NULL source" : "",
+            fam, n_layer, n_exp,
+            null_source ? " (the arm is still computed: it supplies the count)" : "");
+    return true;
+}
+
 void llama_layer_streaming::spec_reset() {
     // DRAIN FIRST: a fill whose H2D is still in flight writes into a per-layer
     // cache buffer that end_row_cache() frees right after this call, so ending a
@@ -7300,6 +7476,14 @@ void llama_layer_streaming::spec_reset() {
     spec_tick.clear();
     spec_calls.clear();
     spec_issue_ord.clear();
+    // the proposer's own state is large (n_layer x n_expert^2 per family table):
+    // the run is over, so it is released rather than kept for a later run
+    spec_pred.reset();
+    spec_null_rng         = 0;
+    row_set_spec_arm      = -1;
+    row_set_spec_null     = false;
+    spec_prop_last        = 0;
+    spec_arm_count_last   = 0;
     row_set_spec_on       = false;
     spec_in_demand_window = false;
 }
@@ -7511,7 +7695,8 @@ bool llama_layer_streaming::spec_note_lead(int il, int pos) {
     return true;
 }
 
-void llama_layer_streaming::spec_issue_next(int il) {
+
+void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, int n_demand) {
     if (!row_set_spec_on || il < 0 || (size_t) il >= spec_state.size()) {
         return;
     }
@@ -7542,6 +7727,33 @@ void llama_layer_streaming::spec_issue_next(int il) {
     spec_reap(il);
 
     const int ord = ++spec_calls[(size_t) il];
+
+    if (row_set_spec_mode == 2) {
+        // MODE 2: ask the arm -- observe the row this stage just served, propose for
+        // this layer's NEXT demand row, plan against the live placement state, then
+        // issue exactly what the plan admits. This is the whole of the engine's
+        // proposer wiring; the policy itself is llama_ls_spec_propose().
+        spec_prop_last      = 0;
+        spec_arm_count_last = 0;
+        const int cap = (int) spec_state[(size_t) il].size();
+        const llama_ls_propose_result pr = llama_ls_spec_propose(
+            spec_pred.get(), row_set_spec_arm, row_set_spec_null, il, row_set_spec_budget,
+            demand_ids, n_demand,
+            cache_expert[(size_t) il].data(), spec_state[(size_t) il].data(), cap,
+            row_set_spec_reserve, row_set_spec_budget, spec_pending_of(il),
+            &spec_null_rng, (int) model_ref->hparams.n_expert);
+        spec_prop_last      = pr.n_proposals;
+        spec_arm_count_last = pr.n_arm_count;
+        const uint32_t gen = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
+        for (int i = 0; i < pr.plan.n_issue; ++i) {
+            // stamp at ISSUE time so a speculative row is older than every row a
+            // demand placed afterwards
+            spec_issue_one(il, pr.plan.issue[i], gen, ++cache_tick);
+        }
+        tel_spec(il, spec_pending_of(il), spec_ready_of(il));
+        return;
+    }
+
     const auto it = spec_script.find(((uint64_t) il << 32) | (uint64_t) (ord + 1));
     if (it != spec_script.end()) {
         const uint32_t gen = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
@@ -7554,10 +7766,20 @@ void llama_layer_streaming::spec_issue_next(int il) {
     tel_spec(il, spec_pending_of(il), spec_ready_of(il));
 }
 
+
 void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now) {
     // fixed shape so the emitted array is always the documented 8 buckets
     std::vector<int64_t> lh = spec_lead_hist;
     lh.resize(8, 0);
+    // MODE 2 only, so a mode-0/1 event stays byte-identical to every recording
+    // made before the proposer was wired: what the SOURCE published this stage, and
+    // the ARM's count a null source was matched to (equal by construction, emitted so
+    // the count match is checkable from the trace alone).
+    std::string prop_str;
+    if (row_set_spec_mode == 2) {
+        prop_str = std::string("\"prop\":") + std::to_string(spec_prop_last) +
+                   ",\"arm_count\":" + std::to_string(spec_arm_count_last) + ",";
+    }
     tel_write(tel_out,
         "{\"event\":\"spec\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"mode\":%d,\"budget\":%d,"
         "\"reserve\":%d,\"cap\":%d,\"pending\":%d,\"ready_spec\":%d,"
@@ -7569,7 +7791,7 @@ void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now
         // only fills a demand was actually served from; `matched_by_demand` above
         // remains the fallback count, never folded in here.
         "\"consumed\":%lld,\"lead_sum\":%lld,\"lead_min\":%d,\"lead_max\":%d,"
-        "\"lead_hist\":[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld],\"t_us\":%lld}",
+        "\"lead_hist\":[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld],%s\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, row_set_spec_mode,
         row_set_spec_budget, row_set_spec_reserve, row_set_cap, pending_now, ready_spec_now,
         (long long) spec_submitted, (long long) spec_ready, (long long) spec_cancelled,
@@ -7582,6 +7804,7 @@ void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now
         (int) spec_lead_min, (int) spec_lead_max,
         (long long) lh[0], (long long) lh[1], (long long) lh[2], (long long) lh[3],
         (long long) lh[4], (long long) lh[5], (long long) lh[6], (long long) lh[7],
+        prop_str.c_str(),
         (long long) ggml_time_us());
 }
 
@@ -7595,6 +7818,14 @@ bool llama_layer_streaming::begin_row_cache() {
     }
     if (adapter == nullptr || !adapter->merge_resident) {
         error_msg = "begin_row_cache: requires a merge-resident (MoE expert-bank) policy";
+        return false;
+    }
+    if (row_set_spec_mode == 2 && row_set_spec_arm < 0) {
+        // loud, before any context or graph exists: a mode-2 run whose proposer was
+        // never configured would otherwise look like an arm that simply proposes
+        // nothing, and that is not a result
+        error_msg = "begin_row_cache: mode 2 has no proposer arm; call set_row_set_spec_arm() "
+                    "(--residency-tg-spec-arm) before allocating the cache";
         return false;
     }
 
@@ -8126,7 +8357,9 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         // construction rather than by hope.
         spec_in_demand_window = false;
         if (row_set_spec_on) {
-            spec_issue_next(il);
+            // the demand's ids, in the trace's order, are the arm's observation
+            // for this stage (mode 2; mode 1 ignores them)
+            spec_issue_next(il, ids.data(), (int) ids.size());
         }
 
         const int64_t t_enq = slot.t_copy_enqueue_done_us;

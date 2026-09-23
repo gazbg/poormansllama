@@ -38,6 +38,10 @@ struct llama_context;
 struct llm_graph_result;
 struct ggml_context;
 struct ggml_tensor;
+// the predictor's learning state (defined with the pure policy API below): the
+// engine holds it behind a pointer so the module's own declaration order -- class
+// first, pure API after -- does not have to change for mode 2.
+struct llama_ls_pred_state;
 
 // one immutable PP chunk descriptor for the layer-major schedule
 // (T-Q38CTX-01): the chunk's first token position and its real token count
@@ -1144,15 +1148,47 @@ struct LLAMA_API llama_layer_streaming {
     int32_t spec_lead_max  = 0;
     std::vector<int64_t> spec_lead_hist; // 8 buckets: lead 1..7, then >= 8
 
+    // T-GPLR-58 MODE 2: the ENGINE-CONSUMED proposer. `row_set_spec_arm` < 0 means
+    // no proposer (mode 1's script is the source); otherwise it is a
+    // llama_ls_pred_arm and the engine asks it at the end of every demand stage,
+    // through the same planner and the same admission rules the scripted source
+    // uses. The learning state is ONE per run, indexed by layer, and is allocated
+    // only for the families the arm actually reads -- the null needs ALL of them,
+    // because its count IS the arm's count and the arm must be computed to have
+    // one. `spec_null_rng` is the null's fixed-seed xorshift state, seeded once
+    // from llama_ls_pred_null_seed(), so a run is reproducible and a null leg is
+    // identifiable from its own trace.
+    int          row_set_spec_arm  = -1;     // llama_ls_pred_arm, or -1 = no proposer
+    bool         row_set_spec_null = false;  // proposal source = the count-matched null
+    std::unique_ptr<llama_ls_pred_state> spec_pred;  // mode 2: allocated by set_row_set_spec_arm()
+    uint32_t     spec_null_rng     = 0;      // mode 2 + null: the xorshift state
+    // Reported per stage by tel_spec(): what the SOURCE published, and -- for a null
+    // leg -- the ARM's count it was matched to. Emitted so count-matching is
+    // checkable from the trace alone, never inferred from a filename.
+    int          spec_prop_last      = 0;
+    int          spec_arm_count_last = 0;
+
     // Configure speculative placement. Validated here AND by the runner before
     // the model load; returns false with a structured error rather than silently
     // degrading to mode 0.
     bool set_row_set_spec(int mode, int budget, const std::string & script_path);
 
-    // Issue the scripted fills that follow layer il's demand stage -- the ids
-    // listed for (il, spec_calls[il] + 1). Reaps first (on this, the speculation
-    // path), then admits and issues. No-op when the mode is off.
-    void spec_issue_next(int il);
+    // MODE 2's own configuration, called after set_row_set_spec(2, ...) and
+    // before begin_row_cache() allocates the cache: WHICH arm proposes and
+    // whether the proposals come from the arm or from the count-matched null.
+    // Allocates the arm's learning state; refuses an arm the port does not
+    // define, and refuses the null without an arm to match (the null takes its
+    // count FROM the arm, so there is nothing to match otherwise).
+    bool set_row_set_spec_arm(int arm, bool null_source);
+
+    // Issue the fills that follow layer il's demand stage: mode 1 takes them from
+    // the script's entry for (il, spec_calls[il] + 1), mode 2 asks the arm --
+    // observing the row the demand just served and proposing for this layer's
+    // NEXT demand row (llama_ls_spec_propose). Reaps first (on this, the
+    // speculation path), then admits and issues. No-op when the mode is off.
+    // `demand_ids` / `n_demand` are the ids that demand just placed, in the
+    // trace's order, and are only ever passed AFTER that demand's own wait closed.
+    void spec_issue_next(int il, const int32_t * demand_ids, int n_demand);
 
     // Issue ONE speculative fill, or refuse it with a reason (P3/P5).
     bool spec_issue_one(int il, int32_t expert, uint32_t generation, int64_t tick);
@@ -1818,6 +1854,65 @@ struct llama_ls_cancel_policy {
 
 LLAMA_API llama_ls_cancel_policy llama_ls_spec_cancel_policy(int n_free, int reserve, int n_want,
                                                             int n_pending);
+
+// ---------------------------------------------------------------------------
+// T-GPLR-58 MODE 2 - the ENGINE-CONSUMED proposer: ONE pure call per demand stage.
+//
+// Modes 1 and 2 differ ONLY in where the proposal comes from. Mode 1 reads a
+// script (A0's test vehicle: a proposal source with no opinion, so the mechanism
+// can be measured on its own); mode 2 asks the arm itself, with the same planner,
+// the same admission rules and the same issue path. Folding that sequence into one
+// function is what makes the WIRING host-provable instead of a code claim: the
+// engine calls this and executes the plan it returns, and
+// tests/test-layer-streaming-tg-spec.cpp drives THIS function over a scripted
+// demand stream -- so the engine cannot drift from the test.
+//
+// The order is A1's faithfulness rule (predict() BEFORE observe() for every
+// (token, layer) row), expressed once:
+//
+//   1. OBSERVE the row the demand just placed, deduplicated in the caller's order
+//      (the screen observes the row as a SET). After observing row k the state
+//      holds rows <= k, which is exactly the state the offline screen predicts row
+//      k+1 FROM -- so this proposal is the screen's own one-step prediction, and
+//      the offline recall figures apply to it as proposal precision.
+//   2. PROPOSE the arm's ranked list, or -- with `null_source` -- the count-matched
+//      null: the ARM's count for that row, published from a fixed-seed xorshift
+//      over [0, n_expert) that consults no ids, no demand and no router output.
+//   3. PLAN those proposals against the live placement state, so P3's reserve, the
+//      per-row budget and the pending cap decide how many are admitted. Not one of
+//      them may displace a resident row (P5).
+//
+// THE HORIZON IS NOT DECIDED HERE, and that is deliberate rather than unfinished:
+// the fill this plans is issued at the end of demand stage k of its layer, and
+// A0/A2's MEASURED reap ordering (the reap runs at the END of a stage, after that
+// stage's demand was served) makes the fill first consumable at stage k+2, while
+// the proposal targets the row of stage k+1. So an id that the stage k+1 demand
+// wants is the MATCHED fallback -- cancelled, its copy paid for twice -- and only
+// ids that survive that demand can be consumed at k+2. M7b's
+// matched/(consumed+matched) band is exactly the score of that asymmetry; moving
+// the horizon or the reap point is a MECHANISM change (A0/A2's settled territory),
+// not a wiring change.
+//
+// A mode-2 run is therefore a bet on id PERSISTENCE across one token, not on the
+// proposal being right at the right time, and its telemetry is what tells the two
+// apart: `consumed` counts the fills a demand was served from, `matched_by_demand`
+// counts the ones that arrived late.
+struct llama_ls_propose_result {
+    llama_ls_plan plan;             // the fills to issue, in issue order, plus the stop reason
+    int           n_proposals = 0;  // ids the SOURCE published (for the null: its own count)
+    int           n_arm_count = 0;  // the ARM's published count (== n_proposals unless the null is on)
+    // The published ids themselves, kept so a caller (or a test) can compare a null
+    // leg against its arm directly instead of inferring a difference from what the
+    // cache happened to admit.
+    int32_t       published[LLAMA_LS_PRED_MAX_OUT] = {};
+};
+
+LLAMA_API llama_ls_propose_result llama_ls_spec_propose(llama_ls_pred_state * st, int arm, bool null_source,
+                                                        int layer, int b,
+                                                        const int32_t * demand_ids, int n_demand,
+                                                        const int32_t * experts, const uint8_t * states, int cap,
+                                                        int reserve, int max_pending, int n_pending,
+                                                        uint32_t * null_rng, int n_expert);
 
 // T-GPLR-36 follow-up (2026-09-18): HOST-memory instrument. The 200k ledger run
 // attributed the time residual but left one measured quantity unattributed: the

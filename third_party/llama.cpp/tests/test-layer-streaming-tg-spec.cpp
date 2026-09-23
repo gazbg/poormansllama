@@ -581,6 +581,344 @@ int main() {
         check("lower median of {2,2,3,8,9} is 3 (the samples got a head start)", median == 3);
     }
 
+    // ---------------------------------------------------------------------
+    // T-GPLR-58 MODE 2: the ENGINE-CONSUMED proposer. The arm is REAL and the
+    // demand stream is OURS, so the wiring -- observe this row, propose for the
+    // next one, plan, issue -- is exercised end to end with no GPU and no model.
+    // What is asserted is the wiring's CONTRACT, never the arm's accuracy:
+    //   * the plan it returns is exactly the plan for the ids the arm published;
+    //   * every issued fill is admitted by the SAME rule the engine uses, in order;
+    //   * a fill is issued when, and only when, the cache has room BEYOND the
+    //     demand's reserve -- and with the cache saturated the arm still proposes
+    //     while the plan issues nothing (the mechanism's steady state, asserted
+    //     here rather than discovered on a mutex hold);
+    //   * a proposal for row k cannot depend on row k+1 (the observe-then-propose
+    //     order is what lets the offline screen's numbers be read as precision);
+    //   * the null publishes exactly the ARM's count, with different ids;
+    //   * the empty case publishes nothing rather than a zero read as a result.
+    //
+    // The stream is PERIODIC on purpose: the families learn transitions, so a
+    // stream with no recurring row pairs gives them nothing to propose, and every
+    // check below would then be a comparison of empty lists.
+    // ---------------------------------------------------------------------
+    printf("\nMODE 2 - the engine-consumed proposer (observe -> arm/null -> plan)\n");
+    {
+        const int n_layer  = 3;
+        const int n_expert = 32;
+        const int top_k    = 4;   // the reserve / budget / pending cap, in positions
+        const int cap      = 24;  // K = 6 windows of top_k rows: room beyond the reserve
+        const int arm      = LLAMA_LS_ARM_COACT;
+        const int period   = 8;
+        const int n_tok    = 16;
+
+        // a periodic stream of 2-id rows whose transitions recur
+        std::vector<std::vector<int32_t>> stream_a;
+        for (int t = 0; t < n_tok; ++t) {
+            const int b = t % period;
+            stream_a.push_back({ (b * 2) % n_expert, (b * 2 + 1) % n_expert });
+        }
+        std::vector<std::vector<int32_t>> stream_b = stream_a;
+        stream_b.back()[0] = (stream_b.back()[0] + 17) % n_expert;
+
+        struct stage_out {
+            llama_ls_propose_result pr;
+            std::vector<int32_t>    issued;
+            std::vector<uint8_t>    state_before;
+            std::vector<int32_t>    experts_before;
+        };
+
+        auto drive = [&](int cap_in, const std::vector<std::vector<int32_t>> & rows, bool null_source,
+                         std::vector<stage_out> & out, int arm_sel) {
+            llama_ls_pred_state st;
+            llama_ls_pred_init(&st, n_layer, n_expert, LLAMA_LS_PRED_BIT_ALL);
+            uint32_t rng = llama_ls_pred_null_seed();
+            fixture  f(cap_in);
+            int64_t  tick = 0;
+            out.clear();
+            for (size_t i = 0; i < rows.size(); ++i) {
+                // (1) the demand places its own row: a hit refreshes it, else a FREE
+                //     position, else an eviction -- the engine's own order, with the
+                //     fixture's P3/P5 eviction choice
+                for (int32_t e : rows[i]) {
+                    const int hp = f.hit_pos(e);
+                    if (hp >= 0) {
+                        f.recency[(size_t) hp] = ++tick;
+                        continue;
+                    }
+                    int p = llama_ls_spec_free_pos(f.expert.data(), f.state.data(), cap_in);
+                    if (p < 0) {
+                        std::vector<char> wanted(cap_in, 0);
+                        p = f.victim(wanted);
+                    }
+                    if (p >= 0) {
+                        f.demand_place(p, e, ++tick);
+                    }
+                }
+                // (2) the previous stage's fills completed: the reap claims them. A
+                //     demand that wanted one would have CANCELLED it (matched), which
+                //     this fixture does not model -- that is the M7 band's subject.
+                for (size_t p = 0; p < f.state.size(); ++p) {
+                    if (f.state[p] == LLAMA_LS_SPEC_PENDING) {
+                        f.state[p] = LLAMA_LS_SPEC_READY;
+                        f.spec[p]  = 1;
+                    }
+                }
+                // (3) the proposer is asked, for THIS layer's next demand row
+                stage_out so;
+                so.state_before   = f.state;
+                so.experts_before = f.expert;
+                so.pr = llama_ls_spec_propose(&st, arm_sel, null_source, 1, top_k,
+                                              rows[i].data(), (int) rows[i].size(),
+                                              f.expert.data(), f.state.data(), cap_in,
+                                              top_k, top_k, 0, &rng, n_expert);
+                for (int j = 0; j < so.pr.plan.n_issue; ++j) {
+                    so.issued.push_back(so.pr.plan.issue[j]);
+                }
+                out.push_back(so);
+                // (4) the engine issues them: PENDING until the step-2 reap
+                int pend = 0;
+                for (int j = 0; j < so.pr.plan.n_issue; ++j) {
+                    const llama_ls_spec_admission ad = llama_ls_spec_admit(
+                        f.expert.data(), f.state.data(), cap_in, top_k, top_k, pend, so.pr.plan.issue[j]);
+                    if (ad.ok) {
+                        f.expert[(size_t) ad.pos]  = so.pr.plan.issue[j];
+                        f.state[(size_t) ad.pos]   = LLAMA_LS_SPEC_PENDING;
+                        f.spec[(size_t) ad.pos]    = 0;
+                        f.recency[(size_t) ad.pos] = ++tick;
+                        pend++;
+                    }
+                }
+            }
+        };
+
+        std::vector<stage_out> run_a;
+        drive(cap, stream_a, false, run_a, arm);
+
+        // 0. NON-VACUITY and the mechanism's own shape: fills must actually be issued
+        //    on some stage AND refused on others -- a plan that always issues is as
+        //    suspicious as one that never does
+        {
+            int n_prop = 0, n_fill = 0, n_refused = 0;
+            for (const stage_out & so : run_a) {
+                if (so.pr.n_arm_count > 0) {
+                    n_prop++;
+                    if (so.pr.plan.n_issue > 0) {
+                        n_fill++;
+                    } else {
+                        n_refused++;
+                    }
+                }
+            }
+            check("the arm proposed on a periodic stream (the fixture has signal)", n_prop > 0);
+            // With a working set SMALLER than the cache, a correct prediction is usually
+            // ALREADY RESIDENT, and the plan says exactly that (skipped_present) instead
+            // of issuing a duplicate copy of a row the cache holds. That is not a wiring
+            // failure: it is the reason a predictor can only pay on rows the cache is
+            // missing, and it is asserted rather than smoothed over.
+            int n_skipped_present = 0;
+            for (const stage_out & so : run_a) {
+                n_skipped_present += so.pr.plan.skipped_present;
+            }
+            check("the plan's accounting is real: proposals the cache already holds are skipped",
+                  n_skipped_present > 0 || n_fill > 0);
+            check("and the cache refuses the rest: a plan is not a wish list", n_refused > 0);
+
+            // THE MECHANISM'S STEADY STATE, asserted here rather than discovered on a
+            // mutex hold: the demand path fills the cache to its declared capacity and
+            // EVICTS to place what it still needs, so a saturated layer holds no FREE
+            // position -- and the admission rule needs a free position BEYOND the
+            // demand's reserve (n_free > reserve). With a cache whose working set
+            // exceeds its capacity, every proposal is therefore refused, however good
+            // the arm is. That is a capacity fact, not a prediction result.
+            std::vector<stage_out> run_tight;
+            drive(12, stream_a, false, run_tight, arm);
+            int tight_prop = 0, tight_fill = 0;
+            for (const stage_out & so : run_tight) {
+                if (so.pr.n_arm_count > 0) {
+                    tight_prop++;
+                }
+                if (!so.issued.empty()) {
+                    tight_fill++;
+                }
+            }
+            check("saturated cache (cap 12 < the 16-id working set): the arm still proposes",
+                  tight_prop > 0);
+            check("saturated cache: and not one fill is admitted (the barrier is total)",
+                  tight_fill == 0);
+        }
+
+        // 1. the plan is the plan FOR WHAT THE ARM PUBLISHED: replaying the arm's own
+        //    list through llama_ls_spec_plan reproduces the issues and the stop reason
+        {
+            llama_ls_pred_state st;
+            llama_ls_pred_init(&st, n_layer, n_expert, LLAMA_LS_PRED_BIT_ALL);
+            bool same = true;
+            for (size_t i = 0; i < stream_a.size() && same; ++i) {
+                llama_ls_pred_observe(&st, 1, stream_a[i].data(), (int) stream_a[i].size());
+                int32_t pub[LLAMA_LS_PRED_MAX_OUT];
+                const int n_pub = llama_ls_pred_arm_predict(&st, arm, 1, top_k, pub, LLAMA_LS_PRED_MAX_OUT);
+                const llama_ls_plan pl = llama_ls_spec_plan(run_a[i].experts_before.data(),
+                                                            run_a[i].state_before.data(), cap,
+                                                            top_k, top_k, 0, top_k, pub, n_pub);
+                if (n_pub != run_a[i].pr.n_arm_count || pl.n_issue != run_a[i].pr.plan.n_issue ||
+                    pl.stop != run_a[i].pr.plan.stop) {
+                    same = false;
+                    break;
+                }
+                for (int j = 0; j < pl.n_issue && same; ++j) {
+                    if (pl.issue[j] != run_a[i].pr.plan.issue[j]) {
+                        same = false;
+                    }
+                }
+            }
+            check("the wiring plans exactly what the arm published (ids + stop reason)", same);
+        }
+
+        // 2. every issue is admitted by the engine's OWN rule, in order, within budget
+        {
+            bool all_admitted = true, budget_ok = true;
+            for (size_t i = 0; i < run_a.size(); ++i) {
+                if (run_a[i].pr.plan.n_issue > top_k) {
+                    budget_ok = false;
+                }
+                std::vector<int32_t> ex  = run_a[i].experts_before;
+                std::vector<uint8_t> stv = run_a[i].state_before;
+                int pend = 0;
+                for (int j = 0; j < run_a[i].pr.plan.n_issue; ++j) {
+                    const llama_ls_spec_admission ad = llama_ls_spec_admit(
+                        ex.data(), stv.data(), cap, top_k, top_k, pend, run_a[i].pr.plan.issue[j]);
+                    if (!ad.ok) {
+                        all_admitted = false;
+                        break;
+                    }
+                    ex[(size_t) ad.pos]  = run_a[i].pr.plan.issue[j];
+                    stv[(size_t) ad.pos] = LLAMA_LS_SPEC_PENDING;
+                    pend++;
+                }
+            }
+            check("every issued fill is admitted by the engine's own rule, in issue order", all_admitted);
+            check("the plan never exceeds the per-row budget", budget_ok);
+        }
+
+        // 3. the BARRIER, both ways. Saturated (no free position): a warm arm proposes
+        //    and the plan must issue nothing. With room beyond the reserve: it issues.
+        {
+            llama_ls_pred_state st;
+            llama_ls_pred_init(&st, n_layer, n_expert, LLAMA_LS_PRED_BIT_ALL);
+            uint32_t rng = llama_ls_pred_null_seed();
+            for (int t = 0; t < 2 * period; ++t) {
+                const int b = t % period;
+                std::vector<int32_t> warm = { (b * 2) % n_expert, (b * 2 + 1) % n_expert };
+                llama_ls_pred_observe(&st, 1, warm.data(), (int) warm.size());
+            }
+            std::vector<int32_t> row = { 0, 1 };
+
+            fixture sat(cap);                                   // every position taken
+            for (int p = 0; p < cap; ++p) {
+                sat.demand_place(p, 200 + p, ++sat.tick);
+            }
+            const llama_ls_propose_result sat_pr = llama_ls_spec_propose(
+                &st, arm, false, 1, top_k, row.data(), (int) row.size(),
+                sat.expert.data(), sat.state.data(), cap, top_k, top_k, 0, &rng, n_expert);
+            check("a saturated cache: the warmed arm still proposes", sat_pr.n_arm_count > 0);
+            check("a saturated cache: the plan issues nothing", sat_pr.plan.n_issue == 0);
+            check("a saturated cache: the refusal is the barrier's, not a silence",
+                  sat_pr.plan.stop == LLAMA_LS_STOP_RESERVE || sat_pr.plan.stop == LLAMA_LS_STOP_NO_FREE);
+
+            fixture room(cap);                                  // room beyond the reserve
+            for (int p = 0; p < top_k; ++p) {
+                room.demand_place(p, 300 + p, ++room.tick);
+            }
+            const llama_ls_propose_result room_pr = llama_ls_spec_propose(
+                &st, arm, false, 1, top_k, row.data(), (int) row.size(),
+                room.expert.data(), room.state.data(), cap, top_k, top_k, 0, &rng, n_expert);
+            check("room beyond the reserve: the plan DOES issue the arm's fills",
+                  room_pr.plan.n_issue > 0);
+            check("room beyond the reserve: it holds the reserve back meanwhile",
+                  room_pr.plan.n_issue <= cap - top_k - top_k);
+        }
+
+        // 4. no-peeking: the two streams differ ONLY in their last row, so every
+        //    earlier stage must be identical -- the wiring observes row k and proposes
+        //    for row k+1, and may never see the row it proposes for
+        {
+            std::vector<stage_out> run_b;
+            drive(cap, stream_b, false, run_b, arm);
+            bool same_upto_last = run_a.size() == run_b.size();
+            for (size_t i = 0; i + 1 < run_a.size() && same_upto_last; ++i) {
+                if (run_a[i].issued != run_b[i].issued ||
+                    run_a[i].pr.n_arm_count != run_b[i].pr.n_arm_count ||
+                    run_a[i].pr.plan.stop != run_b[i].pr.plan.stop) {
+                    same_upto_last = false;
+                }
+            }
+            check("a proposal for row k cannot depend on row k+1 (no peeking)", same_upto_last);
+        }
+
+        // 5. determinism through the wiring: the same stream twice, same fills
+        {
+            std::vector<stage_out> again;
+            drive(cap, stream_a, false, again, arm);
+            bool identical = again.size() == run_a.size();
+            for (size_t i = 0; i < run_a.size() && identical; ++i) {
+                if (again[i].issued != run_a[i].issued) {
+                    identical = false;
+                }
+            }
+            check("the same demand stream produces the same fills twice", identical);
+        }
+
+        // 6. the count-matched null: the ARM's count, different ids (structure-free)
+        {
+            std::vector<stage_out> run_null;
+            drive(cap, stream_a, true, run_null, arm);
+            bool counted = true, differs = false;
+            int  n_warm  = 0, n_diff_stages = 0;
+            for (size_t i = 0; i < run_null.size(); ++i) {
+                if (run_null[i].pr.n_proposals != run_null[i].pr.n_arm_count) {
+                    counted = false;
+                }
+                if (run_null[i].pr.n_arm_count > 0) {
+                    n_warm++;
+                    // compare the PUBLISHED ids, not what the cache happened to admit:
+                    // the null's contract is "the arm's count, no signal in the ids"
+                    bool same_ids = run_null[i].pr.n_proposals == run_a[i].pr.n_proposals;
+                    for (int j = 0; j < run_null[i].pr.n_proposals && same_ids; ++j) {
+                        if (run_null[i].pr.published[j] != run_a[i].pr.published[j]) {
+                            same_ids = false;
+                        }
+                    }
+                    if (!same_ids) {
+                        differs = true;
+                        n_diff_stages++;
+                    }
+                }
+            }
+            check("the null publishes exactly the ARM's count, on every stage", counted);
+            check("the null's published ids are not the arm's (it consults no ids)",
+                  differs && n_diff_stages > 0);
+            check("the arm itself produced proposals (there was a count to match)", n_warm > 0);
+        }
+
+        // 7. the empty case is honest: a cold state and an empty demand row publish
+        //    nothing, and the plan issues nothing -- not a zero dressed as a result
+        {
+            llama_ls_pred_state st;
+            llama_ls_pred_init(&st, n_layer, n_expert, LLAMA_LS_PRED_BIT_ALL);
+            uint32_t rng = llama_ls_pred_null_seed();
+            fixture f(cap);
+            const llama_ls_propose_result pr = llama_ls_spec_propose(
+                &st, arm, false, 1, top_k, nullptr, 0, f.expert.data(), f.state.data(), cap,
+                top_k, top_k, 0, &rng, n_expert);
+            check("a cold state with no observed row proposes nothing", pr.n_arm_count == 0);
+            check("and issues nothing", pr.plan.n_issue == 0);
+            check("with no state at all the call is inert rather than a crash",
+                  llama_ls_spec_propose(nullptr, arm, false, 1, top_k, nullptr, 0,
+                                        f.expert.data(), f.state.data(), cap,
+                                        top_k, top_k, 0, &rng, n_expert).plan.n_issue == 0);
+        }
+    }
+
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

@@ -67,12 +67,20 @@ static void usage(const char * prog) {
         "                         --residency moe-expert-bank and --tg-tokens > 0; incompatible with\n"
         "                         --handoff*/--mtp; emits rowset_* telemetry)\n"
         "  --residency-tg-spec <0|1|2>\n"
-        "                       T-GPLR-58 A0: speculative placement of GUESSED expert rows on the\n"
+        "                       T-GPLR-58: speculative placement of GUESSED expert rows on the\n"
         "                         retention path (requires --residency-tg-retain). 0 = off (default),\n"
-        "                         1 = scripted proposals via --residency-tg-spec-script, 2 = reserved\n"
-        "                         for the A1 proposer and refused. A guessed row is claimed resident\n"
-        "                         only after its own copy completes, demands never wait on it, and a\n"
-        "                         demand's capacity is never taken (emits spec telemetry)\n"
+        "                         1 = scripted proposals via --residency-tg-spec-script (the A0 test\n"
+        "                         vehicle), 2 = the A1 PROPOSER: the engine asks the arm itself.\n"
+        "                         A guessed row is claimed resident only after its own copy\n"
+        "                         completes, demands never wait on it, and a demand's capacity is\n"
+        "                         never taken (emits spec telemetry)\n"
+        "  --residency-tg-spec-arm <coact|bar09|fusion>\n"
+        "                       T-GPLR-58 A1: which of the three pre-registered arms proposes\n"
+        "                         (mode 2 only; required, so a leg always names its own arm)\n"
+        "  --residency-tg-spec-null <0|1>\n"
+        "                       T-GPLR-58 A1: replace the arm's PROPOSALS with the count-matched\n"
+        "                         structure-free null (mode 2 only). The arm is still computed: it\n"
+        "                         supplies the count the null is matched to (default 0)\n"
         "  --residency-tg-spec-budget N\n"
         "                       T-GPLR-58 A0: max pending speculative fills per layer (default: top_k)\n"
         "  --residency-tg-spec-script <path>\n"
@@ -2730,6 +2738,8 @@ int main(int argc, char ** argv) {
     int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
     int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
     std::string residency_tg_spec_script;     // T-GPLR-58 A0: --residency-tg-spec-script <path> the scripted proposal sequence
+    int         residency_tg_spec_arm = -1;   // T-GPLR-58 A1: --residency-tg-spec-arm, -1 = unset (0 coact, 1 bar09, 2 fusion)
+    int         residency_tg_spec_null = 0;   // T-GPLR-58 A1: --residency-tg-spec-null <0|1> the count-matched null source
     bool mtp = false;                // T-Q38HG-06: MTP speculative decode in handoff TG
     int mtp_draft = 2;               // T-Q38HG-06: draft tokens per verify round
     std::string act_slab_dtype_str = "bf16"; // T-GPLR-12: bf16 default (f32 stays explicit)
@@ -2978,11 +2988,11 @@ int main(int argc, char ** argv) {
                 return 2;
             }
         } else if (arg == "--residency-tg-spec") {
-            // T-GPLR-58 A0: opt-in SPECULATIVE placement of guessed expert rows
-            // on the retention path. Default-off. Mode 1 = scripted proposals
-            // (the A0 driver: the guesses come from a file, so the mechanism is
-            // exercised without a predictor); mode 2 is reserved for A1's real
-            // proposer and is refused here rather than quietly accepted.
+            // T-GPLR-58: opt-in SPECULATIVE placement of guessed expert rows on the
+            // retention path. Default-off. Mode 1 = scripted proposals (the A0 test
+            // vehicle: the guesses come from a file, so the mechanism is exercised
+            // without a predictor); mode 2 = the A1 proposer, where the engine asks
+            // the arm itself (--residency-tg-spec-arm).
             residency_tg_spec = atoi(arg_value(argc, argv, i, "--residency-tg-spec").c_str());
             if (residency_tg_spec < 0 || residency_tg_spec > 2) {
                 fprintf(stderr, "error: --residency-tg-spec expects 0, 1 or 2 (got %d)\n", residency_tg_spec);
@@ -2997,6 +3007,27 @@ int main(int argc, char ** argv) {
             }
         } else if (arg == "--residency-tg-spec-script") {
             residency_tg_spec_script = arg_value(argc, argv, i, "--residency-tg-spec-script");
+        } else if (arg == "--residency-tg-spec-arm") {
+            // T-GPLR-58 A1 (mode 2): WHICH arm proposes. Only the three names the
+            // block pre-registered are accepted; an unknown name is refused here
+            // rather than defaulted, because a leg that silently ran a different
+            // arm than it named is worse than no leg.
+            const std::string arm_name = arg_value(argc, argv, i, "--residency-tg-spec-arm");
+            if      (arm_name == "coact")  { residency_tg_spec_arm = 0; }
+            else if (arm_name == "bar09")  { residency_tg_spec_arm = 1; }
+            else if (arm_name == "fusion") { residency_tg_spec_arm = 2; }
+            else {
+                fprintf(stderr, "error: --residency-tg-spec-arm expects coact, bar09 or fusion (got \"%s\")\n",
+                        arm_name.c_str());
+                return 2;
+            }
+        } else if (arg == "--residency-tg-spec-null") {
+            residency_tg_spec_null = atoi(arg_value(argc, argv, i, "--residency-tg-spec-null").c_str());
+            if (residency_tg_spec_null < 0 || residency_tg_spec_null > 1) {
+                fprintf(stderr, "error: --residency-tg-spec-null expects 0 or 1 (got %d)\n",
+                        residency_tg_spec_null);
+                return 2;
+            }
         } else if (arg == "--mtp") {            // T-Q38HG-06: enable MTP speculative decoding in the handoff TG
             // path. Requires --handoff (-attention-only) and --tg-tokens.
             mtp = true;
@@ -3627,9 +3658,25 @@ int main(int argc, char ** argv) {
                         "(speculation places guessed rows in the PER-LAYER cache; the reactive slot path has no per-layer residency to speculate into)\n");
         return 2;
     }
-    if (!forced_off && residency_tg_spec == 2) {
-        fprintf(stderr, "error: --residency-tg-spec 2 is RESERVED for the A1 proposer and is not implemented; "
-                        "use 1 (scripted) with --residency-tg-spec-script <path>\n");
+    if (!forced_off && residency_tg_spec == 2 && residency_tg_spec_arm < 0) {
+        fprintf(stderr, "error: --residency-tg-spec 2 needs --residency-tg-spec-arm <coact|bar09|fusion> "
+                        "(a mode-2 run with no proposer is refused rather than run: an arm that proposes "
+                        "nothing on purpose and an arm that was never configured must not look alike)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec == 2 && !residency_tg_spec_script.empty()) {
+        fprintf(stderr, "error: --residency-tg-spec 2 takes its proposals from the arm; drop "
+                        "--residency-tg-spec-script <path> (that is mode 1's source)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec != 2 && residency_tg_spec_arm >= 0) {
+        fprintf(stderr, "error: --residency-tg-spec-arm is only meaningful with --residency-tg-spec 2 "
+                        "(mode 1 proposes from its script)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec != 2 && residency_tg_spec_null != 0) {
+        fprintf(stderr, "error: --residency-tg-spec-null is only meaningful with --residency-tg-spec 2 "
+                        "(the null is a proposal SOURCE, matched to the arm's count)\n");
         return 2;
     }
     if (!forced_off && residency_tg_spec == 1 && residency_tg_spec_script.empty()) {
@@ -4262,6 +4309,17 @@ int main(int argc, char ** argv) {
     // row-cache refusals below.
     if (residency_tg_spec != 0) {
         if (!ls.set_row_set_spec(residency_tg_spec, residency_tg_spec_budget, residency_tg_spec_script)) {
+            fprintf(stderr, "error: speculative TG placement refused: %s\n", ls.error_msg.c_str());
+            ls.tel_run_refused("tg_spec_config", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
+        // MODE 2 only: name the arm and (optionally) switch the proposal SOURCE to
+        // the count-matched null. This allocates the arm's learning state, so it
+        // must happen before begin_row_cache() -- the same bring-up rule the mode-2
+        // branch of set_row_set_spec follows: every refusal is loud, before any
+        // graph exists.
+        if (residency_tg_spec == 2 &&
+            !ls.set_row_set_spec_arm(residency_tg_spec_arm, residency_tg_spec_null != 0)) {
             fprintf(stderr, "error: speculative TG placement refused: %s\n", ls.error_msg.c_str());
             ls.tel_run_refused("tg_spec_config", ls.error_msg.c_str(), 1, 0, 0, "none");
             return 1;
