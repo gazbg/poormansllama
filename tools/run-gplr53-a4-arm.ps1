@@ -10,12 +10,19 @@
 # wrong-region page touch (64 MiB scratch). 4k is the shape where pass 1 IS a real
 # single-prompt prefill (the excess is ~1.77 s of a ~3.55 s pass-1 wall).
 #
-# PRE-REGISTERED reading (recorded here BEFORE any arm runs): the comparison
-# quantity is the pass-1 wall against the same-session off control (0), with the
-# per-chunk embed excess from analyze-gplr53-decay.py as the corroborating term.
-#   (i)  removes >= 70% -> page-side completion (H1)
-#   (ii) removes it     -> submission-side (H3)
-#   neither             -> the hypothesis set is incomplete: ESCALATE, do not tune
+# PRE-REGISTERED reading (recorded here BEFORE any arm runs). The BAND's QUANTITY was
+# SETTLED 2026-09-23 by owner directive (T-GPLR-53 block, "SETTLED - the band's quantity"
+# section): it is the PER-CHUNK EMBED EXCESS from analyze-gplr53-decay.py against the
+# same-session off control (0) -
+#     excess_removal = (ctrl_excess - arm_excess) / ctrl_excess * 100
+# The pass-1 WALL is NOT a removal band and cannot be one: pass 1 is pass 2 plus the
+# one-off, so its removable share IS the excess and its ceiling is `100*(1 - pass2/pass1)`
+# - measured 56.2% at 4k, 10.5% at 50k, 0.86% at 200k. A wall band is unreachable by
+# construction at every shape, so the wall is read as the RELOCATION instrument (pre-pay
+# plus pass-1 wall as a SUM) and its removal % is printed only beside that ceiling.
+#   (i)  removes >= 70% of the EXCESS -> page-side completion (H1)
+#   (ii) removes it                   -> submission-side (H3)
+#   neither                           -> the hypothesis set is incomplete: ESCALATE, do not tune
 # DOSE SERIES (2026-09-22, added after the falsifier fired): five arms take the mode-4
 # duration from --pp-prewarm-delay-ms (0/200/600/1200/1700 ms) so the curve of absorption
 # against the wait can be read, with arm 'delay' kept flag-ABSENT as the compiled-default
@@ -23,7 +30,8 @@
 # (pre-pay + pass-1 wall) which is what decides whether a shorter pre-pay can win.
 #
 # FALSIFIER (not a branch - a check on (i)): if arm 'delay' (mode 4, no page touched)
-# ALSO clears >= 70% of the control's excess, then elapsed time alone accounts for
+# ALSO clears >= 70% of the control's excess (the settled band's quantity - the wall is
+# not the test), then elapsed time alone accounts for
 # the removal and the page-residency reading of (i) COLLAPSES. If it does not, (i)
 # survives its falsifier. Arm 'wrongtouch' (mode 8) grades whether page touching in
 # ANY region suffices, or only the staged source's own pages. This driver records
@@ -121,7 +129,7 @@ if ($ValidateOnly) {
         Write-Host ("  " + $exe + ' ' + ((Get-ArmArgs $A) -join ' '))
     }
     Write-Host "ONE mutex hold for $($arms.Count) arms; GPU busy gate refuses (exit 125) on a non-clean pre-run probe."
-    Write-Host "Then: pass-1 wall deltas vs gplr53-a4-pw0 (>=70% removal = the pre-registered band)."
+    Write-Host "Then: per-chunk embed EXCESS removal vs gplr53-a4-pw0 (>=70% of the EXCESS = the settled band), and the pass-1 wall printed beside its ceiling as the relocation instrument."
     exit 0
 }
 
@@ -247,30 +255,58 @@ try {
         $armRows[$tag] = $fields
     }
 
-    # pre-registered reading, computed once the arms exist: pass-1 wall delta vs the off control
+    # pre-registered reading, computed once the arms exist. The BAND's quantity is the
+    # per-chunk embed EXCESS against the off control (settled 2026-09-23; see the header):
+    # a wall band is unreachable at every shape, so the wall is printed WITH its ceiling
+    # and only ever as the relocation instrument.
     if ($pass1Wall.ContainsKey('gplr53-a4-pw0') -and $pass1Wall['gplr53-a4-pw0'] -gt 0) {
         $ctrl = [double] $pass1Wall['gplr53-a4-pw0']
+        $ctrlExcess = if ($armRows['gplr53-a4-pw0'].ContainsKey('embed_excess_total_ms')) { [double] $armRows['gplr53-a4-pw0']['embed_excess_total_ms'] } else { 0.0 }
+        $ctrlPass2 = if ($armRows['gplr53-a4-pw0'].ContainsKey('pass2_wall_s')) { [double] $armRows['gplr53-a4-pw0']['pass2_wall_s'] } else { 0.0 }
+        $ceiling = if ($ctrlPass2 -gt 0.0 -and $ctrl -gt 0.0) { [math]::Round((1.0 - ($ctrlPass2 / $ctrl)) * 100.0, 1) } else { $null }
         $removal = @{}
+        $excessRemoval = @{}
         foreach ($k in @('gplr53-a4-pw1', 'gplr53-a4-pw2', 'gplr53-a4-pw3', 'gplr53-a4-delay', 'gplr53-a4-wrongtouch',
                          'gplr53-a4-d000', 'gplr53-a4-d200', 'gplr53-a4-d600', 'gplr53-a4-d1200', 'gplr53-a4-d1700', 'gplr53-a4-pin')) {
             if ($pass1Wall.ContainsKey($k)) {
                 $removed = [math]::Round((($ctrl - [double] $pass1Wall[$k]) / $ctrl) * 100.0, 1)
                 $removal[$k] = $removed
-                Write-Host ("  {0}: pass-1 wall removal vs control = {1}%" -f $k, $removed)
+                $ex = $null
+                if ($ctrlExcess -gt 0.0 -and $armRows.ContainsKey($k) -and $armRows[$k].ContainsKey('embed_excess_total_ms')) {
+                    $ex = [math]::Round((($ctrlExcess - [double] $armRows[$k]['embed_excess_total_ms']) / $ctrlExcess) * 100.0, 1)
+                    $excessRemoval[$k] = $ex
+                }
+                # The band's quantity FIRST, the relocation instrument second, one line each.
+                # One decimal always, so a whole number (e.g. 93) still prints as 93.0 - these
+                # lines are compared against the record verbatim.
+                $exLabel = if ($null -eq $ex) { 'n/a' } else { '{0:0.0}' -f $ex }
+                Write-Host ("  {0}: excess removal {1}% (BAND) | pass-1 wall removal {2:0.0}% (relocation instrument)" -f `
+                    $k, $exLabel, $removed)
             }
         }
-        # The falsifier check, stated as a computed line rather than a judgement:
-        # this is a RESULT, not an arm gate - a firing falsifier does not fail the run.
-        if ($removal.ContainsKey('gplr53-a4-delay')) {
-            $d = $removal['gplr53-a4-delay']
+        # The ceiling, printed ONCE and BEFORE any branch reads a wall number.
+        if ($null -ne $ceiling) {
+            $excessShare = if ($ctrl -gt 0.0) { [math]::Round((($ctrlExcess / 1000.0) / $ctrl) * 100.0, 1) } else { 0.0 }
+            Write-Host ("  WALL CEILING: the excess is {0:0.0}% of the control's pass-1 wall and the pass-2 wall is {1:0.0}% of it, so no arm can remove more than {2:0.0}% of the wall at this shape - the 70% wall band is unreachable HERE by construction." -f `
+                $excessShare, [math]::Round(($ctrlPass2 / $ctrl) * 100.0, 1), $ceiling)
+        }
+        # The falsifier check, stated as a computed line rather than a judgement: this is a
+        # RESULT, not an arm gate - a firing falsifier does not fail the run. It is evaluated
+        # on the BAND's quantity (the excess); the wall number is shown only with its ceiling.
+        if ($excessRemoval.ContainsKey('gplr53-a4-delay')) {
+            $d = $excessRemoval['gplr53-a4-delay']
+            $dWall = if ($removal.ContainsKey('gplr53-a4-delay')) { $removal['gplr53-a4-delay'] } else { $null }
             if ($d -ge 70.0) {
-                Write-Host ("  FALSIFIER FIRED: the no-touch delay removes {0}% (>= 70%) - elapsed time alone accounts for the removal, so the page-residency reading of mode 1 COLLAPSES." -f $d)
+                Write-Host ("  FALSIFIER FIRED: the no-touch delay removes {0:0.0}% of the EXCESS (>= 70%) - elapsed time alone accounts for the removal, so the page-residency reading of mode 1 COLLAPSES." -f $d)
             } else {
-                Write-Host ("  FALSIFIER SURVIVED: the no-touch delay removes only {0}% (< 70%) - the page-residency reading of mode 1 stands against this control." -f $d)
+                Write-Host ("  FALSIFIER SURVIVED: the no-touch delay removes only {0:0.0}% of the EXCESS (< 70%) - the page-residency reading of mode 1 stands against this control." -f $d)
+            }
+            if ($null -ne $dWall -and $null -ne $ceiling -and $ceiling -lt 70.0) {
+                Write-Host ("    (its pass-1 wall removal is {0:0.0}%, but the wall band is NOT EVALUABLE at this shape: ceiling {1:0.0}% < 70%. This line replaces a wall number that used to read as a failed test.)" -f $dWall, $ceiling)
             }
         }
-        if ($removal.ContainsKey('gplr53-a4-wrongtouch')) {
-            Write-Host ("  wrong-region touch removes {0}% (page touching in ANY region vs the staged source's own pages)." -f $removal['gplr53-a4-wrongtouch'])
+        if ($excessRemoval.ContainsKey('gplr53-a4-wrongtouch')) {
+            Write-Host ("  wrong-region touch removes {0:0.0}% of the excess (page touching in ANY region vs the staged source's own pages)." -f $excessRemoval['gplr53-a4-wrongtouch'])
         }
     }
 

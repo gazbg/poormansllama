@@ -56,7 +56,11 @@ the one-off is a time-gated completion rather than the source-span page residenc
 second attempt inferred, and both pre-registered mappings (A3's CHUNK0_SPIKE -> H3 and
 A4's branch (i) -> H1) are unsupported. The pre-registered ESCALATE disposition applies:
 the hypothesis set is incomplete, nothing is adopted, and the remaining work is a
-Planner decision plus a dose-response arm, not a re-run. No rule, threshold or accepted
+Planner decision plus a dose-response arm, not a re-run. That Planner decision is now TAKEN
+(2026-09-23, owner directive): the band's quantity is settled as the per-chunk embed EXCESS
+(option A) and the matching reporting fix landed in tools/run-gplr53-a4-arm.ps1; host-only,
+no GPU, no re-run, and no recorded verdict re-scored. The mechanism question itself stays
+where the A4 controls left it, and the dose-response arm remains the arm that could move it. No rule, threshold or accepted
 verdict was changed by any A4 session.
 Dependencies: T-GPLR-52 (its A1/A2/A3 verdicts are inputs AND correction targets: the
 queue-behind-compute law stands, but "staging and compute are flat across passes"
@@ -204,6 +208,23 @@ and A4 owner-invoked under the GPU mutex, one session each):
   the embed graph set and the hypothesis set is incomplete (escalate; do not tune).
   The same-session pinned control and a repeat-2 route-parity arm accompany it; no
   package bytes, routing or graph content change.
+- **SETTLED 2026-09-23 (owner directive; host-only, no GPU, no arm re-run): the `>= 70%`
+  band's QUANTITY is the per-chunk embed EXCESS removal against the same-session off
+  control** - `(ctrl_excess - arm_excess) / ctrl_excess` - i.e. option A of the ESCALATION
+  section below. That is what the falsifier paragraph and the branch wording always
+  described; it is what the code did not compute. The pass-1 WALL is not a band and cannot
+  be one: pass 1 = pass 2 + the one-off, so its removable share IS the excess and its ceiling
+  is `100*(1 - pass2/pass1)` - 56.2% at 4k, 10.5% at 50k, 0.86% at 200k. A wall band is
+  therefore unreachable at EVERY shape by construction. The wall is kept as the RELOCATION
+  instrument (pre-pay + pass-1 wall read as a SUM) and its removal % may only be printed
+  beside that ceiling. Option B (a shape-relative wall band) was rejected as option A with
+  an extra indirection - the ceiling is itself derived from the excess; option C (drop the
+  band, prose per run) was rejected as the least automatable of the three. No threshold value
+  changed, no recorded run was re-scored, and the A3/A4 conclusions and the 12:44Z/13:10Z
+  withdrawal stand unchanged: they rest on the excess table, not on the wall line.
+  The reporting fix that lands this is in `tools/run-gplr53-a4-arm.ps1`: both quantities per
+  arm on ONE line (excess first, wall second), the ceiling printed once before any branch
+  reads a wall number, and the FALSIFIER verdict evaluated on the excess.
 
 Acceptance criteria:
 
@@ -1304,8 +1325,9 @@ used as its production test.
   ~+-110-130 ms (~6-7% of the control; arm `d000`, which waits 0 ms, reads -7.8% "removal"). The dose law is
   stable: absorbed per ms waited is 1.00/0.95/0.96/0.98 at 200/600/1200/1700 ms and the conserved sum holds
   (3.70-3.76 s, spread 0.06 s). No performance claim is made from any of these numbers.
-- **NEW OPEN DEFECT - recorded, deliberately NOT fixed (the band is pre-registered and is not the
-  implementer's to retune).** The driver states its band on the pass-1 WALL
+- **DEFECT RECORDED 2026-09-22, FIXED 2026-09-23 (see the SETTLED section; the fix is the owner's
+  settlement, not an implementer retune).** It was left unfixed on the day because the band is
+  pre-registered. The driver stated its band on the pass-1 WALL
   (`tools/run-gplr53-a4-arm.ps1:11-15`: "the comparison quantity is the pass-1 wall against the same-session
   off control"), its FALSIFIER paragraph measures against the control's EXCESS (`:25-27`), and its code applies
   the 70% test to wall removal (`:246-264`). The two disagree, and the wall band is **unreachable by
@@ -1316,8 +1338,15 @@ used as its production test.
   1804.6 ms) - the quantity this record's withdrawal rests on. The printed line and the recorded conclusion
   therefore point opposite ways, and neither is wrong arithmetic: the metrics are. Escalates to the Planner,
   because the readable instrument is the excess term and the wall band cannot express (i) at all.
+- **FIXED 2026-09-23.** The escalation was settled as option A (the band is the excess) and the driver now
+  prints, per arm, `excess removal {e}% (BAND) | pass-1 wall removal {w}% (relocation instrument)`, then the
+  `WALL CEILING` line once, then an excess-based `FALSIFIER FIRED/SURVIVED`, with an explicit
+  `NOT EVALUABLE ... ceiling {c}% < 70%` note beside the wall number whenever the ceiling cannot express the
+  band. On the recorded 13:10Z run that line now reads FIRED at **93.0%** (excess) instead of SURVIVED at
+  47.2% (wall) - no number was recomputed, only the quantity the branch reads was made the one the contract
+  always named.
 
-#### ESCALATION - decision-ready for the Planner (2026-09-22, host-only, no GPU, no arm re-run): which quantity does the pre-registered `>= 70%` band actually test?
+#### ESCALATION - SETTLED 2026-09-23 BY OWNER DIRECTIVE: OPTION A (the band is the per-chunk embed EXCESS); the analysis below is the decision record as it stood (2026-09-22, host-only, no GPU, no arm re-run): which quantity does the pre-registered `>= 70%` band actually test?
 
 **The question.** `run-gplr53-a4-arm.ps1:11-15` states the comparison quantity as the pass-1 WALL; `:25-27`
 states the falsifier against the control's EXCESS; `:246-264` applies the 70% test to wall removal. One of those
@@ -1391,6 +1420,15 @@ nothing).** In `tools/run-gplr53-a4-arm.ps1`, inside the block at `:246-264` tha
 Escalated because it changes product intent for the block (what an arm's PASS means), and the record's own
 withdrawal rests on the quantity the printed line does not use. No GPU, no mutex, no arm re-run, no threshold
 retuning, no re-scoring; retention state and the T-GPLR-55 shapes untouched.
+
+**SETTLED 2026-09-23 - the owner chose A.** The band's quantity is the per-chunk embed excess removal against
+the same-session off control; the wall stays the relocation instrument, printed with its ceiling and never as a
+band. B and C are recorded as considered-and-rejected (B: option A with an indirection, since the ceiling is
+derived from the excess; C: least automatable). What landed with the decision: the three-piece reporting fix in
+`tools/run-gplr53-a4-arm.ps1` (both quantities per arm on one line, the ceiling once before the branches, an
+excess-based verdict with the wall's non-evaluability stated), the contract text above, and this record. What did
+NOT change: the 70% threshold value, the two branches' meaning, every arm gate, and every previously recorded
+verdict - the past runs are read, never re-scored. Host-only: no GPU, no mutex, no arm re-run.
 
 #### Evidence durability (2026-09-22, host-only, no GPU): re-runs can no longer destroy the previous run's artifacts
 
@@ -1536,8 +1574,9 @@ walls (14.5-15.2 s). A mode that merely starts waiting sooner leaves the sum unc
 FAILS by construction - the precise failure the pre-warm family exhibited.
 Reported but NEVER gating: `pass1_wall_ms`, the T-GPLR-53 excess, `registered_bytes`,
 `register_init_us` (the ~1.6 ms call vs the ~1.9 s commit), `ws_file_bytes` at pass-1 begin.
-EXPLICITLY NOT INHERITED: A4's `>= 70%` band on pass-1 wall (unreachable at every shape -
-ceiling 56.2%/10.5%/0.86% at 4k/50k/200k, see the ESCALATION section). Each arm writes
+EXPLICITLY NOT INHERITED: A4's `>= 70%` band (on the per-chunk embed excess since the
+2026-09-23 settlement; its earlier wall-band form was unreachable at every shape - ceiling
+56.2%/10.5%/0.86% at 4k/50k/200k, see the ESCALATION section). Each arm writes
 `quantity: q_procstart_pass1end` into its own verdict, so no arm can be scored on a number
 it did not name.
 
