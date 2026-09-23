@@ -1,5 +1,24 @@
 # Current State
 
+## 2026-09-23: THE T-53 SETTLEMENT AND THE T-56 A3 WORK ARE COMMITTED AS A TASK-SPLIT SERIES (five outer + one nested commit; the record 9e2f3ed dropped is restored in the process)
+
+Mechanical record, requested by the owner. No GPU time, no mutex, no arm run.
+
+| commit | what |
+|---|---|
+| outer `ccdd0b7` | T-GPLR-53 band settlement: the plan's contract prose (block header, A4 pre-registered bullet, the 2026-09-22 defect bullet, the ESCALATION section as SETTLED, the T-56 cross-reference) plus `tools/run-gplr53-a4-arm.ps1` (per-arm `excess removal e% (BAND) | pass-1 wall removal w% (relocation instrument)`, the `WALL CEILING` line before any branch reads a wall number, an excess-based falsifier verdict, `NOT EVALUABLE` when the ceiling cannot express the band) |
+| outer `f4e524d` | the two `Commit:` fields and the T-GPLR-53/54/56 series record that `9e2f3ed` deleted when it committed a stale worktree copy of the shared docs (see the entry above for the mechanism) |
+| nested `d8d7253a7` | T-GPLR-56 A3 engine work: `set_pp_span_pace`/`register_paced_begin`/`register_paced_ahead`, the three default-off flags with their pre-load refusals, and the fixture generator |
+| outer `9a012b5` | T-GPLR-56 A3 tooling: `tools/check-gplr56-pace.py`, `tools/run-gplr56-a3-arm.ps1`, `tools/run-gplr56-session.ps1`, the `[t56-a3]` host-suite guard, the A3 subsection in the plan, the currentstate record, and the stale-layout gotcha in `AGENTS.md` |
+| outer `c075671` | the nested pin bump to `d8d7253a7` |
+| this commit | the record above plus the series hashes written into the plan's two `Commit:` fields (the T-56 field is marked an IMPLEMENTATION CHECKPOINT: the 4k hold has not run, so no verdict commit exists yet) |
+
+How the shared files were committed: the plan and `currentstate.md` carry this session's hunks only (nothing else was pending in the tree), so each commit's blob was built by applying a **subset** of the session diff to the fixed base commit `5a383c0` and staged through git plumbing (`hash-object -w` + `update-index --cacheinfo`), then read back and compared byte-for-byte before the commit was allowed. The final A3 commit stages the whole worktree file, so the series ends with index == worktree - the failure mode `9e2f3ed` exposed cannot repeat here. Verified: each blob re-derived from the base and compared against `git show <commit>:<path>` (MATCH at O1/O2/O3), `git diff --check 5a383c0..HEAD` clean, `resplit-gplr-plan.py --verify` PASS, `check-doc-sizes.py` PASS, and `git status` clean in both trees afterwards.
+
+**A tooling defect worth recording, because it silently truncated the first attempt:** a staged series must compute each intermediate blob against the FIXED base commit. `git diff <path>` compares the worktree to the INDEX, so after the first commit the recorded diff shrinks to whatever is still unstaged - the first run of the driver rebuilt O2 from a 4-hunk diff instead of the session's 10 and was stopped by its own hunk-count guard (O1 had already landed correctly and is byte-verified above). The fix is `git diff <base> -- <path>`, which ignores the index.
+
+What this does NOT change: the T-56 A3 hold is still BLOCKED on the shared card and still NOT-STARTED; the settlement changed bookkeeping and one printed line, not physics; and none of this is acceptance evidence for any task.
+
 ## 2026-09-23: T-GPLR-56 A3 IS IMPLEMENTED AND HOST-VALIDATED (`p1-pace` behind three DEFAULT-OFF flags, its own refusing analyzer, one-command session); the 4k HOLD IS BLOCKED ON THE SHARED CARD and nothing was started
 
 A3's mechanism and its reading tools are in the tree and proven host-only (no GPU, no mutex, no model); the arm itself has NOT run, so the mechanism's effect on Q is UNMEASURED and nothing here is a performance result.
