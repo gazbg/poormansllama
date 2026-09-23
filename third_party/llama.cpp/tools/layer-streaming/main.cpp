@@ -66,6 +66,19 @@ static void usage(const char * prog) {
         "                         expert ROWS each token's router selects (reactive; requires\n"
         "                         --residency moe-expert-bank and --tg-tokens > 0; incompatible with\n"
         "                         --handoff*/--mtp; emits rowset_* telemetry)\n"
+        "  --residency-tg-spec <0|1|2>\n"
+        "                       T-GPLR-58 A0: speculative placement of GUESSED expert rows on the\n"
+        "                         retention path (requires --residency-tg-retain). 0 = off (default),\n"
+        "                         1 = scripted proposals via --residency-tg-spec-script, 2 = reserved\n"
+        "                         for the A1 proposer and refused. A guessed row is claimed resident\n"
+        "                         only after its own copy completes, demands never wait on it, and a\n"
+        "                         demand's capacity is never taken (emits spec telemetry)\n"
+        "  --residency-tg-spec-budget N\n"
+        "                       T-GPLR-58 A0: max pending speculative fills per layer (default: top_k)\n"
+        "  --residency-tg-spec-script <path>\n"
+        "                       T-GPLR-58 A0: the scripted sequence, one line per entry:\n"
+        "                         <layer> <ordinal> <expert> [<expert> ...]\n"
+        "                         meaning speculate these ids for this layer's ordinal-th demand\n"
         "  --residency-tg-retain [N]\n"
         "                       T-GPLR-19: per-layer row residency (F2-M1) -- keep the last N\n"
         "                         windows' routed expert rows in PRIVATE per-layer storage so a\n"
@@ -2714,6 +2727,9 @@ int main(int argc, char ** argv) {
     int handoff_partial_n = -1;      // T-GPLR-16: NCMOE-style partial handoff (first N banks stay host-resident; -1 = off)
     bool residency_tg = false;       // T-GPLR-13: --residency-tg moe-row-set TG policy (reactive expert row windows)
     int  residency_tg_retain = 0;    // T-GPLR-19: --residency-tg-retain [N] per-layer row cache (0 = off, default; bare flag = kRowSetRetainDefault)
+    int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
+    int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
+    std::string residency_tg_spec_script;     // T-GPLR-58 A0: --residency-tg-spec-script <path> the scripted proposal sequence
     bool mtp = false;                // T-Q38HG-06: MTP speculative decode in handoff TG
     int mtp_draft = 2;               // T-Q38HG-06: draft tokens per verify round
     std::string act_slab_dtype_str = "bf16"; // T-GPLR-12: bf16 default (f32 stays explicit)
@@ -2961,8 +2977,27 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "error: --residency-tg-retain expects 1..64 windows (got %d)\n", residency_tg_retain);
                 return 2;
             }
-        } else if (arg == "--mtp") {
-            // T-Q38HG-06: enable MTP speculative decoding in the handoff TG
+        } else if (arg == "--residency-tg-spec") {
+            // T-GPLR-58 A0: opt-in SPECULATIVE placement of guessed expert rows
+            // on the retention path. Default-off. Mode 1 = scripted proposals
+            // (the A0 driver: the guesses come from a file, so the mechanism is
+            // exercised without a predictor); mode 2 is reserved for A1's real
+            // proposer and is refused here rather than quietly accepted.
+            residency_tg_spec = atoi(arg_value(argc, argv, i, "--residency-tg-spec").c_str());
+            if (residency_tg_spec < 0 || residency_tg_spec > 2) {
+                fprintf(stderr, "error: --residency-tg-spec expects 0, 1 or 2 (got %d)\n", residency_tg_spec);
+                return 2;
+            }
+        } else if (arg == "--residency-tg-spec-budget") {
+            residency_tg_spec_budget = atoi(arg_value(argc, argv, i, "--residency-tg-spec-budget").c_str());
+            if (residency_tg_spec_budget < 0) {
+                fprintf(stderr, "error: --residency-tg-spec-budget expects a non-negative count (got %d)\n",
+                        residency_tg_spec_budget);
+                return 2;
+            }
+        } else if (arg == "--residency-tg-spec-script") {
+            residency_tg_spec_script = arg_value(argc, argv, i, "--residency-tg-spec-script");
+        } else if (arg == "--mtp") {            // T-Q38HG-06: enable MTP speculative decoding in the handoff TG
             // path. Requires --handoff (-attention-only) and --tg-tokens.
             mtp = true;
             mtp_explicit = true;
@@ -3448,7 +3483,9 @@ int main(int argc, char ** argv) {
         // T-GPLR-13: row-set TG is a streaming-module mode like the others.
         { residency_tg,
           "--residency off is incompatible with --residency-tg (moe-row-set TG is a streaming-module mode)" },
-        // T-GPLR-19: the per-layer row cache is likewise a streaming-module mode.
+        // T-GPLR-58 A0: speculative placement is likewise a streaming-module mode.
+        { residency_tg_spec != 0,
+          "--residency off is incompatible with --residency-tg-spec (speculative placement is a streaming-module mode)" },
         { residency_tg_retain > 0,
           "--residency off is incompatible with --residency-tg-retain (per-layer row residency is a streaming-module mode)" },
         // T-GPLR-12: pw-probe is a layer-major default now; only an explicit
@@ -3583,6 +3620,26 @@ int main(int argc, char ** argv) {
     }
     if (!forced_off && residency_tg_retain > 0 && !residency_tg) {
         fprintf(stderr, "error: --residency-tg-retain requires --residency-tg (the per-layer cache pages the same routed rows the reactive path stages)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec != 0 && residency_tg_retain <= 0) {
+        fprintf(stderr, "error: --residency-tg-spec requires --residency-tg-retain "
+                        "(speculation places guessed rows in the PER-LAYER cache; the reactive slot path has no per-layer residency to speculate into)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec == 2) {
+        fprintf(stderr, "error: --residency-tg-spec 2 is RESERVED for the A1 proposer and is not implemented; "
+                        "use 1 (scripted) with --residency-tg-spec-script <path>\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec == 1 && residency_tg_spec_script.empty()) {
+        fprintf(stderr, "error: --residency-tg-spec 1 needs --residency-tg-spec-script <path> "
+                        "(the A0 driver supplies the guesses; a real proposer is A1's deliverable)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec == 0 && residency_tg_spec_budget != 0) {
+        fprintf(stderr, "error: --residency-tg-spec-budget is only meaningful with --residency-tg-spec "
+                        "(got budget %d with the mode off)\n", residency_tg_spec_budget);
         return 2;
     }
     if (!forced_off && residency_tg && mtp) {
@@ -4196,6 +4253,20 @@ int main(int argc, char ** argv) {
     // loud at bring-up rather than mid-generation.
     ls.row_set_retain   = residency_tg_retain > 0;
     ls.row_set_retain_k = residency_tg_retain > 0 ? residency_tg_retain : kRowSetRetainDefault;
+
+    // T-GPLR-58 A0: configure speculative placement BEFORE begin_row_cache()
+    // allocates its state and long before any TG graph exists, so a bad
+    // configuration -- an unreadable script, an expert id outside the model, a
+    // budget above the cache's capacity -- is loud at bring-up rather than
+    // mid-generation. The refusal goes out as a structured run refusal, like the
+    // row-cache refusals below.
+    if (residency_tg_spec != 0) {
+        if (!ls.set_row_set_spec(residency_tg_spec, residency_tg_spec_budget, residency_tg_spec_script)) {
+            fprintf(stderr, "error: speculative TG placement refused: %s\n", ls.error_msg.c_str());
+            ls.tel_run_refused("tg_spec_config", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
+    }
     // T-GPLR-19 (F2-M1): the DEFAULT depth is fitted to the device so a tight
     // device provisions what fits instead of failing at the full ~2.19 GiB. The
     // allowance is the shared VRAM model's cache_budget: whichever binds of the

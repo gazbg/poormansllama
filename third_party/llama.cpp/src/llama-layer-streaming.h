@@ -1070,7 +1070,117 @@ struct LLAMA_API llama_layer_streaming {
     // residency cap. It stays 0 until an allocation succeeds: a cache that
     // never allocated must not report bytes.
     size_t         row_cache_alloc_bytes = 0;
+    // -----------------------------------------------------------------------
+    // T-GPLR-58 A0 (2026-09-23): speculative placement on the retention path.
+    //
+    // Default-off. Mode 0 leaves every array below EMPTY and every guard inert
+    // by construction (no position is ever PENDING and no event is ever
+    // created), which is what P6's byte-identity claim rests on.
+    //   mode 1 = scripted proposals (A0's test vehicle: the sequence comes from
+    //            a file, so the mechanism is exercised with no predictor)
+    //   mode 2 = RESERVED for A1's real proposer, and REFUSED today, loudly, so
+    //            a scripted run can never be mistaken for a predictor run.
+    // Guesses are placed ONLY in the per-layer row cache (the retention path);
+    // the slot-keyed reactive path has no per-layer residency to speculate into,
+    // so modes 1/2 precondition on retention and are refused otherwise.
+    //
+    // ONE OWNER PER FACT: `cache_expert` / `cache_recency` remain the sole owners
+    // of which expert sits at a position and how recently it was routed. The
+    // arrays below add the speculative STATE only, indexed by the same position,
+    // and are empty whenever the mode is off.
+    //
+    // P1's guard is `spec_in_demand_window`: a demand's own row wait must never
+    // cover a speculative copy's completion, so a reap taken while that window is
+    // open is COUNTED in `spec_waited_by_demand` instead of being assumed away.
+    // It reads 0 in a correct run and non-zero the moment a reap moves inside the
+    // window -- the falsifier the invariant asks for.
+    // -----------------------------------------------------------------------
+    int          row_set_spec_mode    = 0;   // 0 off, 1 scripted, 2 reserved (refused)
+    int          row_set_spec_budget  = 0;   // max PENDING fills per layer (0 = auto = top_k)
+    int          row_set_spec_reserve = 0;   // positions ALWAYS kept free for demand (top_k)
+    std::string  row_set_spec_script;        // path, recorded for the run_start echo
+    bool         row_set_spec_on       = false;
+    bool         spec_in_demand_window = false;  // P1 guard, see above
+    std::vector<std::vector<uint8_t>>  spec_state;  // per layer, pos -> llama_ls_spec_state
+    std::vector<std::vector<uint8_t>>  spec_flag;   // per layer, pos -> placed by speculation
+    std::vector<std::vector<uint32_t>> spec_gen;    // per layer, pos -> slot generation at issue
+    std::vector<std::vector<int64_t>>  spec_tick;   // per layer, pos -> recency to stamp on completion
+    std::vector<std::vector<void *>>   spec_ev;     // per layer, event slot -> fill's OWN completion event
+    std::vector<std::vector<int32_t>>  spec_ev_pos; // per layer, event slot -> position it serves (-1 free)
+    std::vector<int>                   spec_calls;  // demand stages per layer (script ordinals)
+    // T-GPLR-58 A2: per layer, pos -> the demand-stage ORDINAL that issued the
+    // fill now sitting there (-1 = no fill, or already consumed). A1/A2 compute
+    // M7's lead from this: lead = (stage that consumed) - (stage that issued), so a
+    // fill issued at the end of stage t and consumed by stage t+2 has lead 2.
+    std::vector<std::vector<int32_t>>  spec_issue_ord;
+    // scripted proposals: key = (layer << 32) | ordinal -> the ids to speculate
+    // at the END of that layer's (ordinal-1)-th demand stage
+    std::unordered_map<uint64_t, std::vector<int32_t>> spec_script;
+    // counters, emitted per stage by tel_spec()
+    int64_t spec_submitted = 0;          // fills admitted and issued
+    int64_t spec_ready     = 0;          // fills whose copy completed and were claimed resident
+    int64_t spec_cancelled = 0;          // fills abandoned before being needed (P4)
+    // P4 wants the FIRING POINT named, not just the total (colibri's UPDATE101
+    // recorded predictions_cancelled=0 in every leg, which is an untested hook,
+    // not a passing one): one counter per cancellation point.
+    int64_t spec_cancelled_capacity   = 0; // reclaimed for a demand's capacity
+    int64_t spec_cancelled_demand     = 0; // the demand asked for the very row in flight
+    int64_t spec_cancelled_generation = 0; // issued under a stale slot generation
+    int64_t spec_refused_capacity = 0;   // admissions refused by the P3 reserve/budget
+    int64_t spec_dup_refused = 0;        // admissions refused because the row was present/pending
+    int64_t spec_matched_by_demand = 0;  // fills a demand asked for while still PENDING (P2 fallback)
+    int64_t spec_waited_by_demand = 0;   // P1 falsifier: reaps inside a demand window (stays 0)
+    int64_t spec_reap_wait_us = 0;       // host time waiting at reaps (speculation path only)
+    int64_t spec_issued_bytes = 0;       // bytes H2D'd by speculative fills
+    // T-GPLR-58 A2: M7's datum. `lead` counts DEMAND STAGES OF THAT LAYER
+    // between the stage that issued a fill and the stage whose demand was served
+    // from it. Only a CONSUMED fill is recorded: a fill a demand meets while it is
+    // still PENDING is the fallback (spec_matched_by_demand, effective lead 0) and
+    // is deliberately NOT folded into this distribution, so the histogram is the
+    // whole evidence M7 asks for. Bucket 7 = lead >= 8.
+    int64_t spec_consumed  = 0;          // fills a demand was actually served from
+    int64_t spec_lead_sum  = 0;          // sum of lead over consumed fills
+    int32_t spec_lead_min  = 0;          // 0 = none consumed yet
+    int32_t spec_lead_max  = 0;
+    std::vector<int64_t> spec_lead_hist; // 8 buckets: lead 1..7, then >= 8
 
+    // Configure speculative placement. Validated here AND by the runner before
+    // the model load; returns false with a structured error rather than silently
+    // degrading to mode 0.
+    bool set_row_set_spec(int mode, int budget, const std::string & script_path);
+
+    // Issue the scripted fills that follow layer il's demand stage -- the ids
+    // listed for (il, spec_calls[il] + 1). Reaps first (on this, the speculation
+    // path), then admits and issues. No-op when the mode is off.
+    void spec_issue_next(int il);
+
+    // Issue ONE speculative fill, or refuse it with a reason (P3/P5).
+    bool spec_issue_one(int il, int32_t expert, uint32_t generation, int64_t tick);
+
+    // T-GPLR-58 A2 (M7): record the lead of one fill a DEMAND was served from,
+    // and clear its issue ordinal. Returns false when the position holds no fill
+    // (an ordinary resident placed by a demand), in which case nothing is counted.
+    bool spec_note_lead(int il, int pos);
+
+
+    // Complete the fills whose copies finished (claiming residency) and free the
+    // cancelled ones. The ONLY place a PENDING position changes state.
+    void spec_reap(int il);
+
+    // Cancel the layer's OLDEST pending fills (0 = none by capacity pressure; a
+    // generation boundary passes the whole pending count). Marks only: it never
+    // waits, so it is safe inside a demand stage.
+    void spec_cancel(int il, int need_free, const char * reason);
+
+    // Pending / ready-speculative row counts for one layer (telemetry + planning).
+    int spec_pending_of(int il) const;
+    int spec_ready_of(int il) const;
+
+    // Free the speculative state, events included; idempotent.
+    void spec_reset();
+
+    // one `spec` event per demand stage while the mode is on
+    void tel_spec(int il, int pending_now, int ready_spec_now);
     // allocate the per-layer cache storage; called only when row_set_retain is
     // set, before any TG graph is built (the cache is not a graph tensor, but
     // a failed allocation must be loud at bring-up, never mid-generation).
@@ -1469,6 +1579,98 @@ LLAMA_API bool llama_ls_slab_overlaps(size_t a_start, size_t a_end, size_t b_sta
 // arithmetic, no CUDA: unit-tested against the stable-sort form in
 // tests/test-layer-streaming-route-topk.cpp.
 LLAMA_API void llama_ls_route_topk_row(const float * probs, int64_t n_expert, int64_t k, int32_t * ids_out);
+
+// ---------------------------------------------------------------------------
+// T-GPLR-58 A0 (2026-09-23): speculative TG expert-row PLACEMENT, as one pure,
+// host-testable owner.
+//
+// A speculative fill is a GUESSED row for a demand that has not happened yet
+// (the proposer is A1's deliverable; in A0 the guesses come from a scripted
+// sequence, so the mechanism is exercised without a predictor). Three rules
+// decide every outcome, and all three are arithmetic rather than effects -- so
+// they live here, are called by the engine, and are driven directly by
+// tests/test-layer-streaming-tg-spec.cpp with no CUDA and no model. The arrays
+// are the caller's own storage, indexed by cache position:
+//
+//   experts[p]  the expert id at position p (-1 = none). Owned by the engine's
+//               cache (cache_expert); this API never writes it.
+//   states[p]   llama_ls_spec_state: FREE / READY / PENDING / CANCELLED.
+//   recency[p]  the LRU stamp (larger = more recently routed).
+//   spec[p]     1 = placed by speculation and no demand has consumed it yet.
+//
+//   P2  a position is a HIT only in READY state (its own copy completed); a
+//       PENDING position is reserved but never served, and its bytes are never
+//       overwritten while the copy is in flight.
+//   P3  speculation is a HARD BARRIER below demand capacity: an admission is
+//       refused unless at least `reserve` positions stay FREE for the demand
+//       side, speculative fills are capped at `max_pending` per layer, and a
+//       ready speculative row is the FIRST victim -- never a residency claim
+//       that crowds out demand.
+//   P4  cancellation is a PLAN, not an assumption: the caller names how many
+//       positions it must reclaim (`need_free`) and gets back the OLDEST
+//       pending fills to cancel. A cancelled fill frees its position only after
+//       its own copy completed (the caller reaps it), so a write in flight is
+//       never reused, and the mark is non-blocking -- which is what lets a
+//       demand stage cancel without waiting (P1).
+// ---------------------------------------------------------------------------
+enum llama_ls_spec_state : uint8_t {
+    LLAMA_LS_SPEC_FREE      = 0, // no row here
+    LLAMA_LS_SPEC_READY     = 1, // row resident; its own copy completed
+    LLAMA_LS_SPEC_PENDING   = 2, // copy in flight: reserved, never a hit, never evicted
+    LLAMA_LS_SPEC_CANCELLED = 3, // cancelled mid-flight: the reap frees it WITHOUT a residency claim
+};
+
+struct llama_ls_spec_admission {
+    bool         ok     = false;
+    int          pos    = -1;
+    const char * reason = "";    // why it was refused (structured telemetry)
+};
+
+// Admission decision for one speculative fill (P3/P5). Refused when the expert
+// is already present (READY or PENDING -- no duplicate admission), when no FREE
+// position exists, when `n_pending` is already at `max_pending`, or when taking
+// a position would leave fewer than `reserve` FREE positions for demand. It
+// never evicts and never displaces a READY row, so a speculative source cannot
+// reduce the incumbent's coverage (P5).
+LLAMA_API llama_ls_spec_admission llama_ls_spec_admit(const int32_t * experts, const uint8_t * states,
+                                                      int cap, int reserve, int max_pending,
+                                                      int n_pending, int32_t expert);
+
+// The first FREE position, or -1. The demand path uses it too, so "where does a
+// fetched row go" has exactly one owner.
+LLAMA_API int llama_ls_spec_free_pos(const int32_t * experts, const uint8_t * states, int cap);
+
+// P2's hit test, in one place: ONLY READY is a hit. FREE, PENDING and CANCELLED
+// must all be fetched by the demand itself.
+LLAMA_API bool llama_ls_spec_is_hit(uint8_t state);
+
+// P2/P3 eviction rules: a PENDING or CANCELLED position is NEVER a victim (its
+// bytes are in flight); a READY speculative row is preferred over any demanded
+// row; among comparable candidates the smaller recency loses.
+LLAMA_API bool llama_ls_spec_may_evict(uint8_t state);
+LLAMA_API bool llama_ls_spec_victim_better(int64_t a_recency, uint8_t a_spec, bool a_has,
+                                           int64_t b_recency, uint8_t b_spec, bool b_has);
+
+// Cancellation plan (P4): which PENDING positions must be cancelled to reclaim
+// `need_free` positions? OLDEST (smallest recency) first. Writes at most
+// `max_out` positions and returns how many. A generation boundary cancels ALL
+// pending fills, which the caller asks for by passing the layer's whole pending
+// count as `need_free`.
+LLAMA_API int llama_ls_spec_cancel_plan(const int64_t * recencies, const uint8_t * states,
+                                        int cap, int need_free, int * out_positions, int max_out);
+
+// T-GPLR-58 A2 (M7): the LEAD of one consumed fill, in demand stages of its own
+// layer -- the head start a fill actually got before a demand was served from it.
+// The issuing stage counts as 0, so a fill issued at the end of stage t and consumed
+// by stage t+2 has lead 2. Returns 0 when there is no fill to credit (`issue_ord`
+// < 0) or when the fill was consumed in the stage that issued it: 0 therefore always
+// means "not a consumed speculative row", never "a consumed fill with no head start".
+LLAMA_API int llama_ls_spec_lead(int32_t consume_ord, int32_t issue_ord);
+
+// M7's histogram bucket for a lead: 1..7 -> 0..6, >= 8 -> 7 (the overflow bucket),
+// and -1 for a lead that is not a consumption (see llama_ls_spec_lead). The engine
+// keeps exactly 8 counters, so the emitted distribution always has this shape.
+LLAMA_API int llama_ls_spec_lead_bucket(int lead);
 
 // T-GPLR-36 follow-up (2026-09-18): HOST-memory instrument. The 200k ledger run
 // attributed the time residual but left one measured quantity unattributed: the

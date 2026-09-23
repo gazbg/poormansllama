@@ -389,6 +389,15 @@ if (LLAMA_LAYER_STREAMING)
     # counters, which the instrument reports as ok == false rather than 0.
     llama_build_and_test(test-layer-streaming-host-mem.cpp)
     target_compile_definitions(test-layer-streaming-host-mem PRIVATE LLAMA_LAYER_STREAMING)
+
+    # T-GPLR-58 A0: host-only proof of the speculative TG expert-row placement
+    # RULES (llama_ls_spec_*), driven by a scripted proposal sequence: a
+    # PENDING row is never a hit and is never evicted, an admission is refused
+    # at the demand-capacity barrier, cancellation plans oldest-first, and the
+    # mode-off shape keeps today's LRU behaviour. No CUDA, no model load.
+    llama_build_and_test(test-layer-streaming-tg-spec.cpp)
+    target_compile_definitions(test-layer-streaming-tg-spec PRIVATE LLAMA_LAYER_STREAMING)
+
 endif()
 
 llama_build(test-export-graph-ops.cpp)
