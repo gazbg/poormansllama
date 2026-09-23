@@ -141,6 +141,21 @@ static void usage(const char * prog) {
         "                       Duration of the mode-4 no-touch delay in ms (0..60000, default\n"
         "                       1700 = the compiled control duration, so an un-flagged run is\n"
         "                       unchanged). Requires a pre-warm mode with bit 4 set.\n"
+        "  --pp-span-pace N     T-GPLR-56 A3: paced registration of the mmap-registered\n"
+        "                       source spans. 0=off (default; the one-shot path, byte-identical),\n"
+        "                       1=paced: the first group is page-locked before the timed PP and\n"
+        "                       every later group is issued from stage_members() a bounded\n"
+        "                       distance ahead of the layer that needs it, so pending unlocked\n"
+        "                       bytes stay near one group instead of 17.23 GiB. Requires\n"
+        "                       --copy-source mmap-registered; refused, never clamped.\n"
+        "  --pp-span-pace-ahead N\n"
+        "                       Groups issued ahead of the layer being staged (0..64, default 1).\n"
+        "                       Requires --pp-span-pace 1.\n"
+        "  --pp-register-site S T-GPLR-56 A3 arm control: post-prebuild (default, today's\n"
+        "                       site) or early (the earliest legal point, right after the\n"
+        "                       boundary-layer selection; A2 measured that head start at 66.4 ms).\n"
+        "                       Mutually exclusive with --pp-span-pace 1. Registration during\n"
+        "                       the model load is forbidden (owner decision 2026-09-22).\n"
         "  --residency S        weight-residency policy: auto (default), off, dense-layer, moe-expert-bank\n"
         "  --fault-drop-member  T-GPLR-02 negative fixture: drop the last package member from the\n"
         "                       descriptor after init so load_layer must reject the partial package\n"
@@ -2650,6 +2665,9 @@ int main(int argc, char ** argv) {
     int pp_repeat = 1;               // T-GPLR-28: in-process PP repeat (first-touch experiment)
     int pp_prewarm = 0;              // T-GPLR-53 A4: pre-timed modality pre-warm (0=off default; bitfield 1/2/4/8)
     int pp_prewarm_delay_ms = 1700;  // T-GPLR-53 A4: mode-4 no-touch delay duration (default = compiled control)
+    int pp_span_pace = 0;            // T-GPLR-56 A3: paced registration of the mapped spans (0=off default, 1=paced)
+    int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
+    int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
     int device = 0;
     std::string tel_path;
     std::string check_path;
@@ -2829,6 +2847,36 @@ int main(int argc, char ** argv) {
             pp_prewarm_delay_ms = atoi(arg_value(argc, argv, i, "--pp-prewarm-delay-ms").c_str());
             if (pp_prewarm_delay_ms < 0 || pp_prewarm_delay_ms > 60000) {
                 fprintf(stderr, "error: --pp-prewarm-delay-ms expects 0..60000; got %d\n", pp_prewarm_delay_ms);
+                return 2;
+            }
+        } else if (arg == "--pp-span-pace") {
+            // T-GPLR-56 A3: paced registration (see the block). Default 0 = off,
+            // which leaves the code path, the events and the bytes unchanged.
+            pp_span_pace = atoi(arg_value(argc, argv, i, "--pp-span-pace").c_str());
+            if (pp_span_pace < 0 || pp_span_pace > 1) {
+                fprintf(stderr, "error: --pp-span-pace expects 0 (off, default) or 1 (paced); got %d\n", pp_span_pace);
+                return 2;
+            }
+        } else if (arg == "--pp-span-pace-ahead") {
+            // How many GROUPS ahead of the layer being staged a registration is
+            // issued. 1 mirrors the block's "a bounded distance ahead".
+            pp_span_pace_ahead = atoi(arg_value(argc, argv, i, "--pp-span-pace-ahead").c_str());
+            if (pp_span_pace_ahead < 0 || pp_span_pace_ahead > 64) {
+                fprintf(stderr, "error: --pp-span-pace-ahead expects 0..64 groups; got %d\n", pp_span_pace_ahead);
+                return 2;
+            }
+        } else if (arg == "--pp-register-site") {
+            // T-GPLR-56 A3 arm control: WHERE the span registration is issued.
+            // post-prebuild = today's site; early = the earliest legal point, right
+            // after exec_layers is assigned (A2 measured that head start at 66.4 ms).
+            // Registration during the model LOAD stays FORBIDDEN (owner decision).
+            const std::string site = arg_value(argc, argv, i, "--pp-register-site");
+            if (site == "post-prebuild") {
+                pp_register_site = 0;
+            } else if (site == "early") {
+                pp_register_site = 1;
+            } else {
+                fprintf(stderr, "error: --pp-register-site expects post-prebuild (default) or early; got %s\n", site.c_str());
                 return 2;
             }
         } else if (arg == "--greedy") {
@@ -3200,6 +3248,27 @@ int main(int argc, char ** argv) {
     }
     if (pp_prebuild_per_pass < 0 || pp_prebuild_per_pass > 1) {
         fprintf(stderr, "error: --pp-prebuild-per-pass must be 0 or 1\n");
+        return 2;
+    }
+    // T-GPLR-56 A3: the paced mode's preconditions are refused HERE, before the
+    // model load, so a misconfigured arm fails in seconds and is observable with
+    // no GPU and no trace (the T-GPLR-53 prewarm-flag lesson: a refusal that can
+    // only be reached after the load is indistinguishable from a run that
+    // silently took the default path). These are FLAG-level facts, so nothing is
+    // measured by deferring them; the engine keeps its own checks as the second
+    // line of defence.
+    if (pp_span_pace > 0 && copy_source != "mmap-registered") {
+        fprintf(stderr, "error: --pp-span-pace %d requires --copy-source mmap-registered; got %s\n",
+                pp_span_pace, copy_source.c_str());
+        return 2;
+    }
+    if (pp_span_pace > 0 && pp_register_site == 1) {
+        fprintf(stderr, "error: --pp-span-pace 1 cannot be combined with --pp-register-site early "
+                        "(the paced groups emit events that must follow run_start, and the early site precedes it); run one arm or the other\n");
+        return 2;
+    }
+    if (pp_span_pace == 0 && pp_span_pace_ahead != 1) {
+        fprintf(stderr, "error: --pp-span-pace-ahead %d requires --pp-span-pace 1 (nothing to pace)\n", pp_span_pace_ahead);
         return 2;
     }
     if (telemetry_chunk_stride <= 0 || telemetry_chunk_stride > 1000000) {
@@ -4298,6 +4367,17 @@ int main(int argc, char ** argv) {
         ls.tel_run_refused("pp_pool_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
         return 1;
     }
+    // T-GPLR-56 A3: arm the paced registration. The mode's flag-level preconditions
+    // were already refused before the load; what remains here is the engine's own
+    // check against the copy source it actually resolved, and it refuses (never
+    // clamps), so a typo cannot silently run the default path and be reported as pace.
+    if (pp_span_pace > 0 && !ls.set_pp_span_pace(pp_span_pace, pp_span_pace_ahead)) {
+        fprintf(stderr, "error: pp-span-pace configure failed: %s\n", ls.error_msg.c_str());
+        ls.tel_run_refused("span_pace_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
+        return 1;
+    }
+    // T-GPLR-56 A3: set by whichever registration site runs, so the other site skips.
+    bool spans_registered = false;
     // T-GPLR-04: emit the structured byte_account evidence now that the
     // telemetry sink exists (ls.init opened it). The preflight arithmetic
     // above already passed; this re-derivation is cheap (host-only metadata)
@@ -4331,6 +4411,30 @@ int main(int argc, char ** argv) {
         }
     }
     ls.exec_layers = boundary_layers;
+
+    // T-GPLR-56 A3 arm `p1-early`: the earliest LEGAL registration site - after the
+    // load, after ls.init and after exec_layers is assigned, before the prebuild.
+    // A2 measured the head start this buys at 66.4 ms, so this arm is the negative
+    // control for "earlier is enough". Trace consequence, accepted and recorded:
+    // this site's registration events precede run_start. No checker rule objects
+    // (only NAMED layer events carry a before-run_start rule, and unknown event
+    // names are ignored by design), and registration during the model LOAD remains
+    // forbidden, so this is the earliest a mode may go.
+    if (pp_register_site == 1 && copy_source == "mmap-registered") {
+        llama_ls_tel_mark("register_issue", "early");   // pre-sink-safe: WHERE it was issued
+        fprintf(stderr, "mmap-registered staging: registering mapped source spans (site=early, before the prebuild)...\n");
+        int64_t reg_bytes = 0;
+        double  reg_us    = 0.0;
+        if (!ls.register_paced_begin(reg_bytes, reg_us)) {
+            ls.failed = true;
+            fprintf(stderr, "error: %s (aborted before the timed PP)\n", ls.error_msg.c_str());
+            ls.tel_run_refused("mmap_register", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
+        fprintf(stderr, "mmap-registered staging: %lld B (%.2f GiB) pinned in %.1f ms (site=early, pre-timed setup)\n",
+                (long long) reg_bytes, reg_bytes / 1073741824.0, reg_us / 1000.0);
+        spans_registered = true;
+    }
 
     // T-GPLR-02 negative fixture: drop the last member from the first executed
     // layer's descriptor AFTER its slot bundle was built, so the descriptor
@@ -4534,11 +4638,15 @@ int main(int argc, char ** argv) {
             // Pre-timed, so the cost is setup and it cannot pollute the pass
             // wall; a failure is a REFUSAL (same shape as the graph-budget
             // abort) rather than a silent fall back to the copy hop.
-            if (copy_source == "mmap-registered") {
+            // T-GPLR-56 A3: `spans_registered` is set by the early site above, so the
+            // registration happens exactly once whichever site ran. With the mode off
+            // this block is byte-for-byte today's: register_paced_begin() delegates to
+            // register_all_pkg_sources() when pp_span_pace == 0.
+            if (pp_register_site == 0 && !spans_registered && copy_source == "mmap-registered") {
                 int64_t reg_bytes = 0;
                 double  reg_us    = 0.0;
                 fprintf(stderr, "mmap-registered staging: registering mapped source spans (once)...\n");
-                if (!ls.register_all_pkg_sources(reg_bytes, reg_us)) {
+                if (!ls.register_paced_begin(reg_bytes, reg_us)) {
                     ls.failed = true;
                     abort_reason  = "mmap_register";
                     abort_needed  = 0;
@@ -4546,6 +4654,15 @@ int main(int argc, char ** argv) {
                     abort_cap     = "none";
                     fprintf(stderr, "error: %s (aborted before the timed PP)\n", ls.error_msg.c_str());
                     exit_status = 1;
+                } else if (pp_span_pace > 0) {
+                    // T-GPLR-56 A3: the paced call pins the FIRST group only and returns
+                    // what it pinned so far, so the one-shot wording would understate the
+                    // span this run is committing. Print the mode's own accounting instead
+                    // (total groups / total bytes / issued so far), and keep the off path's
+                    // line byte-identical above.
+                    fprintf(stderr, "mmap-registered staging: PACED registration armed - %lld of %lld B in %zu groups; first group pinned in %.1f ms (the rest issues ahead of each layer's first copy, %d group(s) ahead)\n",
+                            (long long) ls.paced_reg_bytes_issued(), (long long) ls.paced_reg_bytes_total(),
+                            ls.paced_reg_group_count(), reg_us / 1000.0, pp_span_pace_ahead);
                 } else {
                     fprintf(stderr, "mmap-registered staging: %lld B (%.2f GiB) pinned in %.1f ms (pre-timed setup)\n",
                             (long long) reg_bytes, reg_bytes / 1073741824.0, reg_us / 1000.0);

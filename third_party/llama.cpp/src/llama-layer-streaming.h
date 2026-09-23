@@ -278,6 +278,46 @@ struct LLAMA_API llama_layer_streaming {
     std::vector<size_t>       all_reg_bytes;
     std::vector<bool>         all_reg_covered;   // T-GPLR-39: member of a coalesced registration group (span owned by the group's first layer)
 
+    // T-GPLR-56 A3 - PACED REGISTRATION (owner-ratified 2026-09-22; DEFAULT OFF).
+    //
+    // The problem the mode attacks is a LATENCY one: `register_all_pkg_sources`
+    // issues every cudaHostRegister up front, and the DEFERRED work of those calls
+    // commits on the first submission, so the first staging copy of the sweep
+    // stalls for it (measured 1814.3 ms at 4k; the calls themselves are ~1.6-2.3 ms).
+    // Paced mode keeps the same total commit but issues it in GROUP order a bounded
+    // distance ahead of the copy that needs it: the first group before the timed
+    // pass, every later group from stage_members() when the sweep reaches the layer
+    // `ahead` groups before it. Pending (unlocked) bytes therefore stay near one
+    // group instead of 17.23 GiB, and the commit is spread across the pass.
+    //
+    // It is additive BY CONSTRUCTION: `pp_span_pace == 0` never enters this state
+    // and register_all_pkg_sources() is not modified by the mode at all, so a
+    // default run's code path, events and bytes are unchanged. Nothing about the
+    // measured quantity changes either: Q is still proc_start -> pass1_end, and
+    // each arm declares it. Telemetry for the mode is emitted under NEW event names
+    // (`span_pace`, `span_pace_stage`, `span_pace_end`) so no existing parser sees
+    // a new shape.
+    struct ls_reg_group {
+        uintptr_t lo       = 0;   // page-rounded group start
+        uintptr_t hi       = 0;   // page-rounded group end (exclusive)
+        size_t    bytes    = 0;   // hi - lo
+        int       first_il = 0;   // the group's FIRST logical layer (it owns the registration)
+        size_t    merged   = 0;   // spans coalesced into this group
+        size_t    members  = 0;   // package members inside it
+        bool      done     = false;
+        // The logical layers whose spans lie inside this group. They are NOT
+        // necessarily contiguous: exec_layers may be a boundary subset, and a
+        // group is coalesced by ADDRESS, so coverage has to be marked per layer.
+        std::vector<int> layers;
+    };
+    std::vector<ls_reg_group> paced_groups;
+    size_t                    paced_next_group = 0;
+    std::vector<uint8_t>      paced_touch_seen;   // per layer: its first staging copy was observed
+    int64_t                   paced_bytes_total  = 0;
+    int64_t                   paced_bytes_issued = 0;
+    int                       pp_span_pace       = 0;   // 0 = off (existing path), 1 = paced
+    int                       pp_span_pace_ahead = 1;   // groups issued ahead of the staging copy
+
     // T-GPLR-30: persistent pinned pool. Empty when off (no --pp-pool).
     // One pinned host buffer per entry, mirroring one bank's package bytes.
     // fixed: entry i mirrors bank i, populated once at configure, never
@@ -607,6 +647,23 @@ struct LLAMA_API llama_layer_streaming {
     // the timed region starts.
     bool register_all_pkg_sources(int64_t & bytes_out, double & us_out);
     void unregister_all_pkg_sources();
+    // T-GPLR-56 A3: the paced variant of the call above. `set_pp_span_pace` arms it
+    // (mode 2 is refused, not clamped, so a typo cannot silently run the default);
+    // `register_paced_begin` replaces the one-shot call at the runner's registration
+    // site and page-locks the FIRST group only; `register_paced_ahead(il)` is called
+    // from stage_members() and issues every group whose first layer is within
+    // `ahead` of il. With pp_span_pace == 0 these are never reached.
+    bool set_pp_span_pace(int mode, int ahead);
+    bool register_paced_begin(int64_t & bytes_out, double & us_out);
+    bool register_paced_ahead(int il);
+    // T-GPLR-56 A3: read-only accounting of the paced mode, so the runner can report
+    // the TOTAL span a paced run is committing. It needs this because the paced call
+    // returns only what it has pinned SO FAR (the first group), while the one-shot
+    // call returned the whole span - the same number would otherwise be read as if the
+    // registration had shrunk. All three are 0 while the mode is off.
+    size_t  paced_reg_group_count()  const { return paced_groups.size(); }
+    int64_t paced_reg_bytes_total()  const { return paced_bytes_total; }
+    int64_t paced_reg_bytes_issued() const { return paced_bytes_issued; }
 
     // find or create the graph set for (mode, n_tokens, rs_z, n_outputs) and make it the
     // current build target. The set's result object and graph list are reset

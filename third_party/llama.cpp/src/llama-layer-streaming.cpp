@@ -834,6 +834,243 @@ bool llama_layer_streaming::register_all_pkg_sources(int64_t & bytes_out, double
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// T-GPLR-56 A3: PACED REGISTRATION (contract in the header). Off by default and
+// additive by construction: with pp_span_pace == 0 nothing below ever runs and
+// register_all_pkg_sources() is not modified. Invariants kept:
+//   * every executed layer is registered (through all_reg_base for a group's
+//     first layer, or all_reg_covered for the rest) BEFORE any staging copy that
+//     needs it, else the existing loud refusal fires - never a silent fall back;
+//   * single-counted ownership and teardown reuse the same vectors as the
+//     one-shot path, so unregister_all_pkg_sources() needs no paced variant;
+//   * telemetry uses NEW event names only, so no existing checker sees a new
+//     shape in a trace.
+// ---------------------------------------------------------------------------
+bool llama_layer_streaming::set_pp_span_pace(int mode, int ahead) {
+    if (mode < 0 || mode > 1) {
+        error_msg = "set_pp_span_pace: mode must be 0 (off) or 1 (paced) - refused, not clamped";
+        return false;
+    }
+    if (mode == 1) {
+        if (!copy_src_registered) {
+            error_msg = "set_pp_span_pace: paced registration requires --copy-source mmap-registered";
+            return false;
+        }
+        if (ahead < 0 || ahead > 64) {
+            error_msg = "set_pp_span_pace: ahead must be 0..64 groups";
+            return false;
+        }
+    }
+    pp_span_pace       = mode;
+    pp_span_pace_ahead = ahead;
+    if (mode == 0) {
+        paced_groups.clear();
+        paced_touch_seen.clear();
+        paced_next_group   = 0;
+        paced_bytes_total  = 0;
+        paced_bytes_issued = 0;
+    }
+    return true;
+}
+
+bool llama_layer_streaming::register_paced_begin(int64_t & bytes_out, double & us_out) {
+    bytes_out = 0;
+    us_out    = 0.0;
+    if (pp_span_pace == 0) {
+        return register_all_pkg_sources(bytes_out, us_out);   // off: the existing one-shot path
+    }
+    if (!copy_src_registered) {
+        error_msg = "register_paced_begin: requires a mmap-registered copy source";
+        return false;
+    }
+    all_reg_base.assign(pkg_cache.size(), nullptr);
+    all_reg_bytes.assign(pkg_cache.size(), (size_t) 0);
+    all_reg_covered.assign(pkg_cache.size(), false);
+    paced_groups.clear();
+    paced_touch_seen.assign(pkg_cache.size(), 0);
+    paced_next_group   = 0;
+    paced_bytes_total  = 0;
+    paced_bytes_issued = 0;
+
+    const uintptr_t page_mask = (uintptr_t) 4095;
+    const int64_t   t0        = ggml_time_us();
+
+    // (1) page-rounded span of every EXECUTED layer: the same rule as the one-shot
+    // path (span of the members' mapped addresses, never a file-offset table), and
+    // the reason this mode needs the loaded model and cannot run earlier.
+    struct span_rec { int il; uintptr_t lo, hi; size_t members; };
+    std::vector<span_rec> spans;
+    for (int il = 0; il < (int) pkg_cache.size(); ++il) {
+        if (!exec_layers.empty()) {
+            bool want = false;
+            for (int e : exec_layers) {
+                if (e == il) { want = true; break; }
+            }
+            if (!want) {
+                continue;
+            }
+        }
+        const llama_ls_package & pkg = pkg_cache[(size_t) il];
+        uintptr_t lo = (uintptr_t) -1;
+        uintptr_t hi = 0;
+        size_t    members = 0;
+        for (const auto & m : pkg.members) {
+            if (m.src == nullptr || m.src->data == nullptr) {
+                continue;
+            }
+            const uintptr_t a = (uintptr_t) m.src->data;
+            const uintptr_t b = a + (uintptr_t) ggml_nbytes(m.src);
+            lo = std::min(lo, a);
+            hi = std::max(hi, b);
+            members++;
+        }
+        if (members == 0 || hi <= lo) {
+            continue;
+        }
+        spans.push_back({ il, lo, hi, members });
+    }
+
+    // (2) coalesce page-touching spans in file order - the SAME grouping the
+    // one-shot path registers, kept in group order so it can be issued one group
+    // at a time. Each group remembers its member layers (they are not necessarily
+    // contiguous: exec_layers may be a boundary subset).
+    size_t si = 0;
+    while (si < spans.size()) {
+        size_t sj = si;
+        uintptr_t glo = spans[si].lo & ~page_mask;
+        uintptr_t ghi = (spans[si].hi + page_mask) & ~page_mask;
+        size_t    gmembers = spans[si].members;
+        while (sj + 1 < spans.size()) {
+            const uintptr_t nlo = spans[sj + 1].lo & ~page_mask;
+            const uintptr_t nhi = (spans[sj + 1].hi + page_mask) & ~page_mask;
+            if (nlo > ghi) {
+                break;   // at least one free page between the groups
+            }
+            ghi = std::max(ghi, nhi);
+            gmembers += spans[sj + 1].members;
+            ++sj;
+        }
+        ls_reg_group g;
+        g.lo       = glo;
+        g.hi       = ghi;
+        g.bytes    = (size_t) (ghi - glo);
+        g.first_il = spans[si].il;
+        g.merged   = sj - si + 1;
+        g.members  = gmembers;
+        g.done     = false;
+        for (size_t k = si; k <= sj; ++k) {
+            g.layers.push_back(spans[k].il);
+        }
+        paced_groups.push_back(g);
+        paced_bytes_total += (int64_t) g.bytes;
+        si = sj + 1;
+    }
+    if (paced_groups.empty()) {
+        error_msg = "register_paced_begin: no package source spans to register";
+        return false;
+    }
+
+    // (3) the FIRST group, before the timed pass: the same head start the one-shot
+    // path gave every group at once. The rest is issued from stage_members().
+    if (!register_paced_ahead(-1)) {
+        return false;
+    }
+    us_out    = (double) (ggml_time_us() - t0);
+    bytes_out = paced_bytes_issued;
+    if (tel_out != nullptr) {
+        tel_write(tel_out, "{\"event\":\"span_pace_init\",\"run_id\":%llu,\"mode\":%d,\"ahead\":%d,"
+                  "\"groups\":%zu,\"bytes_total\":%lld,\"bytes_issued\":%lld,\"us\":%.1f,\"t_us\":%lld}",
+                  (unsigned long long) run_id, pp_span_pace, pp_span_pace_ahead,
+                  paced_groups.size(), (long long) paced_bytes_total, (long long) paced_bytes_issued,
+                  us_out, (long long) ggml_time_us());
+    }
+    return true;
+}
+
+bool llama_layer_streaming::register_paced_ahead(int il) {
+    if (pp_span_pace == 0 || paced_groups.empty()) {
+        return true;   // off: a no-op by construction
+    }
+
+    // (a) the layer's FIRST staging copy is being reached: record whether pacing
+    // had already covered it (the p1-pace discriminator: every layer covered at
+    // its first touch means the commit was issued ahead of the copy that needs it).
+    if (il >= 0 && (size_t) il < paced_touch_seen.size() && paced_touch_seen[(size_t) il] == 0) {
+        paced_touch_seen[(size_t) il] = 1;
+        const bool covered = ((size_t) il < all_reg_base.size()    && all_reg_base[(size_t) il] != nullptr) ||
+                             ((size_t) il < all_reg_covered.size() && all_reg_covered[(size_t) il]);
+        if (tel_out != nullptr) {
+            tel_write(tel_out, "{\"event\":\"span_pace_stage\",\"run_id\":%llu,\"layer\":%d,\"covered\":%d,"
+                      "\"groups_issued\":%zu,\"groups_total\":%zu,\"bytes_unissued\":%lld,\"t_us\":%lld}",
+                      (unsigned long long) run_id, il, covered ? 1 : 0,
+                      paced_next_group, paced_groups.size(),
+                      (long long) (paced_bytes_total - paced_bytes_issued),
+                      (long long) ggml_time_us());
+        }
+        // NOT a check: an uncovered layer is caught by ls_register_pkg_source's own
+        // loud refusal when its copy is staged, so the failure has one owner.
+    }
+
+    // (b) issue the groups that are now due. il < 0 = the pre-pass head start
+    // (the first group only); otherwise every group whose FIRST layer is within
+    // `ahead` groups of the layer being staged.
+    size_t end = 1;
+    if (il >= 0) {
+        end = 0;
+        while (end < paced_groups.size() && paced_groups[end].first_il <= il + pp_span_pace_ahead) {
+            ++end;
+        }
+    }
+    while (paced_next_group < end) {
+        ls_reg_group & g = paced_groups[paced_next_group];
+        const void * base  = (const void *) g.lo;
+        const size_t bytes = g.bytes;
+        char err[256] = {0};
+        if (!ggml_backend_cuda_register_host_range(base, bytes, err, sizeof(err))) {
+            error_msg = "paced registration: cudaHostRegister failed for the group starting at logical layer " +
+                        std::to_string(g.first_il) + " (" + std::to_string(bytes) + " bytes): " + err;
+            unregister_all_pkg_sources();   // leave the box unpinned on refusal
+            paced_next_group = paced_groups.size();
+            return false;
+        }
+        // ownership: the group's FIRST layer carries the registration; its other
+        // members are marked covered so their staging finds the span without a
+        // duplicate register (identical convention to the one-shot path).
+        for (size_t k = 0; k < g.layers.size(); ++k) {
+            const int l2 = g.layers[k];
+            if ((size_t) l2 >= all_reg_base.size()) {
+                continue;
+            }
+            if (k == 0) {
+                all_reg_base[(size_t) l2]  = base;
+                all_reg_bytes[(size_t) l2] = bytes;
+            } else {
+                all_reg_covered[(size_t) l2] = true;
+            }
+        }
+        g.done = true;
+        paced_bytes_issued += (int64_t) bytes;
+        if (tel_out != nullptr) {
+            tel_write(tel_out, "{\"event\":\"span_pace\",\"run_id\":%llu,\"gi\":%zu,\"layer\":%d,"
+                      "\"bytes\":%zu,\"members\":%zu,\"merged\":%zu,\"base\":%llu,\"issued\":%zu,"
+                      "\"total\":%zu,\"bytes_unissued\":%lld,\"t_us\":%lld}",
+                      (unsigned long long) run_id, paced_next_group, g.first_il, bytes, g.members,
+                      (size_t) (g.layers.size() - 1), (unsigned long long) (uintptr_t) base,
+                      paced_next_group + 1, paced_groups.size(),
+                      (long long) (paced_bytes_total - paced_bytes_issued),
+                      (long long) ggml_time_us());
+        }
+        ++paced_next_group;
+    }
+    if (paced_next_group >= paced_groups.size() && paced_groups.size() > 0 && tel_out != nullptr) {
+        // the last group is issued: the total commit is complete
+        tel_write(tel_out, "{\"event\":\"span_pace_end\",\"run_id\":%llu,\"groups\":%zu,\"bytes\":%lld,\"t_us\":%lld}",
+                  (unsigned long long) run_id, paced_groups.size(), (long long) paced_bytes_issued,
+                  (long long) ggml_time_us());
+    }
+    return true;
+}
+
 void llama_layer_streaming::unregister_all_pkg_sources() {
     for (size_t i = 0; i < all_reg_base.size(); ++i) {
         if (all_reg_base[i] != nullptr) {
@@ -870,6 +1107,14 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
                                           char * pool_base, size_t pool_bytes, bool pool_valid,
                                           char * staging, size_t * staged_out,
                                           int * submit_batch_out) {
+    // T-GPLR-56 A3: paced registration is issued HERE, before a single copy for
+    // this layer is enqueued, so the group covering a bounded distance ahead of
+    // the sweep is locked (and its deferred commit started) while this layer's
+    // copies run. No-op when the mode is off; a failure is a refusal.
+    if (pp_span_pace > 0 && !register_paced_ahead(il)) {
+        return false;
+    }
+
     // T-GPLR-33: report the actually-taken submission path so traces are
     // self-verifying (the flag alone cannot distinguish a span copy from a
     // degraded fallback). 0 = per-member only, 1 = single span copy, 2 =
