@@ -194,6 +194,43 @@ point); (c) fusion (+6.9/+6.9 honest, +20.9 echo, needs 4 sources and the
 null-share caveat). None of this changes the T-pf-06 lesson: an offline
 win is a hypothesis; the engine A/B remains the verdict instrument.
 
+## The room these numbers must fill (2026-09-23, host-only)
+
+Every recall figure above is a fraction of *demands*, but a predictor only earns
+anything on the demands the incumbent does not already serve. That room is now
+measured from eight recorded retention legs by `tools/analyze-tg-margin.py`
+(selftest 23 cases, registered as the `[tg-margin]` host guard; full table and
+method in T-GPLR-58's BOUNDING MEASUREMENT in the live plan):
+
+| leg | K | uncovered margin | of which first-visit (unreachable by ids) |
+|---|---|---|---|
+| gplr19 echoed | 2 | 56.7% of demands | 0.5% of the margin |
+| gplr19 echoed | 8 | 22.6% | 1.4% |
+| gplr19 honest | 6 | 35.4% | 0.9% |
+| gplr19 honest | 8 | 27.5% | 1.1% |
+| qa-depth | 4 | 36.8% | 2.3% |
+| qa-depth | 8 | 24.8% | 3.4% |
+
+Two consequences for reading the tables above. First, the ceiling is not the
+binding constraint: at most 3.4% of the margin is content the id stream has
+never seen, so these families are limited by their own precision (~25-43% of
+demands at B=8), not by reachability - a screening recall of 28.1% against an
+8-row budget in a margin of only ~2-3 rows per (token, layer) is the real
+arithmetic, and it is why the bar sweep's precision column matters as much as
+the recall column. Second, the margin is not one target: it splits ~41-43%
+cross-layer within the same token (reachable only with a lead of a few *layers*,
+not a token), 24-49% same-layer beyond K (the region a deeper cache would also
+capture, i.e. the VRAM trade), and 7-31% cross-layer long-range. The families
+screened here are ranked against the first two; the third is what a learned
+cross-layer model would have to reach to beat them.
+
+Also note the incumbents these numbers are relative to are subtly stronger than
+the plan's wording: the row cache is a per-layer capacity-LRU over `K x top_k`
+rows, not "the last K windows" (rebuilding the engine's own booking lands within
+0.06-1.14% under capacity-LRU and 7.5-17.2% under the window rule), so the
+effective horizon exceeds K tokens and every net gain here is net of that deeper
+baseline.
+
 ## Reproduce
 
 ```

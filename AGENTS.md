@@ -183,7 +183,36 @@ authoritative online sources before improvising:
 - Route parity is a pass-2 integrity signal: in a clean `--pp-repeat 2` trace every sampled `route` tuple appears EXACTLY TWICE. Since T-GPLR-39 route telemetry DEFAULTS OFF — a defaulted trace has NO route events and `check-route-parity.py` exits 2 ("nothing to evaluate", NOT a pass); the gate requires an explicit `--route-telemetry 1` run. Since T-GPLR-47 (fresh-context swap-in-slot rebuild, nested 4403c1097) it is CLEAN on every supported mode; a DIVERGED result now means a genuinely new pass-2 divergence (or a pre-T-GPLR-47 binary — check the llama.dll hash), not a known defect — `tools/check-route-parity.py`, host-only, no decode. Its exit 2 (no route events) means the run died before routing, which is NOT a pass. T-GPLR-48 addendum: `--pp-prebuild-per-pass` defaults KV-conditional (ON iff `--pp-repeat > 1` AND KV != f16), and `host_ledger`/`pass_end` markers exist ONLY when the rebuild runs — a rebuild-OFF trace has no per-pass ledger.
 - Quantized KV with the rebuild OFF crashes in pass 2 with exit `-1073740791` (0xC0000409) at the **50k** shape, not just T-GPLR-43's 143k one — never pin `--pp-prebuild-per-pass 0` alongside `--kv-cache q8/q4` and read the result as a measurement.
 - Editing `src/llama-layer-streaming.h` changes the `llama_layer_streaming` TYPE LAYOUT, so every test target linked against it must be REBUILT: the host suite's CTest step does not build, and with a stale `test-layer-streaming-layout.exe` the test prints every assertion `ok` and then dies in teardown with `Exit code 0xc0000409` - which reads exactly like a fresh defect in whatever you just changed (measured 2026-09-23: 3.65 s crash vs 0.08 s pass after `cmake --build build/llama-cuda --config Release`).
+- A speculative TG row fill can never serve a demand before the SECOND demand stage after
+  the stage that issued it: the only hot-path reap runs at the END of a stage (that ordering
+  is what keeps `spec_waited_by_demand` at 0), so a fill issued at the end of stage t first
+  counts as READY at the end of t+1. The LEAD FLOOR is therefore 2 demand stages, a lead of 1
+  is unreachable, and a measured `lead_min < 2` means the ordinal bookkeeping is wrong, not a
+  clever schedule. Consequence for reading bands: a "lead median > 0" criterion is VACUOUS
+  (the median is structurally >= 2); the informative datum is `consumed` vs
+  `matched_by_demand` (fills whose own row was demanded while they were still in flight).
+  Measured 2026-09-23 (T-GPLR-58 A2); tool `tools/check-tg-predict.py` (selftest covers the
+  floor, the histogram and the refusals). SETTLED 2026-09-23 (Planner call, T-GPLR-58): M7 is now
+  the invariant `lead_min >= 2` PLUS the arm band `matched/(consumed+matched) <= 0.5` (scored only
+  with >= 8 resolved fills; the structure-free `null` control's rate is reported, never gated) -
+  a median criterion is vacuous in BOTH forms, `> 0` and `>= 2`.
+- The offline screen observes `list(frozenset(union_ids))`, so ITS history family carries
+  CPython's set-iteration order while the engine sees the trace's id order, and that affects
+  the decay weights a rank-merge feeds on: measured 2026-09-23 on three streams, the order moves
+  the fusion arm by up to 0.09pp and coupling by one rounded tenth (0.02pp echo / 0.01pp qa),
+  while every family and bar row the findings doc records reproduces EXACTLY under either order.
+  Drive the reference in the TRACE's order (`tools/check-tg-predict-port.py` does); do not port
+  CPython's set order, and do not read a 0.1pp coupling/fusion drift as a port defect.
+- REPO NAMING TRAP: every A/B leg in this tree is named `arm-A1.jsonl` / `arm-B1.jsonl`, which
+  has nothing to do with a PREDICTOR arm. A checker that infers a role from a filename
+  mislabels those recordings (measured 2026-09-23: `--trace gplr19-honest-k6-ab/arm-B1.jsonl`
+  was refused as a predictor arm that never ran the instrument). Roles are SESSION
+  DECLARATIONS: `tools/check-tg-predict.py` never infers `arm`, and requires `--leg arm=...`.
 - The GPU mutex is cooperative: a non-conforming project (deepseek_v4.exe, observed 2026-09-21) can hold ~16.5 GiB VRAM DURING a mutex-held run and poison it - uniformly-inflated per-layer compute, teardown `cudaFree` OOM crashes (exit 0xc0000409), normal transfer ratios. The recorded "+67.4 s rebuild-OFF pass-2 excess at 200k" was THIS, not a code regression (re-attributed in T-GPLR-50). Before trusting any timing arm: check `nvidia-smi --query-compute-apps` before AND after, and rerun suspect arms under a free GPU before attributing anything to code.
+- The row cache's retention is a **per-layer capacity-LRU** over `K x top_k` ROWS, not "the last K windows" (measured 2026-09-23 in the T-GPLR-58 bounding pass): rebuilding the engine's OWN `n_rows_resident` from `union_ids` lands -0.2% under capacity-LRU against -16.9% under the window rule (honest K=6; qa-depth K=4 is -0.2% vs -17.2%), so the effective horizon EXCEEDS K tokens whenever ids repeat inside the window and the incumbent is stronger than the SDD's wording implies. `slot == layer % n_slots` holds inthose runs and is a RED HERRING: a per-SLOT cache is off by -57% to -87% (both candidate
+  models), so row coverage is per LAYER. Anyone modelling the cache host-side must use
+  capacity-LRU or they will overstate the predictor margin by ~17%. Tool:
+  `tools/analyze-tg-margin.py`, whose `--identify` prints all four models per trace.
 
 ## Validation and Evidence
 

@@ -2032,6 +2032,1010 @@ by this subsection: A3 decides, and A4's 50k/200k holds stay owner-invoked one l
 
 **A3's own status is unchanged in kind: implemented, host-validated, and awaiting the hold.**
 
+### T-GPLR-58 (draft): wire the TG expert predictor into the row-set path - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), judged on a NULL-CORRECTED, VRAM-normalized miss share under the exact-demand-priority invariant
+
+Status: ready (2026-09-23) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer and its port comparator) remains unbuilt, and the A3/A4 holds stay gated on it.
+in the DECIDED section below; both mutex-held sessions are PRE-AUTHORIZED (owner chose the
+"both up front" option, so A4 is not conditional on A3's share outcome). Nothing is
+implemented yet and no GPU time has been spent: A1/A2 are host-only and A3/A4 are the two
+holds. Nothing here re-opens T-GPLR-15 (closed DONE-falsified-by-evidence), T-GPLR-19 (closed
+on the K ladder) or T-GPLR-26 (closed ADVISORY: no gate binds on (b)). The offline screening this contract
+consumes is `docs/findings/predictor-screen-gplr.md` + `tools/predictor-screen-gplr.py`
+(2026-09-23, host-only, no engine change). Every number quoted below is labeled with where it
+was measured: **ours** (this repo, recorded), **colibri** (the DeepSeek-V4 baseline project,
+read this pass), or **PROJECTION** (arithmetic on measured shares, never a result).
+
+Dependencies: T-GPLR-19 (the row cache and the K ladder this rides on, and the engine/offline
+(b) identity criterion 2 established there); T-GPLR-15 (the reuse ceiling and the explicit
+"predictive hypothesis not falsified, the budgeted variant is" close - this block tests the
+FIRST half of that sentence, not the second); T-GPLR-26 (gate 9's (b) reading is ADVISORY, so
+this block must carry its own quantities rather than inherit that gate); T-GPLR-53/T-GPLR-56
+(the pre-registration, falsifier and relocation discipline this contract copies). Not
+blocking: T-GPLR-54, T-GPLR-55 (their shapes are untouched).
+Commit: nested c861ab0d4 (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, tests/test-layer-streaming-tg-spec.cpp, the runner flag surface) + 7480fb5b9 (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the --dump port surface); outer 8e41a52 (uncovered-margin instrument + guard), 8c01a96 (A2 checker + guard), 10b0798 (A1 port comparator + guard), 7a00d53 (pin bump to 7480fb5b9); the docs commit carries the records in this block. A0/A1/A2 are LANDED and host-validated; the A3/A4 holds are still unbuilt and no arm has run, so there is NO verdict commit.
+
+Goal. Decide, on TWO pre-authorized mutex-held sessions (owner, 2026-09-23), whether a TG expert predictor that stages
+SPECULATIVE rows into the existing per-layer row cache produces a demand-hit gain that
+**survives the null control** and **costs no extra VRAM** - i.e. whether a predictor at a
+shallow retention depth K_low delivers what retention-only needs a deeper K_high to deliver -
+with the exact-demand-priority invariant as a BLOCKING gate rather than a design aspiration.
+Charter placement, stated honestly up front: this is a TG-phase residency task, so it CANNOT
+move the program's first objective (measured in-repo, T-GPLR-26: "no depth changes prefill").
+It is a goals-2-and-3 task - minimize VRAM, and hold up when VRAM is crowded - because the
+row cache's private VRAM is bought per depth (546.8/1093.0/2185.4/3277.8/4370.1 MiB at
+K=1/2/4/6/8, recorded) and a predictor that buys hit rate at K_low is a VRAM instrument, which
+is exactly the instrument the charter names.
+
+Scope. Opt-in, CUDA-only, DEFAULT OFF: a prediction mode on the existing row-set path (0 =
+today's path, then the arm modes), a proposal budget B per (token+1, layer), a speculative
+staging path on the copy backend with its OWN completion event, the invariant's counters, and
+the telemetry the acceptance quantities need. Flag-level preconditions are refused BEFORE the
+model load (the T-GPLR-53/T-GPLR-56 lesson: a refusal placed after the load is unobservable):
+prediction without `--residency-tg`, B out of range, a bar/source combination the port does not
+define, and prediction of any kind without the row cache actually fitted.
+Non-goals: no change to routing, expert ids, sampling, or logits; no change to the reference
+(exact-demand) fetch path's bytes, order or barriers; no change to K's fit rules or the K=8
+default; no change to prefill (this is TG-only by construction, and the block must not claim
+otherwise); NO SAMPLING REGIME IN THIS TASK (owner call 2, decided: the verdict runs greedy +
+`--rep-penalty`; a sampler chain, temperature/top-p/seed and their determinism gates are a
+separate capability, not an implied part of this one); no new dependency (colibri's operators
+are ports, not links - their project stays
+a read-only reference); no per-cell weight tuning (the portable vector is the only fusion
+parameterization allowed); no speculative drafting, no trained sidecar, no learned head; no
+re-tuning of any recorded gate.
+
+DECIDED (owner, 2026-09-23) - the three calls that were open in this block's first draft,
+answered before any implementation or GPU time, and binding on every leg below:
+
+1. CHARTER SCOPE - YES, AND BOTH SESSIONS ARE PRE-AUTHORIZED ("both up front"). The mechanism
+   cannot move prefill (measured: the row cache is a TG residency class), so the block's
+   footing is goals 2 and 3 - VRAM per unit of TG hit rate, and the crowded-VRAM case. The
+   owner authorized A3 AND A4 together rather than gating A4 on A3's share outcome, so A4 runs
+   even if A3's share band fails; what HALTS A4 is a FAIL-INVARIANT leg or a refused leg
+   (correctness, not performance). The offline margin is accepted as small, and a negative
+   close remains written into the acceptance criteria.
+2. DECODE REGIME - GREEDY + `--rep-penalty`, ON A DECLARED NON-ECHOING PROMPT. The runner has
+   no sampler chain at all (measured: no `--temp`/`--top-p`/`--seed`; TG is argmax under
+   `--greedy`, `main.cpp:2882`), but it does have `--rep-penalty F` (default 1 = off), documented
+   as "applied identically at every greedy pick site" - the closest existing lever to colibri's
+   `V4_SAMPLE_NOREPEAT=256` guard, which is what they used against the argmax repetition
+   degeneracy (their T-opt-33: repeated tokens give "zero cross-token structure; history
+   trivially wins"). PRE-REGISTERED: `--rep-penalty 1.15` on EVERY leg of both sessions, chosen
+   as an experimental parameter and never tuned per arm, with the value recorded in every arm
+   verdict; the 885-token non-echoing prompt is the corpus (the conservative one). CONSEQUENCE
+   RECORDED: the recorded K-ladder anchors were taken at F=1 greedy, so they are CROSS-CHECKS
+   ONLY and are not any band's denominator (M3 below is self-contained for exactly this
+   reason). A sampler chain stays out of scope: if a positive result ever needs generalizing to
+   a sampled regime, that is a new task with its own determinism gates.
+3. NULL DEFINITION - THE COUNT-MATCHED, STRUCTURE-FREE NULL GATES; there is NO duplicate-
+   incumbent leg. The null leg publishes the same NUMBER of ids per (token+1, layer) as the arm
+   under test published at that row (a scalar read, nothing else), drawn by a fixed-seed rule
+   that reads no ids, no demand and no router output; M2 still prints the pool-growth share
+   beside it. A duplicate-incumbent (colibri-comparable) leg is deliberately NOT added: it
+   measures added volume rather than signal, and colibri's own offline construction is
+   therefore cited as the design input for M2's existence rather than reproduced as a gate.
+
+TARGET OF RECORD (what "the predictor" means in this block, and nothing more). For each
+(token t+1, layer L) the predictor publishes at most B expert ids, using ONLY information a
+faithful online predictor could have at that moment: tokens < t complete (all layers), token t
+at layers < L, and the caches/table state built from exactly that history. Faithfulness is not
+a promise here - it is already a tested property of the ported harness
+(`tools/predictor-screen-gplr.py --selftest`, PASS, plants known history/markov structure and
+asserts it is detected while `predict()` precedes `observe()`).
+Candidate families are the ported set: history (the incumbent, = what retention already does),
+markov-1 (per-layer id-bigram), coact (normalized per-layer co-activation), coupling-copula
+(cross-layer, lift-weighted). The bar is colibri's rank-geometric operator (publish rank r
+while `bar^r >= 0.5`); fusion is their vote operator, with their weighted operator allowed only
+with the portable weight vector `h1 m2 c1 k2`.
+
+EXACT-DEMAND-PRIORITY INVARIANT (pre-registered, BLOCKING, each clause testable). The name is
+colibri's failure, not a theory: their UPDATE101 root-caused a 36-slot thrash (read this pass)
+in which "predicted fills are placed into the SAME per-layer hot window as exact demands", the
+victim picker's barrier set was `in_use OR undrained OR fill_pending`, and a window of 30
+in-use plus in-flight speculative fills left `pick_victim` nothing - 88 no-slot events, 84
+exhausted, 11 demands failing past the pool. Their existing precedent for the fix class is
+`V4_CUDA_PP_SPEC_GUARD` (default ON: refuse predicted proposals during PP) and their
+T-opt-49a `V4_CUDA_TG_GEN_PROTECT` ("a predicted admission is refused when only protected
+slots exist; exact demand keeps the full path"). Ported to THIS engine's structure
+(`load_row_set`: `uniq` = the exact routed union, `fetch` = the non-resident part, async H2D
+into the per-layer cache, D2D refresh of the whole union into the slot bundle, then a
+host-block on `slot.ev_copy_ready` before the FFN may consume):
+
+- **P1 - a demand never waits on a speculative copy.** Speculative copies are issued on the
+  copy backend with their own completion event, and the demand's `ev_copy_ready` wait covers
+  ONLY the demand's own copies. Falsifier: any demand leg whose stage wait includes a
+  speculative copy's completion. Counter: `spec_waited_by_demand` (must be 0 always).
+- **P2 - a speculative row is resident only AFTER its own copy completed.** `row_set_have[]`
+  is set for a predicted id only on that id's own completion; a demand for a staged-but-not-
+  ready id falls back to a normal demand fetch and is telemetried as such. A half-copied row is
+  never served - the slot-sharing and generation guards that protect layer identity today
+  (`row_set_owner` / `row_set_gen`) must cover the speculative path identically.
+- **P3 - speculation is a HARD BARRIER below demand capacity.** Speculative admissions are
+  refused when the layer's cache has no row free beyond what the current and next generation's
+  demand can need; speculative rows are the FIRST victims and are never counted as "resident
+  margin" for any coverage claim. Counter: `spec_refused_capacity`.
+- **P4 - cancellation is exercised, not assumed.** Queued speculative fills are cancelled at
+  the generation boundary and before any demand's stage. Colibri's UPDATE101 recorded
+  `predictions_cancelled=0` in every leg - a cancel hook that never fires is UNTESTED, so this
+  block requires `spec_cancelled > 0` in at least one leg of an arm (and names that leg in the
+  record). Counter: `spec_cancelled`.
+- **P5 - no displacement between sources.** A new source may not reduce the incumbent
+  (history) proposal set: the arm's `history` proposals must equal the `off` leg's, field for
+  field. The precedent is measured (colibri T-opt-27, logit-band: "those 78 band candidates
+  displaced higher-recall HISTORY candidates (`history_predicted` 256->178), regressing
+  coverage 1.56%->0.87%") - the arm that loses to a displaced incumbent is a FAIL, not a result.
+- **P6 - the path is inert when off, and fails loudly when broken.** With the mode at 0 the
+  runner output is byte-identical to today (`diff` clean) and the existing
+  `test-layer-streaming-*` family stays green; a stale generation, a failed speculative copy, a
+  missing completion event or an admission refusal is structured telemetry plus a refusal -
+  never a silent fallback to another generation's rows (the SDD's existing rule).
+
+PRE-REGISTERED ACCEPTANCE QUANTITIES (NULL-CORRECTED; the denominator lesson is ported, not
+invented). Colibri's T-pf-06 was re-scoped by owner decision because its first band measured
+the wrong denominator: their probe's hits were real, but "the live union already covers
+43,625 of 43,904 demands = 99.36%", so the probe's entire unique contribution was bounded by a
+279-demand margin and the original `unique_vs_live/hits >= 5%` band was unreachable by
+construction. This block therefore states BOTH forms and gates on the margin form, and every
+band below reads `null@B` as the leg per decision 3: COUNT-MATCHED PER ROW to the arm under
+test (the arm's published count is the only thing the null reads), NOT a fixed budget - which
+is what makes the bar-0.9 arm's null valid, since that arm publishes fewer rows than B by
+design and a fixed-B null would not be count-matched to it.
+
+- **The engine quantity, and why it is trustworthy: the share is the same number the offline
+  tool predicts.** Per leg, `share = rows_reused / rows_demanded` with
+  `rows_demanded = top_k x layers x TG tokens` (8 x 40 x T), from `rowset_round`/`rowset_fetch`.
+  T-GPLR-19 criterion 2 measured that the runtime `rows_retained` equals the offline
+  `hits_total` EXACTLY (52,930 at K=6 and 59,432 at K=8, 40/40 layers, 0 refusals), so the
+  offline (b) table and this engine quantity are the same statistic on the same stream - the
+  honest ladder is K=1 0.2468, K=2 0.3778, K=4 0.5355, K=6 0.6487, K=8 0.7283 (recorded).
+- **M1 - STRUCTURE-ATTRIBUTABLE SHARE GAIN (PRIMARY, and the only band that can carry a
+  PASS).** On the UNCOVERED MARGIN: `margin_share(arm) = unique_arm / uncovered`, where
+  `uncovered` = demands the `off` leg did not serve as hits in the same session. Band:
+  `margin_share(arm) > margin_share(null@B)` AND `share(arm) - share(null@B) >= the session's
+  own control spread` (the spread is MEASURED in-session by a repeated `off` leg, so the margin
+  is not invented). Both numbers print; a PASS requires both.
+- **M2 - THE POOL-GROWTH SHARE, reported and NEVER credited.** `share(null@B) - share(off)` is
+  printed beside M1. Offline this share is large and must not be confused with the finding:
+  the null-source control lifted held history 22.7 -> 28.0 (ours; the structure-attributable
+  part was +1.6pp honest / +6.3pp echo). Any arm whose M1 is within noise of zero FAILS
+  regardless of how large M2 is.
+- **M3 - VRAM-NORMALIZED EQUIVALENCE (the charter band), SELF-CONTAINED.** Same session,
+  same prompt, same allowlist, same decode regime: `share(arm @ K=2) >= share(off @ K=4)` - the
+  predictor at 1,093.0 MiB must reach what retention-only delivers at 2,185.4 MiB, with BOTH
+  numbers coming from the SAME session's legs. The recorded honest K=4 share (0.5355) is kept
+  as a CROSS-CHECK only, per decision 2: the recorded ladder was taken at F=1 greedy while
+  these legs run at `--rep-penalty 1.15`, so it cannot be a denominator. Report the arm's own
+  peak VRAM beside the pair, and `share(off @ K=6)` as a reported reference (not a band).
+- **M4 - NO REGRESSION (non-inferiority; the safety arm's whole reason to exist).** For every
+  arm, `share(arm) >= share(off) - <session spread>` and the demanded-copy transfer medians are
+  inside the `off` leg's spread. The bar-0.9 arm's offline case is STRICT dominance on both
+  axes (25.1/29.0 vs 24.6/24.7 honest, i.e. +0.5 recall at +4.3 ppb - ours, held-out), so a
+  regression there is a port or invariant defect, not a finding.
+- **M5 - PROPOSAL-VOLUME DISCIPLINE (ported from colibri's L5, and the same lesson as M2).**
+  Total proposals + staged rows growth off/on <= +5%. Their T-pf-04 merge was falsified for
+  exactly this: its proposals "rode on history's ~98k, were absorbed by drops, and were charged
+  staging at history's own waste rate" (their +13%). An arm that wins only by adding volume
+  FAILS this band and M1 together, by construction.
+- **M6 - TIMING HONESTY (reported; gating only in the regression direction).** TG tok/s and
+  `rowset_fetch` transfer medians per leg, against the same-session `off` leg. The honest prior
+  is colibri's own end-to-end lesson (T-pf-06: their fusion advantage "shrank to noise on
+  larger samples"), so this block does NOT promise a tok/s win: it requires that a share win
+  does not COST tok/s beyond the session spread, and reports the direction.
+- **M7 - REACHABILITY: the lead must be measured, not assumed.** A proposal can only become a
+  hit if its copy lands before the demand. Colibri measured this quantity (`lead_avg=2.0,
+  lead_max=2`, "the k=1 staging lead the horizon screen promised") and their S3 failure was a
+  margin problem, not a lead problem. **RESTATED 2026-09-23 (Planner call, taken after A2
+  measured the wording below vacuous - see the M7 RESTATEMENT section of this block).** M7 is
+  now three parts, and only the first two are gates:
+  - **M7a - the floor (invariant, integrity).** `lead_min >= 2` on any leg with a consumption.
+    The reap ordering makes a lower lead impossible, so a lower value is wrong bookkeeping
+    rather than a clever schedule: FAIL-INVARIANT, no share read, and the series HALTS.
+  - **M7b - the late-fill rate (arm band, quality).** `matched_by_demand / (consumed +
+    matched_by_demand) <= 0.5`, equivalently `matched <= consumed`. A fill a demand asked for
+    while it was still PENDING is cancelled and the demand fetches its own copy, so the guess
+    is paid for twice and returns nothing: the rate IS the arm's wasted-guess rate. Gated on
+    `arm` legs ONLY - the count-matched `null` control draws its ids structure-free, so gating
+    its targeting would fail the control by construction; its rate is reported instead, as
+    pool-growth evidence.
+  - **M7c - the distribution (reported, never gated).** `lead_rows` min/median/max/mean and the
+    8-bucket histogram. Not a band: M7a already forces the floor, so the median follows from it
+    and any median criterion is true of every leg that is not already FAIL-INVARIANT.
+  - M7b is SCORED only with `consumed + matched >= 8` resolved fills; a thinner leg reports its
+    rate UNSCORED (its other bands still score) and cannot satisfy M7's clause, so a session
+    with no qualifying arm leg reports M7 UNMEASURED - never PASS. An arm whose guesses never
+    land fails M7b even when it consumed nothing (rate 1.000), which the pre-restatement
+    wording could not see at all.
+
+Arms (each declares its own quantity BEFORE it runs; each writes `quantity:` into its own verdict):
+
+- `off` - today's row-set path, no prediction (`--residency moe-expert-bank --residency-tg
+  --residency-tg-retain K`). The control AND the M1/M2/M4 denominator, run TWICE per session
+  (the second leg is the control spread).
+- `null@B` - predictions on, proposals COUNT-MATCHED PER ROW and STRUCTURE-FREE: the null
+  reads the ARM's published COUNT for each (token+1, layer) - a scalar - and publishes exactly
+  that many ids from a fixed-seed xorshift over [0, n_expert), duplicates rejected, consulting
+  no ids, no demand and no router output (asserted by construction and by a host test that
+  feeds it a reordered router stream and requires an identical proposal sequence). Per-row
+  count-matching is what makes the bar-0.9 arm's null valid: that arm publishes FEWER rows than
+  B by design, so a fixed-B null would not be count-matched to it.
+- `arm-bar09` - same-layer markov-1/coact ranked, published while `0.9^rank >= 0.5` (the SAFETY
+  arm: offline it strictly dominates history on both axes on both streams).
+- `arm-coact` - unbarred co-activation, top-B (the SIMPLE arm: offline +3.5pp recall at equal
+  precision-per-byte on the honest stream).
+- `arm-fusion` - vote fusion (param-free) over {history, markov-1, coact, coupling-copula} (the
+  AMBITIOUS arm: offline +6.9/+6.9 over history honest, but only +1.6pp of it structure-
+  attributable - so M1's margin form is the ONLY way this arm can PASS). The tuned weighted
+  variant is allowed ONLY with the portable vector, with the tune/held split preserved.
+- `retref@K4` - retention-only at the deeper depth, the SELF-CONTAINED M3 denominator (the
+  same-session `share(off @ K=4)` the arm at K=2 must reach). `retref@K6` is an optional
+  REPORTED reference only, never a band. No flag other than `--residency-tg-retain` differs.
+
+Sessions (mutex-held, one per group, one length at a time, BOTH PRE-AUTHORIZED by the owner
+decisions above), each at the declared short shape - the 885-token non-echoing prompt,
+`--tg-tokens 256`, `--rep-penalty 1.15` on every leg:
+- **A3/pilot**: `off@K2`, `off@K2` (the second leg IS the control spread), `null@8@K2`,
+  `arm-coact@K2`, `retref@K4` (the self-contained M3 denominator; optionally `retref@K6` as a
+  reported reference).
+- **A4**: the same set with `arm-bar09@K2` and `arm-fusion@K2` in place of `arm-coact@K2`
+  (its own null leg is count-matched per row to the arm under test).
+50k/200k are NOT pre-authorized: this mechanism's own quantity does not scale with context the
+way prefill's does, and the charter ranks the crowded case second - so a longer-context leg
+would need its own owner call.
+
+Known evidence (measured, with provenance - and the honest headroom, stated first):
+
+- **The headroom is small and bounded.** Colibri's T-32e bounds the live UNCOVERED margin at
+  ~6.7% of demands, and their live union covered 99.36% of demands in the saturated cell. Our
+  own conservative stream is the same shape: history (the incumbent = what retention does)
+  already holds 0.2458 (b) at K=1 and 0.7283 at K=8. A predictor's absolute room is therefore
+  the region between the incumbent's share and 1.0 - which is why M1 gates on the margin and
+  why a "big" raw hit count is explicitly not evidence.
+- **The offline frontier is measured on OUR model** (`docs/findings/predictor-screen-gplr.md`,
+  held-out where noted): unbarred coact 28.1/28.4 vs history 24.6/24.7 at B=8 honest (+3.5pp);
+  bar-0.9 same-layer 25.1/29.0 (+0.5 recall, +4.3 ppb - the risk-free point); vote fusion
+  29.6/29.6 with the null source at 28.0 (structure-attributable +1.6pp); echo stream roughly
+  doubles every margin (42.6/43.0 coact) - the echo bias is the reason the honest stream is the
+  conservative one. The port is anchored: history@B=8 reproduces the recorded (b) K=1 to ~1e-3
+  on both vehicles.
+- **The offline-to-live shrink is the prior, not a surprise.** Colibri T-pf-06's end-to-end A/B
+  reduced their fusion advantage to noise at larger samples, and their strongest shadow result
+  was a MARGIN result (probe caught 90/279 = 32.3% of the uncovered margin) - the exact shape
+  M1 is written in.
+- **The invariant has a measured failure precedent and a measured fix class** (their UPDATE101 +
+  T-opt-49a, quoted above); their T-opt-36 (Markov-2) is a measured NULL in a related direction
+  (emissions all fused onto already-admitted jobs, `bigram_matches=0` while `hist_matches=231`),
+  which is why M1 requires UNIQUE-ON-MARGIN attribution rather than any match counter.
+- **The decode regime is a declared limit, not a neutral choice** (decision 2): the runner is
+  argmax-only, so `--rep-penalty 1.15` breaks repetition without sampling a distribution, and
+  the recorded K-ladder anchors (F=1 greedy) are cross-checks only. A verdict here is evidence
+  about a repetition-broken greedy demand stream - named in every record, never extended to a
+  sampled regime.
+- **Our engine's insertion point is known and single.** `load_row_set` owns the demand set
+  (`uniq`), the non-resident part (`fetch`), the H2D, the D2D union refresh and the blocking
+  wait; `row_set_have/owner/gen` are the residency bookkeeping. A speculative path that does not
+  touch `uniq`, does not enter `fetch`, and marks `have[]` only on its own completion is
+  additive by construction - which is what makes P1-P3 testable host-side.
+
+Failure contract. Every clause above has a named counter, and a missing counter is a FAILED
+check, not a skipped one. A3 and A4 are pre-authorized, so a FAILED share band in A3 does NOT
+cancel A4; a FAIL-INVARIANT leg (P1/P4/M7a as specified below) or a refused leg HALTS the
+series at that point, because the remaining legs would be measuring a broken mechanism. An arm that cannot show P1 (`spec_waited_by_demand == 0`), P4
+(`spec_cancelled > 0` in at least one leg) or M7a (`lead_min >= 2` wherever a fill was
+consumed) is reported FAIL-INVARIANT with no share read at all. M7b is an ARM BAND in the
+M1/M4/M5 family: a FAILED late-fill rate fails that leg's M7 line and does NOT halt the
+session or cancel A4. A direction flip between the offline table and the engine is a
+faithfulness bug and ESCALATES (colibri's T-pf-03 rule: escalate, do not retry). A leg whose
+`share` cannot be computed (missing `rowset_fetch`/`rowset_round`, missing `retain_k`, a
+refusal in the leg) is refused with no number printed - never read as zero. An arm that changes
+routing, greedy ids or the scheduler's staged bytes FAILS the identity gate and is reverted,
+not tuned.
+
+#### A2 IMPLEMENTATION LANDED (2026-09-23, host-only: no GPU, no mutex, no arm run, no model loaded)
+
+**What landed.** The verdict surface this block judges arms with - `tools/check-tg-predict.py` - plus
+the two engine additions its bands needed and could not read from any existing recording.
+
+| piece | where | what it does |
+|---|---|---|
+| the checker | `tools/check-tg-predict.py` (new, registered as the `[tg-predict]` host guard) | reads one leg per `--leg ROLE=PATH` (or `--trace PATH`), computes share / margin / M2 / M4 / M4n / M3 / M5 / M7 and every P-counter, prints the per-leg evidence, or REFUSES the leg |
+| M7's datum | `llama_ls_spec_lead` / `_lead_bucket` (pure, declared in the header) + `spec_issue_ord` + the `lead_hist` counters in `tel_spec` | stamps each fill with the stage that issued it and, when a DEMAND is later served from it, records the lead in demand stages of that layer: the min / median / max and the 8-bucket histogram the band asks for |
+| the resolved mode, in the trace | `run_start` gains `row_spec_mode` / `row_spec_budget` / `row_spec_reserve`, present only when the mode is on | a leg is recognisable as an arm leg from the trace ALONE, never from a filename or a command history (the T-GPLR-48/T-GPLR-52 lesson); mode 0 traces are byte-unchanged |
+| the fixture coverage | `tests/test-layer-streaming-tg-spec.cpp`, new M7 section (11 checks) | proves the lead arithmetic and the bucket shape the checker reads: the two-stage floor, the same-stage non-consumption, the overflow bucket, a full histogram with min/median/max, and that a matched-in-flight fill is NOT a consumption |
+
+**The refusals, and why each is a refusal rather than a zero.** Exit 2 prints NO number for a refused
+leg, because a leg that cannot be justified is not evidence: `no-retention` (no `rowset_init`),
+`no-retain-k` (absent, or 0 = the reactive baseline, which has no per-layer residency and therefore
+no margin), `no-rowset-fetch` (no demand stage), `arm-without-spec` (a leg declared arm/null with no
+`spec` events at all), `spec-missing-keys` (including a `spec` that lacks `cancelled`, the schema the
+block names), `cancel-hook-never-fired` (submitted > 0 with `cancelled == 0`: P4 is UNTESTED there, so
+the leg is refused rather than scored - the acceptance fixture), `off-leg-with-speculation` (the run
+resolved a mode while the leg is declared the no-prediction control), `accounting-negative`
+(submitted below consumed + cancelled + live = double counting), `lead-inconsistent` (the histogram
+and `consumed` disagree, or the sum is unreachable).
+
+**Invariants the checker falsifies (a FAIL blocks reporting; it never authorizes).** P1
+`waited_by_demand == 0`; P2 the fill accounting closes (a positive residual is a READY fill evicted
+before any demand used it, and is printed as the uninstrumented quantity it is); P4 the named
+cancellation points sum to `cancelled`; P6 an off leg carries no speculation; and a NEW one this
+pass measured - **`lead_min >= 2`**, because the only hot-path reap runs at the END of a demand
+stage, so a fill issued after stage t cannot serve a demand before stage t+2. A lead below that floor
+is not a good schedule, it is wrong bookkeeping, and the checker fails the leg.
+
+**Validation (all of it, no GPU).**
+- `python tools/check-tg-predict.py --selftest` -> **PASS, 56 checks**: a scored off/arm/null session
+  whose every band is asserted exactly (share, M2, M4, M4n, M7 median, the four invariant PASSes),
+  then one fixture per refusal above asserting BOTH the exit code AND that no band number is printed,
+  then two invariant-violation legs asserting exit 1 with the failing invariant NAMED.
+- **Emitter <-> checker cross-check, no GPU**: the selftest reads `tel_spec()`'s own format string out
+  of `src/llama-layer-streaming.cpp` and fails if a key the checker REQUIRES is not emitted - the
+  failure mode that would otherwise refuse every arm leg at the first hold.
+- **Cross-tool agreement on real recordings**: the five recorded retention legs
+  (`gplr19-k{2,4,6,8}-ab/arm-B1.jsonl`, `gplr19-honest-k6-ab/arm-B1.jsonl`) score
+  share 0.4326 / 0.6260 / 0.7141 / 0.7745 / 0.6461, identical to `tools/analyze-tg-margin.py`'s own
+  booking of the same traces - two independently written readers, one recording.
+- `ctest -C Release -R test-layer-streaming-tg-spec` -> **PASS** (36 + 11 checks);
+  `run-tests.ps1 -Suite host` -> **SUCCESS 43/43** with the new guard running.
+
+**MEASURED FINDING, recorded because it changes how M7 must be read (and NOT applied to the band).**
+The engine's only hot-path reap runs at the end of a demand stage (the demand-side ordering is what
+keeps P1 true), so a fill issued at the end of stage t first counts as READY at the end of stage t+1
+and is consumable no earlier than stage t+2. **The lead floor is therefore 2, not 0**, and the
+pre-registered M7 band as written ("lead median > 0") is VACUOUS for any leg that consumes a single
+fill: the median cannot be 1. The informative reading of the same datum is the balance between
+`consumed` and `matched_by_demand` - a guess aimed at the next stage of its layer ALWAYS arrives after
+that stage was classified, so it pays only if the ids repeat across the two-stage gap (or if a deeper
+cache would have held them anyway), and `matched` is exactly the count of fills whose own row was
+demanded while they were still in flight. **PLANNER CALL TAKEN 2026-09-23**: M7 is restated as
+M7a / M7b / M7c in the M7 RESTATEMENT section that follows - the median gate is DROPPED, because
+`median >= 2` is vacuous for exactly the same structural reason as `median > 0`, the reap floor
+becomes the invariant, and the late-fill rate becomes the arm band with a threshold chosen before
+any measurement.
+
+**What is NOT proven, stated plainly.** No real `spec` event has ever been emitted: the mechanism has
+not executed against a real cache, so the engine-to-checker integration - a recorded instrumented leg
+read back by this tool - remains unmeasured and is what the first A3 hold must show. A1's proposer and
+the port comparator do not exist, so no arm can be run at all (mode 2 is refused). The session driver
+the block's validation commands name (`tools/run-gplr58-session.ps1`) does not exist yet and is an A3
+prerequisite. Every M-band above is therefore a TOOL result, not a predictor result: nothing here
+says a predictor wins anything.
+
+#### M7 RESTATEMENT - SETTLED 2026-09-23 (Planner call; contract text plus the A2 checker, no engine code path, no GPU, no arm run)
+
+**The defect.** M7 as pre-registered read "an arm whose lead median is 0 is a scheduling defect and
+FAILS before any share band is read". A2 measured that criterion VACUOUS: the engine's only hot-path
+reap runs at the END of a demand stage, so a fill issued at the end of stage t cannot be READY before
+the end of t+1 and cannot serve a demand before t+2. Every consumed fill therefore has lead >= 2, the
+median of any non-empty set of consumed fills is >= 2, and "lead median > 0" can never fail. The
+obvious repair is no repair at all: **`median >= 2` is equally vacuous**, because it restates exactly
+the floor M7a now enforces directly, and it is true of every leg that is not already FAIL-INVARIANT.
+Worse, the old wording was SILENT on the case M7 exists for: a leg that consumed NOTHING published no
+M7 reading at all, so an arm whose guesses never land on time failed nothing.
+
+**The settled rule: M7a / M7b / M7c.**
+- **M7a - the floor (invariant, integrity).** `lead_min >= 2` on any leg with a consumption. A lower
+  value means the ordinal bookkeeping is wrong, not that the schedule was clever: FAIL-INVARIANT, no
+  share read, and the series HALTS. (Implemented in A2 as the `M7-floor` check; unchanged by this
+  call.)
+- **M7b - the late-fill rate (arm band, quality).** `matched_by_demand / (consumed +
+  matched_by_demand) <= 0.5`, equivalently `matched <= consumed`. `matched_by_demand` counts fills a
+  demand asked for while they were still PENDING: the fill is cancelled and the demand fetches its own
+  copy, so the guess is paid for twice and returns nothing. The rate is therefore the arm's own
+  wasted-guess rate, and the band asks one question - is the proposer aiming PAST the reap floor, or at
+  the very next stage of its own layer, which can never be served in time? It is gated on `arm` legs
+  ONLY: the count-matched `null` control draws its ids structure-free, so gating its targeting would
+  fail the control by construction, and its rate is reported instead, as pool-growth evidence.
+- **M7c - the distribution (reported, never gated).** `lead_rows` min/median/max/mean plus the
+  8-bucket histogram. Reported because it is how a reader sees the schedule; not gated because M7a
+  already forces the floor and the median follows from it.
+- **The sample floor.** M7b is SCORED only with `consumed + matched >= 8` resolved fills. A thinner
+  leg reports its rate as UNSCORED - its other bands still score - and cannot satisfy M7's clause, so
+  a session in which no arm leg reaches the floor reports M7 **UNMEASURED**, never PASS.
+
+**The threshold, and what it is not.** 0.5 - "more guesses land in time than arrive too late" - was
+chosen A PRIORI from the mechanism's own ordering, not fitted to any observation, because no real
+`spec` event has ever been emitted. It is FIXED for A3 and A4 and is NOT re-registered after a
+session's data: an arm that fails it is failed, not the threshold re-tuned, and the only legitimate
+change is a Planner call taken BEFORE the affected session runs. What the band can and cannot decide
+is worth stating plainly: an arm whose guesses all arrive late cannot win the margin anyway (a late
+fill is cancelled and the demand fetches its own copy), so M1/M4n expose that OUTCOME while M7b says
+WHY - no room to win, versus targeting aimed inside the floor.
+
+**Consequence for the failure contract.** M7a stays in the FAIL-INVARIANT list with P1 and P4. M7b
+joins the M1/M4/M5 band family: a FAILED late-fill rate fails that leg's M7 line, does NOT halt a
+pre-authorized session, and does NOT cancel A4. No other band, arm, session or length moves.
+
+**Validation (host-only, no GPU, no mutex).** `python tools/check-tg-predict.py --selftest` covers all
+three outcomes of M7b on fixtures: an arm at `matched 9 / consumed 3` (rate 0.750 -> FAIL), an arm at
+`matched 4 / consumed 4` (rate 0.500 -> PASS, the boundary is inclusive) and an arm that consumed
+NOTHING with `matched 9` (rate 1.000 -> FAIL, the case the old wording could not see at all) - and
+asserts in every case that the verdict stays `scored`, because a band is not an invariant. The scored
+session's own arm leg resolves 7 fills and is asserted UNSCORED, pinning the sample floor; the `null`
+leg's rate is asserted reported-not-gated.
+
+#### OWNERSHIP AND PLACEMENT - SETTLED 2026-09-23 (Planner call; contract text only, no code changed, no GPU, no arm run)
+
+**The defect this settles.** As first drafted, A0 and A1 both owned the P1-P5 decision tests
+(near-verbatim duplicates), and A1 said the predictor is "ported to the runner side". The second
+was an architectural claim the code does not support; the first violated the rule this plan uses
+everywhere else - one rule, one owner.
+
+**What the code actually allows (measured 2026-09-23, source inspection only).** The demand - the
+router's exact top-k ids for one (ubatch, layer) - is computed INSIDE the module
+(`src/llama-layer-streaming.cpp` ~3625, where `union_ids` is assembled and handed to
+`load_row_set(il, union_ids)`); the resident-row state is module members (`row_set_have`,
+`row_set_owner`, `row_set_gen`, `row_set_ids`); the per-layer retention cache and its recency
+policy are module-owned; and the module exposes NO callback, `std::function` or hook interface of
+any kind (grep for `std::function` and `_hook` in `src/llama-layer-streaming.h`: zero hits). The
+runner (`tools/layer-streaming/main.cpp`) configures the module before init/prebuild and reads its
+telemetry; it never sees a per-layer routing decision, and it could only be handed one if the
+module grew an inversion-of-control interface - a new architectural pattern in this codebase, and
+not this block's business.
+
+**The split, as settled.**
+
+| concern | owner | where it lives | how it is proven |
+|---|---|---|---|
+| proposal budget + mode, flag surface, preconditions refused before the model load | A0 | `tools/layer-streaming/main.cpp` | each refusal fires before any model work |
+| speculative staging: its own completion event, `row_set_have[]` marked only on that copy's completion, capacity-boundary refusal, cancellation points | A0 | `src/llama-layer-streaming.{h,cpp}` | engine-behavior fixtures with a SCRIPTED proposal sequence |
+| P1-P6 counters and the per-id residency state the checker reads | A0 | same | a fixture issuing a spec copy that shows zero demand waits |
+| proposer families, merge operators, the count-matched structure-free null | A1 | same module, PURE functions declared in the header | determinism, exact proposal sets, budget, null demand-blindness under a reordered stream |
+| the planner's ordering, cancellation point and capacity-refusal POLICY decisions | A1 | same | pure-function tests: same inputs -> same decisions, no clock, no I/O |
+| equivalence to the offline screen (the port must not be a re-implementation with its own opinion) | A1 | nested `--dump` mode + outer `tools/check-tg-predict-port.py` | per-row equality on the eight recorded legs; a mismatch blocks A1 |
+
+**Rules that follow, and bind later steps.** (1) A0's tests may only assert engine behavior under
+a scripted proposal sequence; a test that needs the proposer to DECIDE something belongs to A1.
+(2) A1 may not add a runner flag and may not alter the staging path's semantics; needing a
+mechanism the engine does not have is an A0 amendment, returned to the Planner. (3) A2 owns
+neither: it reads what A0 and A1 emit. (4) A runner-side proposer is explicitly NOT part of this
+block. (5) The engine-side placement is what makes P1-P3 testable host-side at all, which is why
+it is a contract clause and not an implementation detail.
+
+**What would overturn it.** A decision to run this predictor under a different harness that drives
+layers itself would need the module to hand out routing, i.e. a callback interface; that is a
+separate architectural task with its own contract, and it would have to argue against the measured
+fact that no such interface exists in the module today.
+
+Implementation steps (the holds are AUTHORIZED, not scheduled: A3/A4 run only after A0-A2 pass
+their host validation, because a hold taken against an unvalidated spec path measures nothing):
+- A0 (the ONLY source change; opt-in, default-off) - **owns the MECHANISM: enforcement, state
+  transitions, events and counters, all inside the streaming module.** A prediction mode on the
+  row-set path (0 = today's path), a proposal budget, and the speculative staging path - copies
+  issued on the copy backend against the per-layer row cache with their OWN completion event,
+  `row_set_have[]` marked for a predicted id only on that id's own completion, admission refused
+  at the capacity boundary, cancellation at the generation boundary and before every demand
+  stage, and the P1-P6 counters (`spec_waited_by_demand`, `spec_cancelled`,
+  `spec_refused_capacity`, plus the per-id residency state the checker reads). Flag-level
+  preconditions refused BEFORE the model load. Placement: the mechanism in
+  `src/llama-layer-streaming.{h,cpp}`, the flag surface and reporting in
+  `tools/layer-streaming/main.cpp` only - the module's own convention is that the runner sets
+  policy BEFORE init/prebuild and the engine owns everything after it. Host validation, no GPU:
+  engine-behavior fixtures driven by a SCRIPTED proposal sequence (no policy involved, so no test
+  here depends on a proposer decision) - a demand never queues behind a spec fill; a
+  staged-but-not-ready id falls back to a demand fetch; speculation is refused at the capacity
+  boundary; the incumbent's proposal set is not reduced; cancellation fires; plus a fixture that
+  issues a spec copy and observes its completion with no demand waiting on it, and the
+  byte-identity check that mode 0 leaves the runner's output and the existing
+  `test-layer-streaming-*` family exactly as they are. New nested target for these:
+  `tests/test-layer-streaming-tg-spec.cpp` (CTest `test-layer-streaming-tg-spec`).
+- A1 (host-only, no GPU, no mutex) - **owns the POLICY: pure functions over a demand history,
+  plus their equivalence to the offline screen.** Placement: the proposer families (history /
+  markov-1 / coact / coupling-copula), the two merge operators, the count-matched structure-free
+  null and the speculative-fill PLANNER live in the same module as PURE functions declared in the
+  header - the demand site, the routing ids and the cache state are all engine-side (see the
+  OWNERSHIP AND PLACEMENT subsection below), so there is NO runner-side proposer and NO new
+  runner flag in this step; if the policy needs a mechanism the engine does not have, that is an
+  A0 amendment returned to the Planner. Validate: (i) policy unit tests - the proposer is
+  deterministic, emits exactly the ids it claims, respects the budget, and the null proposer's
+  sequence is invariant under a reordered router stream (demand-blind); (ii) pure-function tests
+  of the planner (same inputs -> same issue order, cancellation point and capacity-refusal
+  decision; no clock, no I/O); (iii) the replay equivalence: the module's per-row proposal
+  sequence must EQUAL `tools/predictor-screen-gplr.py`'s on all eight recorded legs and the three
+  arms' held-out tables must reproduce `docs/findings/predictor-screen-gplr.md` - a mismatch
+  BLOCKS A1 and is enumerated, never tolerated as a tie-break.
+  The reference is that tool AT A RECORDED REVISION (its file hash, written into the A1 result),
+  because it is live code: taking the comparison against whatever the tool says later would let the
+  target move after the fact, which is the same defect the pinned-binary rule exists to prevent.
+  New nested target for (i)/(ii):
+  `tests/test-layer-streaming-tg-predict.cpp` (CTest `test-layer-streaming-tg-predict`), which
+  also gains a `--dump <trace.jsonl>` mode writing its proposal sequence in the same JSON-lines
+  shape; (iii) is run by the outer host tool `tools/check-tg-predict-port.py`, registered as a
+  host guard, so the nested test never depends on build-tree artifacts.
+- A2 (host-only): `tools/check-tg-predict.py` - computes share, margin_share, M2, the
+  per-leg VRAM and transfer medians, `lead_rows`, and every P-counter; REFUSES (exit 2, no
+  numbers) a non-instrumented trace, a trace missing `spec_cancelled`, or a leg with no
+  `retain_k`. `--selftest` covers each refusal with a fixture, including the "cancel hook never
+  fires" leg that must be refused rather than scored.
+- A3 (one mutex hold, pilot shape): `off` x2 + `null@8` + `arm-coact` + `retref@K4`, at K=2 for
+  the prediction arms (the shallow depth the charter case needs) - decides M1/M3/M4/M5 for the
+  simple arm, and produces the session's own control spread.
+- A4 (one mutex hold, PRE-AUTHORIZED with A3 - it is not conditional on A3's share outcome;
+  only a FAIL-INVARIANT or a refused leg halts it): `off` x2 + a per-row count-matched `null` +
+  `arm-bar09` + `arm-fusion` at the same shape and depth, `retref@K4` included for M3.
+
+Acceptance criteria (falsifiable):
+- A0 (mechanism only - every claim below is an ENGINE behavior under a scripted proposal
+  sequence, so no claim here depends on a proposer decision): mode 0 leaves the runner
+  byte-identical to today and the existing host tests green; a demand never queues behind a
+  speculative fill; a staged-but-not-ready id falls back to a demand fetch rather than being
+  served; speculation is refused at the capacity boundary; the incumbent's proposal set is not
+  reduced; cancellation fires at the generation boundary and before a demand stage; the spec-copy
+  fixture shows a speculative copy completing with ZERO demand waits
+  (`spec_waited_by_demand == 0`); and every flag precondition is refused before the model load.
+- A1 (policy only): the proposer is deterministic and budget-exact (it emits exactly the ids it
+  claims, never more than the budget); the null proposer's sequence is provably demand-blind
+  (invariant under a reordered router stream); the planner's issue order / cancellation point /
+  capacity-refusal decisions are pure and reproducible; and the port's per-row proposal sequence
+  equals the offline screen's on all eight recorded legs with the three arms' held-out tables
+  reproduced.
+- A2: every refusal fires on its fixture and the tool prints NO number for a refused leg.
+- A3/A4 (both pre-authorized; A4 runs regardless of A3's share result, and is halted only by
+  an A3 FAIL-INVARIANT or a refused leg): for the arm under test, M1 holds (margin gain AND >= control spread), M4 holds (no
+  regression beyond the spread), M5 holds (<= +5% volume), M7a holds (`lead_min >= 2` wherever
+  a fill was consumed) and M7b holds (late-fill rate <= 0.5 with >= 8 resolved fills), and every
+  P-counter reads as specified (`spec_waited_by_demand == 0`, `spec_cancelled > 0` in a named
+  leg, `spec_refused_capacity` present).
+- The charter band M3: at least one arm reaches `share >= 0.5355` at K=2 with its peak VRAM
+  reported. If no arm does, the recorded finding is "predictors do not buy depth-equivalent
+  hits at this headroom" and the block closes NEGATIVE - itself the decision-useful result,
+  exactly as T-GPLR-56's contract handles its own negative.
+- Default preservation: mode 0 (and every precondition-refused invocation) leaves the runner's
+  output byte-identical to today, with the existing host tests and the semantic-QA smoke rung
+  green on the changed binary.
+- Identity: route digest and greedy ids identical across all legs of a session (the blocking
+  gate every TG task in this repo carries).
+
+Focused validation commands and expected results:
+- `cmake --build build/llama-cuda --config Release --target llama-layer-streaming` -> green;
+  record the exe/dll hashes (a new pair means the control must be re-recorded).
+- `python tools/predictor-screen-gplr.py --selftest` -> PASS (recorded); the A1 replay mode
+  reproduces the findings doc's held-out rows for all three arms.
+- `python tools/check-tg-predict.py --selftest` -> PASS including the absent-counter and
+  never-fired-cancellation refusals; `--trace <leg>` prints the full band set or refuses.
+- `ctest --test-dir build/llama-cuda -C Release -R test-layer-streaming-tg-spec` -> PASS (the
+  A0 engine-behavior fixtures under a scripted proposal sequence).
+- `ctest --test-dir build/llama-cuda -C Release -R test-layer-streaming-tg-predict` -> PASS (the
+  A1 policy unit tests), and `python tools/check-tg-predict-port.py --selftest` -> PASS with the
+  port-equivalence verdict printed for each of the eight recorded legs (the `--dump` mode of the
+  A1 target is what it compares against; CTest instance names in this build keep the `test-`
+  prefix, measured with `ctest -N`).
+- `powershell -File tools/run-gplr58-session.ps1 -Session p1 -ValidateOnly` -> exit 0 (all legs
+  printed with resolved flags); `-PreflightOnly` -> exit 0 on a clean card or 125 within seconds
+  naming the PID when busy; never `-AllowBusy`.
+- `powershell -File tools/run-tests.ps1 -Suite host` -> PASS with the new guard registered;
+  the T-GPLR-07 smoke rung -> check-telemetry OK, answer PASS, negative control failing as
+  designed (runner change).
+- `python tools/check-doc-sizes.py` and `python tools/resplit-gplr-plan.py --verify` -> PASS.
+
+Required state/document updates: a `docs/currentstate.md` entry per executed session (with the
+legs that did NOT run named rather than inferred); the SDD's mechanism section ONLY if a mode is
+adopted (owner decision) - and then the invariant goes in as a contract clause, not as prose;
+this block's status lines; the findings doc gains the engine-vs-offline comparison table.
+AGENTS.md gains a gotcha only if a measured, transferable trap appears (the cancel-hook lesson
+is a candidate once it is demonstrated here, not before).
+
+Escalation condition: any need for a routing-visible or sampling-visible change (that is a
+different task, and owner call 2 governs it); any arm where the demanded-copy transfer medians
+regress beyond the session spread (bandwidth contention is a measurement, not an assumption);
+any leg where `spec_cancelled == 0` while the arm claims a share win; any case where the
+incumbent's proposal set is reduced by a new source (a design defect, never a result); any
+direction flip between offline and engine numbers (faithfulness bug: escalate, do not retry);
+and any result whose M1 gain is inside the control spread while M2 is large - that is the
+"pool growth dressed as prediction" outcome and belongs back with the screening as its verdict.
+
+#### A0 IMPLEMENTATION LANDED (2026-09-23, host-only: no GPU, no mutex, no arm run, no model loaded)
+
+**What landed.** The mechanism of A0, default-off, on the RETENTION path (`row_set_retain`),
+because that is the only path with a per-layer cache to speculate into - the slot-keyed reactive
+path is refused with that reason rather than silently degraded.
+
+| piece | where | what it does |
+|---|---|---|
+| the placement RULES, pure and host-testable | `llama_ls_spec_*` in `src/llama-layer-streaming.{h,cpp}` | `is_hit` (P2), `admit` (P3/P5), `free_pos`, `may_evict` / `victim_better` (P3 eviction law), `cancel_plan` (P4) |
+| the engine's own placement state | `spec_state` / `spec_flag` / `spec_gen` / `spec_tick`, per layer and position | speculative state ONLY: `cache_expert` / `cache_recency` remain the sole owners of which row is where |
+| the fills | `spec_issue_next` / `spec_issue_one` / `spec_reap` / `spec_cancel` / `spec_reset` | admit a scripted guess, issue its own H2D on the copy backend, record its OWN completion event, claim residency only at the reap, release cancelled positions only after their copy completed |
+| the demand-side guards | inside `load_row_set`'s retention branch | a PENDING position is not a hit and not a victim; a demand that finds its row in flight fetches its own copy (P1/P2) and the fill is cancelled as a duplicate; an eviction clears the row's placement state with it |
+| the counters and telemetry | `tel_spec`, one `spec` event per demand stage | submitted / ready / cancelled (+ per-point capacity, demand, generation) / refused_capacity / dup_refused / matched_by_demand / waited_by_demand / reap_wait_us / issued_bytes, plus mode, budget, reserve, cap, pending and ready_spec |
+| the driver | `--residency-tg-spec <0|1|2>`, `--residency-tg-spec-budget N`, `--residency-tg-spec-script <path>` | mode 1 = scripted (`<layer> <ordinal> <expert>...` per line, the "speculate these ids for this layer's ordinal-th demand" contract); mode 2 is RESERVED for A1's proposer and refused |
+
+**The reservations the design rests on, stated plainly.** (1) A demand's own row wait never
+covers a fill: the reap runs only on the speculation path, after the demand's `ev_copy_ready`
+wait, and `spec_in_demand_window` counts any reap that happens inside that window - so
+`spec_waited_by_demand` is a falsifier, not an assumption. (2) The admission rule keeps `top_k`
+positions FREE at all times, which is what makes (1) achievable: the demand's complement always
+fits without reclaiming, or waiting on, a speculative position. (3) `ggml` exposes only
+`synchronize` (no non-blocking query) in this tree, so a reap can block; the honest measurable
+for "did the guess arrive early" is therefore `reap_wait_us` per stage, not a per-fill latency,
+and A1's real proposer inherits that limitation.
+
+**Teardown owns an in-flight fill.** A demand stage always synchronizes its own copies before
+returning, so no copy can be outstanding at teardown - but a speculative fill has no such owner,
+and `end_row_cache()` frees the per-layer cache buffers the fill is writing into. `spec_reset()`
+therefore DRAINS every fill event before freeing it. This is the one place where waiting on a
+speculative copy is correct, and it is not a demand: `spec_waited_by_demand` counts only reaps
+inside a demand window, and the drain runs after the last one.
+
+**Host validation (all of it, no GPU).**
+- `ctest -C Release -R test-layer-streaming-tg-spec` -> **PASS** (new nested target,
+  `tests/test-layer-streaming-tg-spec.cpp`): 36 scripted-sequence checks covering P2 (pending is
+  never a hit, residence only on completion), P3 (the reserve barrier, the budget, no
+  displacement, spec-first eviction), P4 (oldest-first cancellation, READY never in the plan),
+  P6 (null states = today's behaviour), plus a three-step guess/demand walk with the hit, the
+  matched-but-pending and the wrong-guess outcomes counted.
+- **The mode-0 differential PASSES**: the pre-A0 retention algorithm is kept verbatim in the test
+  as the oracle and agrees with the new decision functions over **1200 random windows** across
+  three capacities - identical hits, fetch sets, victim choices, eviction counts, placement
+  positions and resulting cache. This is the strongest host-side statement available for P6; the
+  run-level byte-identity check still belongs to a GPU arm.
+- **The differential found a real defect while being written**: evicting a speculative row left
+  its placement state READY on a position whose row was gone, which would have made the demand's
+  free-position search skip a free position and shrink its guaranteed capacity. Fixed in the code
+  (an eviction clears the row's placement state) and the free-position predicate was simplified to
+  key on physical occupancy.
+- `run-tests.ps1 -Suite host` -> **SUCCESS, 43/43** (the new target is registered in the suite's
+  include pattern; the whole family was rebuilt after the header change, per the recorded
+  stale-layout trap). Parse-time flag refusals verified against the built runner
+  (`--residency-tg-spec 3` -> exit 2 before any model work); the remaining flag-precondition
+  refusals sit with the other residency preconditions, i.e. after the architecture metadata read
+  and before any model load.
+
+**What is NOT proven, and stays with A1/A3.** A1's proposers do not exist (mode 2 is refused);
+the mechanism has never executed against a real CUDA cache (no fill has ever been issued, no
+event ever recorded), so every wiring claim here is a code-level claim with a host proof of the
+RULES behind it; the run-level byte-identity of mode 0 on runner output, and every M-band, remain
+unmeasured. A2's checker does not exist yet either, so the `spec` event's shape is defined by the
+emitter and not yet read back by any tool.
+
+#### BOUNDING MEASUREMENT (2026-09-23, host-only, no GPU, no arm run): the incumbent's uncovered margin and what an id-stream predictor can reach - the ceiling M1 and M3 are read inside
+
+**What was asked.** Bound the room every T-GPLR-58 arm must fit inside, before any hold: how
+much of the demand stream the incumbent row cache does NOT already serve, and how much of that
+room is reachable BY ANY predictor built from observed expert ids. Tool:
+`tools/analyze-tg-margin.py` (selftest 23 cases; registered as the `[tg-margin]` host guard);
+measured on eight recorded retention legs, no GPU and no mutex.
+
+**The retention semantics had to be identified first, and the documented reading is wrong.**
+Rebuilding each trace's OWN `n_rows_resident` from `union_ids`, per layer, under four candidate
+models (deviation of the rebuilt hit count from the engine's booking). Reproduce with
+`python tools/analyze-tg-margin.py --identify gplr19-k2-ab/arm-B1.jsonl
+gplr19-honest-k6-ab/arm-B1.jsonl qa-depth-k4.jsonl` (from `build/llama-cuda`):
+
+| model | gplr19 honest K=6 | qa-depth K=4 | gplr19 echoed K=2 |
+|---|---|---|---|
+| last K windows, per LAYER | -16.92% | -17.15% | -7.53% |
+| last K windows, per SLOT | -61.90% | -69.44% | -86.60% |
+| capacity-LRU, per SLOT | -56.54% | -68.58% | -85.86% |
+| **capacity-LRU, per LAYER, `K x top_k` rows** | **-0.21%** | **-0.17%** | **-1.14%** |
+
+So the cache is PER LAYER (per-slot sharing is decisively excluded under BOTH candidate models,
+even though `slot == layer % n_slots` holds in every one of these runs and a slot demonstrably
+carries more than one layer) and its semantics are a capacity-LRU over `K x top_k` ROWS: the
+effective retention horizon EXCEEDS K tokens whenever ids repeat inside the window, because a
+row is evicted only under capacity pressure, never merely for age. The incumbent is therefore
+stronger than the "last K windows" wording implies, and a predictor's room is smaller than a
+naive reading of K suggests. A residual of 0.06-1.14% remains unexplained (eviction tie-breaking
+or a first-window special case); the tool prints it and refuses any trace deviating more than
+`--max-dev` (default 2%). The four-model comparison is a first-class mode of the tool rather
+than a side experiment, because a margin is only a measurement if the cache model behind it
+reproduces the run it is computed from.
+
+**The margin, and its decomposition (the ceiling).** `share` = engine hits / demanded; each
+margin row is classified once as C1/C2/C3/C4 (see the tool's docstring for the definitions).
+Legs: echoed = `gplr19-k{2,4,6,8}-ab/arm-B1.jsonl`, honest =
+`gplr19-honest-k6-ab/arm-B1.jsonl` and `gplr19-honest-k6-ab/gplr19-honest-k8-ab/arm-B1.jsonl`,
+qa-depth = `qa-depth-k4.jsonl` / `qa-depth-k8.jsonl` (all under `build/llama-cuda`):
+
+| trace | K | demanded | share | margin | C1 same token, earlier layer | C2 same layer, >K .. <=W | C3 seen elsewhere earlier | C4 FIRST VISIT (unreachable) | ceiling for id streams |
+|---|---|---|---|---|---|---|---|---|---|
+| echoed | 2 | 81,920 | 0.4326 | 0.5674 | 43.4% | 49.1% | 6.9% | 0.5% | 0.9969 |
+| echoed | 4 | 81,920 | 0.6260 | 0.3740 | 42.5% | 46.1% | 10.6% | 0.8% | 0.9969 |
+| echoed | 6 | 81,920 | 0.7141 | 0.2859 | 42.0% | 43.1% | 13.8% | 1.1% | 0.9969 |
+| echoed | 8 | 81,920 | 0.7745 | 0.2255 | 40.9% | 40.2% | 17.5% | 1.4% | 0.9969 |
+| honest | 6 | 81,920 | 0.6461 | 0.3539 | 41.2% | 38.7% | 19.2% | 0.9% | 0.9969 |
+| honest | 8 | 81,920 | 0.7255 | 0.2745 | 40.7% | 33.3% | 24.8% | 1.1% | 0.9969 |
+| qa-depth | 4 | 30,720 | 0.6319 | 0.3681 | 42.7% | 34.5% | 20.5% | 2.3% | 0.9917 |
+| qa-depth | 8 | 30,720 | 0.7521 | 0.2479 | 42.1% | 24.0% | 30.5% | 3.4% | 0.9917 |
+
+The hit numerator is the recorded (b) ladder's own (52,930 at honest K=6, 59,432 at K=8); this
+tool's denominator additionally counts the warm-up window (81,920 rows = 256 tokens x 40 layers x
+top_k 8 against the record's 81,600 = 255 tokens), so the honest K=6 share here reads 0.6461
+where the record reads 0.6487 - the same residency, a slightly colder denominator, and the
+reason M3 compares within a session instead of against the record.
+
+**Three readings that change how the arms should be read (none of them retunes a band).**
+
+1. **There is no information wall worth the name: C4 is 0.5-3.4% of the margin (0.3-0.8% of
+   demands).** So an id-stream predictor is NOT limited by rows it has never seen - it is limited
+   by PRECISION: what the offline screen actually achieves is 24.6% (history) to 28.1% (coact) of
+   demands at B=8, against a margin of 22-57% of demands. M1's fate therefore rests on proposal
+   precision inside a margin that is only ~2-3 rows per (token, layer) at the depths that matter
+   (2.945 at qa K=4, 1.983 at qa K=8), while an arm may propose B=8 - which is why M5's volume
+   discipline (`<= +5%`) is load-bearing and not a formality.
+2. **The margin is not one lever but three, and they need different mechanisms**: C1 (~41-43%
+   everywhere, stable across K and vehicles) is the cross-layer region and it is reachable only
+   with an INTRA-TOKEN layer lead (a few layers ahead, not a token ahead) - it is the coupling
+   family's target, and an arm that stages coupling proposals a full token early is aiming at the
+   wrong horizon. C2 (24-49%, shrinking as K rises) is precisely the region a DEEPER CACHE would
+   also capture, which is the VRAM-vs-prediction trade M3 measures. C3 (7-31%, growing with K and
+   at longer context) is what only a learned cross-layer model reaches.
+3. **The incumbent is stronger than documented** (capacity-LRU, reading above), so every arm's
+   baseline is higher than the "last K windows" model would predict: at honest K=6 the incumbent
+   already serves 64.6% of demands, and honest K=8 serves 72.6% - the M3 comparison (arm at K=2
+   against retention-only at K=4 same-session) is therefore a comparison against a deeper-than-K
+   baseline, which is the harder, correct reading.
+
+**Status of this subsection:** supporting evidence for the bands, not an acceptance. It changes
+no pre-registered quantity, re-scores no recorded verdict, and was taken with no GPU. What it
+does NOT establish: nothing about any predictor's actual effect (no arm has run), and nothing
+about shapes beyond these eight legs (the 50k/200k TG shapes are not covered here).
+
+#### A1 IMPLEMENTATION LANDED (2026-09-23, host-only: no GPU, no mutex, no arm run, no model loaded)
+
+**What landed.** The POLICY half of the predictor block, as pure functions in the same module,
+plus the comparator that proves it faithful to the offline screen. The reference is PINNED BY FILE
+HASH, as this block's A1 step requires, because that tool is live code:
+`tools/predictor-screen-gplr.py`
+`sha256 81c9a4afa5333bad1599d774b6488c33f9d97156c0a3cc8a826267e7150caef2`, findings doc
+`sha256 f414fc8f53b9456f...`.
+
+| piece | where | what it does |
+|---|---|---|
+| the proposer families | `src/llama-layer-streaming.{h,cpp}`, pure `llama_ls_pred_*` | history / markov-1 / coact / coupling-copula - the screen's four - over an EXPLICIT caller-owned state (`llama_ls_pred_state`, allocated per family mask), so a test can hold two copies of one stream and prove determinism and demand-blindness |
+| the arms | same | `llama_ls_pred_arm_predict`: `coact` (unbarred), `bar09` = `Barred(Markov1, 0.9)`, `fusion` = vote fusion over the four sources (param-free, equal weights, in-source dedup, rank-decay tiebreak) |
+| the count-matched null | same (`llama_ls_pred_null_seed` / `_null_fill`) | xorshift32 over [0, n_expert) publishing exactly the ARM's count for the row, duplicates rejected, consulting no ids, no demand and no router output |
+| the planner and the cancellation point | same (`llama_ls_spec_plan`, `llama_ls_spec_cancel_policy`) | the issue order, the stop reason (budget / pending cap / reserve / no free), what it declined and why, and when a cancel is needed ahead of a demand |
+| the policy tests + the dump | `tests/test-layer-streaming-tg-predict.cpp` (new, CTest `test-layer-streaming-tg-predict`, 28 checks) | determinism, budget-exactness, range/uniqueness, no-peeking, null demand-blindness, planner purity AND replay equivalence against `llama_ls_spec_admit`, the cancellation policy; `--dump <trace.jsonl>` writes the per-row proposal sequence as JSON Lines |
+| the port comparator | `tools/check-tg-predict-port.py` (new, registered as the `[tg-predict-port]` host guard) | IMPORTS the screen, drives its own classes row by row in the trace's order, and requires per-row SEQUENCE equality for the four families and the three arms; `--tables` re-derives the findings doc's recorded rows from that same reference |
+
+**The port is anchored row by row (measured 2026-09-23).** On the eight recorded legs -
+`gplr19-k{2,4,6,8}-ab/arm-B1.jsonl`, `gplr19-honest-k6-ab/arm-B1.jsonl`,
+`gplr19-honest-k6-ab/gplr19-honest-k8-ab/arm-B1.jsonl`, `qa-depth-k4.jsonl`, `qa-depth-k8.jsonl` -
+the module's per-row proposal sequence EQUALS the screen's for all four families and all three
+arms: **483,840 row comparisons, zero mismatches**, with the null count-exact against its matched
+arm on every row. The comparator also verifies the doc's own "same stream" claim from the demand
+rows themselves: the four echo legs share one stream (`1c99b7fc6cf1`), the two honest legs another
+(`da834f794b31`), the two qa legs a third (`57fb9aaa6d9e`).
+
+**The doc's recorded rows are re-derived, not restated.** `--tables` computes each row from the
+reference and requires the findings doc to state it: echo 30.8/30.9 history, 39.5/39.9 markov-1,
+42.6/43.0 coact, 36.1/41.7 bar09; honest 24.6/24.7, 27.4/27.7, 28.1/28.4, 25.1/29.0; qa
+33.3/33.7, 35.5/36.4, 36.8/37.7 - all reproduced to the doc's tenth.
+
+**A measured artifact that had to be DECIDED, not smoothed over.** The screen observes
+`list(frozenset(ids))`, so ITS history family carries CPython's set-iteration order while the
+engine sees `union_ids` in the trace's order. Measured on three streams
+(`build/tmp-tg-a1/orderexp.py`, seven candidates each): the order changes ONLY the fusion arm
+(<= 0.09pp) and can move coupling by one rounded tenth (0.02pp echo, 0.01pp qa), while every
+family and bar number the doc records reproduces EXACTLY under either order. So the comparator
+drives the reference in the TRACE's order - the order the engine actually has - and holds those
+two rows to the doc's tenth plus that measured artifact. That choice is recorded here because the
+alternative (making the port imitate CPython's set order) would have been a port of an
+implementation detail, not of the screen's method.
+
+**What is NOT proven, stated plainly.** (1) The engine does not CONSUME the proposer yet: mode 2
+is still reserved and refused, so no arm can run and A3 cannot start - that wiring is the
+remaining A1 work and the next step in this block. (2) No real `spec` event has ever been emitted,
+so nothing here says any arm wins anything; M7b's 0.5 and every M-band remain pre-registrations.
+(3) The doc's fusion row (29.6/29.6 held-out vote fusion) is a tune/held quantity over a 4-source
+pool and is deliberately NOT gated by `--tables`; the port's equivalence is exact because both
+sides are driven identically. (4) `bar09` is implemented over MARKOV-1 because this block quotes
+the markov-1@bar0.9 row (25.1/29.0) as the safety point; coact@bar0.9 (25.8/29.8) is the stronger
+barred row and switching the arm to it is a Planner call, not a port detail.
+
+**Validation (all of it host-only, no GPU, no mutex).** `ctest -C Release -R
+test-layer-streaming-tg-predict` PASS, 28 checks; `python tools/check-tg-predict-port.py
+--selftest` PASS, 13 checks - including the NEGATIVE control (one flipped id is CAUGHT, and a
+dropped row, a short null row and a dropped candidate are each caught) and the refusals (a trace
+with no `rowset_init`, a leg out of `(ubatch, layer)` order, a missing dump binary); `python
+tools/check-tg-predict-port.py --tables` EQUAL; `run-tests.ps1 -Suite host` SUCCESS 44/44
+(revision digest `3FE379D5EE294043`, llama.dll `09437EE03CE61125`). Committed as nested 7480fb5b9 + outer 10b0798.
+### T-GPLR-59 (draft): the two predictor source classes T-GPLR-58 excludes - an MTP draft-preview source (PROPOSED FUTURES at zero learned weights) and a hidden-state probe head (measured offline against its OWN ceiling gate) - each with its own pre-registered gate
+
+Status: draft (2026-09-23) - NOT ready: the three owner calls below are unanswered, and two of
+them are blocking (a dependency install, and an execution-mode change for class D's arms).
+Nothing is implemented, no GPU time spent, no arm run. This block REUSES T-GPLR-58's machinery
+rather than restating it: the exact-demand-priority invariant (P1-P6), the count-matched
+per-row null, the band set's shape (M1/M2/M4-M7), the control-spread rule and the refusal
+discipline all live there, and a band or invariant clause must never exist in two places with
+two owners. What is NEW here is exactly three things: class-specific GATES, the void rule class
+D needs, and class E's capture hook plus its trainer.
+
+Dependencies: T-GPLR-58 (the invariant, the null and the bands - this block is a source-class
+companion to it, not a second mechanism); T-GPLR-19 (the row cache and the K ladder both
+classes feed); the MTP draft head (T-GPLR-12 / T-Q38HG-06: `--mtp`, `--mtp-draft`, the `mtp`
+telemetry event) for class D; the recorded model inventory `build/llama-cuda/q36-moe-inventory.json`
+for the shape facts below. Not blocking: T-GPLR-53/T-GPLR-56 (untouched).
+Commit: (unfilled - nothing is implemented, so there is nothing to checkpoint)
+
+Goal. Answer the two questions T-GPLR-58 deliberately leaves out, each with a gate that can
+FAIL on its own terms: (D) does a predictor that reads a PROPOSED FUTURE - the tokens the MTP
+draft head proposes before the target model routes them - add demand-hit value that the
+past-only families cannot, at zero learned weights in the engine; and (E) does the model's own
+hidden state carry more routing signal than the id stream, measured as a CEILING offline
+before anyone argues about shipping it. Neither class is allowed to be judged by the other's
+evidence, and neither is allowed to inherit T-GPLR-58's bands without its own gate.
+
+Scope. Class D: one online table keyed by the DRAFTED token id (D1, no new weights) plus the
+single nextn layer's own routed set reported as a carried, low-expectation source (D2); the
+checker's class-D refusals; the void rule read from the EXISTING `mtp` event. Class E: ONE
+default-off, capture-only engine hook for the pre-attention residual state per (token, layer),
+an offline trainer with a tune/held split by token, and the class gate scored offline. Both
+classes feed their proposals through T-GPLR-58's speculative path; neither adds a second one.
+Non-goals: no change to drafting or speculative-acceptance logic, and no change to the drafter
+itself; no training inside the engine; no engine-side learned weights (a sidecar) - that is a
+separate owner decision with colibri's T-opt-45 no-go as precedent; no new dependency before
+owner approval (measured: neither numpy nor torch is installed here); no PP-side use of either
+class; no re-derivation of T-GPLR-58's bands or invariant; no claim that either class helps
+prefill (the row cache is a TG residency class, recorded).
+
+ESTABLISHED FACTS (measured this pass, host-only - each one bites the design):
+
+- **The draft head has NO depth, and that is the fact that reshapes class D.** The recorded
+  inventory (`q36-moe-inventory.json`, model `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`) reads
+  `trunk_layers` 40, `total_block_count` 41, **`nextn_predict_layers` 1**, and byte class
+  `mtp_layer` **4,863,651 B**; `load_block_mtp` builds that one block as a full MoE layer
+  (ffn_gate_inp 2048x256, ffn_down_exps, gate_up_exps, plus a shared expert). So colibri's
+  formulation - "the draft model's per-layer routing selections preview the target model's
+  expert sets" (their drafter had depth) - **does not port as written**: our draft's OWN routed
+  set exists at ONE layer out of 40. The axes that DO exist are the drafted token IDS (D1) and
+  that single nextn route (D2), and the block is designed around exactly those two.
+- **Class D's void-rule input already exists.** The `mtp` telemetry event carries `tokens`,
+  `mtp_drafted`, `mtp_accepted`, `accept_rate` (llama-layer-streaming.cpp:5843-5850), so the
+  pairing/acceptance arithmetic needs no new counter.
+- **No MTP arm has ever been recorded in this build directory** (no `mtp` event in the recorded
+  top-level traces), so class D starts from zero evidence: its first run's acceptance rate is a
+  MEASUREMENT and a void-rule input, not a result.
+- **MTP is an execution-mode change.** `--mtp` requires `--handoff (-attention-only)` and
+  `--tg-tokens` (main.cpp:2965-2970), is refused with `--pp-repeat > 1` (:3173) and with
+  `--pp-prebuild-per-pass` (:3241); and the recorded AGENTS constraint stands - `--pp-schedule
+  layer-major` refuses `--tg-tokens > 3` when handoff auto does not activate. Consequence,
+  stated so no reader pools the two: class D's arms run in a HANDOFF session and T-GPLR-58's
+  arms in a PLAIN TG session, and legs from the two sessions are NOT comparable to each other.
+- **Class E has no numerical library available.** `import numpy` and `import torch` both FAIL in
+  this environment (measured). So the trainer is either pure Python or an owner-approved new
+  dependency - which AGENTS gates explicitly. This is owner call 1, and it is blocking.
+- **The ceiling these classes aim inside is now measured** (T-GPLR-58's BOUNDING MEASUREMENT,
+  below its arms): the incumbent's uncovered margin is 22-57% of demands depending on K, only
+  0.5-3.4% of that margin is unreachable by observed ids (C4), and it splits ~41% same-token
+  cross-layer (C1, needs an intra-token lead), 24-49% same-layer beyond K (C2, also reachable by
+  a deeper cache) and 7-31% cross-layer long-range (C3). Class D and class E must therefore beat
+  the past-only frontier INSIDE that composition; there is no information wall to exploit.
+- **The capture budget is bounded and known.** `embedding_length` 2048, 40 trunk layers (30
+  recurrent + 10 attention - a hybrid), `expert_count` 256, `expert_used_count` 8. At int8 plus
+  a per-row scale the state row is 2,052 B, so a 256-token x 40-layer TG cell is **21.0 MB**
+  captured (bf16 would be 41.9 MB); the hook therefore needs a sample-every rule for larger
+  cells, not a format change.
+- **Faithfulness holds for both classes by construction, and differently from T-GPLR-58's
+  families.** A draft for position t+1 is produced from tokens <= t; a probe at (t, L)
+  predicting (t+1, L) reads state computed a full token sweep earlier. Neither can leak the
+  demand it predicts - which is why these two classes are the ones the past-only families
+  cannot imitate.
+- **The trap that governs D's table is measured, not hypothetical:** colibri's Atlas record -
+  "rejected drafts' routes are noise by construction: speculative drafts count pre-verification
+  routes". The table is therefore built from ACCEPTED drafts ONLY, and coverage is reported
+  BOTH overall and paired-only, so the class cannot claim coverage its live form would not have.
+
+CLASS D - MTP DRAFT PREVIEW (proposed futures; no learned weights in the engine):
+
+- **D1 (PRIMARY).** An online table P(ranked expert ids | drafted token id, layer) learned from
+  observed (token, exact route) pairs - the same class of online table as coact/markov, but
+  keyed by the token the DRAFTER proposes instead of tokens already seen. At draft time (one
+  round before the demand) the drafted token's ranked ids are staged speculatively through
+  T-GPLR-58's path. This is the SP-MoE "proposed futures" axis and it needs no new weights, no
+  sidecar and no dependency.
+- **D2 (carried for completeness; low expectation, named as such).** The draft head's own
+  routed expert set - ONE layer of 40 - as a feature about the future position. The block
+  requires D2's reach to be printed beside its number and does NOT expect it to move a band.
+- **D-GATE (its own, pre-registered, and the reason this class exists).** D1's margin share
+  must beat the BEST PAST-ONLY ARM measured in the SAME session (T-GPLR-58's strongest available
+  arm at that shape) by more than the session's own spread, under T-GPLR-58's count-matched
+  per-row null. **Beating history alone is explicitly NOT a pass**: the class claims that
+  proposed futures add what the past cannot, so the comparison must be against the past-only
+  FRONTIER, and a result that only re-measures history is recorded as such.
+- **VOID RULE (pre-registered).** If fewer than 60% of target positions pair with an ACCEPTED
+  draft, the class is recorded NULL-UNPAIRED with the measured acceptance rate from the `mtp`
+  event, and no share band is read (colibri's join-rate void rule; their T-pf-06 also records
+  that a low-pairing candidate is void rather than degraded).
+- **LEAD, different in kind.** A draft arrives one ROUND ahead, not one layer ahead, so the lead
+  is reported in rounds and draft-depth (with the drafted -> accepted -> demanded ordering
+  visible in the trace), and T-GPLR-58's layer-lead band is not reused as-is.
+
+CLASS E - HIDDEN-STATE PROBE HEAD (offline ceiling first; engine form explicitly deferred):
+
+- **E1 capture (the ONLY engine code in this block).** A default-off, capture-only hook emitting
+  the pre-attention residual state entering layer L, one row per (token, layer), int8-quantized
+  with a per-row scale, budget-bounded with an explicit sample-every rule; byte-identical off;
+  no effect on routing, ids or output. This is colibri's T-pf-01-class discipline: capture-only,
+  default off, no admission wiring.
+- **Trainer.** A per-layer linear ranking map fit on a TUNE window only (80/20 split BY TOKEN),
+  with a ranking-aware loss; per-layer recall reported, never pooled (colibri's surveyed
+  failures concentrate in shallow layers, and a pooled number would hide exactly that).
+- **E-GATE (its own, pre-registered, comparative - not absolute).** On held-out data and at the
+  SAME proposal budget on the SAME stream, the probe's per-layer recall must beat the BEST
+  id-stream family; and an int8-state probe must agree with a float-state probe within 1pp
+  recall, else widen to int16 and record why (their quantization-sanity rule). A FAIL is a
+  recorded NULL: "this class does not transfer to this model" - decision-useful, and the whole
+  point of measuring a ceiling before arguing about shipping it.
+- **ENGINE FORM IS OUT OF SCOPE.** Putting the probe in the engine means shipping learned
+  weights - a sidecar - and colibri's T-opt-45 was an explicit no-go on trained sidecars; plus
+  the trainer carries the dependency question. Nothing in this block authorizes either, and
+  owner call 2 decides whether that is ever a separate task.
+- **TWO COMPARABILITY LIMITS, recorded so the number is not over-read:** (a) this ceiling is
+  measured on OUR model with OUR capture, so it is NOT comparable to colibri's reported
+  "93%-class" probe signal, which came from a different model, capture and task; (b) recall@B
+  on a held-out split is not a VRAM-normalized quantity, so a probe WIN here justifies a
+  follow-up block - it does not justify adoption.
+
+OWNER CALLS (two blocking, one shaping):
+1. DEPENDENCY, BLOCKING: may the class-E trainer use an approved numerical library (numpy) as a
+   tools-only dependency, or must it stay pure Python? Measured: neither numpy nor torch is
+   installed, and AGENTS requires owner approval before any install. A pure-Python fallback is
+   feasible at this size but slower; the block must state which one it is before B3 starts.
+2. LEARNED SIDECARS, BLOCKING FOR CLASS E's future only: is a trained sidecar in the engine ever
+   in scope? If no, class E's E-gate is its terminal artifact and that is a complete, useful
+   result; if yes, that is a separate block with its own policy (T-opt-45 no-go as precedent).
+3. EXECUTION MODE, SHAPING: may class D force handoff to get MTP arms at short shapes? MTP
+   requires `--handoff*` and the recorded constraint refuses long TG under layer-major without
+   it, so this answer sets which shapes class D can be measured at - and it must be recorded,
+   because it makes class D's legs non-comparable with T-GPLR-58's plain-TG legs.
+
+Implementation steps:
+- B0 (host-only): extend T-GPLR-58's checker with `--class D` - the class-D refusals (an MTP
+  trace with no `mtp` event; a paired fraction below the void bar) and the D-gate comparison
+  (D1 against the session's best past-only arm). A missing `mtp` event is a FAILED check, never
+  a zero, and a refused leg prints no number.
+- B1 (host-only): the D1 table plus paired/overall coverage reporting, validated by replaying a
+  recorded route stream CONDITIONED on drafted tokens (a fixture synthesises the pairing; the
+  real pairing needs an MTP arm, and the fixture proves the table and the coverage arithmetic,
+  not the model).
+- B2 (engine, default-off, capture-only): the class-E capture hook and its host test - row
+  shape, per-row scale, sample-every honoured, mode 0 byte-identical, no routing/output change.
+- B3 (host-only): the trainer (pure Python or the approved dependency, per owner call 1) and the
+  E-gate scoring on a held-out split, including the int8-vs-float agreement check.
+- B4 (one mutex hold, HANDOFF session): the class-D arms, void rule read from the `mtp` event;
+  the class-E capture may ride along in the same hold once B2 is host-validated, since it is
+  capture-only and changes no demand path. Class E's gate itself is scored offline afterwards.
+
+Acceptance criteria (falsifiable):
+- B0: the checker refuses an MTP trace lacking the `mtp` event and one below the void bar, and
+  prints no number in either case; the D-gate fails a leg whose gain exists only against
+  history (a fixture constructs exactly that leg and must be reported NOT A PASS).
+- B1: the replay reproduces the fixture's paired table and the both-forms coverage.
+- B2: capture row shape/scale asserted, sample-every respected, mode 0 byte-identical, and the
+  existing `test-layer-streaming-*` family green.
+- B3: the E-gate is computed on held-out data with PER-LAYER reporting and the agreement check;
+  a FAIL is recorded as a named NULL, not as a rerun.
+- B4: class D yields either a scored D-gate result or NULL-UNPAIRED with the measured acceptance
+  rate; T-GPLR-58's identity gate (route digest + greedy ids across legs) applies unchanged.
+- Default preservation: with both classes' features absent, the runner is byte-identical to
+  today; `run-tests.ps1 -Suite host`, `check-doc-sizes.py` and `resplit-gplr-plan.py --verify`
+  all PASS.
+
+Focused validation commands and expected results:
+- `cmake --build build/llama-cuda --config Release --target llama-layer-streaming` -> green;
+  exe/dll hashes recorded (a new pair means the control must be re-recorded).
+- `python tools/check-tg-predict.py --selftest --class D` -> PASS including the two class-D
+  refusals; `--class E` refuses a capture-less analysis.
+- `ctest --test-dir build/llama-cuda -C Release -R test-layer-streaming-predict` -> PASS,
+  including the new capture-shape test.
+- `python tools/train-probe-head.py --selftest` -> PASS (deterministic fixture with a planted
+  per-layer signal and a planted NULL layer, so the gate is shown to fail when it should).
+- `powershell -File tools/run-gplr59-session.ps1 -Session d1 -ValidateOnly` -> exit 0;
+  `-PreflightOnly` -> 0 on a clean card or 125 naming the PID when busy; never `-AllowBusy`.
+- `python tools/check-doc-sizes.py`, `python tools/resplit-gplr-plan.py --verify` -> PASS.
+
+Required state/document updates: a `docs/currentstate.md` entry per executed arm, naming the
+legs that did NOT run and the execution mode each leg ran in (handoff vs plain TG, because the
+two are not comparable); the findings doc gains the D-gate and E-gate tables; T-GPLR-58's block
+gains a pointer ONLY if either class changes its arms (otherwise it is untouched); the SDD only
+if a mechanism is adopted (owner decision).
+
+Escalation condition: any proposal to change drafting or acceptance logic (that is the drafter's
+task, not this block's); any dependency install or sidecar (owner calls 1 and 2); any result
+where D1's advantage exists only against history and not against the past-only frontier (that is
+the "we re-measured history" outcome and belongs back with the screening as its verdict); any
+capture that perturbs the run's output or routing (a broken hook, not a measurement); any
+offline-vs-engine direction flip (faithfulness bug: escalate, do not retry).
+
 ### T-GPLR-16 (CLOSED 2026-09-22 — the option (a) revert LANDED): the `--handoff-partial` MIN_BATCH=1 override is out of the tree, and a host-only guard keeps it out
 
 T-GPLR-16 was the mixed-placement TG mode (partial handoff: the first N layers' expert banks
