@@ -920,6 +920,17 @@ static const char * ls_pred_arm_name(int arm) {
     }
 }
 
+static const char * ls_spec_plan_stop_name(int stop) {
+    switch (stop) {
+        case LLAMA_LS_STOP_PROPOSALS: return "proposals";
+        case LLAMA_LS_STOP_BUDGET:    return "budget";
+        case LLAMA_LS_STOP_PENDING:   return "pending";
+        case LLAMA_LS_STOP_RESERVE:   return "reserve";
+        case LLAMA_LS_STOP_NO_FREE:   return "no_free";
+        default:                      return "unknown";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T-GPLR-58 MODE 2: the ENGINE-CONSUMED proposer, as ONE pure call per demand
 // stage. Everything the engine does at the end of a demand stage when the mode
@@ -7480,6 +7491,13 @@ void llama_layer_streaming::spec_reset() {
     // the run is over, so it is released rather than kept for a later run
     spec_pred.reset();
     spec_null_rng         = 0;
+    spec_stage_submitted  = 0;
+    spec_fills_last.clear();
+    spec_candidates_last.clear();
+    spec_skipped_present_last = 0;
+    spec_skipped_dup_last = 0;
+    spec_plan_refused_capacity_last = 0;
+    spec_plan_stop_last = 0;
     row_set_spec_arm      = -1;
     row_set_spec_null     = false;
     spec_prop_last        = 0;
@@ -7635,6 +7653,10 @@ bool llama_layer_streaming::spec_issue_one(int il, int32_t expert, uint32_t gene
         bytes += slab_bytes;
     }
 
+    // The fill occupies this cache position as soon as its copy is issued. Keeping
+    // the expert id in the cache owner's array makes duplicate admission and the
+    // demand reserve see the physical row while its copy is in flight.
+    ex[(size_t) p] = expert;
     st[(size_t) p] = LLAMA_LS_SPEC_PENDING;
     fl[(size_t) p] = 0;
     if ((size_t) il < spec_issue_ord.size()) {
@@ -7647,6 +7669,7 @@ bool llama_layer_streaming::spec_issue_one(int il, int32_t expert, uint32_t gene
     evp[(size_t) slot] = p;
     ggml_backend_event_record((ggml_backend_event_t) evs[(size_t) slot], backend_copy);
     spec_submitted++;
+    spec_stage_submitted++;
     spec_issued_bytes += bytes;
     return true;
 }
@@ -7703,6 +7726,15 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
     if (backend_copy == nullptr) {
         return;
     }
+    // T-GPLR-58 A2: the stage-scoped telemetry starts here. `submitted` on this
+    // stage's event counts the fills THIS stage issues, and `fill_ids` names them.
+    spec_stage_submitted = 0;
+    spec_fills_last.clear();
+    spec_candidates_last.clear();
+    spec_skipped_present_last = 0;
+    spec_skipped_dup_last = 0;
+    spec_plan_refused_capacity_last = 0;
+    spec_plan_stop_last = 0;
     // lazy allocation of the per-layer event slots (one per budgeted fill)
     if (spec_ev.size() < spec_state.size()) {
         const ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
@@ -7744,11 +7776,20 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
             &spec_null_rng, (int) model_ref->hparams.n_expert);
         spec_prop_last      = pr.n_proposals;
         spec_arm_count_last = pr.n_arm_count;
+        spec_skipped_present_last = pr.plan.skipped_present;
+        spec_skipped_dup_last = pr.plan.skipped_dup;
+        spec_plan_refused_capacity_last = pr.plan.refused_capacity;
+        spec_plan_stop_last = pr.plan.stop;
+        for (int i = 0; i < pr.n_proposals && i < LLAMA_LS_PRED_MAX_OUT; ++i) {
+            spec_candidates_last.push_back(pr.published[i]);
+        }
         const uint32_t gen = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
         for (int i = 0; i < pr.plan.n_issue; ++i) {
             // stamp at ISSUE time so a speculative row is older than every row a
             // demand placed afterwards
-            spec_issue_one(il, pr.plan.issue[i], gen, ++cache_tick);
+            if (spec_issue_one(il, pr.plan.issue[i], gen, ++cache_tick)) {
+                spec_fills_last.push_back(pr.plan.issue[i]);
+            }
         }
         tel_spec(il, spec_pending_of(il), spec_ready_of(il));
         return;
@@ -7760,7 +7801,9 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
         for (int32_t e : it->second) {
             // stamp at ISSUE time so a speculative row is older than every row a
             // demand placed afterwards
-            spec_issue_one(il, e, gen, ++cache_tick);
+            if (spec_issue_one(il, e, gen, ++cache_tick)) {
+                spec_fills_last.push_back(e);
+            }
         }
     }
     tel_spec(il, spec_pending_of(il), spec_ready_of(il));
@@ -7778,12 +7821,37 @@ void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now
     std::string prop_str;
     if (row_set_spec_mode == 2) {
         prop_str = std::string("\"prop\":") + std::to_string(spec_prop_last) +
-                   ",\"arm_count\":" + std::to_string(spec_arm_count_last) + ",";
+                   ",\"arm_count\":" + std::to_string(spec_arm_count_last) +
+                   ",\"skipped_present\":" + std::to_string(spec_skipped_present_last) +
+                   ",\"skipped_dup\":" + std::to_string(spec_skipped_dup_last) +
+                   ",\"plan_refused_capacity\":" + std::to_string(spec_plan_refused_capacity_last) +
+                   ",\"stop\":" + std::to_string(spec_plan_stop_last) +
+                   ",\"stop_reason\":\"" + ls_spec_plan_stop_name(spec_plan_stop_last) + "\",";
+        std::string candidates;
+        for (size_t i = 0; i < spec_candidates_last.size(); ++i) {
+            candidates += (i ? "," : "");
+            candidates += std::to_string(spec_candidates_last[i]);
+        }
+        prop_str += "\"candidate_ids\":[" + candidates + "],";
+    }
+    // T-GPLR-58 A2: the ids THIS stage issued, in issue order, as `fill_ids`. The
+    // runner's retention cache model replays them (ls_retention_errors), so a `spec`
+    // event is a complete record of the layer's occupancy change; without the ids the
+    // model can only see demand events and every fetch after a fill-issuing stage looks
+    // like a retention-accounting violation. `submitted` is the per-stage count and never
+    // exceeds the budget; `submitted_total` is the run-wide cumulative the P2 accounting
+    // closes against (T-GPLR-58 A2, measured on the 2026-09-23 K-probe: the cumulative
+    // value read as a +306 per-stage increment against a budget of 8).
+    std::string fills;
+    for (size_t i = 0; i < spec_fills_last.size(); ++i) {
+        fills += (i ? "," : "");
+        fills += std::to_string(spec_fills_last[i]);
     }
     tel_write(tel_out,
         "{\"event\":\"spec\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"mode\":%d,\"budget\":%d,"
         "\"reserve\":%d,\"cap\":%d,\"pending\":%d,\"ready_spec\":%d,"
-        "\"submitted\":%lld,\"ready\":%lld,\"cancelled\":%lld,\"cancelled_capacity\":%lld,"
+        "\"submitted\":%lld,\"submitted_total\":%lld,\"fill_ids\":[%s],"
+        "\"ready\":%lld,\"cancelled\":%lld,\"cancelled_capacity\":%lld,"
         "\"cancelled_demand\":%lld,\"cancelled_generation\":%lld,"
         "\"refused_capacity\":%lld,\"dup_refused\":%lld,\"matched_by_demand\":%lld,"
         "\"waited_by_demand\":%lld,\"reap_wait_us\":%lld,\"issued_bytes\":%lld,"
@@ -7794,7 +7862,8 @@ void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now
         "\"lead_hist\":[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld],%s\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, row_set_spec_mode,
         row_set_spec_budget, row_set_spec_reserve, row_set_cap, pending_now, ready_spec_now,
-        (long long) spec_submitted, (long long) spec_ready, (long long) spec_cancelled,
+        (long long) spec_stage_submitted, (long long) spec_submitted, fills.c_str(),
+        (long long) spec_ready, (long long) spec_cancelled,
         (long long) spec_cancelled_capacity, (long long) spec_cancelled_demand,
         (long long) spec_cancelled_generation, (long long) spec_refused_capacity,
         (long long) spec_dup_refused, (long long) spec_matched_by_demand,
@@ -7851,9 +7920,22 @@ bool llama_layer_streaming::begin_row_cache() {
     cache_expert.assign(n_layer, std::vector<int32_t>((size_t) row_set_cap, -1));
     cache_recency.assign(n_layer, std::vector<int64_t>((size_t) row_set_cap, -1));
     cache_tick = 0;
-    // T-GPLR-58 A0: speculative placement state. Empty unless the mode is on, so
-    // the default path allocates nothing and every guard below is inert (P6).
-    spec_reset();
+    // T-GPLR-58 A0/A1: speculative placement state. The per-layer arrays are
+    // (re)assigned just below, so a CONFIGURED run needs no clearing here -- and
+    // must not get one: spec_reset() is the TEARDOWN (it clears the mode, the arm
+    // and the null source), while this call site runs AFTER set_row_set_spec() and
+    // set_row_set_spec_arm() configured the run and BEFORE the allocation gated on
+    // row_set_spec_on. Measured 2026-09-23 (T-GPLR-58 A3 session, the FIRST real arm
+    // run): the mode was configured at bring-up -- the log reads "mode 2 (proposer
+    // arm) budget 8, reserve 8 of cap 16" and "proposer arm coact" -- yet the trace
+    // carried NO row_spec_mode in run_start and ZERO `spec` events, because this
+    // reset had already turned a mode-2 run back into a plain retention run. The
+    // host fixtures could not catch it: they drive the pure functions and never call
+    // begin_row_cache() at all. The DEFAULT path (mode 0) still resets here, so P6
+    // holds: nothing speculative survives an off leg.
+    if (row_set_spec_mode == 0) {
+        spec_reset();
+    }
     if (row_set_spec_on) {
         spec_state.assign(n_layer, std::vector<uint8_t>((size_t) row_set_cap, LLAMA_LS_SPEC_FREE));
         spec_flag.assign(n_layer, std::vector<uint8_t>((size_t) row_set_cap, 0));

@@ -1120,8 +1120,29 @@ struct LLAMA_API llama_layer_streaming {
     // scripted proposals: key = (layer << 32) | ordinal -> the ids to speculate
     // at the END of that layer's (ordinal-1)-th demand stage
     std::unordered_map<uint64_t, std::vector<int32_t>> spec_script;
-    // counters, emitted per stage by tel_spec()
-    int64_t spec_submitted = 0;          // fills admitted and issued
+    // counters, emitted on every demand stage by tel_spec(). The stage_scoped ones
+    // are per-stage; the rest are run totals, so a reader never has to guess the grain.
+    int64_t spec_submitted = 0;          // fills admitted and issued, RUN TOTAL
+    // T-GPLR-58 A2: the `submitted` field of a `spec` event is PER-STAGE -- the fills
+    // THIS stage issued, and by the admission rule never more than the budget. The run
+    // total (spec_submitted) is emitted beside it as `submitted_total`. Measured on the
+    // 2026-09-23 K-probe: a run-cumulative value on a per-stage event read as a +306
+    // increment against a budget of 8, because between two events of one layer every
+    // OTHER layer's stage in that token also issued its fills into the same counter.
+    int64_t spec_stage_submitted = 0;    // fills issued during THIS demand stage
+    // The ids THIS stage actually issued, in issue order, as `fill_ids`. The runner's
+    // retention cache model (ls_retention_errors) replays them, so a spec event without
+    // them cannot reproduce the layer's occupancy: that is what made every fetch after a
+    // fill-issuing stage look like a retention-accounting violation (216 on the recorded
+    // null@K8 leg, 2026-09-23) while the runtime's own numbers were self-consistent.
+    std::vector<int32_t> spec_fills_last;
+    // Per-stage planner telemetry. These explain an empty issue list without requiring
+    // a second admission pass. They are populated only for mode 2.
+    std::vector<int32_t> spec_candidates_last;
+    int spec_skipped_present_last      = 0;
+    int spec_skipped_dup_last          = 0;
+    int spec_plan_refused_capacity_last = 0;
+    int spec_plan_stop_last             = 0;
     int64_t spec_ready     = 0;          // fills whose copy completed and were claimed resident
     int64_t spec_cancelled = 0;          // fills abandoned before being needed (P4)
     // P4 wants the FIRING POINT named, not just the total (colibri's UPDATE101

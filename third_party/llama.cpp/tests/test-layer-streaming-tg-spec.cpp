@@ -98,6 +98,29 @@ struct fixture {
     }
 
     int64_t tick = 0;
+
+    // the engine's spec_pending_of(): positions whose copy is in flight. The
+    // speculative budget is checked against THIS count, so a stage can never
+    // admit more than `budget` fills: every admitted fill holds its position
+    // until the next stage's reap, which is the only reap on the run path.
+    int pending() const {
+        int n = 0;
+        for (uint8_t st : state) {
+            n += (st == LLAMA_LS_SPEC_PENDING);
+        }
+        return n;
+    }
+
+    // the engine's spec_reap(): the previous stage's fills completed, so they
+    // claim residency and become the FIRST eviction victim while unconsumed.
+    void reap() {
+        for (size_t p = 0; p < state.size(); ++p) {
+            if (state[p] == LLAMA_LS_SPEC_PENDING) {
+                state[p] = LLAMA_LS_SPEC_READY;
+                spec[p]  = 1;
+            }
+        }
+    }
 };
 
 int main() {
@@ -916,6 +939,186 @@ int main() {
                   llama_ls_spec_propose(nullptr, arm, false, 1, top_k, nullptr, 0,
                                         f.expert.data(), f.state.data(), cap,
                                         top_k, top_k, 0, &rng, n_expert).plan.n_issue == 0);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // T-GPLR-58 A2: `submitted` is PER-STAGE, and a stage never exceeds the budget.
+    //
+    // The engine's per-stage count is the number of successful spec_issue_one()
+    // calls inside one demand stage, and every one of them is admitted by
+    // llama_ls_spec_admit with max_pending = budget, with the fill holding its
+    // position until the NEXT stage's reap. So the count is bounded by the budget
+    // by construction. These fixtures drive the engine's own issue loop over a
+    // 32-stage stream at the production shape (reserve/budget 8, cap 64 =
+    // K*top_k, 306 candidate ids per stage -- the shape that read as a +306
+    // per-stage increment when the field carried the run-global total instead).
+    // They prove the bound NON-vacuously, prove the cumulative reading is a
+    // different number, and show the defect's own shape (a per-layer increment of
+    // a run-global counter) so a regression to the cumulative field is caught.
+    // ---------------------------------------------------------------------
+    printf("\nA2 TELEMETRY - `submitted` is per stage, and a stage never exceeds the budget\n");
+    {
+        const int n_expert = 1024;
+        const int top_k    = 8;   // the demand reserve, in positions
+        const int budget   = 8;   // the per-layer speculative budget: the bound proved here
+        const int cap      = 64;  // K=8 windows of top_k rows
+        const int n_stage  = 32;
+        const int n_cand   = 306; // candidates the source publishes per stage, 38x the budget
+
+        // the source's candidate pool, disjoint from every id the demand routes
+        std::vector<int32_t> cands;
+        for (int c = 0; c < n_cand; ++c) {
+            cands.push_back(512 + c);
+        }
+
+        // one demand stage, in the engine's order: classify, place, evict as needed
+        auto demand_stage = [&](fixture & f, int s) {
+            for (int k = 0; k < top_k; ++k) {
+                const int32_t e = (k < top_k / 2)
+                    ? (int32_t) ((s * (top_k / 2) + k) % 128)   // a fresh row every stage
+                    : (int32_t) (200 + k - top_k / 2);          // a row the cache keeps
+                const int hp = f.hit_pos(e);
+                if (hp >= 0) {
+                    f.recency[(size_t) hp] = ++f.tick;
+                    continue;
+                }
+                int p = llama_ls_spec_free_pos(f.expert.data(), f.state.data(), cap);
+                if (p < 0) {
+                    std::vector<char> wanted((size_t) cap, 0);
+                    p = f.victim(wanted);
+                }
+                if (p >= 0) {
+                    f.demand_place(p, e, ++f.tick);
+                }
+            }
+        };
+
+        // the engine's issue loop: the ids the SOURCE published, each admitted by the
+        // engine's own rule in rank order. Returns how many fills this stage placed.
+        auto issue_stage = [&](fixture & f, const std::vector<int32_t> & pub) {
+            int admitted = 0;
+            for (int32_t e : pub) {
+                const llama_ls_spec_admission ad = llama_ls_spec_admit(
+                    f.expert.data(), f.state.data(), cap, top_k, budget, f.pending(), e);
+                if (!ad.ok) {
+                    continue;
+                }
+                f.expert[(size_t) ad.pos]  = e;
+                f.state[(size_t) ad.pos]   = LLAMA_LS_SPEC_PENDING;
+                f.spec[(size_t) ad.pos]    = 0; // the spec flag is set at the reap
+                f.recency[(size_t) ad.pos] = ++f.tick;
+                admitted++;
+            }
+            return admitted;
+        };
+
+        // 1. the SCRIPTED source (mode 1's shape): 306 published ids per stage, and
+        //    the per-stage count still never passes the budget.
+        {
+            fixture f(cap);
+            int  max_stage = 0, at_budget = 0;
+            long long cumulative = 0;
+            bool bounded = true;
+            for (int s = 0; s < n_stage; ++s) {
+                demand_stage(f, s);
+                f.reap(); // the previous stage's fills completed (the runtime's order:
+                          // the demand classifies while they are still PENDING)
+                const int admitted = issue_stage(f, cands);
+                bounded = bounded && admitted <= budget;
+                max_stage = std::max(max_stage, admitted);
+                at_budget += (admitted == budget);
+                cumulative += admitted;
+            }
+            check("a stage places at most the budget, whatever the source publishes", bounded);
+            check("the bound is reached, so the check above is not vacuous", at_budget > 0);
+            check("the cumulative total is a different, larger number", cumulative > budget);
+            printf("       (%d stages, max per-stage %d, %d stage(s) at the budget, cumulative %lld)\n",
+                   n_stage, max_stage, at_budget, cumulative);
+        }
+
+        // 2. the reading that produced the defect: the engine's spec_submitted is RUN
+        //    GLOBAL, so between two events of ONE layer every other layer's stage in
+        //    that token lands in it too. Two layers in lockstep reproduce a per-layer
+        //    increment above the budget on that cumulative reading while each layer's
+        //    own per-stage count stays inside it.
+        {
+            fixture a(cap), b(cap);
+            long long global_total = 0, seen_a = 0, max_delta = 0;
+            int max_a = 0, max_b = 0;
+            for (int s = 0; s < n_stage; ++s) {
+                for (int which = 0; which < 2; ++which) {
+                    fixture & f = (which == 0) ? a : b;
+                    demand_stage(f, s);
+                    f.reap();
+                    const int admitted = issue_stage(f, cands);
+                    global_total += admitted;
+                    if (which == 0) {
+                        max_a = std::max(max_a, admitted);
+                    } else {
+                        max_b = std::max(max_b, admitted);
+                        max_delta = std::max(max_delta, global_total - seen_a);
+                        seen_a = global_total;
+                    }
+                }
+            }
+            check("both layers stay within the budget on every stage", max_a <= budget && max_b <= budget);
+            check("a run-global counter read per layer does exceed it (the defect)", max_delta > budget);
+            printf("       (per-layer max %d/%d, max run-global increment between one layer's events %lld)\n",
+                   max_a, max_b, max_delta);
+        }
+
+        // 3. the MODE 2 wiring, over 32 stages with the arm warm (two periods of the same
+        //    periodic row) and the cache holding only the demand reserve -- the shape the
+        //    mode-2 block above calls "room beyond the reserve". Every stage's plan goes
+        //    through the engine's own admission loop, and every per-stage count is within
+        //    the budget.
+        {
+            llama_ls_pred_state st;
+            const int n_expert2 = 32; // the working shape of the mode-2 block above
+            llama_ls_pred_init(&st, 3, n_expert2, LLAMA_LS_PRED_BIT_ALL);
+            for (int t = 0; t < 2 * 8; ++t) {
+                const int b = t % 8;
+                const std::vector<int32_t> warm = { (int32_t) ((b * 2) % n_expert2),
+                                                    (int32_t) ((b * 2 + 1) % n_expert2) };
+                llama_ls_pred_observe(&st, 1, warm.data(), (int) warm.size());
+            }
+            uint32_t rng = llama_ls_pred_null_seed();
+            int  max_issue = 0, placing = 0;
+            long long placed = 0;
+            for (int s = 0; s < n_stage; ++s) {
+                const int b = s % 8;
+                const std::vector<int32_t> row = { (int32_t) ((b * 2) % n_expert2),
+                                                   (int32_t) ((b * 2 + 1) % n_expert2) };
+                fixture f(cap); // only the demand reserve is resident: room beyond it
+                for (int p = 0; p < top_k; ++p) {
+                    f.demand_place(p, 300 + p, ++f.tick);
+                }
+                const llama_ls_propose_result pr = llama_ls_spec_propose(
+                    &st, LLAMA_LS_ARM_COACT, false, 1, budget, row.data(), (int) row.size(),
+                    f.expert.data(), f.state.data(), cap, top_k, budget, f.pending(), &rng, n_expert2);
+                int admitted = 0;
+                for (int j = 0; j < pr.plan.n_issue; ++j) {
+                    const llama_ls_spec_admission ad = llama_ls_spec_admit(
+                        f.expert.data(), f.state.data(), cap, top_k, budget, f.pending(),
+                        pr.plan.issue[j]);
+                    if (!ad.ok) {
+                        continue;
+                    }
+                    f.expert[(size_t) ad.pos]  = pr.plan.issue[j];
+                    f.state[(size_t) ad.pos]   = LLAMA_LS_SPEC_PENDING;
+                    f.spec[(size_t) ad.pos]    = 0;
+                    f.recency[(size_t) ad.pos] = ++f.tick;
+                    admitted++;
+                }
+                max_issue = std::max(max_issue, admitted);
+                placing  += (admitted > 0);
+                placed   += admitted;
+            }
+            check("mode 2: every stage's plan places at most the budget", max_issue <= budget);
+            check("mode 2: and the bound is exercised (stages did place fills)", placing > 0);
+            printf("       (max per-stage %d over %d stages, %lld fills placed in total)\n",
+                   max_issue, n_stage, placed);
         }
     }
 

@@ -680,6 +680,55 @@ static std::string json_str(const std::string & line, const char * key) {
     return line.substr(s, e - s);
 }
 
+// T-GPLR-58: a JSON array of non-negative integers, e.g. the `fill_ids` a `spec` event
+// carries. `*found` distinguishes an absent key from a present empty array, which the
+// retention cache model needs: an empty array means the stage issued nothing, an absent
+// key means the trace predates the field.
+static std::vector<long long> json_int_list(const std::string & line, const char * key, bool * found) {
+    std::vector<long long> out;
+    const std::string pat = std::string("\"") + key + "\":[";
+    const size_t pos = line.find(pat);
+    if (pos == std::string::npos) {
+        if (found) {
+            *found = false;
+        }
+        return out;
+    }
+    if (found) {
+        *found = true;
+    }
+    size_t s = pos + pat.size();
+    while (s < line.size()) {
+        while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) {
+            s++;
+        }
+        if (s >= line.size() || line[s] == ']') {
+            break;
+        }
+        bool neg = false;
+        if (line[s] == '-') {
+            neg = true;
+            s++;
+        }
+        if (s >= line.size() || line[s] < '0' || line[s] > '9') {
+            break; // not an integer array: stop, the caller sees what was parsed
+        }
+        long long v = 0;
+        while (s < line.size() && line[s] >= '0' && line[s] <= '9') {
+            v = v * 10 + (line[s] - '0');
+            s++;
+        }
+        out.push_back(neg ? -v : v);
+        while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) {
+            s++;
+        }
+        if (s < line.size() && line[s] == ',') {
+            s++;
+        }
+    }
+    return out;
+}
+
 static long long json_ll(const std::string & line, const char * key, bool * found) {
     const std::string v = json_str(line, key);
     if (v.empty()) {
@@ -757,12 +806,165 @@ static void ls_err_off_streaming_event(int line_no, const char * tag, int & erro
 // K>=2, where the LRU can only retain more.
 // `tick` is a monotonic recency source shared across the whole trace; only the
 // RELATIVE order matters, so it need not match the runtime's counter.
-static std::vector<std::string> ls_retention_errors(
-        long long layer, long long route_union, long long n_rows_resident,
-        const std::string & ids, long long n_retained, long long n_retired,
-        long long retain_k, long long n_expert, long long top_k,
-        std::unordered_map<long long, long long> & cache, long long & tick) {
+//
+// T-GPLR-58: the model also replays the SPECULATIVE fills, which is what makes it a
+// model of the cache the runtime actually held and not of the demand stream alone.
+// It calls the runtime's OWN pure rules (llama_ls_spec_is_hit / _may_evict /
+// _victim_better), so the checker cannot drift from the engine, and it keeps the
+// per-position speculative state the runtime keeps:
+//   spec_state  FREE / READY / PENDING / CANCELLED -- an in-flight position holds its
+//               bytes: never a hit, never a victim, and a demand for that very row
+//               fetches its own copy (P1/P2/P5);
+//   spec        1 = placed by a fill and not yet consumed, so it is the FIRST victim
+//               (P3). A consumed fill is an ordinary resident again.
+// The recency order is the runtime's: the union is stamped in its ascending-id order
+// and each fill at ISSUE, so only the absolute tick value differs (nothing reads it.
+struct ls_retention_row {
+    long long recency    = 0;   // the runtime's cache_tick stamp for this row
+    bool      spec       = false; // placed by a fill, not yet consumed: first victim
+    uint8_t   spec_state = LLAMA_LS_SPEC_FREE; // the runtime's per-position spec state
+};
+
+// T-GPLR-58: a `spec` event is written BEFORE the rowset_fetch of the stage it belongs
+// to (spec_issue_next runs inside load_row_set, ahead of tel_rowset_fetch), so its
+// fills are STAGED here and applied after that fetch -- which is also the order the
+// runtime applies them in, and the only order in which a fill is PENDING while the next
+// window classifies it and READY when the window after that may evict it.
+struct ls_retention_model {
+    std::unordered_map<long long, ls_retention_row> rows; // (layer<<32)|expert -> the row
+    long long tick = 0;                       // monotonic recency source (the runtime's)
+    std::unordered_map<long long, std::vector<long long>> staged; // layer -> this stage's fills
+    std::unordered_set<long long>             staged_seen;         // layers with a staged spec event
+    std::unordered_map<long long, long long>  last_gen;            // layer -> last generation
+    std::unordered_map<long long, long long>  last_phase;          // layer -> last phase
+    // A trace recorded before `fill_ids` existed reports the fills' COUNT but not their
+    // ids, so the model cannot replay them. That is UNVERIFIABLE, not wrong: the per-fetch
+    // rules are suppressed and the leg fails ONCE with the cause named, rather than
+    // blaming every later fetch (216 violations on the recorded null@K8 leg, 2026-09-23).
+    bool      unreplayable         = false;
+    long long unreplayable_stages  = 0;
+};
+
+// One `spec` event: record the fills this stage issued. Sets model.unreplayable when the
+// event reported fills without their ids.
+static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const std::string & line) {
     std::vector<std::string> out;
+    bool have_layer = false;
+    const long long layer = json_ll(line, "layer", &have_layer);
+    if (!have_layer || layer < 0) {
+        out.push_back("spec missing layer");
+        return out;
+    }
+    bool have_fills = false;
+    const std::vector<long long> fills = json_int_list(line, "fill_ids", &have_fills);
+
+    // Mode 2 admission telemetry is additive: older traces have no candidate_ids and
+    // remain replayable only through their legacy path. A trace with any new field must
+    // carry the complete per-stage schema, or the checker refuses the ambiguous record.
+    const bool has_admission_field =
+        line.find("\"candidate_ids\"") != std::string::npos ||
+        line.find("\"skipped_present\"") != std::string::npos ||
+        line.find("\"skipped_dup\"") != std::string::npos ||
+        line.find("\"plan_refused_capacity\"") != std::string::npos ||
+        line.find("\"stop_reason\"") != std::string::npos;
+    if (has_admission_field) {
+        const char * required[] = {"candidate_ids", "skipped_present", "skipped_dup",
+                                   "plan_refused_capacity", "stop", "stop_reason", "fill_ids"};
+        for (const char * key : required) {
+            if (line.find(std::string("\"") + key + "\"") == std::string::npos) {
+                out.push_back(std::string("spec admission telemetry missing ") + key);
+            }
+        }
+        bool have_candidates = false;
+        const std::vector<long long> candidates = json_int_list(line, "candidate_ids", &have_candidates);
+        bool have_stop = false;
+        const long long stop = json_ll(line, "stop", &have_stop);
+        const std::string stop_reason = json_str(line, "stop_reason");
+        if (have_candidates && have_stop) {
+            if (stop < 0 || stop > 4) {
+                out.push_back("spec admission stop is outside the planner enum");
+            }
+            const char * expected = stop == 0 ? "proposals" :
+                                    stop == 1 ? "budget" :
+                                    stop == 2 ? "pending" :
+                                    stop == 3 ? "reserve" :
+                                    stop == 4 ? "no_free" : "";
+            if (expected[0] == '\0' || stop_reason != expected) {
+                out.push_back("spec admission stop_reason does not match stop");
+            }
+            bool have_prop = false;
+            const long long prop = json_ll(line, "prop", &have_prop);
+            if (!have_prop || prop != (long long) candidates.size()) {
+                out.push_back("spec candidate_ids length does not match prop");
+            }
+            std::unordered_set<long long> unique;
+            for (long long id : candidates) {
+                if (id < 0 || !unique.insert(id).second) {
+                    out.push_back("spec candidate_ids carries a negative or duplicate id");
+                    break;
+                }
+            }
+        }
+        if (have_fills) {
+            const long long submitted = json_ll(line, "submitted", nullptr);
+            if (submitted != (long long) fills.size()) {
+                out.push_back("spec fill_ids length does not match submitted");
+            }
+            std::unordered_set<long long> unique;
+            for (long long id : fills) {
+                if (id < 0 || !unique.insert(id).second) {
+                    out.push_back("spec fill_ids carries a negative or duplicate id");
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!have_fills) {
+        // `submitted` is PER-STAGE since T-GPLR-58 A2, so only a positive `submitted_total`
+        // (or a pre-A2 cumulative `submitted`) proves fills were issued at all. The reap still
+        // happened either way, so the layer stays staged.
+        const long long submitted = json_ll(line, "submitted", nullptr);
+        const long long total     = json_ll(line, "submitted_total", nullptr);
+        if (submitted > 0 || total > 0) {
+            model.unreplayable = true;
+            model.unreplayable_stages++;
+        }
+        model.staged_seen.insert(layer);
+        return out;
+    }
+    for (long long x : fills) {
+        if (x < 0) {
+            out.push_back("spec fill_ids carries a negative expert id");
+        }
+    }
+    model.staged[layer] = fills;
+    model.staged_seen.insert(layer);
+    return out;
+}
+
+// The deferred, leg-level form of the rule above: one error, naming the cause.
+static std::vector<std::string> ls_spec_replay_errors(const ls_retention_model & model) {
+    std::vector<std::string> out;
+    if (model.unreplayable) {
+        out.push_back("spec: " + std::to_string(model.unreplayable_stages) +
+                      " stage(s) reported speculative fills with no `fill_ids`, so the retention "
+                      "cache model cannot replay them and the per-fetch retention rules are "
+                      "UNVERIFIED for this trace (recorded before T-GPLR-58 A2)");
+    }
+    return out;
+}
+
+static std::vector<std::string> ls_retention_errors(
+        ls_retention_model & model,
+        long long layer, long long generation, long long phase,
+        long long route_union, long long n_rows_resident,
+        const std::string & ids, long long n_retained, long long n_retired,
+        long long retain_k, long long n_expert, long long top_k) {
+    std::vector<std::string> out;
+    if (model.unreplayable) {
+        return out; // every per-fetch rule would be downstream of the missing fills
+    }
     const long long layer_hi = layer << 32;
     const long long cap = std::min(n_expert, retain_k * top_k);
 
@@ -781,47 +983,90 @@ static std::vector<std::string> ls_retention_errors(
         }
     }
 
-    // 1. classify: which union members the cache already holds. Eviction never
-    //    displaces a row this window needs, so this is also the reported
-    //    resident count both before and after the eviction step below.
+    // 0. a generation boundary: the runtime cancels every in-flight fill issued under a
+    //    stale generation before it classifies the window, and a PHASE boundary
+    //    (begin_row_set) cancels AND reaps them before the phase's first window, so those
+    //    positions are already free when the new phase starts.
+    {
+        const auto g = model.last_gen.find(layer);
+        if (g != model.last_gen.end() && g->second != generation) {
+            const auto ph = model.last_phase.find(layer);
+            const bool new_phase = ph != model.last_phase.end() && ph->second != phase;
+            for (auto it = model.rows.begin(); it != model.rows.end(); ) {
+                if ((it->first & ~0xffffffffLL) != layer_hi) {
+                    ++it;
+                    continue;
+                }
+                const bool in_flight = it->second.spec_state == LLAMA_LS_SPEC_PENDING ||
+                                       it->second.spec_state == LLAMA_LS_SPEC_CANCELLED;
+                if (in_flight && new_phase) {
+                    it = model.rows.erase(it); // drained at the phase boundary
+                    continue;
+                }
+                if (it->second.spec_state == LLAMA_LS_SPEC_PENDING) {
+                    it->second.spec_state = LLAMA_LS_SPEC_CANCELLED; // stale generation
+                }
+                ++it;
+            }
+        }
+        model.last_gen[layer]   = generation;
+        model.last_phase[layer] = phase;
+    }
+
+    // 1. classify: which union members the cache already holds as a HIT. Only a READY row
+    //    is a hit (P2): a PENDING row this window wants is a duplicate (cancelled here -- its
+    //    bytes are superseded by the demand's own copy) and a CANCELLED row is already
+    //    superseded. Eviction never displaces a row this window needs, so this is also the
+    //    reported resident count both before and after the eviction step below.
     long long resident = 0;
     for (long long x : uniq) {
-        if (cache.find(layer_hi | (long long) (unsigned) x) != cache.end()) {
+        auto it = model.rows.find(layer_hi | (long long) (unsigned) x);
+        if (it == model.rows.end()) {
+            continue;
+        }
+        if (llama_ls_spec_is_hit(it->second.spec_state)) {
             ++resident;
+        } else if (it->second.spec_state == LLAMA_LS_SPEC_PENDING) {
+            it->second.spec_state = LLAMA_LS_SPEC_CANCELLED; // demand duplicate
         }
     }
     long long occupied = 0;
-    for (const auto & e : cache) {
+    for (const auto & e : model.rows) {
         if ((e.first & ~0xffffffffLL) == layer_hi) {
-            ++occupied;
+            ++occupied; // physical occupancy: an in-flight fill holds its position
         }
     }
     const long long need = (long long) uniq.size() - resident;
 
-    // 2. recency eviction, BEFORE placement -- the same rule the runtime
-    //    applies, so the trace cannot describe a cache the runtime could not
-    //    have held: evict the least recently routed position that this window
-    //    does not need, until the fetched complement fits.
+    // 2. recency eviction, BEFORE placement -- the same rule the runtime applies, so the
+    //    trace cannot describe a cache the runtime could not have held: a speculative row is
+    //    the FIRST victim (P3), then the least recently routed position that this window does
+    //    not need, until the fetched complement fits. An in-flight position is never a victim.
     long long expect_retired = 0;
     while (occupied + need > cap) {
-        auto victim = cache.end();
-        for (auto it = cache.begin(); it != cache.end(); ++it) {
+        auto victim = model.rows.end();
+        for (auto it = model.rows.begin(); it != model.rows.end(); ++it) {
             if ((it->first & ~0xffffffffLL) != layer_hi) {
                 continue;
+            }
+            if (!llama_ls_spec_may_evict(it->second.spec_state)) {
+                continue; // bytes in flight: the reap releases it, an eviction never does
             }
             const long long x = (long long) (unsigned) (it->first & 0xffffffffLL);
             if (std::find(uniq.begin(), uniq.end(), x) != uniq.end()) {
                 continue; // needed by this window: never evicted
             }
-            if (victim == cache.end() || it->second < victim->second) {
+            if (victim == model.rows.end() ||
+                llama_ls_spec_victim_better(it->second.recency, it->second.spec, true,
+                                            victim->second.recency, victim->second.spec, true)) {
                 victim = it;
             }
         }
-        if (victim == cache.end()) {
+        if (victim == model.rows.end()) {
             out.push_back("rowset_fetch retention cannot fit the union in the declared capacity");
             return out;
         }
-        cache.erase(victim);
+        model.rows.erase(victim);
         --occupied;
         ++expect_retired;
     }
@@ -829,18 +1074,34 @@ static std::vector<std::string> ls_retention_errors(
         out.push_back("rowset_fetch n_rows_retired != rows evicted by the row-capacity policy");
     }
 
-    // 3. stamp recency across the WHOLE union in ascending expert-id order, so a
-    //    hit and a miss refresh recency alike and the in-window tie-break is
-    //    deterministic
-    long long expect_retained = 0;
+    // 3. stamp recency across the WHOLE union in ascending expert-id order, so a hit and a
+    //    miss refresh recency alike and the in-window tie-break is deterministic -- the
+    //    runtime's own order
+    const long long expect_retained = resident;
     std::vector<long long> asc = uniq;
     std::sort(asc.begin(), asc.end());
     for (long long x : asc) {
         const long long k = layer_hi | (long long) (unsigned) x;
-        if (cache.find(k) != cache.end()) {
-            ++expect_retained;
+        auto it = model.rows.find(k);
+        if (it != model.rows.end() && it->second.spec_state == LLAMA_LS_SPEC_CANCELLED) {
+            // The demand fetched its own copy because the fill was still pending.
+            // The cancelled position is released by the reap after this window, so
+            // the post-window cache is represented by the demand row, not the
+            // superseded fill that happened to have the same expert id.
+            it->second.recency    = ++model.tick;
+            it->second.spec_state = LLAMA_LS_SPEC_READY;
+            it->second.spec       = false;
+        } else if (it != model.rows.end()) {
+            it->second.recency    = ++model.tick;
+            it->second.spec_state = LLAMA_LS_SPEC_READY;
+            it->second.spec       = false; // a consumed fill is an ordinary resident
+        } else {
+            ls_retention_row r;
+            r.recency    = ++model.tick;
+            r.spec       = false; // a row the demand placed is never speculative
+            r.spec_state = LLAMA_LS_SPEC_READY;
+            model.rows.emplace(k, r);
         }
-        cache[k] = ++tick;
     }
     if (expect_retained != n_retained || expect_retained != n_rows_resident) {
         out.push_back("rowset_fetch retention accounting mismatch (cache-derived != reported)");
@@ -848,7 +1109,7 @@ static std::vector<std::string> ls_retention_errors(
 
     // 4. the cache can never exceed its declared capacity
     long long layer_rows = 0;
-    for (const auto & e : cache) {
+    for (const auto & e : model.rows) {
         if ((e.first & ~0xffffffffLL) == layer_hi) {
             ++layer_rows;
         }
@@ -858,6 +1119,45 @@ static std::vector<std::string> ls_retention_errors(
     }
     if (route_union > n_expert) {
         out.push_back("rowset_fetch route_union exceeds n_expert");
+    }
+
+    // 5. this stage's speculation, applied AFTER the window it belongs to: the runtime reaps
+    //    first (PENDING -> READY and speculative, CANCELLED released), then issues this
+    //    stage's fills, each into a FREE position with a fresh recency stamp, in the order
+    //    `fill_ids` lists them.
+    if (model.staged_seen.count(layer)) {
+        for (auto it = model.rows.begin(); it != model.rows.end(); ) {
+            if ((it->first & ~0xffffffffLL) != layer_hi) {
+                ++it;
+                continue;
+            }
+            if (it->second.spec_state == LLAMA_LS_SPEC_CANCELLED) {
+                it = model.rows.erase(it); // released without a residency claim
+                continue;
+            }
+            if (it->second.spec_state == LLAMA_LS_SPEC_PENDING) {
+                it->second.spec_state = LLAMA_LS_SPEC_READY;
+                it->second.spec       = true; // a ready fill is the first victim
+            }
+            ++it;
+        }
+        const auto st = model.staged.find(layer);
+        if (st != model.staged.end()) {
+            for (long long x : st->second) {
+                const long long k = layer_hi | (long long) (unsigned) x;
+                if (model.rows.find(k) != model.rows.end()) {
+                    out.push_back("spec fill_ids repeats a row the cache already holds");
+                    continue;
+                }
+                ls_retention_row r;
+                r.recency    = ++model.tick; // stamped at ISSUE, as the runtime does
+                r.spec       = false;        // the flag is set at the reap
+                r.spec_state = LLAMA_LS_SPEC_PENDING;
+                model.rows.emplace(k, r);
+            }
+        }
+        model.staged.erase(layer);
+        model.staged_seen.erase(layer);
     }
     return out;
 }
@@ -1028,8 +1328,9 @@ static int check_telemetry(const std::string & path) {
     std::unordered_map<int, rowset_slot_state> rowset_slots;
     // T-GPLR-19: >0 when rowset_init declares per-layer retention
     long long rowset_retain_k = -1;
-    std::unordered_map<long long, long long> rowset_cache; // (layer<<32)|expert -> recency stamp
-    long long rowset_retention_tick = 0;                   // monotonic recency source
+    // T-GPLR-58: the per-layer retention cache model (rows, recency, and the staged
+    // speculative fills of the `spec` events that precede each rowset_fetch).
+    ls_retention_model rowset_retention;
     long long rowset_rounds = 0;
     // T-GPLR-19: byte_account's row_cache figure, held until rowset_init has
     // been read so the record can be tied to the policy it claims.
@@ -1501,10 +1802,10 @@ static int check_telemetry(const std::string & path) {
                 if (!rf || ub < 1 || nret < 0 || nrtd < 0) {
                     err("rowset_fetch missing retention fields under a retain_k policy");
                 } else {
-                    for (const auto & e : ls_retention_errors(layer, ru, nr,
+                    for (const auto & e : ls_retention_errors(rowset_retention,
+                             layer, gen, json_ll(line, "phase", nullptr), ru, nr,
                              json_str(line, "union_ids"), nret, nrtd, rowset_retain_k,
-                             rowset_n_expert, rowset_top_k, rowset_cache,
-                             rowset_retention_tick)) {
+                             rowset_n_expert, rowset_top_k)) {
                         err(e.c_str());
                     }
                 }
@@ -1556,6 +1857,13 @@ static int check_telemetry(const std::string & path) {
             err((std::string("rowset_refused: ") +
                  (reason.empty() ? "<no reason>" : reason) + " (" +
                  json_str(line, "detail") + ")").c_str());
+        } else if (event == "spec" && rowset_retain_k > 0) {
+            // T-GPLR-58: the speculative fills this stage issued. They are STAGED
+            // here and replayed by ls_retention_errors after the rowset_fetch of the
+            // same stage, which is the order the runtime applies them in.
+            for (const auto & e : ls_spec_errors(rowset_retention, line)) {
+                err(e.c_str());
+            }
         } else if (ls_parse_run_refused(event, line, refusal)) {
         } else if (event == "run_end") {
             bool found = false;
@@ -1842,6 +2150,12 @@ static int check_telemetry(const std::string & path) {
         err(be.c_str());
     }
 
+    // T-GPLR-58: the deferred form of the `spec` rule -- a trace whose fills cannot be
+    // replayed fails ONCE, with the cause named, instead of once per later fetch.
+    for (const auto & se : ls_spec_replay_errors(rowset_retention)) {
+        err(se.c_str());
+    }
+
     // T-GPLR-22: the three rules below describe a run that started; a refusal
     // trace may not have started one, so they are suppressed for it and replaced
     // by the shared refusal rule (one owner, ls_refusal_trace_errors).
@@ -1993,8 +2307,9 @@ static int validate_telemetry(const std::string & path) {
     std::unordered_map<int, rowset_slot_state> rowset_slots;
     // T-GPLR-19: >0 when rowset_init declares per-layer retention
     long long rowset_retain_k = -1;
-    std::unordered_map<long long, long long> rowset_cache; // (layer<<32)|expert -> recency stamp
-    long long rowset_retention_tick = 0;                   // monotonic recency source
+    // T-GPLR-58: the per-layer retention cache model (rows, recency, and the staged
+    // speculative fills of the `spec` events that precede each rowset_fetch).
+    ls_retention_model rowset_retention;
     // T-GPLR-19: byte_account's row_cache figure, held until rowset_init has
     // been read so the record can be tied to the policy it claims.
     bool ba_row_cache_seen = false;
@@ -2340,10 +2655,10 @@ static int validate_telemetry(const std::string & path) {
                     if (!rf || ub < 1 || nret < 0 || nrtd < 0) {
                         err("rowset_fetch missing retention fields under a retain_k policy");
                     } else {
-                        for (const auto & e : ls_retention_errors(layer, ru, nr,
+                        for (const auto & e : ls_retention_errors(rowset_retention,
+                                 layer, gen, json_ll(line, "phase", nullptr), ru, nr,
                                  json_str(line, "union_ids"), nret, nrtd, rowset_retain_k,
-                                 rowset_n_expert, rowset_top_k, rowset_cache,
-                                 rowset_retention_tick)) {
+                                 rowset_n_expert, rowset_top_k)) {
                             err(e.c_str());
                         }
                     }
@@ -2377,6 +2692,13 @@ static int validate_telemetry(const std::string & path) {
                 const long long bb = json_ll(line, "bytes_full_bank", &f);
                 if (!f || bs < 0 || bb <= 0) {
                     err("rowset_round missing required fields");
+                }
+            } else if (event == "spec" && rowset_retain_k > 0) {
+                // T-GPLR-58 (validator parity with check_telemetry): the speculative
+                // fills this stage issued, staged for the rowset_fetch of the same
+                // stage to replay.
+                for (const auto & e : ls_spec_errors(rowset_retention, line)) {
+                    err(e.c_str());
                 }
             } else {
                 err((std::string("rowset_refused: ") +
@@ -2526,6 +2848,11 @@ static int validate_telemetry(const std::string & path) {
     // must agree with the retention policy this trace declared.
     for (const auto & be : ls_byte_account_policy_errors(ba_row_cache_seen, ba_row_cache, rowset_retain_k)) {
         fprintf(stderr, "validate-telemetry: %s\n", be.c_str());
+        errors++;
+    }
+    // T-GPLR-58: the deferred form of the `spec` rule (validator parity).
+    for (const auto & se : ls_spec_replay_errors(rowset_retention)) {
+        fprintf(stderr, "validate-telemetry: %s\n", se.c_str());
         errors++;
     }
     if (phases.empty() && !off_audit_trace && !refusal.saw) {
