@@ -1,21 +1,18 @@
-# T-GPLR-58 A3 arm driver: the predictor legs at the declared short shape, ALL legs inside
+# T-GPLR-58 A3/A4 arm driver: predictor legs at the declared short shape, all legs inside
 # ONE acquisition of the shared-GPU mutex.
 #
-# Contract (T-GPLR-58, A3; the two sessions were PRE-AUTHORIZED by the owner 2026-09-23):
+# Contract (T-GPLR-58; both sessions were PRE-AUTHORIZED by the owner 2026-09-23):
 # the shape is the declared 885-token non-echoing prompt (`build/calc-prompt.txt`),
 # `--tg-tokens 256` and `--rep-penalty 1.15` on EVERY leg; the prediction arms run at the
 # SHALLOW depth K=2 (the depth the charter case needs) and the retention reference at K=4.
 #
-# LEGS (exactly the contract's A3/pilot set, in the contract's order):
-#   off1  @K2 - the incumbent retention, no prediction: the baseline every band is read against
-#   off2  @K2 - the SAME configuration again: the second leg IS the session control SPREAD
-#   null  @K2 - the count-matched, structure-free control (mode 2, arm computed, proposals
-#               drawn from the fixed-seed xorshift): M2's pool-growth reading
-#   coact @K2 - the SIMPLE pre-registered arm, unbarred co-activation at budget 8
-#   retref@K4 - retention-only at the deeper depth: the self-contained M3 denominator
+# A3 legs: off@K2 x2, the coact count-matched null/arm pair, then retref@K4.
+# A4 legs: off@K2 x2, a SEPARATE count-matched null and arm for bar09 and for fusion,
+#          then retref@K4. The null is paired by the arm that supplies its per-row count;
+#          one shared fixed-B null would not satisfy the contract for the barred arm.
 #
 # QUANTITIES (pre-registered by the block; this driver computes NONE of them itself except
-# the two arithmetic differences noted below -- the single owner of every band is
+# the arithmetic cross-checks noted below -- the single owner of every band is
 # `tools/check-tg-predict.py`, run here in the same session over the whole leg set):
 #   M1  margin gain of the arm over the session's off baseline, against the control spread
 #   M2  share(null) - share(off): how much of the merged gain is only pool growth
@@ -68,8 +65,11 @@
 # Dry run (no GPU, no mutex, no CUDA): -ValidateOnly prints the exact commands and resolves
 # every input, so the whole session can be checked before a mutex window is spent.
 param(
+    [ValidateSet('a3', 'a4')][string] $Session = 'a3',
     [switch] $ValidateOnly,
-    [switch] $AllowUnprovenanced
+    [switch] $RefreshPairReportsOnly,
+    [switch] $AllowUnprovenanced,
+    [switch] $ExternalMutex
 )
 $ErrorActionPreference = 'Continue'
 $root = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
@@ -86,18 +86,33 @@ $specBudget = 8
 $verdictDir = Join-Path $base 'verdicts'
 $checker  = Join-Path $root 'tools\check-tg-predict.py'
 $fillroom = Join-Path $root 'tools\analyze-gplr58-fill-room.py'
-$summaryPath = Join-Path $base 'gplr58-a3-summary.json'
+$sessionPrefix = "gplr58-$Session"
+$summaryPath = Join-Path $base ($sessionPrefix + '-summary.json')
 . (Join-Path $root 'tools\arm-verdict.ps1')
 
 # role: 'off' | 'null' | 'arm' | 'retref' (the checker's OWN role vocabulary; `retref` is
-# the contract's name for the K=4 retention leg and is NOT the same role token as 'off',
-# which is exactly the M3 keying mismatch the driver works around).
+# the contract's name for the K=4 retention leg and is NOT the same role token as 'off').
 $legs = @(
-    @{ tag = 'gplr58-a3-off1';    role = 'off';    retain = 2; spec = 0; arm = '';      null = 0; note = 'incumbent retention, no prediction (baseline)' },
-    @{ tag = 'gplr58-a3-off2';    role = 'off';    retain = 2; spec = 0; arm = '';      null = 0; note = 'the same configuration again: the session control SPREAD' },
-    @{ tag = 'gplr58-a3-null';    role = 'null';   retain = 2; spec = 2; arm = 'coact'; null = 1; note = 'count-matched structure-free null (mode 2, arm supplies only the count)' },
-    @{ tag = 'gplr58-a3-coact';   role = 'arm';    retain = 2; spec = 2; arm = 'coact'; null = 0; note = 'the SIMPLE arm: unbarred co-activation, budget 8' },
-    @{ tag = 'gplr58-a3-retref4'; role = 'retref'; retain = 4; spec = 0; arm = '';      null = 0; note = 'retention-only at K=4: the M3 denominator' }
+    @{ tag = ($sessionPrefix + '-off1');    role = 'off';    retain = 2; spec = 0; arm = '';      null = 0; note = 'incumbent retention, no prediction (baseline)' },
+    @{ tag = ($sessionPrefix + '-off2');    role = 'off';    retain = 2; spec = 0; arm = '';      null = 0; note = 'the same configuration again: the session control SPREAD' }
+)
+if ($Session -eq 'a3') {
+    $armNames = @('coact')
+    $legs += @(
+        @{ tag = ($sessionPrefix + '-null');  role = 'null'; retain = 2; spec = 2; arm = 'coact'; null = 1; note = 'coact count-matched structure-free null' },
+        @{ tag = ($sessionPrefix + '-coact'); role = 'arm';  retain = 2; spec = 2; arm = 'coact'; null = 0; note = 'unbarred co-activation at budget 8' }
+    )
+} else {
+    $armNames = @('bar09', 'fusion')
+    foreach ($armName in $armNames) {
+        $legs += @(
+            @{ tag = ($sessionPrefix + '-null-' + $armName); role = 'null'; retain = 2; spec = 2; arm = $armName; null = 1; note = ($armName + ' count-matched structure-free null') },
+            @{ tag = ($sessionPrefix + '-' + $armName);        role = 'arm';  retain = 2; spec = 2; arm = $armName; null = 0; note = ($armName + ' pre-registered arm at budget 8') }
+        )
+    }
+}
+$legs += @(
+    @{ tag = ($sessionPrefix + '-retref4'); role = 'retref'; retain = 4; spec = 0; arm = ''; null = 0; note = 'retention-only at K=4: the M3 denominator' }
 )
 
 $missing = @()
@@ -132,6 +147,117 @@ function Get-LegArgs {
     return $out
 }
 
+function Get-PairLegs {
+    param([string] $ArmName)
+    $offLegs = @($legs | Where-Object { $_.role -eq 'off' })
+    $nullLeg = @($legs | Where-Object { $_.role -eq 'null' -and $_.arm -eq $ArmName })[0]
+    $armLeg  = @($legs | Where-Object { $_.role -eq 'arm'  -and $_.arm -eq $ArmName })[0]
+    $retLeg  = @($legs | Where-Object { $_.role -eq 'retref' })[0]
+    if ($offLegs.Count -ne 2 -or $null -eq $nullLeg -or $null -eq $armLeg -or $null -eq $retLeg) {
+        return @()
+    }
+    return @($offLegs) + @($nullLeg) + @($armLeg) + @($retLeg)
+}
+
+function Get-PairReport {
+    param([string] $ArmName)
+    $pairLegs = @(Get-PairLegs -ArmName $ArmName)
+    if ($pairLegs.Count -ne 5) {
+        return [ordered]@{
+            complete = $false
+            checker_exit = 1
+            session_exit = 1
+            reason = 'pair selection did not produce exactly two off legs, the named null/arm, and one retref leg'
+        }
+    }
+
+    $pairArgs = @()
+    $missingTraces = @()
+    foreach ($pairLeg in $pairLegs) {
+        $pairTrace = Join-Path $base ($pairLeg.tag + '.jsonl')
+        if (Test-Path -LiteralPath $pairTrace) {
+            $pairArgs += @('--leg', ('{0}={1}' -f $pairLeg.role, $pairTrace))
+        } else {
+            $missingTraces += $pairLeg.tag
+        }
+    }
+    if ($missingTraces.Count -gt 0) {
+        return [ordered]@{
+            complete = $false
+            checker_exit = 1
+            session_exit = 1
+            reason = 'missing pair trace(s): ' + ($missingTraces -join ',')
+        }
+    }
+
+    $pairJson = Join-Path $base ($sessionPrefix + '-bands-' + $ArmName + '.json')
+    Remove-Item -LiteralPath $pairJson -ErrorAction SilentlyContinue
+    $pairOut = [string] (& python $checker @pairArgs --session ($sessionPrefix + '-' + $ArmName) --json $pairJson 2>&1 | Out-String)
+    $pairExit = $LASTEXITCODE
+    if ($pairExit -ne 0) {
+        return [ordered]@{
+            complete = $false
+            checker_exit = $pairExit
+            session_exit = $pairExit
+            report = $pairOut
+        }
+    }
+
+    $pairPayload = Get-Content -Raw -LiteralPath $pairJson | ConvertFrom-Json
+    $pairOff = @($pairPayload.legs | Where-Object { $_.role -eq 'off' })
+    $pairNull = @($pairPayload.legs | Where-Object { $_.role -eq 'null' })[0]
+    $pairArm = @($pairPayload.legs | Where-Object { $_.role -eq 'arm' })[0]
+    $pairRet = @($pairPayload.legs | Where-Object { $_.role -eq 'retref' })[0]
+    if ($pairOff.Count -ne 2 -or $null -eq $pairNull -or $null -eq $pairArm -or $null -eq $pairRet) {
+        return [ordered]@{
+            complete = $false
+            checker_exit = $pairExit
+            session_exit = 1
+            report = $pairOut
+            reason = 'checker output did not contain two off legs plus the named null, arm and retref leg'
+        }
+    }
+
+    $pairOffShares = @($pairOff | ForEach-Object { [double] $_.share })
+    $pairOffMean = ($pairOffShares | Measure-Object -Average).Average
+    $pairOffStats = $pairOffShares | Measure-Object -Minimum -Maximum
+    $pairSpread = [math]::Round($pairOffStats.Maximum - $pairOffStats.Minimum, 6)
+    $pairArmShare = [double] $pairArm.share
+    $pairNullShare = [double] $pairNull.share
+    $pairRetShare = [double] $pairRet.share
+    $shareGain = [math]::Round($pairArmShare - $pairNullShare, 6)
+    $denom = 1.0 - $pairOffMean
+    $armMargin = ($pairArmShare - $pairOffMean) / $denom
+    $nullMargin = ($pairNullShare - $pairOffMean) / $denom
+    $marginGain = $armMargin - $nullMargin
+    $consumed = [int] $pairArm.spec.consumed
+    $cancelled = [int] $pairArm.spec.cancelled
+    return [ordered]@{
+        complete = $true
+        checker_exit = 0
+        session_exit = $(if ($consumed -gt 0) { 1 } else { 0 })
+        report = $pairOut
+        pair_roles = @($pairLegs | ForEach-Object { $_.role })
+        off_share_mean = $pairOffMean
+        control_spread = $pairSpread
+        null_share = $pairNullShare
+        arm_share = $pairArmShare
+        retref4_share = $pairRetShare
+        share_gain_vs_paired_null = $shareGain
+        arm_margin_share = $armMargin
+        null_margin_share = $nullMargin
+        margin_gain_vs_paired_null = $marginGain
+        M1_scoreable = ($consumed -gt 0)
+        M1_unique_margin_share = $null
+        M1_exceeds_control_spread = $null
+        M3_arm_vs_retref4 = [math]::Round($pairArmShare - $pairRetShare, 6)
+        M5_arm_vs_off_staged = [double] $pairArm.staged_bytes / (($pairOff | Measure-Object -Property staged_bytes -Average).Average)
+        consumed = $consumed
+        cancelled = $cancelled
+        P4_exercised = ($cancelled -gt 0)
+    }
+}
+
 if ($ValidateOnly) {
     $exeSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.Substring(0, 16)
     $dllSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.Substring(0, 16)
@@ -144,16 +270,87 @@ if ($ValidateOnly) {
             $L.tag, $L.role, $L.retain, $L.spec, $(if ($L.spec -gt 0) { $L.arm } else { '-' }), $L.null, $L.note)
         Write-Host ("  " + $exe + ' ' + ((Get-LegArgs $L) -join ' '))
     }
+    foreach ($armName in $armNames) {
+        $pairLegs = @(Get-PairLegs -ArmName $armName)
+        $pairShape = @($pairLegs | ForEach-Object { $_.role + ':' + $_.arm }) -join ','
+        $expectedShape = 'off:,off:,null:' + $armName + ',arm:' + $armName + ',retref:'
+        if ($pairLegs.Count -ne 5 -or $pairShape -ne $expectedShape) {
+            Write-Error ("PAIR CHECK FAILED for {0}: got {1}" -f $armName, $pairShape)
+            exit 1
+        }
+        Write-Host ("PAIR CHECK {0}: {1} (5 legs)" -f $armName, $pairShape)
+    }
     Write-Host ("ONE mutex hold for {0} legs; the GPU busy gate refuses (exit 125) on a non-clean pre-run probe." -f $legs.Count)
-    Write-Host "Then: tools/check-tg-predict.py over the whole leg set (M1/M2/M3/M4/M5/M7 + P1-P6), the control spread"
-    Write-Host "      differenced by this driver with M3 cross-checked against the checker, and the fill-room ceiling per leg."
+    Write-Host "Then: one full-session checker report plus one paired checker report per arm (its own count-matched null)."
+    Write-Host "      The driver also checks ordered TG route identity and greedy token identity across every leg."
     exit 0
 }
 
 $exeSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.Substring(0, 16)
 $dllSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.Substring(0, 16)
-Write-Host ("gplr58-a3: exe {0} dll {1}" -f $exeSha, $dllSha)
+Write-Host ("{0}: exe {1} dll {2}" -f $sessionPrefix, $exeSha, $dllSha)
 Write-Host "  (a new binary pair means older controls are a DIFFERENT binary; this session's own off legs are the control)"
+
+if ($RefreshPairReportsOnly) {
+    if (-not (Test-Path -LiteralPath $summaryPath)) {
+        Write-Error "REFRESH REFUSED: missing summary $summaryPath"
+        exit 1
+    }
+    $existingSummary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
+    if ($existingSummary.session -ne $sessionPrefix -or
+        $existingSummary.shape.exe_sha256_16 -ne $exeSha -or
+        $existingSummary.shape.llama_dll_sha256_16 -ne $dllSha) {
+        Write-Error 'REFRESH REFUSED: summary session or binary provenance does not match the current inputs'
+        exit 10
+    }
+    $legRows = $existingSummary.legs
+    $badRows = @($legs | Where-Object {
+        $rowProperty = $legRows.PSObject.Properties[$_.tag]
+        $null -eq $rowProperty -or $rowProperty.Value.leg_exit -ne 0
+    })
+    if ($badRows.Count -gt 0) {
+        Write-Error ('REFRESH REFUSED: missing or failed leg(s): ' + (@($badRows | ForEach-Object { $_.tag }) -join ', '))
+        exit 1
+    }
+    if (-not (Assert-ArmProvenance -Dir $verdictDir -Tags @($legs | ForEach-Object { $_.tag }) `
+            -Label ($sessionPrefix + ' recorded leg') -AllowUnprovenanced:$AllowUnprovenanced)) {
+        Write-Error 'REFRESH REFUSED: recorded leg provenance is not current'
+        exit 10
+    }
+
+    $refreshExit = 0
+    $pairReports = [ordered]@{}
+    foreach ($armName in $armNames) {
+        $pairReport = Get-PairReport -ArmName $armName
+        $pairReports[$armName] = $pairReport
+        if ($pairReport['complete']) {
+            Write-Host ("  {0} paired: off {1:F6} | null {2:F6} | arm {3:F6} | share gain {4:+0.000000;-0.000000;0.000000} | margin gain {5:+0.000000;-0.000000;0.000000} | consumed {6} | cancelled {7}" -f `
+                $armName, $pairReport['off_share_mean'], $pairReport['null_share'], $pairReport['arm_share'], `
+                $pairReport['share_gain_vs_paired_null'], $pairReport['margin_gain_vs_paired_null'], `
+                $pairReport['consumed'], $pairReport['cancelled'])
+            if ($pairReport['consumed'] -gt 0) {
+                Write-Warning ("M1 for {0}: fills were consumed, but aggregate trace telemetry cannot identify UNIQUE per-row hits; M1 is not scoreable from this schema." -f $armName)
+            }
+        } else {
+            Write-Warning ("PAIR REPORT {0} INCOMPLETE: {1}" -f $armName, $pairReport['reason'])
+        }
+        if ($refreshExit -eq 0) { $refreshExit = [int] $pairReport['session_exit'] }
+    }
+
+    $existingSummary.bands.pair_reports = $pairReports
+    $refreshInfo = [ordered]@{
+        refreshed_utc = (Get-Date).ToUniversalTime().ToString('o')
+        mode = 'host-only paired checker refresh; no model, CUDA, GPU or mutex'
+        source_summary = $summaryPath
+        checker = $checker
+    }
+    $existingSummary | Add-Member -NotePropertyName pair_reports_refresh -NotePropertyValue $refreshInfo -Force
+    [System.IO.File]::WriteAllText($summaryPath,
+        ($existingSummary | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host ("  paired reports refreshed -> {0}" -f $summaryPath)
+    Write-Host ("{0} REFRESH {1}" -f $sessionPrefix, $(if ($refreshExit -eq 0) { 'PASS (recorded legs and both paired reports are usable)' } else { 'FAIL' }))
+    exit $refreshExit
+}
 
 # --------------------------------------------------- arm-verdict handling FIRST
 foreach ($L in $legs) { Clear-ArmVerdict -Dir $verdictDir -Tag $L.tag | Out-Null }
@@ -163,21 +360,27 @@ foreach ($L in $legs) {
         -LogPath (Join-Path $base ($L.tag + '.log')) -Command ($exe + ' ' + ((Get-LegArgs $L) -join ' ')) | Out-Null
 }
 
-$mutex = [System.Threading.Mutex]::new($false, 'Global\AI-GPU-EXCLUSIVE-v1')
+$mutex = $null
 $acquired = $false
+$ownsMutex = -not $ExternalMutex
 $sessionExit = 1
 $legRows = [ordered]@{}
 $halted = ''
 try {
-    try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds(3600)) }
-    catch [System.Threading.AbandonedMutexException] { $acquired = $true; Write-Warning 'Recovered an abandoned GPU mutex.' }
-    if (-not $acquired) {
-        foreach ($L in $legs) {
-            Write-ArmVerdict -Dir $verdictDir -Tag $L.tag -ExitCode 124 -StartedUtc $sessionStart -ErrorText 'mutex timeout' | Out-Null
+    if ($ExternalMutex) {
+        Write-Host '  mutex held by tools/with-gpu-lock.ps1 (outer wrapper)'
+    } else {
+        $mutex = [System.Threading.Mutex]::new($false, 'Global\AI-GPU-EXCLUSIVE-v1')
+        try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds(3600)) }
+        catch [System.Threading.AbandonedMutexException] { $acquired = $true; Write-Warning 'Recovered an abandoned GPU mutex.' }
+        if (-not $acquired) {
+            foreach ($L in $legs) {
+                Write-ArmVerdict -Dir $verdictDir -Tag $L.tag -ExitCode 124 -StartedUtc $sessionStart -ErrorText 'mutex timeout' | Out-Null
+            }
+            exit 124
         }
-        exit 124
+        Write-Host '  mutex held'
     }
-    Write-Host '  mutex held'
 
     $gpuPre = Format-GpuBusy (Get-GpuComputeApps)
     Write-Host ("  gpu_pre_run = {0}" -f $gpuPre)
@@ -226,6 +429,26 @@ try {
             if ($gpuPostLeg -ne 'clean') { Write-Warning ("GPU post-run probe: {0} - the leg is suspect." -f $gpuPostLeg) }
 
             $lines = @(Get-Content $trace)
+            $routeText = [System.Text.StringBuilder]::new()
+            $tgIds = ''
+            foreach ($line in $lines) {
+                $eventObj = $line | ConvertFrom-Json
+                if ($eventObj.event -eq 'rowset_fetch') {
+                    [void]$routeText.Append(('{0},{1},{2};' -f $eventObj.ubatch, $eventObj.layer, $eventObj.union_ids))
+                } elseif ($eventObj.event -eq 'tg_tokens') {
+                    $tgIds = (@($eventObj.ids) -join ',')
+                }
+            }
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $routeDigest = ([System.BitConverter]::ToString(
+                    $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($routeText.ToString()))) -replace '-', '').ToLower()
+            } finally {
+                $sha.Dispose()
+            }
+            $fields['tg_route_digest'] = $routeDigest
+            $fields['tg_ids'] = $tgIds
+
             $rs = @($lines | Where-Object { $_ -like '*"event":"run_start"*' })[0] | ConvertFrom-Json
             $init = @($lines | Where-Object { $_ -like '*"event":"rowset_init"*' })[0] | ConvertFrom-Json
             $fields['resolved_retain_k'] = [int] $init.retain_k
@@ -328,7 +551,7 @@ try {
     # ---------------- the bands, from their single owner, over the whole leg set ---------
     $ran = @($legs | Where-Object { $legRows.Contains($_.tag) -and $legRows[$_.tag]['leg_exit'] -eq 0 })
     if ($ran.Count -lt 2) {
-        Write-Host '  A3 RESULT: UNUSABLE - fewer than two legs produced a trace, so no band can be read'
+        Write-Host ("  {0} RESULT: UNUSABLE - fewer than two legs produced a trace, so no band can be read" -f $sessionPrefix)
         if ($sessionExit -eq 0) { $sessionExit = 1 }
     } else {
         $legArgs = @()
@@ -336,8 +559,8 @@ try {
             $tr = Join-Path $base ($L.tag + '.jsonl')
             if (Test-Path -LiteralPath $tr) { $legArgs += @('--leg', ("{0}={1}" -f $L.role, $tr)) }
         }
-        $jsonOut = Join-Path $base 'gplr58-a3-bands.json'
-        $bandOut = (& python $checker @legArgs --session gplr58-a3 --json $jsonOut 2>&1 | Out-String)
+        $jsonOut = Join-Path $base ($sessionPrefix + '-bands.json')
+        $bandOut = (& python $checker @legArgs --session $sessionPrefix --json $jsonOut 2>&1 | Out-String)
         $sessionCheckerExit = $LASTEXITCODE
         $bandLines = @($bandOut.Trim() -split "`n")
         Write-Host '  --- A2 band report (its own lines, unedited) ---'
@@ -364,7 +587,7 @@ try {
                 Write-Host ("  off baseline share (mean of {0}) = {1}; CONTROL SPREAD = {2} (the M1 hurdle)" -f `
                     $offShares.Count, [math]::Round($baseShare, 4), $spread)
             }
-            if ($byRole.ContainsKey('arm')) {
+            if ($Session -eq 'a3' -and $byRole.ContainsKey('arm')) {
                 $armShare = [double] $byRole['arm'][0].share
                 if ($bands.Contains('off_share_mean')) {
                     $gain = [math]::Round($armShare - [double] $bands['off_share_mean'], 4)
@@ -400,10 +623,51 @@ try {
             }
         }
         if ($sessionCheckerExit -eq 2) {
-            Write-Host '  A3 RESULT: the band report was REFUSED (exit 2) - no numbers, no verdict'
+            Write-Host ("  {0} RESULT: the band report was REFUSED (exit 2) - no numbers, no verdict" -f $sessionPrefix)
             $sessionExit = 2
         } elseif ($sessionCheckerExit -eq 1) {
-            Write-Host '  A3 RESULT: FAIL-INVARIANT under A2 - the numbers are reported for the record and are NOT usable as evidence'
+            Write-Host ("  {0} RESULT: FAIL-INVARIANT under A2 - the numbers are reported for the record and are NOT usable as evidence" -f $sessionPrefix)
+            $sessionExit = 1
+        }
+
+        # A4 has two different per-row proposal counts. Each arm is therefore paired with
+        # its OWN null in a five-leg checker call; the seven-leg report above remains the
+        # common integrity view. This prevents the old fixed-B null from being used for the
+        # barred arm and prevents M4n from being printed as ambiguous.
+        $bands['pair_reports'] = [ordered]@{}
+        foreach ($armName in $armNames) {
+            $pairReport = Get-PairReport -ArmName $armName
+            $bands['pair_reports'][$armName] = $pairReport
+            if ($pairReport['complete']) {
+                Write-Host ("  {0} paired: off {1:F6} | null {2:F6} | arm {3:F6} | share gain {4:+0.000000;-0.000000;0.000000} | margin gain {5:+0.000000;-0.000000;0.000000} | consumed {6} | cancelled {7}" -f `
+                    $armName, $pairReport['off_share_mean'], $pairReport['null_share'], $pairReport['arm_share'], `
+                    $pairReport['share_gain_vs_paired_null'], $pairReport['margin_gain_vs_paired_null'], `
+                    $pairReport['consumed'], $pairReport['cancelled'])
+                if ($pairReport['consumed'] -gt 0) {
+                    Write-Warning ("M1 for {0}: fills were consumed, but aggregate trace telemetry cannot identify UNIQUE per-row hits; M1 is not scoreable from this schema." -f $armName)
+                }
+            } else {
+                Write-Warning ("PAIR REPORT {0} INCOMPLETE: {1}" -f $armName, $pairReport['reason'])
+            }
+            if ($sessionExit -eq 0) { $sessionExit = [int] $pairReport['session_exit'] }
+        }
+
+        $identityTags = @($ran | ForEach-Object { $_.tag })
+        $routeDigests = @($identityTags | ForEach-Object { $legRows[$_]['tg_route_digest'] } | Where-Object { $_ } | Select-Object -Unique)
+        $idRows = @($identityTags | ForEach-Object { $legRows[$_]['tg_ids'] } | Where-Object { $_ -ne $null } | Select-Object -Unique)
+        $bands['identity'] = [ordered]@{
+            route_digest = if ($routeDigests.Count -eq 1) { $routeDigests[0] } else { $null }
+            route_unique_count = $routeDigests.Count
+            greedy_ids_sha256 = if ($idRows.Count -eq 1) {
+                $sha2 = [System.Security.Cryptography.SHA256]::Create()
+                try { ([System.BitConverter]::ToString($sha2.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($idRows[0]))) -replace '-', '').ToLower() }
+                finally { $sha2.Dispose() }
+            } else { $null }
+            greedy_unique_count = $idRows.Count
+        }
+        Write-Host ("  identity: route unique {0} ({1}) | greedy unique {2} ({3})" -f `
+            $routeDigests.Count, $bands['identity']['route_digest'], $idRows.Count, $bands['identity']['greedy_ids_sha256'])
+        if ($routeDigests.Count -ne 1 -or $idRows.Count -ne 1) {
             $sessionExit = 1
         }
 
@@ -422,8 +686,8 @@ try {
         }
 
         $summary = [ordered]@{
-            schema = 'gplr58-a3-summary/1'
-            session = 'gplr58-a3'
+            schema = 'gplr58-session-summary/1'
+            session = $sessionPrefix
             created_utc = (Get-Date).ToUniversalTime().ToString('o')
             shape = @{ prompt = $prompt; pp_tokens = $ppTokens; ctx_size = $ctxSize; tg_tokens = $tgTokens
                        rep_penalty = 1.15; spec_budget = $specBudget; exe_sha256_16 = $exeSha; llama_dll_sha256_16 = $dllSha }
@@ -438,13 +702,13 @@ try {
     $gpuPost = Format-GpuBusy (Get-GpuComputeApps)
     Write-Host ("  gpu_post_run = {0}" -f $gpuPost)
 } finally {
-    if ($acquired) { $mutex.ReleaseMutex(); Write-Host '  mutex released' }
-    $mutex.Dispose()
+    if ($ownsMutex -and $acquired) { $mutex.ReleaseMutex(); Write-Host '  mutex released' }
+    if ($null -ne $mutex) { $mutex.Dispose() }
 }
 # --- provenance gate (re-scores nothing; see the header) ---------------------
 if (-not (Assert-ArmProvenance -Dir $verdictDir -Tags @($legs | ForEach-Object { $_.tag }) `
-        -Label 'A3 leg' -AllowUnprovenanced:$AllowUnprovenanced)) {
+        -Label ($sessionPrefix + ' leg') -AllowUnprovenanced:$AllowUnprovenanced)) {
     if ($sessionExit -eq 0) { $sessionExit = 10 }
 }
-Write-Host ("gplr58-a3 VERDICT {0}" -f $(if ($sessionExit -eq 0) { 'PASS (every leg usable; the bands above are the result)' } else { 'FAIL' }))
+Write-Host ("{0} VERDICT {1}" -f $sessionPrefix, $(if ($sessionExit -eq 0) { 'PASS (every leg usable; the bands above are the result)' } else { 'FAIL' }))
 exit $sessionExit

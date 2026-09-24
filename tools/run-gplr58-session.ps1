@@ -1,10 +1,11 @@
-# T-GPLR-58 A3 session launcher: ONE documented command for the owner-invoked GPU spend of
-# this block - the five A3/pilot legs (off x2, count-matched null, arm-coact, retref@K4) at
-# the declared 885-token short shape, in ONE mutex hold.
+# T-GPLR-58 A3/A4 session launcher: ONE documented command for each owner-invoked GPU
+# spend. A3 runs five legs; A4 runs seven (off x2, a separate count-matched null/arm pair
+# for bar09 and fusion, then retref@K4) at the declared 885-token short shape.
 #
 #   tools/run-gplr58-session.ps1                 # the A3 session (5 legs, one hold)
-#   tools/run-gplr58-session.ps1 -Session p1     # same (p1 = the pilot leg family, like the
-#                                                # T-GPLR-53/T-56 launchers; a3 = the task stage)
+#   tools/run-gplr58-session.ps1 -Session p1     # A3 pilot family (backward-compatible alias)
+#   tools/run-gplr58-session.ps1 -Session a3     # A3: off x2 + null/coact + retref@K4
+#   tools/run-gplr58-session.ps1 -Session a4     # A4: off x2 + null/arm for bar09 and fusion + retref@K4
 #   tools/run-gplr58-session.ps1 -ValidateOnly   # DRY: no mutex, no CUDA, prints the legs
 #   tools/run-gplr58-session.ps1 -PreflightOnly  # probe the card only; launch nothing
 #   tools/run-gplr58-session.ps1 -ArchiveOnly    # snapshot current evidence only; launch nothing
@@ -35,14 +36,14 @@
 # Start-Process, so a previous run's marker/verdict can never be read as this run's.
 # Start-Process is used on purpose (never setsid).
 param(
-    # 'p1' = the pilot leg family, 'a3' = the task's stage. They select the SAME single
-    # session on purpose: there is exactly one hold to take here.
-    [ValidateSet('p1', 'a3')][string] $Session = 'p1',
+    # p1 is the historical A3 alias; a3 and a4 select the two pre-authorized holds.
+    [ValidateSet('p1', 'a3', 'a4')][string] $Session = 'p1',
     [int] $ArmTimeoutSeconds = 5400,
     [switch] $ValidateOnly,
     [switch] $ArchiveOnly,
     [switch] $PreflightOnly,
-    [switch] $AllowUnprovenanced
+    [switch] $AllowUnprovenanced,
+    [switch] $ExternalMutex
 )
 $ErrorActionPreference = 'Continue'
 $root = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
@@ -50,12 +51,21 @@ $base = Join-Path $root 'build\llama-cuda'
 $verdictDir = Join-Path $base 'verdicts'
 . (Join-Path $root 'tools\arm-verdict.ps1')
 
-$a3Script = Join-Path $root 'tools\run-gplr58-a3-arm.ps1'
-# Every tag the A3 driver can write, in the contract's drive order.
-$a3Tags = @('gplr58-a3-off1', 'gplr58-a3-off2', 'gplr58-a3-null', 'gplr58-a3-coact', 'gplr58-a3-retref4')
-
-$plan = @(@{ script = $a3Script; tags = $a3Tags; slug = 'a3'
-             name = 'A3 pilot (off x2 + null@8 + arm-coact @K2 + retref@K4, one mutex hold)' })
+$armScript = Join-Path $root 'tools\run-gplr58-a3-arm.ps1'
+$driverSession = if ($Session -eq 'p1') { 'a3' } else { $Session }
+$sessionPrefix = "gplr58-$driverSession"
+$driverPrefix = if ($Session -eq 'p1') { 'p1' } else { $Session }
+if ($driverSession -eq 'a3') {
+    $armTags = @('gplr58-a3-off1', 'gplr58-a3-off2', 'gplr58-a3-null', 'gplr58-a3-coact', 'gplr58-a3-retref4')
+    $stepName = 'A3 pilot (off x2 + null/coact @K2 + retref@K4, one mutex hold)'
+} else {
+    $armTags = @('gplr58-a4-off1', 'gplr58-a4-off2',
+                 'gplr58-a4-null-bar09', 'gplr58-a4-bar09',
+                 'gplr58-a4-null-fusion', 'gplr58-a4-fusion',
+                 'gplr58-a4-retref4')
+    $stepName = 'A4 (off x2 + paired null/bar09 + paired null/fusion + retref@K4, one mutex hold)'
+}
+$plan = @(@{ script = $armScript; tags = $armTags; slug = $driverSession; name = $stepName })
 foreach ($step in $plan) {
     if (-not (Test-Path -LiteralPath $step.script)) { Write-Host "MISSING ARM DRIVER: $($step.script)"; exit 1 }
 }
@@ -64,7 +74,7 @@ if ($ValidateOnly) {
     $rc = 0
     foreach ($step in $plan) {
         Write-Host ("==== DRY: {0} ====" -f $step.name)
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $step.script -ValidateOnly
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $step.script -Session $driverSession -ValidateOnly
         if ($LASTEXITCODE -ne 0) { $rc = 1 }
     }
     Write-Host ("DRY-RUN {0}" -f $(if ($rc -eq 0) { 'OK (inputs present; no mutex, no CUDA)' } else { 'FAILED' }))
@@ -95,7 +105,10 @@ function Save-RunEvidence {
             )
         }
     }
-    $srcsAll += @((Join-Path $base 'gplr58-a3-summary.json'), (Join-Path $base 'gplr58-a3-bands.json'))
+    $srcsAll += @((Join-Path $base ($sessionPrefix + '-summary.json')),
+                  (Join-Path $base ($sessionPrefix + '-bands.json')))
+    $srcsAll += @(Get-ChildItem -LiteralPath $base -Filter ($sessionPrefix + '-bands-*.json') -ErrorAction SilentlyContinue |
+                  ForEach-Object { $_.FullName })
     if ($LogPrefix) {
         $srcsAll += @(Get-ChildItem -LiteralPath $base -Filter ($LogPrefix + '-driver-*.out') -ErrorAction SilentlyContinue |
                       ForEach-Object { $_.FullName })
@@ -129,7 +142,7 @@ function Save-RunEvidence {
 }
 
 if ($ArchiveOnly) {
-    $adir = Save-RunEvidence -Steps $plan -Root (Join-Path $base 'runs') -Name ('session ' + $Session) -LogPrefix 'p1'
+    $adir = Save-RunEvidence -Steps $plan -Root (Join-Path $base 'runs') -Name ('session ' + $driverSession) -LogPrefix $driverPrefix
     if ($null -eq $adir) { Write-Host 'ARCHIVE: nothing to archive (no artifact exists at these tags)' }
     else { Write-Host ('ARCHIVE OK: {0}' -f $adir) }
     exit 0
@@ -156,7 +169,7 @@ if ($PreflightOnly) {
 Write-Host ('  preflight gpu state = {0}' -f $gpuState)
 
 # Evidence safety: preserve what this run is about to replace, BEFORE clearing it.
-$archived = Save-RunEvidence -Steps $plan -Root (Join-Path $base 'runs') -Name ('session ' + $Session) -LogPrefix 'p1'
+$archived = Save-RunEvidence -Steps $plan -Root (Join-Path $base 'runs') -Name ('session ' + $driverSession) -LogPrefix $driverPrefix
 if ($null -eq $archived) { Write-Host '  no predecessor artifacts to archive (nothing exists at these tags yet)' }
 else { Write-Host ('  archived predecessor evidence -> {0}' -f $archived) }
 
@@ -170,8 +183,9 @@ foreach ($step in $plan) {
     Write-Host ("==== SESSION: {0} ====" -f $step.name)
     $drvOut = Join-Path $base ("{0}-driver-{1}.out" -f $Session, $step.slug)
     $drvErr = Join-Path $base ("{0}-driver-{1}.err" -f $Session, $step.slug)
-    $drvArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $step.script)
+    $drvArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $step.script, '-Session', $driverSession)
     if ($AllowUnprovenanced) { $drvArgs += '-AllowUnprovenanced' }
+    if ($ExternalMutex) { $drvArgs += '-ExternalMutex' }
     $proc = Start-Process -FilePath 'powershell' -ArgumentList $drvArgs `
         -RedirectStandardOutput $drvOut -RedirectStandardError $drvErr -PassThru -WindowStyle Hidden
     # MEASURED TRAP (2026-09-22): with redirection a Start-Process -PassThru object reports
