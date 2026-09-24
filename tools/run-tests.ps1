@@ -311,6 +311,8 @@ $suites = @{
         # (P2 readiness, P3 demand barrier, P4 cancellation) and the mode-0
         # differential against the pre-A0 retention algorithm must run
         # host-only, with no GPU and no model.
+        # T-GPLR-07: the semantic-QA checker CLI self-test runs here too, so
+        # --tg-text argparse/exit/verdict wiring is covered without CUDA/model.
         Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
@@ -429,6 +431,25 @@ if (-not $spec.Gpu) {
         }
     } else {
         Write-Host "[plan-split] FAILED: $splitTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# --- T-GPLR-07 semantic-QA checker CLI selftest (host-only, ~1s, no GPU) ------
+# The helper tests in check-answer.py do not exercise argparse, input-source
+# selection, subprocess exit codes, or --out-verdict. Drive the real CLI here so
+# a parser/grade wiring regression cannot leave the host suite green.
+if (-not $spec.Gpu) {
+    $qaChecker = Join-Path $PSScriptRoot 'semantic-qa\check-answer.py'
+    if (Test-Path -LiteralPath $qaChecker) {
+        Write-Host "[semantic-qa] checker CLI self-test (host-only, no model/GPU)..."
+        & python $qaChecker self-test
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-answer.py self-test exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[semantic-qa] FAILED: $qaChecker not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
         exit 1
     }
 }

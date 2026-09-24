@@ -301,14 +301,30 @@ NEEDLES = [
 ]
 
 
+def _validate_items(items):
+    """Return normalized item ids, refusing typos instead of dropping them."""
+    if items is None:
+        return None
+    requested = [str(item).strip() for item in items]
+    known = [n["id"] for n in NEEDLES]
+    unknown = [item for item in dict.fromkeys(requested) if item not in known]
+    if unknown:
+        raise ValueError(
+            "unknown grading item id(s): " + ", ".join(unknown)
+            + " (known: " + ", ".join(known) + ")")
+    return requested
+
+
 def grade(answer_text, negative=False, items=None, answer_overrides=None):
     """Return the verdict dict. Aggregate PASS = every enabled needle found
     (or, in negative mode, NONE found). items: subset of ids to grade (the
-    generator prints the per-length list); default = all. answer_overrides:
-    id -> expected-text overrides for the negative control (the negative
-    prompt must ask something different, so the expected answer changes)."""
+    generator prints the per-length list); default = all. Unknown ids are a
+    loud error. answer_overrides: id -> expected-text overrides for the negative
+    control (the negative prompt must ask something different, so the expected
+    answer changes)."""
     norm = normalize(answer_text)
-    wanted = [n for n in NEEDLES if items is None or n["id"] in items]
+    requested = _validate_items(items)
+    wanted = [n for n in NEEDLES if requested is None or n["id"] in requested]
     if not wanted:
         raise ValueError("no grading items selected (empty --items?)")
     overrides = answer_overrides or {}
@@ -418,6 +434,51 @@ def self_test():
     except ValueError:
         expect("missing tg-text fails loudly", True)
 
+    print("tg-text CLI lifecycle:")
+    import subprocess
+
+    def run_cli(*args):
+        return subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "check", *args],
+            text=True, capture_output=True)
+
+    def expect_cli(name, result, returncode, stdout_terms=(), stderr_terms=()):
+        ok = (result.returncode == returncode
+              and all(term in result.stdout for term in stdout_terms)
+              and all(term in result.stderr for term in stderr_terms))
+        if not ok:
+            print(f"    stdout={result.stdout!r}")
+            print(f"    stderr={result.stderr!r}")
+        expect(name, ok)
+
+    with tempfile.TemporaryDirectory(prefix="gplr07-cli-") as td:
+        answer_path = os.path.join(td, "answers.txt")
+        verdict_path = os.path.join(td, "verdict.json")
+        with open(answer_path, "w", encoding="utf-8") as f:
+            f.write("QX-7741 TR-2918 MK-5501 LD-8834 Paris")
+
+        result = run_cli("--tg-text", answer_path, "--out-verdict", verdict_path)
+        expect_cli("CLI positive grades and persists verdict", result, 0,
+                   stdout_terms=("aggregate=PASS",))
+        try:
+            with open(verdict_path, encoding="utf-8") as f:
+                expect("CLI verdict JSON aggregate PASS",
+                       json.load(f)["aggregate"] == "PASS")
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            expect("CLI verdict JSON aggregate PASS", False)
+
+        result = run_cli("--tg-text", answer_path, "--negative")
+        expect_cli("CLI negative control fails", result, 1,
+                   stdout_terms=("aggregate=FAIL",))
+
+        result = run_cli("--tg-text", answer_path, "--items", "N1,NOT_AN_ITEM")
+        expect_cli("CLI unknown item id is refused", result, 1,
+                   stderr_terms=("unknown grading item id", "NOT_AN_ITEM"))
+
+        result = run_cli("--tg-text", answer_path, "--trace", answer_path)
+        expect_cli("CLI input sources are mutually exclusive", result, 1,
+                   stderr_terms=("exactly one of --trace or --tg-text",))
+
     print(f"self-test: {'PASS' if not failures else 'FAIL ' + str(failures)}")
     return 0 if not failures else 1
 
@@ -512,8 +573,11 @@ def main():
             if not k or not v:
                 sys.exit(f"error: --answer expects ID=TEXT, got {kv!r}")
             overrides[k] = v
-        v = grade(text, negative=a.negative, items=items,
-                  answer_overrides=overrides or None)
+        try:
+            v = grade(text, negative=a.negative, items=items,
+                      answer_overrides=overrides or None)
+        except ValueError as e:
+            sys.exit(f"error: {e}")
         print_verdict(v)
         if a.out_verdict:
             import os
