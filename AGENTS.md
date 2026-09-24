@@ -239,6 +239,27 @@ authoritative online sources before improvising:
   new guards both reported `98A59B376F8E07DE`. Read it as the engine pin, never as "the tree is
   unchanged".
 
+- `llama_layer_streaming::spec_reset()` is the **TEARDOWN** (it clears the mode, the arm and the
+  null source) and must never run on the bring-up path. `begin_row_cache()` called it AFTER the
+  runner's `set_row_set_spec()`/`set_row_set_spec_arm()` and BEFORE the allocation gated on
+  `if (row_set_spec_on)`, so a correctly configured speculative run silently became a plain
+  retention run: no `row_spec_mode` in `run_start`, ZERO `spec` events, and - measured 2026-09-23
+  on the FIRST real T-GPLR-58 A3 arm run - 10,178 stages of PROPOSALS with `submitted == 0`.
+  `tests/test-layer-streaming-tg-spec.cpp` cannot catch it: it drives the pure functions and never
+  calls `begin_row_cache()`, so the bring-up ORDERING is outside every host fixture (a host-only
+  guard for it is an open item). Fixed in that session: the reset is now taken only when
+  `row_set_spec_mode == 0`.
+- Two A2 band-arithmetic rules that were WRONG until 2026-09-23 (found by the T-GPLR-58 A3 session,
+  fixed in `tools/check-tg-predict.py` with selftest fixtures, now 76 checks): **M5 must be a
+  per-leg MEAN, never a ratio of SUMS** - a session supplies `off` as a PAIR (that pair IS the
+  control spread) and the arm once, so a sum-over-legs ratio reports the leg COUNT; with two `off`
+  legs against one arm leg it printed exactly `0.500x (-50.0%)` while every leg staged 85.084 GiB
+  (the band now prints the leg counts and every per-leg volume beside the mean). And **M3's
+  denominator is the session's K=4 RETENTION reference**, preferring an `off`-role leg and
+  accepting the contract's `retref@K4` - keying on the `off` role alone printed NOT COMPUTABLE on
+  a session that HAD the reference, and forced the arm driver to difference the two shares by hand
+  (the driver now cross-checks the checker's own M3 line and warns on disagreement).
+
 ## Validation and Evidence
 
 Run the narrowest meaningful validation first:

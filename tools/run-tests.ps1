@@ -585,10 +585,29 @@ if (-not $spec.Gpu) {
     } else {
         Write-Host "[tg-predict-port] FAILED: $portTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
         exit 1
+    }}
+
+# --- T-GPLR-58 candidate-selection counterfactual (host-only, no GPU, no model) --
+# The cache-aware mode replays fixed recorded demand through the capacity-LRU,
+# reserve, PENDING/READY lifecycle, and measured lead-2 floor. Its hermetic
+# checks cover full-ranking backfill, union-protected LRU, reserve admission,
+# demand-duplicate cancellation, and the earliest consumable stage.
+if (-not $spec.Gpu) {
+    $screenTool = Join-Path $PSScriptRoot 'predictor-screen-gplr.py'
+    if (Test-Path -LiteralPath $screenTool) {
+        Write-Host "[tg58-cache-counterfactual] predictor cache lifecycle selftest (host-only fixtures)..."
+        & python $screenTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: predictor-screen-gplr.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg58-cache-counterfactual] FAILED: $screenTool not found - this guard is REQUIRED." -ForegroundColor Red
+        exit 1
     }
 }
 
-# --- T-GPLR-58 mode-2 wiring: speculative fill-room bound (host-only, no GPU) ---
+# --- T-GPLR-58 mode-2 wiring: speculative fill-room bound (host-only, no GPU) --
 # The mode-2 wiring consumes the A1 proposer, but a speculative fill can only be
 # admitted when the row cache has room beyond the demand reserve. This analyzer
 # rebuilds that occupancy from the recorded traces and pins the RULE its fixture

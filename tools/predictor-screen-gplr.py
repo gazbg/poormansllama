@@ -33,6 +33,7 @@ predictors are bad.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -261,6 +262,345 @@ def load_rows(path):
     return rows
 
 
+# ------------------------------------------------- cache-aware counterfactual
+
+def load_cache_rows(path):
+    """Load one retention trace for the cache counterfactual.
+
+    The ordinary screen intentionally reduces each union to a frozenset. This
+    mode also needs the trace's id order, its recorded per-stage hit count, and
+    rowset_init metadata, so it uses a separate loader and refuses mixed or
+    out-of-order streams.
+    """
+    init = None
+    rows = []
+    seen = set()
+    previous = None
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            if '"rowset_fetch"' not in line and '"rowset_init"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get('event') == 'rowset_init' and init is None:
+                init = ev
+                continue
+            if ev.get('event') != 'rowset_fetch':
+                continue
+            ids = [int(x) for x in str(ev.get('union_ids', '')).split(',') if x != '']
+            if not ids:
+                continue
+            if len(ids) != len(set(ids)):
+                raise ValueError('%s: rowset_fetch union_ids contains duplicates' % path)
+            key = (ev.get('ubatch'), ev.get('layer'))
+            if key in seen:
+                raise ValueError('%s: duplicate demand row %s' % (path, key))
+            if previous is not None and key < previous:
+                raise ValueError('%s: demand rows are not in ascending (ubatch, layer) order' % path)
+            seen.add(key)
+            previous = key
+            rows.append({
+                'token': key[0], 'layer': key[1], 'ids': ids,
+                'hits': int(ev.get('n_rows_resident', 0) or 0),
+            })
+    if init is None:
+        raise ValueError('%s: no rowset_init' % path)
+    if not rows:
+        raise ValueError('%s: no rowset_fetch demand rows' % path)
+    for name in ('retain_k', 'n_expert', 'top_k'):
+        if int(init.get(name, 0) or 0) <= 0:
+            raise ValueError('%s: rowset_init has no positive %s' % (path, name))
+    return init, rows
+
+
+def stream_signature(rows):
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(('%s|%s\n' % (row['layer'], ','.join(str(x) for x in row['ids']))).encode())
+    return h.hexdigest()[:16]
+
+
+def cache_filtered(ranked, present, budget):
+    """Keep the highest-ranked candidates absent from the live cache."""
+    out = []
+    seen = set()
+    for expert in ranked:
+        if expert in seen:
+            continue
+        seen.add(expert)
+        if expert in present:
+            continue
+        out.append(expert)
+        if len(out) >= budget:
+            break
+    return out
+
+
+class LayerCache:
+    """Capacity-LRU plus the speculative READY/PENDING lifecycle."""
+
+    FREE, PENDING, READY = 0, 1, 2
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.rows = {}  # insertion order is LRU order; value carries state and issue stage
+
+    def _refresh(self, expert):
+        row = self.rows.pop(expert)
+        self.rows[expert] = row
+
+    def apply_demand(self, ids, stage):
+        hits = consumed = matched = cancelled_capacity = 0
+        leads = []
+        uniq = sorted(set(ids))
+        needed = set(uniq)
+        resident = set()
+        for expert in uniq:
+            row = self.rows.get(expert)
+            if row is None:
+                continue
+            if row['state'] == self.PENDING:
+                # The engine places the demand's own copy and marks the pending
+                # position cancelled; after that stage's reap the pair collapses
+                # to this one final demand row.
+                matched += 1
+                del self.rows[expert]
+                continue
+            hits += 1
+            resident.add(expert)
+            if row['spec']:
+                consumed += 1
+                leads.append(stage - row['issue_stage'])
+                row['spec'] = 0
+
+        # Classify the whole union before evicting. No row in this demand may be
+        # a victim, and the engine refreshes the union in ascending expert order.
+        need = len(uniq) - hits
+        while len(self.rows) + need > self.cap:
+            victim = None
+            for candidate, candidate_row in self.rows.items():
+                if candidate in needed or candidate_row['state'] == self.PENDING:
+                    continue
+                if candidate_row['spec']:
+                    victim = candidate
+                    break
+            if victim is None:
+                for candidate, candidate_row in self.rows.items():
+                    if candidate not in needed and candidate_row['state'] != self.PENDING:
+                        victim = candidate
+                        break
+            if victim is None:
+                raise ValueError('demand reached a cache with no legal victim')
+            victim_row = self.rows.pop(victim)
+            cancelled_capacity += int(victim_row['spec'])
+
+        for expert in uniq:
+            if expert in resident:
+                self._refresh(expert)
+            else:
+                self.rows[expert] = {
+                    'state': self.READY, 'spec': 0, 'issue_stage': stage,
+                }
+        return {
+            'hits': hits, 'consumed': consumed, 'matched': matched,
+            'cancelled_capacity': cancelled_capacity, 'leads': leads,
+        }
+
+    def reap(self):
+        for row in self.rows.values():
+            if row['state'] == self.PENDING:
+                row['state'] = self.READY
+
+    def admit(self, candidates, reserve, budget, stage):
+        free = self.cap - len(self.rows)
+        pending = sum(row['state'] == self.PENDING for row in self.rows.values())
+        admitted = 0
+        skipped_present = skipped_dup = refused_capacity = 0
+        stop = 'proposals'
+        seen = set()
+        for expert in candidates:
+            if expert in seen:
+                skipped_dup += 1
+                continue
+            seen.add(expert)
+            if expert in self.rows:
+                skipped_present += 1
+                continue
+            if pending >= budget:
+                refused_capacity += 1
+                stop = 'pending'
+            elif free - admitted <= 0:
+                refused_capacity += 1
+                stop = 'no_free'
+            elif free - admitted - 1 < reserve:
+                refused_capacity += 1
+                stop = 'reserve'
+            elif admitted >= budget:
+                refused_capacity += 1
+                stop = 'budget'
+            else:
+                self.rows[expert] = {
+                    'state': self.PENDING, 'spec': 1, 'issue_stage': stage,
+                }
+                admitted += 1
+                pending += 1
+        return {
+            'fills': admitted, 'skipped_present': skipped_present,
+            'skipped_dup': skipped_dup, 'refused_capacity': refused_capacity,
+            'stop': stop,
+        }
+
+
+def simulate_cache_leg(init, rows, method, budget):
+    """Replay one selector on fixed recorded demand with ideal copy completion."""
+    if method not in ('retention', 'history', 'coact', 'cache-aware'):
+        raise ValueError('unknown cache-counterfactual method: %s' % method)
+    retain_k = int(init['retain_k'])
+    n_expert = int(init['n_expert'])
+    top_k = int(init['top_k'])
+    cap = min(n_expert, retain_k * top_k)
+    reserve = top_k
+    caches = defaultdict(lambda: LayerCache(cap))
+    predictor = None
+    if method == 'history':
+        predictor = History()
+    elif method in ('coact', 'cache-aware'):
+        predictor = Coact()
+
+    out = {
+        'method': method, 'stages': 0, 'demands': 0, 'hits': 0,
+        'proposals': 0, 'fills': 0, 'consumed': 0, 'matched_by_demand': 0,
+        'cancelled_capacity': 0, 'skipped_present': 0, 'skipped_dup': 0,
+        'refused_capacity': 0, 'room_stages': 0, 'proposal_room_stages': 0,
+        'missing_room_candidates': 0, 'lead_sum': 0, 'lead_min': None, 'lead_max': None,
+        'stop_counts': defaultdict(int), 'hit_mismatches': [],
+    }
+    for stage, row in enumerate(rows):
+        layer = row['layer']
+        ids = row['ids']
+        cache = caches[layer]
+        demand = cache.apply_demand(ids, stage)
+        cache.reap()
+        out['stages'] += 1
+        out['demands'] += len(ids)
+        out['hits'] += demand['hits']
+        out['consumed'] += demand['consumed']
+        out['matched_by_demand'] += demand['matched']
+        out['cancelled_capacity'] += demand['cancelled_capacity']
+        for lead in demand['leads']:
+            out['lead_sum'] += lead
+            out['lead_min'] = lead if out['lead_min'] is None else min(out['lead_min'], lead)
+            out['lead_max'] = lead if out['lead_max'] is None else max(out['lead_max'], lead)
+        if method == 'retention' and demand['hits'] != row['hits']:
+            out['hit_mismatches'].append((stage, layer, row['hits'], demand['hits']))
+        room = cap - len(cache.rows) > reserve
+        if room:
+            out['room_stages'] += 1
+
+        if predictor is not None:
+            predictor.observe(layer, ids)
+            if method == 'history':
+                candidates = predictor.predict(layer, budget)
+            elif method == 'coact':
+                candidates = predictor.predict(layer, budget)
+            else:
+                ranked = predictor.predict(layer, n_expert)
+                candidates = cache_filtered(ranked, cache.rows.keys(), budget)
+            out['proposals'] += len(candidates)
+            if room and candidates:
+                out['proposal_room_stages'] += 1
+                out['missing_room_candidates'] += sum(
+                    1 for expert in candidates if expert not in cache.rows)
+            admitted = cache.admit(candidates, reserve, budget, stage)
+            out['fills'] += admitted['fills']
+            out['skipped_present'] += admitted['skipped_present']
+            out['skipped_dup'] += admitted['skipped_dup']
+            out['refused_capacity'] += admitted['refused_capacity']
+            if candidates:
+                out['stop_counts'][admitted['stop']] += 1
+
+    out['share'] = out['hits'] / out['demands'] if out['demands'] else 0.0
+    out['fill_precision'] = out['consumed'] / out['fills'] if out['fills'] else 0.0
+    out['late_rate'] = out['matched_by_demand'] / out['fills'] if out['fills'] else 0.0
+    out['staged_bytes'] = int(out['fills'] * BYTES_PER_ROW_MEASURED)
+    out['stop_counts'] = dict(sorted(out['stop_counts'].items()))
+    return out
+
+
+def cache_counterfactual(paths, budget, expected_k=None):
+    legs = []
+    for path in paths:
+        init, rows = load_cache_rows(path)
+        legs.append((path, init, rows))
+    signatures = {stream_signature(rows) for _, _, rows in legs}
+    if len(signatures) != 1:
+        raise ValueError('recorded K legs do not carry the same ordered demand stream')
+    actual_k = [int(init['retain_k']) for _, init, _ in legs]
+    if len(set(actual_k)) != len(actual_k):
+        raise ValueError('cache counterfactual requires one trace per K')
+    if expected_k is not None and actual_k != expected_k:
+        raise ValueError('recorded K values %s do not match requested %s' % (actual_k, expected_k))
+
+    results = []
+    for path, init, rows in legs:
+        baseline = simulate_cache_leg(init, rows, 'retention', budget)
+        if baseline['hit_mismatches']:
+            first = baseline['hit_mismatches'][0]
+            raise ValueError('%s: cache replay differs at stage/layer %s/%s: recorded %d, replay %d' %
+                             ((path,) + first))
+        methods = {}
+        for method in ('history', 'coact', 'cache-aware'):
+            method_result = simulate_cache_leg(init, rows, method, budget)
+            method_result['gain'] = method_result['share'] - baseline['share']
+            methods[method] = method_result
+        results.append({
+            'path': path, 'retain_k': int(init['retain_k']),
+            'cap': min(int(init['n_expert']), int(init['retain_k']) * int(init['top_k'])),
+            'top_k': int(init['top_k']), 'baseline': baseline, 'methods': methods,
+        })
+    return {
+        'schema': 'gplr58-candidate-counterfactual/1',
+        'host_only': True, 'budget': budget, 'stream_signature': next(iter(signatures)),
+        'legs': results,
+    }
+
+
+def print_cache_counterfactual(result):
+    print('T-GPLR-58 cache-aware candidate-selection counterfactual (host-only)')
+    print('demand stream: %d rows, signature %s; no model, CUDA, GPU, or mutex' %
+          (result['legs'][0]['baseline']['stages'], result['stream_signature']))
+    print('All baseline cache replays match their recorded per-stage hit counts exactly.')
+    print()
+    print('%2s %4s %-12s %8s %8s %8s %6s %6s %8s %6s %7s %9s %8s' %
+          ('K', 'cap', 'selector', 'proposed', 'skipP', 'refuse', 'room', 'p@room',
+           'miss@room', 'fills', 'useful', 'share', 'gain_pp'))
+    for leg in result['legs']:
+        base = leg['baseline']
+        print('%2d %4d %-12s %8d %8s %8s %6d %6s %8s %6d %7d %9.5f %9s' %
+              (leg['retain_k'], leg['cap'], 'retention', base['stages'], '-', '-',
+               base['room_stages'], '-', '-', 0, 0, base['share'], '-'))
+        for name, row in leg['methods'].items():
+            print('%2s %4s %-12s %8d %8d %8d %6d %6d %8d %6d %7d %9.5f %+9.4f' %
+                  ('', '', name, row['proposals'], row['skipped_present'],
+                   row['refused_capacity'], row['room_stages'], row['proposal_room_stages'],
+                   row['missing_room_candidates'], row['fills'], row['consumed'],
+                   row['share'], 100.0 * row['gain']))
+    print()
+    for leg in result['legs']:
+        stop_text = []
+        for name, row in leg['methods'].items():
+            stops = ','.join('%s=%d' % item for item in row['stop_counts'].items()) or 'none'
+            stop_text.append('%s:%s' % (name, stops))
+        print('K=%-2d stop reasons: %s' % (leg['retain_k'], '; '.join(stop_text)))
+    print('Reading: candidates are selected AFTER the current demand, so history names rows')
+    print('already resident. cache-aware filters those rows and backfills lower-ranked coact.')
+    print('p@room is a non-empty proposal while capacity remains; miss@room is the subset')
+    print('actually absent from cache. miss@room=0 means no selector had an admissible candidate.')
+    print('useful counts actual lead>=2 consumptions; fill bytes use the measured 1.6875 MiB row.')
+
+
 # ---------------------------------------------------------------- evaluation
 def evaluate_range(rows, make, b, lo, hi):
     """Score rows with lo <= token < hi; every earlier row feeds observation
@@ -409,8 +749,58 @@ def selftest():
     held_m = evaluate_range(rows, lambda: Fusion(CANDIDATES, (1, 1, 1, 1)), 8, warm_tok, float("inf"))
     assert tune_m[3] == warm_tok * n_layer, "tune window size wrong"
     assert held_m[3] == (n_tok - warm_tok) * n_layer, "held window size wrong"
+
+    # Cache-aware selection asks coact for its full ranking. Its top B must be
+    # byte-for-byte the ordinary B-row arm; filtering happens only afterwards.
+    full = Coact()
+    for _tok, layer, ids in rows[:20]:
+        full.observe(layer, list(ids))
+    assert full.predict(0, 8) == full.predict(0, n_exp)[:8], "full ranking changed the top B"
+    assert cache_filtered([3, 1, 4, 1, 2, 0], {1, 4}, 3) == [3, 2, 0], \
+        "cache filter must dedup, remove present rows, and backfill"
+
+    # The LRU baseline is exact on a hand-checked sequence.
+    cache = LayerCache(4)
+    replay = []
+    for ids in ([0, 1], [2, 3], [0, 1]):
+        replay.append(cache.apply_demand(ids, len(replay))['hits'])
+        cache.reap()
+    assert replay == [0, 0, 2], "capacity-LRU replay changed the recorded hit rule"
+
+    # A fill issued after stage 0 cannot serve stage 1; it is matched/cancelled
+    # there and can first be consumed at stage 2.
+    cache = LayerCache(8)
+    assert cache.apply_demand([0, 1], 0)['hits'] == 0
+    cache.reap()
+    assert cache.admit([4, 5], 2, 2, 0)['fills'] == 2
+    demand1 = cache.apply_demand([2, 3], 1)
+    assert (demand1['hits'], demand1['matched'], demand1['consumed']) == (0, 0, 0), \
+        "pending fill was visible one stage too early"
+    cache.reap()
+    demand2 = cache.apply_demand([4, 5], 2)
+    assert (demand2['hits'], demand2['consumed'], demand2['leads']) == (2, 2, [2, 2]), \
+        "lead-2 consumption lifecycle is wrong"
+
+    # If the one-stage demand asks for the pending row, it is cancelled rather
+    # than counted as a hit; the demand copy replaces it.
+    cache = LayerCache(8)
+    cache.apply_demand([0, 1], 0)
+    cache.reap()
+    cache.admit([4], 2, 2, 0)
+    cancelled = cache.apply_demand([4, 2], 1)
+    assert (cancelled['hits'], cancelled['matched'], cancelled['consumed']) == (0, 1, 0), \
+        "demand-duplicate cancellation lifecycle is wrong"
+
+    # Reserve admission stops before consuming the last protected positions.
+    cache = LayerCache(8)
+    cache.apply_demand([0, 1], 0)
+    cache.reap()
+    admitted = cache.admit([2, 3, 4, 5, 6], 2, 8, 0)
+    assert (admitted['fills'], admitted['refused_capacity'], admitted['stop']) == (4, 1, 'reserve'), \
+        "capacity reserve boundary is wrong"
+
     print("SELFTEST PASS: online faithfulness held; planted history/markov structure detected; "
-          "bar/fusion operators sane; split windows disjoint")
+          "bar/fusion operators sane; cache filter, LRU, reserve, and lead-2 lifecycle verified")
 
 
 # ---------------------------------------------------------------- main
@@ -420,10 +810,17 @@ def main():
     ap.add_argument("--b", default="8,16,32", help="budgets (comma-sep, default 8,16,32)")
     ap.add_argument("--warm", type=int, default=0,
                     help="leading tokens used as observation only (default 0 = colibri F4)")
-    ap.add_argument("--mode", default="base", choices=["base", "bar", "fusion"],
+    ap.add_argument("--mode", default="base", choices=["base", "bar", "fusion", "cache"],
                     help="base = screening table; bar = confidence-bar sweep "
                          "(precision-recall frontier); fusion = weighted + vote "
-                         "merge with tune/held split and null control")
+                         "merge with tune/held split and null control; cache = "
+                         "recorded-demand cache-aware selector replay")
+    ap.add_argument("--budget", type=int, default=8,
+                    help="cache mode: speculative proposal budget (default 8)")
+    ap.add_argument("--expect-k", default="",
+                    help="cache mode: comma-separated K values in trace order")
+    ap.add_argument("--json-out", default="",
+                    help="cache mode: write the deterministic JSON result here")
     ap.add_argument("--grid-b", type=int, default=8,
                     help="fusion mode: budget the weight grid is tuned at (default 8)")
     ap.add_argument("--holdout", type=float, default=0.2,
@@ -436,6 +833,23 @@ def main():
     if not args.traces:
         ap.error("no traces given: a screen with no input would be a silent pass")
     budgets = [int(x) for x in args.b.split(",")]
+    if args.mode == "cache":
+        if args.budget <= 0:
+            ap.error("--budget must be positive")
+        expected_k = [int(x) for x in args.expect_k.split(",")] if args.expect_k else None
+        try:
+            result = cache_counterfactual(args.traces, args.budget, expected_k)
+        except (OSError, ValueError) as exc:
+            print("REFUSED: %s" % exc, file=sys.stderr)
+            return 2
+        print_cache_counterfactual(result)
+        if args.json_out:
+            with open(args.json_out, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            print("json: %s" % args.json_out)
+        return 0
+
     for path in args.traces:
         rows = load_rows(path)
         if not rows:
@@ -504,4 +918,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

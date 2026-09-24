@@ -39,8 +39,15 @@ Bands (as pre-registered in the block; NOT re-derived here)
   M2               share(null) - share(off): the pool-growth share of a merged set
   M4               margin_share(arm) = (share(arm) - share(off)) / (1 - share(off))
   M4n              share(arm) - share(null): the NULL-CORRECTED gain (structure only)
-  M3               the same session's arm@K2 share against its off@K4 share
-  M5               staged-volume growth: bytes_staged(arm) / bytes_staged(off)
+  M3               the same session's arm@K2 share against its K=4 RETENTION reference:
+                   an `off`-role leg at K=4 when the session supplies one, otherwise the
+                   contract's `retref@K4` (keying on the `off` role alone printed NOT
+                   COMPUTABLE on the real 2026-09-23 A3 session, which HAD the reference)
+  M5               staged-volume growth: MEAN staged bytes per arm leg over MEAN staged
+                   bytes per off leg -- never a ratio of SUMS, because the roles usually
+                   carry different leg counts (two `off` legs against one arm leg summed
+                   to exactly 0.500x on the real 2026-09-23 A3 session: a 50% "saving"
+                   that was pure arithmetic, while the per-leg volumes were identical)
   M7a              lead_min >= 2 over CONSUMED fills: the reap-ordering floor
   M7b              the late-fill rate matched/(consumed+matched) <= 0.5 on an ARM
                    leg with >= 8 resolved fills (the 2026-09-23 restatement)
@@ -62,20 +69,42 @@ that balance is the M7b band, scored on ARM legs only.
 Invariants (falsifiers).  A FAIL here blocks REPORTING a task complete; it never
 authorizes anything.  Every gate in this repository is soft.
   P1  spec_waited_by_demand == 0        a demand never waited on a speculative copy
-  P2  the fill accounting closes        submitted >= consumed + cancelled + live
+  P2  the fill accounting closes        submitted_total >= consumed + cancelled + live
   P4  cancelled == gen + demand + capacity   every cancellation names its firing point
   P6  an off leg carries no speculation  the default path is unpolluted
+  P7  a stage stays inside the budget   every `submitted` <= `budget`, and the per-stage
+                                        counts sum to `submitted_total`
   M7a lead_min >= 2 on a consumed leg    the reap ordering cannot be beaten
+
+The mode-2 admission schema adds `candidate_ids`, `skipped_present`, `skipped_dup`,
+`plan_refused_capacity`, `stop`, and `stop_reason` to each `spec` event. These are
+per-stage values. A trace with any one of these keys must carry the complete set;
+older traces without the keys remain readable as legacy admission telemetry.
+
+The `spec` schema, and why P2 reads `submitted_total`
+----------------------------------------------------
+T-GPLR-58 A2 changed the GRAIN of one field on 2026-09-23.  `submitted` is now
+PER-STAGE: the fills that one demand stage issued, which by the admission rule can
+never exceed the stage's `budget` (8 in every measured leg).  It used to carry the
+RUN-GLOBAL cumulative, which on a per-stage event read as a +306 increment against
+a budget of 8 -- the sum over all 40 layers' stages in one token, not one stage.
+The run total is emitted beside it as `submitted_total`, and that is what the P2
+accounting closes against.  A trace recorded BEFORE the change carries the
+cumulative under `submitted` alone; those legs are read as schema
+`legacy-cumulative`, P2 still closes on them, and P7 reports no evidence rather
+than scoring a cumulative number as if it were a per-stage one.  `fill_ids` (the
+ids each stage issued) arrived with the same pass: it is what lets the runner's
+retention cache model replay the fills instead of blaming every later fetch.
 
 Refusals (exit 2, NO numbers printed -- a refused leg is not a scored leg)
 ------------------------------------------------------------------------
   file-missing | not-a-trace | no-retention (no rowset_init) | no-retain-k |
   no-rowset-fetch | arm-without-spec (a leg declared arm/null emitted no `spec`) |
   spec-missing-keys (incl. a trace whose `spec` lacks `cancelled`) |
-  cancel-hook-never-fired (submitted > 0 with cancelled == 0: P4 is UNTESTED, so the
-  leg is refused rather than scored -- this is the A2 acceptance fixture) |
+  cancel-hook-never-fired (submitted_total > 0 with cancelled == 0: P4 is UNTESTED, so
+  the leg is refused rather than scored -- this is the A2 acceptance fixture) |
   off-leg-with-speculation (role/label conflict) |
-  accounting-negative (submitted < consumed + cancelled + live: double counting) |
+  accounting-negative (submitted_total < consumed + cancelled + live: double counting) |
   lead-inconsistent (lead_hist and `consumed` disagree, or the sum is unreachable)
 
 usage:
@@ -111,6 +140,10 @@ SPEC_REQUIRED = ('submitted', 'ready', 'cancelled', 'cancelled_capacity',
                  'cancelled_demand', 'cancelled_generation', 'refused_capacity',
                  'dup_refused', 'matched_by_demand', 'waited_by_demand',
                  'consumed', 'lead_sum', 'lead_min', 'lead_max', 'lead_hist')
+ADMISSION_REQUIRED = ('candidate_ids', 'skipped_present', 'skipped_dup',
+                      'plan_refused_capacity', 'stop', 'stop_reason', 'fill_ids',
+                      'prop', 'arm_count', 'submitted_total')
+PLAN_STOP_REASONS = {0: 'proposals', 1: 'budget', 2: 'pending', 3: 'reserve', 4: 'no_free'}
 
 
 class Refused(Exception):
@@ -135,6 +168,12 @@ def read_leg(path, role):
         'staged_bytes': 0, 'bank_bytes': 0, 'retired': 0,
         'xfer': [], 'region_union': 0,
         'spec_events': 0, 'spec': {}, 'lead_hist': None, 'spec_layers': {},
+        'spec_schema': None, 'submitted_total': 0,
+        'submitted_stage_sum': 0, 'submitted_stage_max': 0, 'spec_fill_events': 0,
+        'admission_schema': 'legacy', 'admission_events': 0,
+        'admission_missing': [], 'admission_errors': [],
+        'skipped_present_sum': 0, 'skipped_dup_sum': 0,
+        'plan_refused_capacity_sum': 0, 'admission_stop_counts': {},
         'refused_events': [],
         'phase_summary': {},
     }
@@ -177,6 +216,68 @@ def read_leg(path, role):
                     leg['xfer'].append(float(d['transfer_us']))
             elif ev == 'spec':
                 leg['spec_events'] += 1
+                # `submitted` is PER-STAGE (T-GPLR-58 A2); `submitted_total` is the
+                # run-wide cumulative P2 closes against; `fill_ids` is what the
+                # runner's retention model replays.  A trace recorded before the
+                # change carries the cumulative under `submitted` alone and is
+                # read as schema `legacy-cumulative`.
+                st_sub = int(d.get('submitted', 0) or 0)
+                if 'submitted_total' in d:
+                    leg['spec_schema'] = 'per-stage'
+                    leg['submitted_stage_sum'] += st_sub
+                    leg['submitted_stage_max'] = max(leg['submitted_stage_max'], st_sub)
+                    tot = int(d['submitted_total'] or 0)
+                    leg['submitted_total'] = max(leg['submitted_total'], tot)
+                else:
+                    leg['spec_schema'] = 'legacy-cumulative'
+                    leg['submitted_total'] = max(leg['submitted_total'], st_sub)
+                if d.get('fill_ids') is not None:
+                    leg['spec_fill_events'] += 1
+                admission_present = any(k in d for k in ADMISSION_REQUIRED)
+                if admission_present:
+                    leg['admission_schema'] = 'v1'
+                    missing = [k for k in ADMISSION_REQUIRED if k not in d]
+                    if missing:
+                        leg['admission_missing'].extend(missing)
+                    else:
+                        leg['admission_events'] += 1
+                        try:
+                            candidates = d['candidate_ids']
+                            if not isinstance(candidates, list):
+                                raise ValueError('candidate_ids is not an array')
+                            if any(not isinstance(x, int) or isinstance(x, bool) for x in candidates):
+                                raise ValueError('candidate_ids contains a non-integer')
+                            if len(candidates) != int(d['prop']):
+                                raise ValueError('candidate_ids length does not match prop')
+                            if int(d['prop']) != int(d['arm_count']):
+                                raise ValueError('prop does not match arm_count')
+                            if len(candidates) != len(set(candidates)):
+                                raise ValueError('candidate_ids contains duplicates')
+                            if leg['init'] is not None and any(
+                                    x < 0 or x >= int(leg['init']['n_expert']) for x in candidates):
+                                raise ValueError('candidate_ids is outside n_expert')
+                            stop = int(d['stop'])
+                            if stop not in PLAN_STOP_REASONS or d['stop_reason'] != PLAN_STOP_REASONS[stop]:
+                                raise ValueError('stop and stop_reason disagree')
+                            for key in ('skipped_present', 'skipped_dup', 'plan_refused_capacity'):
+                                if int(d[key]) < 0:
+                                    raise ValueError(key + ' is negative')
+                            fills = d['fill_ids']
+                            if not isinstance(fills, list) or any(
+                                    not isinstance(x, int) or isinstance(x, bool) for x in fills):
+                                raise ValueError('fill_ids contains a non-integer')
+                            if len(fills) != int(d['submitted']):
+                                raise ValueError('fill_ids length does not match submitted')
+                            if any(x not in candidates for x in fills):
+                                raise ValueError('fill_ids contains an id not in candidate_ids')
+                            leg['skipped_present_sum'] += int(d['skipped_present'])
+                            leg['skipped_dup_sum'] += int(d['skipped_dup'])
+                            leg['plan_refused_capacity_sum'] += int(d['plan_refused_capacity'])
+                            reason = str(d['stop_reason'])
+                            leg['admission_stop_counts'][reason] = \
+                                leg['admission_stop_counts'].get(reason, 0) + 1
+                        except (KeyError, TypeError, ValueError) as e:
+                            leg['admission_errors'].append(str(e))
                 for k in SPEC_REQUIRED:
                     if k in d:
                         if k == 'lead_hist':
@@ -231,6 +332,20 @@ def read_leg(path, role):
     leg['run_spec_mode'] = spec_mode
     claims_prediction = bool(spec_mode > 0 or leg['spec_events'] > 0)
 
+    if leg['admission_missing']:
+        missing = sorted(set(leg['admission_missing']))
+        raise Refused('spec-missing-admission-keys',
+                      'mode-2 admission telemetry is incomplete; missing: %s (%s)'
+                      % (', '.join(missing), path))
+    if leg['admission_errors']:
+        raise Refused('spec-admission-invalid',
+                      'mode-2 admission telemetry is inconsistent: %s (%s)'
+                      % ('; '.join(leg['admission_errors'][:3]), path))
+    if leg['admission_schema'] == 'v1' and leg['admission_events'] != leg['spec_events']:
+        raise Refused('spec-admission-partial',
+                      'only %d of %d spec events carry the mode-2 admission schema (%s)'
+                      % (leg['admission_events'], leg['spec_events'], path))
+
     if role == 'off' and claims_prediction:
         raise Refused('off-leg-with-speculation',
                       'declared off but the run resolved row_spec_mode=%d with %d spec '
@@ -249,14 +364,10 @@ def read_leg(path, role):
                           'instrumented leg is missing required spec keys: %s. A leg without '
                           'them cannot be scored (a trace whose `spec` lacks `cancelled` is '
                           'exactly this case: P4 is unverifiable) (%s)' % (', '.join(missing), path))
-
-    if leg['spec_events']:
-        missing = [k for k in SPEC_REQUIRED if leg['spec'].get(k) is None]
-        if missing:
-            raise Refused('spec-missing-keys',
-                          'instrumented leg is missing required spec keys: %s (%s)'
-                          % (', '.join(missing), path))
         s = leg['spec']
+        # the run total the accounting closes against: `submitted_total` since the
+        # A2 grain fix, the cumulative `submitted` on a pre-fix trace
+        s['submitted'] = leg['submitted_total']
         leg['lead_hist'] = [int(x) for x in s['lead_hist']]
         if len(leg['lead_hist']) != 8:
             raise Refused('lead-inconsistent',
@@ -387,13 +498,16 @@ def report(legs, session):
     if spec_legs:
         out.append('')
         out.append('SPECULATION (P1-P6 evidence; `matched` is the fallback, not a lead)')
-        out.append('  %-6s %-10s %-9s %-8s %-9s %-5s %-7s %-9s %-8s %-7s %-7s %-9s %-5s %-5s %-5s'
-                   % ('role', 'submitted', 'consumed', 'matched', 'cancelled', 'gen', 'demand',
-                      'capacity', 'refused', 'dup_ref', 'waited', 'lead_min', 'med', 'max', 'resid'))
+        out.append('  %-6s %-10s %-7s %-9s %-8s %-9s %-5s %-7s %-9s %-8s %-7s %-7s %-9s %-5s %-5s %-5s'
+                   % ('role', 'submitted', 'max/stg', 'consumed', 'matched', 'cancelled', 'gen',
+                      'demand', 'capacity', 'refused', 'dup_ref', 'waited', 'lead_min', 'med',
+                      'max', 'resid'))
         for leg in spec_legs:
             s = leg['spec']
-            out.append('  %-6s %-10d %-9d %-8d %-9d %-5d %-7d %-9d %-8d %-7d %-7d %-9d %-5s %-5s %-5d'
-                       % (leg['role'], int(s['submitted']), int(s['consumed']),
+            out.append('  %-6s %-10d %-7s %-9d %-8d %-9d %-5d %-7d %-9d %-8d %-7d %-7d %-9d %-5s %-5s %-5d'
+                       % (leg['role'], int(s['submitted']),
+                          leg['submitted_stage_max'] if leg['spec_schema'] == 'per-stage' else '-',
+                          int(s['consumed']),
                           int(s['matched_by_demand']), int(s['cancelled']),
                           int(s['cancelled_generation']), int(s['cancelled_demand']),
                           int(s['cancelled_capacity']), int(s['refused_capacity']),
@@ -404,6 +518,21 @@ def report(legs, session):
         out.append('  lead_hist (bucket i = lead i+1 stages, bucket 7 = lead >= 8):')
         for leg in spec_legs:
             out.append('    %-6s %s' % (leg['role'], leg['lead_hist']))
+        out.append('  schema: %s (`submitted` is per stage and `submitted_total` is the run'
+                   ' total; `max/stg` is - on a pre-A2 trace, where `submitted` is the'
+                   ' cumulative)' % ', '.join('%s=%s' % (l['role'], l['spec_schema'])
+                                              for l in spec_legs))
+        admission_legs = [l for l in spec_legs if l['admission_schema'] == 'v1']
+        if admission_legs:
+            out.append('  admission schema: v1; per-stage skips: %s' %
+                       ', '.join('%s skipped_present=%d skipped_dup=%d plan_refused=%d stop=%s'
+                                 % (l['role'], l['skipped_present_sum'], l['skipped_dup_sum'],
+                                    l['plan_refused_capacity_sum'],
+                                    ','.join('%s:%d' % (k, v)
+                                             for k, v in sorted(l['admission_stop_counts'].items())))
+                                 for l in admission_legs))
+        else:
+            out.append('  admission schema: legacy; candidate ids and planner skips are not present')
 
     offs = [l for l in legs if l['role'] == 'off']
     arms = [l for l in legs if l['role'] == 'arm']
@@ -441,21 +570,41 @@ def report(legs, session):
                            '(no null leg: a raw gain cannot be separated from pool growth)')
 
     k2_arms = [l for l in arms if l['retain_k'] == 2]
-    k4_offs = [l for l in offs if l['retain_k'] == 4]
-    if k2_arms and k4_offs:
-        out.append('  M3  same-session arm@K2 vs off@K4               : %.4f vs %.4f = %+.4f'
-                   % (k2_arms[0]['share'], k4_offs[0]['share'],
-                      k2_arms[0]['share'] - k4_offs[0]['share']))
+    # The M3 denominator is the session's RETENTION reference at the deeper depth. The
+    # contract names that leg `retref@K4` and declares its checker role `retref`, so an
+    # `off`-role K=4 leg is preferred when a session supplies one and a `retref` leg at
+    # K=4 is the documented fallback. Keying on the `off` role alone printed NOT
+    # COMPUTABLE on the real 2026-09-23 A3 session even though that session HAD the
+    # reference, which forced the arm driver to difference the two shares by hand.
+    k4_den = [l for l in offs if l['retain_k'] == 4] or [l for l in rets if l['retain_k'] == 4]
+    if k2_arms and k4_den:
+        den = k4_den[0]
+        label = 'same-session arm@K2 vs %s@K4' % den['role']
+        out.append('  M3  %-46s: %.4f vs %.4f = %+.4f'
+                   % (label, k2_arms[0]['share'], den['share'],
+                      k2_arms[0]['share'] - den['share']))
     else:
-        out.append('  M3  same-session arm@K2 vs off@K4               : NOT COMPUTABLE from these '
-                   'legs (needs an arm at K=2 and THE SAME session\'s off at K=4)')
+        out.append('  M3  same-session arm@K2 vs retref@K4            : NOT COMPUTABLE from these '
+                   'legs (needs an arm at K=2 and THE SAME session\'s retention reference at '
+                   'K=4, supplied as an `off` or a `retref` leg)')
 
     if arms and offs:
-        a_staged = sum(l['staged_bytes'] for l in arms)
-        o_staged = sum(l['staged_bytes'] for l in offs)
+        # M5 is a per-leg MEAN ratio, never a ratio of SUMS: the `off` role is routinely
+        # supplied as a PAIR (that pair IS the session's control spread) while an arm is
+        # supplied once, so a sum-over-legs ratio reports the leg COUNT instead of the
+        # volume. Measured 2026-09-23 (T-GPLR-58 A3): two off legs against one arm leg
+        # printed exactly `0.500x (-50.0%)` while every leg staged 85.084 GiB.
+        a_staged = sum(l['staged_bytes'] for l in arms) / float(len(arms))
+        o_staged = sum(l['staged_bytes'] for l in offs) / float(len(offs))
         if o_staged:
-            out.append('  M5  staged-volume growth (arm/off)              : %.3fx (%+.1f%%)  '
+            out.append('  M5  staged-volume growth (arm/off, per-leg mean) : %.3fx (%+.1f%%)  '
                        '[soft band <= +5%%]' % (a_staged / o_staged, 100.0 * (a_staged / o_staged - 1.0)))
+            out.append('      %d arm / %d off leg(s); per-leg staged bytes: %s -- a ratio of SUMS '
+                       'over unequal leg counts reports the count, not the volume'
+                       % (len(arms), len(offs),
+                          ', '.join('%s %s %.0f' % (l['role'], os.path.basename(l['path']),
+                                                    l['staged_bytes'])
+                                    for l in (arms + offs))))
 
     lead_legs = [l for l in spec_legs if l['lead_median'] is not None]
     if lead_legs:
@@ -558,6 +707,36 @@ def report(legs, session):
         out.append('  P6  an off leg carries no speculation          : FAIL')
     else:
         out.append('  P6  an off leg carries no speculation          : PASS')
+
+    # P7 (T-GPLR-58 A2): the per-stage budget bound. `submitted` is what ONE stage
+    # issued, and the admission rule admits at most `budget` fills per stage (a fill
+    # holds its position until the next stage's reap), so a per-stage count above the
+    # budget means the barrier broke -- and the per-stage counts must add up to the run
+    # total, which is what makes the sum a count of fills rather than of snapshots.
+    p7_bad, p7_evidence = [], []
+    for l in spec_legs:
+        if l['spec_schema'] != 'per-stage':
+            continue
+        p7_evidence.append(l)
+        budget = int(l['spec'].get('budget', 0) or 0)
+        if l['submitted_stage_max'] > budget or l['submitted_stage_sum'] != l['submitted_total']:
+            p7_bad.append(l)
+    if not p7_evidence:
+        out.append('  P7  a stage issues within the budget        : no evidence (legacy '
+                   'cumulative `submitted`: these traces predate the per-stage field)')
+    elif p7_bad:
+        failures.append('P7')
+        out.append('  P7  a stage issues within the budget        : FAIL %s'
+                   % ', '.join('%s (max/stage %d vs budget %d, per-stage sum %d vs total %d)'
+                               % (os.path.basename(l['path']), l['submitted_stage_max'],
+                                  int(l['spec'].get('budget', 0) or 0), l['submitted_stage_sum'],
+                                  l['submitted_total']) for l in p7_bad))
+    else:
+        out.append('  P7  a stage issues within the budget        : PASS (%s)'
+                   % ', '.join('%s max/stage %d <= budget %d, %d stage(s) sum to %d'
+                               % (l['role'], l['submitted_stage_max'],
+                                  int(l['spec'].get('budget', 0) or 0), l['spec_events'],
+                                  l['submitted_total']) for l in p7_evidence))
 
     below_floor = [l for l in spec_legs if l['lead_median'] is not None and int(l['spec']['lead_min']) < 2]
     if below_floor:
@@ -716,14 +895,35 @@ def _fetch(layer, resident, fetched, phase=1, xfer=100.0, staged=1000):
 
 def _spec(layer, submitted, consumed, matched, cancelled, gen, dem, cap, refused=0, dup=0,
           waited=0, lead_min=2, lead_max=8, lead_sum=20, hist=(1, 2, 1, 0, 0, 0, 0, 1),
-          pending=1, ready_spec=0, mode=1):
-    return _ev(event='spec', run_id=1, ubatch=1, layer=layer, mode=mode, budget=8, reserve=8,
-               cap=16, pending=pending, ready_spec=ready_spec, submitted=submitted, ready=1,
-               cancelled=cancelled, cancelled_capacity=cap, cancelled_demand=dem,
-               cancelled_generation=gen, refused_capacity=refused, dup_refused=dup,
-               matched_by_demand=matched, waited_by_demand=waited, reap_wait_us=0,
-               issued_bytes=100, consumed=consumed, lead_sum=lead_sum, lead_min=lead_min,
-               lead_max=lead_max, lead_hist=list(hist), t_us=3)
+          pending=1, ready_spec=0, mode=1, total=None, per_stage=True, budget=8, fill_ids=None,
+          admission=True, candidate_ids=None, skipped_present=0, skipped_dup=0,
+          plan_refused_capacity=0, stop=0, stop_reason=None, prop=None, arm_count=None):
+    """One `spec` event.  `submitted` is the PER-STAGE count (T-GPLR-58 A2) and `total` the
+    run-wide cumulative it belongs to; `per_stage=False` builds a pre-A2 event, where
+    `submitted` alone carries the cumulative.  `fill_ids` is what the runner's retention
+    cache model replays; a per-stage event without it is a legacy trace for that model."""
+    d = dict(event='spec', run_id=1, ubatch=1, layer=layer, mode=mode, budget=budget,
+             reserve=8, cap=16, pending=pending, ready_spec=ready_spec, submitted=submitted,
+             ready=1, cancelled=cancelled, cancelled_capacity=cap, cancelled_demand=dem,
+             cancelled_generation=gen, refused_capacity=refused, dup_refused=dup,
+             matched_by_demand=matched, waited_by_demand=waited, reap_wait_us=0,
+             issued_bytes=100, consumed=consumed, lead_sum=lead_sum, lead_min=lead_min,
+             lead_max=lead_max, lead_hist=list(hist), t_us=3)
+    if per_stage:
+        d['submitted_total'] = submitted if total is None else total
+        d['fill_ids'] = list(range(fill_ids if fill_ids is not None else submitted))
+        if admission:
+            names = {0: 'proposals', 1: 'budget', 2: 'pending', 3: 'reserve', 4: 'no_free'}
+            ids = list(range(submitted)) if candidate_ids is None else list(candidate_ids)
+            d['candidate_ids'] = ids
+            d['skipped_present'] = skipped_present
+            d['skipped_dup'] = skipped_dup
+            d['plan_refused_capacity'] = plan_refused_capacity
+            d['stop'] = stop
+            d['stop_reason'] = names[stop] if stop_reason is None else stop_reason
+            d['prop'] = submitted if prop is None else prop
+            d['arm_count'] = submitted if arm_count is None else arm_count
+    return _ev(**d)
 
 
 def _start(role_mode=0):
@@ -775,17 +975,19 @@ def selftest():
     # off: 4096 demands, 2048 hits -> share 0.5
     off = write_trace(tmp, 'off-K4.jsonl',
                       [_start(0), _init(4), _fetch(0, 2048, 2048), _acct(), _end()])
-    # arm: 4096 demands, 3072 hits -> share 0.75; invariant-consistent spec block
-    # submitted 10 = consumed 5 + cancelled 3 + live 2 (... + residual 0)
+    # arm: 4096 demands, 3072 hits -> share 0.75; invariant-consistent spec block.
+    # Per-stage `submitted` 8 (at the budget), run total 8 = consumed 5 + cancelled 1 +
+    # live 2 (residual 0)
     arm = write_trace(tmp, 'arm-K2.jsonl',
-                      [_start(1), _init(2), _fetch(0, 3072, 1024, xfer=250.0, staged=2000),
-                       _spec(0, submitted=10, consumed=5, matched=2, cancelled=3, gen=1, dem=1,
-                             cap=1, hist=(0, 3, 1, 0, 0, 0, 0, 1), lead_min=2, lead_max=8,
+                      [_start(1), _init(2), _fetch(0, 3072, 1024, xfer=250.0, staged=2000),                        _spec(0, submitted=8, total=8, consumed=5, matched=2, cancelled=1,
+                              gen=1, dem=0,                              cap=0, hist=(0, 3, 1, 0, 0, 0, 0, 1), lead_min=2, lead_max=8,
+
                              lead_sum=19, pending=1, ready_spec=1),
                        _acct(), _end()])
     null = write_trace(tmp, 'null-K4.jsonl',
                        [_start(1), _init(4), _fetch(0, 2560, 1536),
-                        _spec(0, submitted=4, consumed=2, matched=1, cancelled=1, gen=1, dem=0,
+                        _spec(0, submitted=4, total=4, consumed=2, matched=1, cancelled=1,
+                              gen=1, dem=0,
                               cap=0, hist=(0, 2, 0, 0, 0, 0, 0, 0), lead_min=2, lead_max=2,
                               lead_sum=4, pending=0, ready_spec=1),
                         _acct(), _end()])
@@ -816,6 +1018,10 @@ def selftest():
           'UNSCORED - matched 2 / resolved 7 is below the n >= 8 floor' in out, True)
     check('M7b null leg is reported, not gated',
           'M7b late-fill rate (null)' in out and '[reported, not gated]' in out, True)
+    check('per-stage schema records fill ids',
+          read_leg(arm, 'arm')['spec_fill_events'], 1)
+    check('mode-2 admission schema is reported',
+          'admission schema: v1' in out, True)
 
     # ---- M7b: the late-fill rate band (the 2026-09-23 M7 restatement) --------
     # A band, not an invariant: every case below must still verdict `scored`.  The three
@@ -825,19 +1031,22 @@ def selftest():
     # could not see at all, because it consumed nothing and published no median.
     late = write_trace(tmp, 'arm-late-K2.jsonl',
                        [_start(1), _init(2), _fetch(0, 2800, 1296),
-                        _spec(0, submitted=12, consumed=3, matched=9, cancelled=9, gen=2, dem=6,
-                              cap=1, hist=(0, 2, 1, 0, 0, 0, 0, 0), lead_min=2, lead_max=3,
+                        _spec(0, submitted=8, total=8, consumed=3, matched=9, cancelled=5,
+                              gen=2, dem=3,
+                              cap=0, hist=(0, 2, 1, 0, 0, 0, 0, 0), lead_min=2, lead_max=3,
                               lead_sum=8, pending=0, ready_spec=0),
                         _acct(), _end()])
     even = write_trace(tmp, 'arm-even-K2.jsonl',
                        [_start(1), _init(2), _fetch(0, 2800, 1296),
-                        _spec(0, submitted=8, consumed=4, matched=4, cancelled=4, gen=1, dem=3,
+                        _spec(0, submitted=8, total=8, consumed=4, matched=4, cancelled=4,
+                              gen=1, dem=3,
                               cap=0, hist=(0, 2, 1, 1, 0, 0, 0, 0), lead_min=2, lead_max=4,
                               lead_sum=11, pending=0, ready_spec=0),
                         _acct(), _end()])
     never = write_trace(tmp, 'arm-never-K2.jsonl',
                         [_start(1), _init(2), _fetch(0, 2900, 1196),
-                         _spec(0, submitted=9, consumed=0, matched=9, cancelled=9, gen=0, dem=9,
+                         _spec(0, submitted=8, total=8, consumed=0, matched=9, cancelled=8,
+                               gen=0, dem=8,
                                cap=0, hist=(0, 0, 0, 0, 0, 0, 0, 0), lead_min=0, lead_max=0,
                                lead_sum=0, pending=0, ready_spec=0),
                          _acct(), _end()])
@@ -862,13 +1071,61 @@ def selftest():
 
     nofill = write_trace(tmp, 'arm-nofill-K2.jsonl',
                          [_start(1), _init(2), _fetch(0, 2900, 1196),
-                          _spec(0, submitted=5, consumed=0, matched=0, cancelled=5, gen=5, dem=0,
+                          _spec(0, submitted=5, total=5, consumed=0, matched=0, cancelled=5,
+                                gen=5, dem=0,
                                 cap=0, hist=(0, 0, 0, 0, 0, 0, 0, 0), lead_min=0, lead_max=0,
                                 lead_sum=0, pending=0, ready_spec=0),
                           _acct(), _end()])
     code, out, err = _run(['--leg', 'arm=' + nofill, '--leg', 'off=' + off])
     check('M7b UNMEASURED when no arm leg resolved a fill',
           'UNMEASURED (no arm leg resolved a fill)' in out, True)
+
+    # ---- band ARITHMETIC under uneven leg counts (the 2026-09-23 A3 findings) ----
+    # A real session supplies the `off` role as a PAIR (that pair IS the control spread)
+    # and the arm once. Both bands below are the exact shapes the A3 session carried, so a
+    # regression to the sum-over-legs ratio or to the `off`-only M3 keying fails HERE.
+    off2 = write_trace(tmp, 'off2-K4.jsonl',
+                       [_start(0), _init(4), _fetch(0, 2048, 2048), _acct(), _end()])
+    # the arm stages EXACTLY what each off leg stages (2048 x 1000 bytes), so the honest
+    # per-leg mean ratio is 1.000x -- a ratio of sums would read 0.500x on these legs
+    code, out, err = _run(['--leg', 'off=' + off, '--leg', 'off=' + off2, '--leg', 'arm=' + arm])
+    check('M5 unequal counts exit code', code, EXIT_OK)
+    check('M5 is a per-leg MEAN, not a ratio of sums',
+          'M5  staged-volume growth (arm/off, per-leg mean) : 1.000x (+0.0%)' in out, True)
+    check('M5 no longer prints the leg-count artifact', '0.500x' not in out, True)
+    check('M5 states the leg counts', '1 arm / 2 off leg(s)' in out, True)
+    check('M5 explains that a ratio of sums reports the count',
+          'a ratio of SUMS over unequal leg counts reports the count' in out, True)
+
+    # M3's denominator: the contract names its K=4 reference `retref@K4`, so a session
+    # that supplies THAT leg (and no off-role K=4 leg) must still compute M3.
+    ret4 = write_trace(tmp, 'retref-K4.jsonl',
+                       [_start(0), _init(4), _fetch(0, 2048, 2048), _acct(), _end()])
+    code, out, err = _run(['--leg', 'arm=' + arm, '--leg', 'retref=' + ret4])
+    check('M3 from a retref@K4 denominator exit code', code, EXIT_OK)
+    check('M3 computes when the K=4 leg is the contract retref',
+          'M3  same-session arm@K2 vs retref@K4' in out and '+0.2500' in out, True)
+    check('M3 no longer refuses the contract\'s own leg name',
+          'M3  same-session arm@K2 vs retref@K4            : NOT COMPUTABLE' not in out, True)
+
+    # An off-role K=4 leg still WINS the denominator when both are supplied, which keeps
+    # the historical number for a session that pairs its arm with an off-role reference.
+    # The two references carry DIFFERENT shares (0.75 vs 0.50) so the preference is
+    # observable in the value, not just in the label.
+    off_hi = write_trace(tmp, 'off-hi-K4.jsonl',
+                         [_start(0), _init(4), _fetch(0, 3072, 1024), _acct(), _end()])
+    code, out, err = _run(['--leg', 'arm=' + arm, '--leg', 'off=' + off_hi,
+                           '--leg', 'retref=' + ret4])
+    check('M3 prefers the off-role K=4 reference',
+          'M3  same-session arm@K2 vs off@K4' in out and '+0.0000' in out, True)
+    # and with only the K=2 baseline there is no K=4 reference at all
+    off_k2 = write_trace(tmp, 'off-K2only.jsonl',
+                         [_start(0), _init(2), _fetch(0, 2048, 2048), _acct(), _end()])
+    code, out, err = _run(['--leg', 'arm=' + arm, '--leg', 'off=' + off_k2])
+    check('M3 still NOT COMPUTABLE without any K=4 reference',
+          'M3  same-session arm@K2 vs retref@K4            : NOT COMPUTABLE' in out, True)
+    check('M3 not-computable message names both accepted roles',
+          'supplied as an `off` or a `retref` leg' in out, True)
 
     # ---- refusals: exit 2, no numbers --------------------------------------
     def refusal(name, argv_extra, code_want, marker, trace=None):
@@ -908,6 +1165,16 @@ def selftest():
                      _end()])
     refusal('cancel hook never fired', ['--leg', 'arm=' + p], EXIT_REFUSED,
             'cancel-hook-never-fired', p)
+
+    # 5b. a partial mode-2 admission schema is refused, not read as legacy
+    bad_admission = _json_drop(_spec(0, submitted=1, consumed=0, matched=0, cancelled=1,
+                                    gen=1, dem=0, cap=0, hist=(0, 0, 0, 0, 0, 0, 0, 0),
+                                    lead_min=0, lead_max=0, lead_sum=0, pending=0, ready_spec=0),
+                           ('candidate_ids',))
+    p = write_trace(tmp, 'arm-partial-admission.jsonl',
+                    [_start(1), _init(2), _fetch(0, 1, 1), bad_admission, _end()])
+    refusal('partial admission schema', ['--leg', 'arm=' + p], EXIT_REFUSED,
+            'spec-missing-admission-keys', p)
 
     # 6. an arm leg with no spec events at all
     p = write_trace(tmp, 'arm-silent.jsonl', [_start(1), _init(2), _fetch(0, 1, 1), _end()])
@@ -976,6 +1243,46 @@ def selftest():
     check('lead below floor exit code', code, EXIT_INVARIANT)
     check('lead below floor named', 'M7a' in out, True)
 
+    # P7: the new per-stage field is bounded and reconciles with the run total.
+    over_budget = write_trace(tmp, 'arm-over-budget.jsonl',
+                              [_start(1), _init(2), _fetch(0, 1, 1),
+                               _spec(0, submitted=9, total=9, consumed=2, matched=0, cancelled=7,
+                                     gen=7, dem=0, cap=0,
+                                     hist=(0, 2, 0, 0, 0, 0, 0, 0), lead_min=2, lead_max=2,
+                                     lead_sum=4, pending=0, ready_spec=0, budget=8),
+                               _end()])
+    code, out, err = _run(['--leg', 'arm=' + over_budget, '--leg', 'off=' + off])
+    check('P7 over-budget exit code', code, EXIT_INVARIANT)
+    check('P7 over-budget names the leg and counts',
+          'VERDICT: FAIL-INVARIANT (P7)' in out and 'max/stage 9 vs budget 8' in out, True)
+
+    sum_mismatch = write_trace(tmp, 'arm-stage-sum-mismatch.jsonl',
+                               [_start(1), _init(2), _fetch(0, 1, 1),
+                                _spec(0, submitted=4, total=5, consumed=2, matched=0, cancelled=2,
+                                      gen=2, dem=0, cap=0,
+                                      hist=(0, 2, 0, 0, 0, 0, 0, 0), lead_min=2, lead_max=2,
+                                      lead_sum=4, pending=0, ready_spec=0),
+                                _end()])
+    code, out, err = _run(['--leg', 'arm=' + sum_mismatch, '--leg', 'off=' + off])
+    check('P7 stage-sum mismatch exit code', code, EXIT_INVARIANT)
+    check('P7 stage-sum mismatch is named',
+          'VERDICT: FAIL-INVARIANT (P7)' in out and 'per-stage sum 4 vs total 5' in out, True)
+
+    legacy = write_trace(tmp, 'arm-legacy-cumulative.jsonl',
+                         [_start(1), _init(2), _fetch(0, 1, 1),
+                          _spec(0, submitted=4, consumed=2, matched=0, cancelled=2,
+                                gen=2, dem=0, cap=0, per_stage=False,
+                                hist=(0, 2, 0, 0, 0, 0, 0, 0), lead_min=2, lead_max=2,
+                                lead_sum=4, pending=0, ready_spec=0),
+                          _end()])
+    code, out, err = _run(['--leg', 'arm=' + legacy, '--leg', 'off=' + off])
+    check('legacy cumulative exit code', code, EXIT_OK)
+    check('legacy cumulative schema is named', 'arm=legacy-cumulative' in out, True)
+    check('legacy cumulative has no P7 evidence',
+          'P7  a stage issues within the budget        : no evidence' in out, True)
+    check('legacy cumulative still closes P2',
+          'P2  fill accounting closes                     : PASS' in out, True)
+
     # ---- emitter <-> checker schema (host-only, no GPU) --------------------
     keys = _emitter_keys()
     if keys is None:
@@ -986,6 +1293,10 @@ def selftest():
         check('every key the checker requires is emitted by tel_spec', missing, [])
         check('the emitter emits `cancelled` (the key the block names)', 'cancelled' in keys, True)
         check('the emitter emits the lead histogram', 'lead_hist' in keys, True)
+        check('the emitter emits the run total', 'submitted_total' in keys, True)
+        check('the emitter emits speculative fill ids', 'fill_ids' in keys, True)
+        missing_admission = [k for k in ADMISSION_REQUIRED if k not in keys]
+        check('every mode-2 admission key is emitted by tel_spec', missing_admission, [])
 
     # ---- real recorded traces: the off baseline must score -----------------
     # (host-only; absent in a clean checkout, in which case this case is skipped)
