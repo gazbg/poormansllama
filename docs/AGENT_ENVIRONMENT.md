@@ -738,38 +738,50 @@ ctx_shell allowlist extras. So `rg` is the COMPLETE, non-truncating search and
 `ctx_search` is the CONVENIENT, incomplete one — pick accordingly, and prefer `rg`
 whenever the answer could be in `docs/currentstate.md`.
 
-## Where current state lives (split 2026-09-18)
+## Where current state lives (resplit 2026-09-24)
 
-`docs/currentstate.md` is still the canonical current-state record, but it no longer holds every
-historical entry: on 2026-09-18 it reached 557,144 B and passed lean-ctx's per-file search cap,
-which made `ctx_search` skip it ENTIRELY while reporting "0 matches" (addendum H, fact 1), so
-the older entries were moved VERBATIM into contiguous shards.
+`docs/currentstate.md` remains the canonical current-state record, but it no longer
+holds every historical entry. The initial split on 2026-09-18 moved entries
+through 2026-09-16 into five contiguous shards after the file reached 557,144 B
+and became invisible to `ctx_search` (addendum H, fact 1). The 2026-09-24
+resplit applied the same rule to the entries added since then.
 
-| Part | Where | Size at split |
+| Part | Where | Size after resplit |
 | --- | --- | --- |
-| Recent entries (2026-09-17 .. 2026-09-18) | `docs/currentstate.md` | 102,470 B total |
-| 2026-08-18 .. 2026-09-16 | `docs/currentstate/*.md` (5 shards) | 26.7-147.0 KB each |
-| Index of every archived entry (date, shard, line) | `docs/currentstate.md` | 121 rows |
+| Recent dated entries (2026-09-23 .. 2026-09-24) | `docs/currentstate.md` | 25 entries |
+| Historical entries (2026-08-18 .. 2026-09-22) | `docs/currentstate/*.md` (11 shards) | 11.3-147.0 KB each |
+| Derived index of archived entries | `docs/currentstate.md` | 196 rows |
 | Live non-entry state ("Known gaps / risks", "Blocked / escalated") | `docs/currentstate.md` | bottom |
+| Complete live file after resplit | `docs/currentstate.md` | 149,123 B |
 
 Rules that follow:
 
-- **New entries are written exactly as before** — appended at the top of the "Recent entries"
-  block in `docs/currentstate.md`. The split changed where OLD entries live, nothing else.
-- **Find an older entry by its index row** in `docs/currentstate.md`, which gives
-  `<date> -- <shard>:<line>`; then read that window. `rg` across `docs/currentstate/` also works
-  and is the better tool when the date is unknown.
-- **The split is verifiable, not asserted.** `docs/currentstate/archive-manifest.json` records
-  the original sha256, every line range with its disposition, and the from-disk reconstruction
-  check: stripping the 8-line shard headers and concatenating preamble + recent + shards + tail
-  in ORIGINAL order reproduces the pre-split file byte-for-byte
-  (`8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4`, 557,144 B, PASS).
-- **Verification caveat, measured:** `git show HEAD:docs/currentstate.md` returns the
-  LF-normalised blob (550,051 B), NOT the CRLF working-tree bytes, because `core.autocrlf=true`.
-  A verbatim re-check must use the recorded sha256, or convert the blob to CRLF first (verified
-  to reproduce the original exactly).
-- **When a shard approaches the cap**, split it further by the same method and extend the
-  manifest; never reorder or reword existing entries.
+- **New entries go at the top of the `Recent entries` block** in `docs/currentstate.md`.
+  A later resplit may move OLD entries, but it never edits entry text in place.
+- **Find an older entry by its derived index row**, which gives
+  `<date> -- <shard>:<line> -- <entry>`. `rg` across `docs/currentstate/` is the
+  better tool when the date is unknown.
+- **Both splits are mechanically recorded.** The initial proof remains in
+  `docs/currentstate/archive-manifest.json`: it reconstructs the original 557,144 B
+  file byte-for-byte (`8d1c5e1be349f3e4b85540a695b24f68851b86cdbaf6db701a269a2c9d2c7ea4`).
+  The current resplit is `docs/currentstate/resplit-manifest-2026-09-24.json`: it records
+  the 402,485 B pre-resplit LF source hash
+  (`896b4a83f9fdffe3375013172df85b3ed2aac35e871c7c3fbc4ffb734faebcea`),
+  all 100 dated entry-body hashes, the six new per-day shard bodies, and the
+  disposition of the generated organization/index block.
+- **Verify from disk, not from memory:**
+  `python tools/resplit-currentstate.py --verify` re-hashes the five pre-existing
+  shards, all six new shard bodies and every apply-time entry body, checks that the
+  live Recent entries remain present and ordered, and re-derives all 196 index rows
+  from the shard files. The tool is wired into every non-GPU host suite.
+- **A failed apply can be rebuilt from the committed pre-split source:**
+  `python tools/resplit-currentstate.py --repair-from-git --git-ref <ref>` is allowed
+  only when the failed manifest's source hash matches that committed blob. This was
+  used once during the 2026-09-24 split after verification caught a dated-addendum
+  recognition bug and inconsistent trailing-blank hashing; the repaired result
+  passed before any acceptance claim.
+- **When a shard or the live file approaches the cap**, split again by the same
+  method and add a new manifest. Never reorder or silently reword existing entries.
 - **The cap is guarded, not remembered.** `tools/check-doc-sizes.py` (host-only, about a second,
   no GPU and no mutex) scans every tracked text file and FAILS LOUDLY (exit 1) when one reaches
   the fail band, naming the file, its size as a percentage of the band, and the split remedy.

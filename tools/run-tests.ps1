@@ -412,6 +412,25 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- current-state split integrity (host-only, <1s, no GPU, no mutex) ---------
+# The live current-state file is a recent-entry window plus a derived index.
+# Verify every archived entry body, every shard body and every index row from
+# disk; a split that cannot be checked is a hard host-suite failure.
+if (-not $spec.Gpu) {
+    $stateSplitTool = Join-Path $PSScriptRoot 'resplit-currentstate.py'
+    if (Test-Path -LiteralPath $stateSplitTool) {
+        Write-Host "[currentstate-split] verifying live entries, shard bodies and derived index..."
+        & python $stateSplitTool --verify
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: resplit-currentstate.py --verify exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[currentstate-split] FAILED: $stateSplitTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- plan split integrity (host-only, ~1s, no GPU, no mutex) -----------------
 # The live plan's header index is DERIVED from the archive, so a stale index or a
 # lost rules paragraph is a mechanical, checkable defect -- it happened once
