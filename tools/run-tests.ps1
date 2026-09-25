@@ -685,6 +685,22 @@ if (-not $spec.Gpu) {
     }
 }
 
+# --- T-GPLR-59 D1: proposed-token predictor replay (host-only, no GPU) ---
+if (-not $spec.Gpu) {
+    $d1Tool = Join-Path $PSScriptRoot 'tg59_d1.py'
+    if (Test-Path -LiteralPath $d1Tool) {
+        Write-Host "[tg59-d1] MTP proposed-token replay selftest (host-only fixtures)..."
+        & python $d1Tool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: tg59_d1.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[tg59-d1] FAILED: $d1Tool not found - this guard is REQUIRED." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # --- T-GPLR-58 mode-2 wiring: speculative fill-room bound (host-only, no GPU) --
 # The mode-2 wiring consumes the A1 proposer, but a speculative fill can only be
 # admitted when the row cache has room beyond the demand reserve. This analyzer

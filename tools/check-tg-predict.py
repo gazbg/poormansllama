@@ -249,7 +249,17 @@ def read_leg(path, role):
                                 raise ValueError('candidate_ids contains a non-integer')
                             if len(candidates) != int(d['prop']):
                                 raise ValueError('candidate_ids length does not match prop')
-                            if int(d['prop']) != int(d['arm_count']):
+                            # D1 aggregates one proposal list per draft token into
+                            # one unique generic `spec` event. `prop` is that exact
+                            # deduplicated event list; `arm_count` deliberately
+                            # remains the pre-dedup count used to match the null.
+                            # Every other mode-2 arm emits one list, for which the
+                            # historical equality remains mandatory.
+                            is_d1 = str((leg['start'] or {}).get('row_spec_arm', '')) == 'd1'
+                            if is_d1:
+                                if int(d['prop']) > int(d['arm_count']):
+                                    raise ValueError('D1 prop exceeds arm_count')
+                            elif int(d['prop']) != int(d['arm_count']):
                                 raise ValueError('prop does not match arm_count')
                             if len(candidates) != len(set(candidates)):
                                 raise ValueError('candidate_ids contains duplicates')
@@ -793,10 +803,56 @@ def run(argv):
     ap.add_argument('--session', default=None, help='label for the leg set (recorded in the report)')
     ap.add_argument('--json', dest='json_out', default=None, help='write the computed quantities as JSON')
     ap.add_argument('--selftest', action='store_true', help='run the host fixture suite (no GPU)')
+    ap.add_argument('--class', dest='trace_class', choices=('t58', 'D'), default='t58',
+                    help='trace verdict surface: t58 (default) or D (T-GPLR-59 D1 replay/D-gate)')
+    ap.add_argument('--d1-null', help='D-gate count-matched D1 null trace')
+    ap.add_argument('--frontier-arm', action='append', default=[], metavar='LABEL=PATH',
+                    help='D-gate past-only arm; repeat for every frontier family')
+    ap.add_argument('--frontier-null', action='append', default=[], metavar='LABEL=PATH',
+                    help='D-gate count-matched null paired with --frontier-arm')
     args = ap.parse_args(argv)
 
     if args.selftest:
+        if args.trace_class == 'D':
+            from tg59_d1 import selftest as d1_selftest
+            return d1_selftest()
         return selftest()
+
+    if args.trace_class == 'D':
+        from tg59_d1 import D1Refused, _labeled_paths, dgate, print_gate, print_result, replay
+        gate_requested = bool(args.d1_null or args.frontier_arm or args.frontier_null)
+        if gate_requested:
+            if len(args.trace) != 1 or args.leg or args.legs:
+                sys.stderr.write('REFUSED: the D-gate takes one --trace D1_ARM plus D-gate options only\n')
+                return EXIT_REFUSED
+            try:
+                arms = _labeled_paths(args.frontier_arm, '--frontier-arm')
+                nulls = _labeled_paths(args.frontier_null, '--frontier-null')
+                if not args.d1_null:
+                    raise D1Refused('missing-d1-null', 'the D-gate requires --d1-null')
+                result = dgate(args.trace[0], args.d1_null, arms, nulls)
+            except (D1Refused, OSError) as exc:
+                code = getattr(exc, 'code', 'io-error')
+                detail = getattr(exc, 'detail', str(exc))
+                sys.stderr.write('REFUSED (exit 2) [%s]: %s\n' % (code, detail))
+                return EXIT_REFUSED
+            print_gate(result)
+            if args.json_out:
+                with open(args.json_out, 'w', encoding='utf-8') as handle:
+                    json.dump(result, handle, indent=2, sort_keys=True)
+            return EXIT_OK if result['verdict'] == 'PASS' else EXIT_INVARIANT
+        if len(args.trace) != 1 or args.leg or args.legs:
+            sys.stderr.write('REFUSED: --class D takes exactly one --trace D1_JSONL and no T-GPLR-58 legs\n')
+            return EXIT_REFUSED
+        try:
+            result = replay(args.trace[0])
+        except (D1Refused, OSError) as exc:
+            code = getattr(exc, 'code', 'io-error')
+            detail = getattr(exc, 'detail', str(exc))
+            sys.stderr.write('REFUSED (exit 2) [%s]: %s\n' % (code, detail))
+            return EXIT_REFUSED
+        print_result(result)
+        return EXIT_OK
 
     pairs = []
     for spec in args.leg:
@@ -926,11 +982,13 @@ def _spec(layer, submitted, consumed, matched, cancelled, gen, dem, cap, refused
     return _ev(**d)
 
 
-def _start(role_mode=0):
+def _start(role_mode=0, arm=None):
     d = {'event': 'run_start', 'run_id': 1, 'arch': 'qwen35moe', 'n_layer': 40, 'rowset': 'on',
          'kv_cache': 'q8', 'schedule': 'layer-major'}
     if role_mode:
         d.update({'row_spec_mode': role_mode, 'row_spec_budget': 8, 'row_spec_reserve': 8})
+    if arm is not None:
+        d['row_spec_arm'] = arm
     return _ev(**d)
 
 
@@ -1165,6 +1223,26 @@ def selftest():
                      _end()])
     refusal('cancel hook never fired', ['--leg', 'arm=' + p], EXIT_REFUSED,
             'cancel-hook-never-fired', p)
+
+    # 5a. D1's generic per-layer event deduplicates candidates across draft
+    # tokens, while arm_count remains the pre-dedup null-match count. The
+    # checker must accept that declared asymmetry and still reject prop > count.
+    d1_ok = write_trace(tmp, 'd1-aggregate-ok.jsonl', [
+        _start(2, arm='d1'), _init(2), _fetch(0, 1, 1),
+        _spec(0, submitted=0, consumed=0, matched=0, cancelled=0, gen=0, dem=0,
+              cap=0, hist=(0, 0, 0, 0, 0, 0, 0, 0), lead_min=0, lead_max=0,
+              lead_sum=0, pending=0, ready_spec=0, candidate_ids=[1, 2],
+              prop=2, arm_count=3), _end()])
+    code, out, err = _run(['--leg', 'arm=' + d1_ok])
+    check('D1 aggregate candidates may be deduplicated below arm_count', code, EXIT_OK)
+    d1_bad = write_trace(tmp, 'd1-aggregate-bad.jsonl', [
+        _start(2, arm='d1'), _init(2), _fetch(0, 1, 1),
+        _spec(0, submitted=0, consumed=0, matched=0, cancelled=0, gen=0, dem=0,
+              cap=0, hist=(0, 0, 0, 0, 0, 0, 0, 0), lead_min=0, lead_max=0,
+              lead_sum=0, pending=0, ready_spec=0, candidate_ids=[1, 2],
+              prop=4, arm_count=3), _end()])
+    refusal('D1 aggregate prop cannot exceed arm_count', ['--leg', 'arm=' + d1_bad],
+            EXIT_REFUSED, 'spec-admission-invalid', d1_bad)
 
     # 5b. a partial mode-2 admission schema is refused, not read as legacy
     bad_admission = _json_drop(_spec(0, submitted=1, consumed=0, matched=0, cancelled=1,
