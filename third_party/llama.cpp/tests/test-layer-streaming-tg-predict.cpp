@@ -424,7 +424,49 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // ---------------------------------------------------------------- (iv) the planner
+    // ---------------------------------------------------------------- (iv) D1 draft token table
+    {
+        printf("\n(iv) D1 learns only from accepted draft-token pairs\n");
+        llama_ls_d1_state d1;
+        llama_ls_d1_init(&d1, 2, 16);
+        int32_t out[8];
+        const int32_t route_a[] = { 3, 1, 99, -1 };
+        const int32_t route_b[] = { 3, 3, 1 };
+        const int32_t route_c[] = { 3 };
+        check("an unseen D1 token publishes nothing", llama_ls_d1_predict(&d1, 7, 0, 8, out, 8) == 0);
+        llama_ls_d1_observe(&d1, 7, 0, false, route_a, 4);
+        check("a rejected D1 draft does not train the table", llama_ls_d1_predict(&d1, 7, 0, 8, out, 8) == 0);
+        llama_ls_d1_observe(&d1, 7, 0, true, route_a, 4);
+        llama_ls_d1_observe(&d1, 7, 0, true, route_b, 3);
+        llama_ls_d1_observe(&d1, 7, 0, true, route_c, 1);
+        const int n = llama_ls_d1_predict(&d1, 7, 0, 2, out, 8);
+        check("D1 ranks accepted counts then breaks ties by expert id", n == 2 && out[0] == 3 && out[1] == 1);
+        check("D1 is isolated by layer", llama_ls_d1_predict(&d1, 7, 1, 8, out, 8) == 0);
+        check("D1 obeys its prediction budget", llama_ls_d1_predict(&d1, 7, 0, 1, out, 8) == 1);
+        check("D1 pairing gate passes at three accepted rows", llama_ls_d1_pairing_valid(&d1));
+        llama_ls_d1_state sparse;
+        llama_ls_d1_init(&sparse, 1, 16);
+        llama_ls_d1_observe(&sparse, 1, 0, true, route_a, 4);
+        llama_ls_d1_observe(&sparse, 2, 0, false, route_a, 4);
+        check("D1 pairing gate refuses a below-60-percent stream", !llama_ls_d1_pairing_valid(&sparse));
+
+        int32_t experts[16];
+        uint8_t states[16];
+        for (int i = 0; i < 16; ++i) {
+            experts[i] = -1;
+            states[i] = LLAMA_LS_SPEC_FREE;
+        }
+        const llama_ls_propose_result d1_plan = llama_ls_spec_propose_d1(
+            &d1, 7, 0, 2, false, experts, states, 16, 0, 4, 0, nullptr, 16);
+        check("D1 feeds the shared proposal planner", d1_plan.n_arm_count == 2 && d1_plan.n_proposals == 2 &&
+              d1_plan.plan.n_issue == 2 && d1_plan.plan.issue[0] == 3 && d1_plan.plan.issue[1] == 1);
+        uint32_t null_rng = llama_ls_pred_null_seed();
+        const llama_ls_propose_result d1_null = llama_ls_spec_propose_d1(
+            &d1, 7, 0, 2, true, experts, states, 16, 0, 4, 0, &null_rng, 16);
+        check("D1 null is count-matched to the D1 arm", d1_null.n_arm_count == 2 && d1_null.n_proposals == 2);
+    }
+
+    // ---------------------------------------------------------------- (v) the planner
     {
         printf("\n(iv) the planner is pure and agrees with the admission rule\n");
         // budget-limited

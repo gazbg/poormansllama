@@ -44,6 +44,7 @@ struct ggml_tensor;
 // engine holds it behind a pointer so the module's own declaration order -- class
 // first, pure API after -- does not have to change for mode 2.
 struct llama_ls_pred_state;
+struct llama_ls_d1_state;
 
 // one immutable PP chunk descriptor for the layer-major schedule
 // (T-Q38CTX-01): the chunk's first token position and its real token count
@@ -1184,7 +1185,16 @@ struct LLAMA_API llama_layer_streaming {
     // identifiable from its own trace.
     int          row_set_spec_arm  = -1;     // llama_ls_pred_arm, or -1 = no proposer
     bool         row_set_spec_null = false;  // proposal source = the count-matched null
-    std::unique_ptr<llama_ls_pred_state> spec_pred;  // mode 2: allocated by set_row_set_spec_arm()
+    std::unique_ptr<llama_ls_pred_state> spec_pred;  // past-only mode 2: allocated by set_row_set_spec_arm()
+    // T-GPLR-59 D1: proposed-future source. It shares mode 2's placement state and
+    // planner, but owns a separate sparse table and publishes at the MTP
+    // pre-verify boundary rather than after a demand stage.
+    std::unique_ptr<llama_ls_d1_state> d1_state;
+    int          row_set_window_tokens = 1;  // target rows in one row-set demand (MTP: 1 + draft depth)
+    std::vector<std::vector<std::vector<int32_t>>> d1_last_routes; // [target row][layer]
+    std::vector<std::vector<std::vector<int32_t>>> d1_last_candidates; // [draft index][layer]
+    bool         d1_shape_emitted = false;
+    uint32_t     d1_round = 0;
     uint32_t     spec_null_rng     = 0;      // mode 2 + null: the xorshift state
     // Reported per stage by tel_spec(): what the SOURCE published, and -- for a null
     // leg -- the ARM's count it was matched to. Emitted so count-matching is
@@ -1196,6 +1206,12 @@ struct LLAMA_API llama_layer_streaming {
     // the model load; returns false with a structured error rather than silently
     // degrading to mode 0.
     bool set_row_set_spec(int mode, int budget, const std::string & script_path);
+
+    // Declare the number of target rows staged by one row-set demand. The
+    // ordinary TG path is one; MTP batch verify is 1 + the configured draft
+    // depth. Must be set before set_row_set_spec() so the demand reserve covers
+    // the full possible union.
+    bool set_row_set_window_tokens(int tokens);
 
     // MODE 2's own configuration, called after set_row_set_spec(2, ...) and
     // before begin_row_cache() allocates the cache: WHICH arm proposes and
@@ -1214,8 +1230,20 @@ struct LLAMA_API llama_layer_streaming {
     // trace's order, and are only ever passed AFTER that demand's own wait closed.
     void spec_issue_next(int il, const int32_t * demand_ids, int n_demand);
 
+    // T-GPLR-59 D1 engine wiring. The MTP runner calls d1_issue_preverify()
+    // after drafting and before target verification, then d1_observe_round()
+    // after the accept prefix is known. Publication uses the same real-cache
+    // planner/count-matched-null path as mode 2; observation learns accepted
+    // pairs only. Both methods fail loudly rather than falling back to a
+    // past-only proposal.
+    bool d1_issue_preverify(const std::vector<int32_t> & draft_tokens);
+    bool d1_observe_round(const std::vector<int32_t> & draft_tokens,
+                          const std::vector<uint8_t> & accepted);
+    void d1_emit_summary();
+
     // Issue ONE speculative fill, or refuse it with a reason (P3/P5).
     bool spec_issue_one(int il, int32_t expert, uint32_t generation, int64_t tick);
+    bool spec_ensure_events();
 
     // T-GPLR-58 A2 (M7): record the lead of one fill a DEMAND was served from,
     // and clear its issue ordinal. Returns false when the position holds no fill
@@ -1299,8 +1327,12 @@ struct LLAMA_API llama_layer_streaming {
     bool begin_row_pool();
     void end_row_pool();
 
-    // one `spec` event per demand stage while the mode is on
+    // one `spec` event per demand/pre-verify stage while the mode is on
     void tel_spec(int il, int pending_now, int ready_spec_now);
+    void tel_d1_shape();
+    void tel_d1_pair(int round, int draft_index, int32_t draft_token,
+                     int layer, bool accepted, const int32_t * ids, int n_ids,
+                     const int32_t * predicted, int n_predicted);
     // allocate the per-layer cache storage; called only when row_set_retain is
     // set, before any TG graph is built (the cache is not a graph tensor, but
     // a failed allocation must be loud at bring-up, never mid-generation).
@@ -1846,6 +1878,7 @@ enum llama_ls_pred_arm : uint8_t {
     LLAMA_LS_ARM_COACT  = 0, // unbarred co-activation, top-B
     LLAMA_LS_ARM_BAR09  = 1, // markov-1 ranked, published while 0.9^rank >= 0.5
     LLAMA_LS_ARM_FUSION = 2, // vote fusion over {history, markov-1, coact, coupling-copula}
+    LLAMA_LS_ARM_D1     = 3, // T-GPLR-59: MTP proposed-token table (not a past-only arm)
 };
 
 #define LLAMA_LS_PRED_MAX_OUT 64   // arms are never allowed to publish more than this
@@ -1882,6 +1915,29 @@ LLAMA_API int llama_ls_pred_arm_predict(const llama_ls_pred_state * st, int arm,
 
 // Fold one observed demand row into the state. Call AFTER predict() for it.
 LLAMA_API void llama_ls_pred_observe(llama_ls_pred_state * st, int layer, const int32_t * ids, int n_ids);
+
+// T-GPLR-59 D1: an online table keyed by the token proposed by the MTP drafter.
+// The table is deliberately separate from the past-token families: D1 is allowed
+// to use one proposed future token, while the existing state remains past-only.
+struct llama_ls_d1_entry {
+    int32_t expert = -1;
+    int32_t count  = 0;
+};
+
+struct llama_ls_d1_state {
+    int n_layer = 0;
+    int n_expert = 0;
+    uint64_t rows_seen = 0;
+    uint64_t accepted_rows = 0;
+    std::unordered_map<uint64_t, std::vector<llama_ls_d1_entry>> table;
+};
+
+LLAMA_API void llama_ls_d1_init(llama_ls_d1_state * st, int n_layer, int n_expert);
+LLAMA_API int llama_ls_d1_predict(const llama_ls_d1_state * st, int draft_token, int layer, int b,
+                                  int32_t * out, int max_out);
+LLAMA_API void llama_ls_d1_observe(llama_ls_d1_state * st, int draft_token, int layer, bool accepted,
+                                   const int32_t * ids, int n_ids);
+LLAMA_API bool llama_ls_d1_pairing_valid(const llama_ls_d1_state * st);
 
 // The structure-free null's fixed seed and its fill primitive: publish `count`
 // distinct ids from a xorshift32 over [0, n_expert). Returns how many were
@@ -1991,6 +2047,16 @@ LLAMA_API llama_ls_propose_result llama_ls_spec_propose(llama_ls_pred_state * st
                                                         const int32_t * experts, const uint8_t * states, int cap,
                                                         int reserve, int max_pending, int n_pending,
                                                         uint32_t * null_rng, int n_expert);
+
+// T-GPLR-59 D1: publish from the proposed-token table, then use the same planner
+// and count-matched-null path as the past-only proposer. The caller supplies the
+// current draft token and observes accepted target routes separately.
+LLAMA_API llama_ls_propose_result llama_ls_spec_propose_d1(const llama_ls_d1_state * d1,
+                                                         int draft_token, int layer, int b,
+                                                         bool null_source,
+                                                         const int32_t * experts, const uint8_t * states, int cap,
+                                                         int reserve, int max_pending, int n_pending,
+                                                         uint32_t * null_rng, int n_expert);
 
 // T-GPLR-36 follow-up (2026-09-18): HOST-memory instrument. The 200k ledger run
 // attributed the time residual but left one measured quantity unattributed: the

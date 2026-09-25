@@ -763,6 +763,93 @@ void llama_ls_pred_observe(llama_ls_pred_state * st, int layer, const int32_t * 
     }
 }
 
+static uint64_t ls_d1_key(int draft_token, int layer) {
+    return (uint64_t) (uint32_t) layer << 32 | (uint32_t) draft_token;
+}
+
+void llama_ls_d1_init(llama_ls_d1_state * st, int n_layer, int n_expert) {
+    if (st == nullptr) {
+        return;
+    }
+    st->n_layer = n_layer > 0 ? n_layer : 0;
+    st->n_expert = n_expert > 0 ? n_expert : 0;
+    st->rows_seen = 0;
+    st->accepted_rows = 0;
+    st->table.clear();
+}
+
+int llama_ls_d1_predict(const llama_ls_d1_state * st, int draft_token, int layer, int b,
+                       int32_t * out, int max_out) {
+    if (st == nullptr || out == nullptr || b <= 0 || max_out <= 0 ||
+        draft_token < 0 || layer < 0 || layer >= st->n_layer) {
+        return 0;
+    }
+    const auto it = st->table.find(ls_d1_key(draft_token, layer));
+    if (it == st->table.end()) {
+        return 0;
+    }
+    std::vector<llama_ls_d1_entry> ranked = it->second;
+    std::sort(ranked.begin(), ranked.end(), [](const llama_ls_d1_entry & a, const llama_ls_d1_entry & b) {
+        if (a.count != b.count) {
+            return a.count > b.count;
+        }
+        return a.expert < b.expert;
+    });
+    const int n = std::min<int>(b, std::min<int>(max_out, (int) ranked.size()));
+    for (int i = 0; i < n; ++i) {
+        out[i] = ranked[(size_t) i].expert;
+    }
+    return n;
+}
+
+void llama_ls_d1_observe(llama_ls_d1_state * st, int draft_token, int layer, bool accepted,
+                         const int32_t * ids, int n_ids) {
+    if (st == nullptr || draft_token < 0 || layer < 0 || layer >= st->n_layer) {
+        return;
+    }
+    ++st->rows_seen;
+    if (!accepted) {
+        return;
+    }
+    ++st->accepted_rows;
+    if (ids == nullptr || n_ids <= 0) {
+        return;
+    }
+    auto & entries = st->table[ls_d1_key(draft_token, layer)];
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t expert = ids[i];
+        if (expert < 0 || expert >= st->n_expert) {
+            continue;
+        }
+        bool duplicate_input = false;
+        for (int j = 0; j < i; ++j) {
+            if (ids[j] == expert) {
+                duplicate_input = true;
+                break;
+            }
+        }
+        if (duplicate_input) {
+            continue;
+        }
+        size_t found = entries.size();
+        for (size_t j = 0; j < entries.size(); ++j) {
+            if (entries[j].expert == expert) {
+                found = j;
+                break;
+            }
+        }
+        if (found == entries.size()) {
+            entries.push_back({expert, 1});
+        } else {
+            ++entries[found].count;
+        }
+    }
+}
+
+bool llama_ls_d1_pairing_valid(const llama_ls_d1_state * st) {
+    return st != nullptr && st->rows_seen > 0 && st->accepted_rows * 5 >= st->rows_seen * 3;
+}
+
 uint32_t llama_ls_pred_null_seed(void) {
     return 0x9E3779B9u;
 }
@@ -917,6 +1004,7 @@ static const char * ls_pred_arm_name(int arm) {
         case LLAMA_LS_ARM_COACT:  return "coact";
         case LLAMA_LS_ARM_BAR09:  return "bar09";
         case LLAMA_LS_ARM_FUSION: return "fusion";
+        case LLAMA_LS_ARM_D1:     return "d1";
         default:                  return "none";
     }
 }
@@ -1015,6 +1103,28 @@ llama_ls_propose_result llama_ls_spec_propose(llama_ls_pred_state * st, int arm,
     //    the pending cap decide how many proposals are admitted, and not one of them
     //    may displace a resident row (P5).
     r.plan = llama_ls_spec_plan(experts, states, cap, reserve, max_pending, n_pending, b, cand, r.n_proposals);
+    return r;
+}
+
+llama_ls_propose_result llama_ls_spec_propose_d1(const llama_ls_d1_state * d1,
+                                                  int draft_token, int layer, int b,
+                                                  bool null_source,
+                                                  const int32_t * experts, const uint8_t * states, int cap,
+                                                  int reserve, int max_pending, int n_pending,
+                                                  uint32_t * null_rng, int n_expert) {
+    llama_ls_propose_result r;
+    int32_t cand[LLAMA_LS_PRED_MAX_OUT];
+    r.n_arm_count = llama_ls_d1_predict(d1, draft_token, layer, b, cand, LLAMA_LS_PRED_MAX_OUT);
+    r.n_proposals = r.n_arm_count;
+    if (null_source) {
+        r.n_proposals = llama_ls_pred_null_fill(null_rng, n_expert, r.n_arm_count,
+                                                 cand, LLAMA_LS_PRED_MAX_OUT);
+    }
+    for (int i = 0; i < r.n_proposals; ++i) {
+        r.published[i] = cand[i];
+    }
+    r.plan = llama_ls_spec_plan(experts, states, cap, reserve, max_pending, n_pending,
+                                b, cand, r.n_proposals);
     return r;
 }
 
@@ -4288,6 +4398,9 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             ls->tel_error(ls->error_msg.c_str());
             return GGML_STATUS_FAILED;
         }
+        if (ls->row_set_spec_arm == LLAMA_LS_ARM_D1) {
+            ls->d1_last_routes.assign((size_t) ubatch.n_tokens, {});
+        }
 
         // F3/H8: time each part around the staging so the TG transfer term can
         // be attributed against real compute. setup_us is reset+alloc, compute_us
@@ -4357,8 +4470,23 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 ls->tel_error(ls->error_msg.c_str());
                 return GGML_STATUS_FAILED;
             }
+            if (ls->row_set_spec_arm == LLAMA_LS_ARM_D1) {
+                if (ids_per_token.size() != (size_t) ubatch.n_tokens) {
+                    ls->error_msg = "layer_streaming_compute: D1 route row count " +
+                                    std::to_string(ids_per_token.size()) + " != ubatch " +
+                                    std::to_string(ubatch.n_tokens);
+                    ls->failed = true;
+                    ls->tel_error(ls->error_msg.c_str());
+                    return GGML_STATUS_FAILED;
+                }
+                for (size_t t = 0; t < ids_per_token.size(); ++t) {
+                    ls->d1_last_routes[t].resize((size_t) ls->n_layer);
+                    ls->d1_last_routes[t][(size_t) il] = ids_per_token[t];
+                }
+            }
 
-            // the token-level union of routed experts (window W = 1 token;
+            // the token-level union of routed experts (the declared MTP width
+            // is the number of target rows in this ubatch);
             // ids_per_token has exactly one row here)
             std::vector<int32_t> union_ids;
             for (const auto & ids : ids_per_token) {
@@ -7670,6 +7798,19 @@ int llama_layer_streaming::spec_ready_of(int il) const {
 }
 
 
+bool llama_layer_streaming::set_row_set_window_tokens(int tokens) {
+    if (tokens < 1 || tokens > 256) {
+        error_msg = "set_row_set_window_tokens: width must be in [1,256]";
+        return false;
+    }
+    if (row_set_spec_mode != 0) {
+        error_msg = "set_row_set_window_tokens: must be called before set_row_set_spec()";
+        return false;
+    }
+    row_set_window_tokens = tokens;
+    return true;
+}
+
 bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::string & script_path) {
     if (mode == 0) {
         row_set_spec_mode = 0;
@@ -7681,6 +7822,11 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
         row_set_spec_arm  = -1;
         row_set_spec_null = false;
         spec_pred.reset();
+        d1_state.reset();
+        d1_last_routes.clear();
+        d1_last_candidates.clear();
+        d1_shape_emitted = false;
+        row_set_window_tokens = 1;
         return true;
     }
     if (mode != 1 && mode != 2) {
@@ -7721,7 +7867,13 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
         }
         row_set_spec_mode    = 2;
         row_set_spec_budget  = b;
-        row_set_spec_reserve = row_set_spec_pool > 0 ? 0 : top_k;
+        row_set_spec_reserve = row_set_spec_pool > 0 ? 0 : row_set_window_tokens * top_k;
+        if (row_set_spec_reserve > cap) {
+            error_msg = "set_row_set_spec: MTP row-set width " + std::to_string(row_set_window_tokens) +
+                        " needs reserve " + std::to_string(row_set_spec_reserve) +
+                        " but K=" + std::to_string(K) + " provides cap " + std::to_string(cap);
+            return false;
+        }
         row_set_spec_on      = true;
         row_set_spec_script.clear();
         spec_script.clear();
@@ -7825,10 +7977,36 @@ bool llama_layer_streaming::set_row_set_spec_arm(int arm, bool null_source) {
         error_msg = "set_row_set_spec_arm: called before the model is available";
         return false;
     }
-    if (arm < 0 || arm > LLAMA_LS_ARM_FUSION) {
+    if (arm < 0 || arm > LLAMA_LS_ARM_D1) {
         error_msg = "set_row_set_spec_arm: arm " + std::to_string(arm) +
-                    " is not one of the three pre-registered arms (0 = coact, 1 = bar09, 2 = fusion)";
+                    " is not one of coact, bar09, fusion or d1";
         return false;
+    }
+    if (arm == LLAMA_LS_ARM_D1) {
+        if (row_set_spec_pool > 0) {
+            error_msg = "set_row_set_spec_arm: D1 currently uses the real per-layer cache, not the separate prediction pool";
+            return false;
+        }
+        const int n_exp = (int) model_ref->hparams.n_expert;
+        const int top_k = (int) model_ref->hparams.n_expert_used;
+        const int k = row_set_retain_k < 1 ? 1 : row_set_retain_k;
+        const int cap = std::min(n_exp, k * top_k);
+        if (row_set_spec_reserve >= cap) {
+            error_msg = "set_row_set_spec_arm: D1 needs at least one free cache position beyond the declared target union (increase K)";
+            return false;
+        }
+        spec_pred.reset();
+        d1_state = std::make_unique<llama_ls_d1_state>();
+        llama_ls_d1_init(d1_state.get(), n_layer, n_exp);
+        row_set_spec_arm  = LLAMA_LS_ARM_D1;
+        row_set_spec_null = null_source;
+        spec_null_rng     = llama_ls_pred_null_seed();
+        spec_prop_last      = 0;
+        spec_arm_count_last = 0;
+        fprintf(stderr, "tg-spec (T-GPLR-59 D1): proposed-token source%s, %d layers x %d experts, MTP window %d\n",
+                null_source ? " with the COUNT-MATCHED NULL source" : "",
+                n_layer, n_exp, row_set_window_tokens);
+        return true;
     }
     // Only the families the arm READS are allocated -- except under the null, which
     // needs all of them: its count IS the arm's count, so the arm has to be computed
@@ -7844,6 +8022,7 @@ bool llama_layer_streaming::set_row_set_spec_arm(int arm, bool null_source) {
     const int n_exp = (int) model_ref->hparams.n_expert;
     spec_pred = std::make_unique<llama_ls_pred_state>();
     llama_ls_pred_init(spec_pred.get(), n_layer, n_exp, fam);
+    d1_state.reset();
     row_set_spec_arm    = arm;
     row_set_spec_null   = null_source;
     spec_null_rng       = llama_ls_pred_null_seed();
@@ -7854,6 +8033,159 @@ bool llama_layer_streaming::set_row_set_spec_arm(int arm, bool null_source) {
             fam, n_layer, n_exp,
             null_source ? " (the arm is still computed: it supplies the count)" : "");
     return true;
+}
+
+bool llama_layer_streaming::d1_issue_preverify(const std::vector<int32_t> & draft_tokens) {
+    if (row_set_spec_mode != 2 || row_set_spec_arm != LLAMA_LS_ARM_D1 || !d1_state) {
+        error_msg = "d1_issue_preverify: D1 source is not configured";
+        return false;
+    }
+    if (!row_set_active || !cache_active) {
+        error_msg = "d1_issue_preverify: row-set staging is not active";
+        return false;
+    }
+    if (draft_tokens.empty()) {
+        error_msg = "d1_issue_preverify: no MTP draft tokens";
+        return false;
+    }
+    if (backend_copy == nullptr || !spec_ensure_events()) {
+        if (error_msg.empty()) {
+            error_msg = "d1_issue_preverify: speculative copy backend is unavailable";
+        }
+        failed = true;
+        return false;
+    }
+
+    d1_last_routes.clear();
+    d1_last_candidates.assign(draft_tokens.size(), std::vector<std::vector<int32_t>>((size_t) n_layer));
+    ++d1_round;
+    const int n_exp = (int) model_ref->hparams.n_expert;
+    for (int il = 0; il < n_layer; ++il) {
+        spec_stage_submitted = 0;
+        spec_fills_last.clear();
+        spec_candidates_last.clear();
+        spec_skipped_present_last = 0;
+        spec_skipped_dup_last = 0;
+        spec_plan_refused_capacity_last = 0;
+        spec_plan_stop_last = LLAMA_LS_STOP_PROPOSALS;
+        spec_prop_last = 0;
+        spec_arm_count_last = 0;
+
+        // D1 is settled at this pre-verify boundary, so a completed round never
+        // leaves an event slot or a PENDING row for the coming demand.
+        spec_reap(il);
+        ++spec_calls[(size_t) il];
+        const int cap = (int) spec_state[(size_t) il].size();
+        for (size_t di = 0; di < draft_tokens.size(); ++di) {
+            const int32_t token = draft_tokens[di];
+            const llama_ls_propose_result pr = llama_ls_spec_propose_d1(
+                d1_state.get(), (int) token, il, row_set_spec_budget, row_set_spec_null,
+                cache_expert[(size_t) il].data(), spec_state[(size_t) il].data(), cap,
+                row_set_spec_reserve, row_set_spec_budget, spec_pending_of(il),
+                &spec_null_rng, n_exp);
+            spec_prop_last += pr.n_proposals;
+            spec_arm_count_last += pr.n_arm_count;
+            // The generic spec event is one aggregate list per layer/round.
+            // D1 has one proposal list per draft token, so the same expert can
+            // legitimately appear in more than one draft.  Emit the aggregate
+            // candidate set once; the per-draft exact proposals remain in
+            // d1_pair.predicted_ids and arm_count still records the total count
+            // used by the count-matched null.
+            for (int i = 0; i < pr.n_proposals; ++i) {
+                if (std::find(spec_candidates_last.begin(), spec_candidates_last.end(), pr.published[i]) == spec_candidates_last.end()) {
+                    spec_candidates_last.push_back(pr.published[i]);
+                }
+            }
+            d1_last_candidates[di][(size_t) il].assign(pr.published, pr.published + pr.n_proposals);
+            spec_skipped_present_last += pr.plan.skipped_present;
+            spec_skipped_dup_last += pr.plan.skipped_dup;
+            spec_plan_refused_capacity_last += pr.plan.refused_capacity;
+            spec_plan_stop_last = pr.plan.stop;
+            const uint32_t gen = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
+            for (int i = 0; i < pr.plan.n_issue; ++i) {
+                if (spec_issue_one(il, pr.plan.issue[i], gen, ++cache_tick)) {
+                    spec_fills_last.push_back(pr.plan.issue[i]);
+                }
+            }
+        }
+        // candidate_ids is the aggregate event's exact published set; D1's
+        // arm_count remains the pre-dedup count used for the matched null.
+        spec_prop_last = (int) spec_candidates_last.size();
+    }
+
+    // The D1 lead is a ROUND, not a layer stage. Complete the speculative copies
+    // here, before target verification starts, so no demand wait can include a
+    // speculative completion (P1 remains exactly zero for this source).
+    ls_stage_drain();
+    for (int il = 0; il < n_layer; ++il) {
+        spec_reap(il);
+        tel_spec(il, spec_pending_of(il), spec_ready_of(il));
+    }
+    if (failed) {
+        error_msg = "d1_issue_preverify: speculative issue or settle failed";
+        return false;
+    }
+    return true;
+}
+
+bool llama_layer_streaming::d1_observe_round(const std::vector<int32_t> & draft_tokens,
+                                             const std::vector<uint8_t> & accepted) {
+    if (!d1_state || draft_tokens.size() != accepted.size()) {
+        error_msg = "d1_observe_round: draft/acceptance shape mismatch";
+        return false;
+    }
+    if (d1_last_routes.size() != draft_tokens.size() + 1) {
+        error_msg = "d1_observe_round: captured target width " + std::to_string(d1_last_routes.size()) +
+                    " does not match frontier + drafts " + std::to_string(draft_tokens.size() + 1);
+        return false;
+    }
+    if (d1_last_candidates.size() != draft_tokens.size()) {
+        error_msg = "d1_observe_round: candidate capture width does not match drafts";
+        return false;
+    }
+    const int top_k = (int) model_ref->hparams.n_expert_used;
+    for (size_t j = 0; j < draft_tokens.size(); ++j) {
+        if (accepted[j] > 1) {
+            error_msg = "d1_observe_round: accepted flag is not boolean";
+            return false;
+        }
+        const bool is_accepted = accepted[j] != 0;
+        if (d1_last_routes[j + 1].size() != (size_t) n_layer ||
+            d1_last_candidates[j].size() != (size_t) n_layer) {
+            error_msg = "d1_observe_round: captured layer vectors do not match the layer count";
+            return false;
+        }
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & ids = d1_last_routes[j + 1][(size_t) il];
+            if ((int) ids.size() != top_k) {
+                error_msg = "d1_observe_round: target route width " + std::to_string(ids.size()) +
+                            " != top_k " + std::to_string(top_k) + " at layer " + std::to_string(il);
+                return false;
+            }
+            const auto & predicted = d1_last_candidates[j][(size_t) il];
+            tel_d1_pair((int) d1_round, (int) j, draft_tokens[j], il, is_accepted,
+                        ids.data(), (int) ids.size(), predicted.data(), (int) predicted.size());
+            llama_ls_d1_observe(d1_state.get(), (int) draft_tokens[j], il, is_accepted, ids.data(), (int) ids.size());
+        }
+    }
+    d1_last_routes.clear();
+    d1_last_candidates.clear();
+    return true;
+}
+
+void llama_layer_streaming::d1_emit_summary() {
+    if (!d1_state) {
+        return;
+    }
+    tel_write(tel_out,
+        "{\"event\":\"d1_summary\",\"run_id\":%llu,\"rounds\":%u,\"rows_seen\":%llu,"
+        "\"accepted_rows\":%llu,\"acceptance_rate\":%.6f,\"pairing_valid\":%s,\"t_us\":%lld}",
+        (unsigned long long) run_id, d1_round,
+        (unsigned long long) d1_state->rows_seen,
+        (unsigned long long) d1_state->accepted_rows,
+        d1_state->rows_seen > 0 ? (double) d1_state->accepted_rows / (double) d1_state->rows_seen : 0.0,
+        llama_ls_d1_pairing_valid(d1_state.get()) ? "true" : "false",
+        (long long) ggml_time_us());
 }
 
 void llama_layer_streaming::spec_reset() {
@@ -8117,6 +8449,27 @@ bool llama_layer_streaming::spec_note_lead(int il, int pos) {
 }
 
 
+bool llama_layer_streaming::spec_ensure_events() {
+    if (!row_set_spec_on || spec_ev.size() >= spec_state.size()) {
+        return true;
+    }
+    const ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
+    spec_ev.assign(spec_state.size(), {});
+    spec_ev_pos.assign(spec_state.size(), {});
+    for (size_t L = 0; L < spec_state.size(); ++L) {
+        spec_ev[L].assign((size_t) row_set_spec_budget, nullptr);
+        spec_ev_pos[L].assign((size_t) row_set_spec_budget, -1);
+        for (int s = 0; s < row_set_spec_budget; ++s) {
+            spec_ev[L][(size_t) s] = ggml_backend_event_new(dev_copy);
+            if (spec_ev[L][(size_t) s] == nullptr) {
+                error_msg = "spec_ensure_events: failed to create completion event for layer " + std::to_string(L);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, int n_demand) {
     if (!row_set_spec_on || il < 0 || (size_t) il >= spec_state.size()) {
         return;
@@ -8138,6 +8491,12 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
     // PENDING position resolves, and it runs after the demand's own wait has
     // closed, so a fill's completion can never extend a demand's stage wait.
     spec_reap(il);
+
+    if (row_set_spec_mode == 2 && row_set_spec_arm == LLAMA_LS_ARM_D1) {
+        // D1 publishes at the MTP pre-verify boundary and is settled there. The
+        // post-demand path must not silently fall back to a past-only proposer.
+        return;
+    }
 
     if (row_set_spec_pool > 0 && row_set_spec_mode == 2) {
         pool_submitted_last = 0;
@@ -8219,21 +8578,9 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
     }
 
     // lazy allocation of the per-layer event slots (one per budgeted fill)
-    if (spec_ev.size() < spec_state.size()) {
-        const ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
-        spec_ev.assign(spec_state.size(), {});
-        spec_ev_pos.assign(spec_state.size(), {});
-        for (size_t L = 0; L < spec_state.size(); ++L) {
-            spec_ev[L].assign((size_t) row_set_spec_budget, nullptr);
-            spec_ev_pos[L].assign((size_t) row_set_spec_budget, -1);
-            for (int s = 0; s < row_set_spec_budget; ++s) {
-                spec_ev[L][(size_t) s] = ggml_backend_event_new(dev_copy);
-                if (spec_ev[L][(size_t) s] == nullptr) {
-                    error_msg = "spec_issue_next: failed to create a completion event for layer " + std::to_string(L);
-                    return;
-                }
-            }
-        }
+    if (!spec_ensure_events()) {
+        failed = true;
+        return;
     }
 
     const int ord = ++spec_calls[(size_t) il];
@@ -8355,6 +8702,42 @@ void llama_layer_streaming::tel_spec(int il, int pending_now, int ready_spec_now
         (long long) ggml_time_us());
 }
 
+void llama_layer_streaming::tel_d1_shape() {
+    if (d1_shape_emitted || !d1_state) {
+        return;
+    }
+    d1_shape_emitted = true;
+    tel_write(tel_out,
+        "{\"event\":\"d1_shape\",\"run_id\":%llu,\"source\":\"d1\",\"n_expert\":%d,\"top_k\":%d,"
+        "\"window_tokens\":%d,\"draft_depth\":%d,\"budget\":%d,\"null\":%s,\"predicted_ids\":true,\"t_us\":%lld}",
+        (unsigned long long) run_id, d1_state->n_expert,
+        (int) model_ref->hparams.n_expert_used, row_set_window_tokens,
+        row_set_window_tokens > 0 ? row_set_window_tokens - 1 : 0,
+        row_set_spec_budget, row_set_spec_null ? "true" : "false",
+        (long long) ggml_time_us());
+}
+
+void llama_layer_streaming::tel_d1_pair(int round, int draft_index, int32_t draft_token,
+                                        int layer, bool accepted, const int32_t * ids, int n_ids,
+                                        const int32_t * predicted, int n_predicted) {
+    std::string id_list;
+    for (int i = 0; i < n_ids; ++i) {
+        id_list += (i ? "," : "");
+        id_list += std::to_string(ids[i]);
+    }
+    std::string predicted_list;
+    for (int i = 0; i < n_predicted; ++i) {
+        predicted_list += (i ? "," : "");
+        predicted_list += std::to_string(predicted[i]);
+    }
+    tel_write(tel_out,
+        "{\"event\":\"d1_pair\",\"run_id\":%llu,\"round\":%d,\"draft_index\":%d,"
+        "\"draft_token\":%d,\"layer\":%d,\"accepted\":%s,\"demand_ids\":[%s],"
+        "\"predicted_ids\":[%s],\"t_us\":%lld}",
+        (unsigned long long) run_id, round, draft_index, (int) draft_token, layer,
+        accepted ? "true" : "false", id_list.c_str(), predicted_list.c_str(), (long long) ggml_time_us());
+}
+
 bool llama_layer_streaming::begin_row_cache() {
     if (!row_set_retain) {
         return true; // default-off: nothing allocated, nothing reported
@@ -8375,6 +8758,10 @@ bool llama_layer_streaming::begin_row_cache() {
                     "(--residency-tg-spec-arm) before allocating the cache";
         return false;
     }
+    if (row_set_spec_arm == LLAMA_LS_ARM_D1 && !d1_state) {
+        error_msg = "begin_row_cache: D1 source is selected but its table was not configured";
+        return false;
+    }
 
     const ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
 
@@ -8385,6 +8772,12 @@ bool llama_layer_streaming::begin_row_cache() {
     // the telemetry validator (rowset_init window_tokens != 1 is an error), so
     // the window width is 1 by construction here.
     row_set_cap = std::min(n_exp, K * top_k);
+    if (row_set_window_tokens * top_k > row_set_cap) {
+        error_msg = "begin_row_cache: target row-set width " + std::to_string(row_set_window_tokens) +
+                    " needs capacity " + std::to_string(row_set_window_tokens * top_k) +
+                    " but K=" + std::to_string(K) + " provides " + std::to_string(row_set_cap);
+        return false;
+    }
 
     ggml_init_params meta_params = { (size_t) 4 * 1024 * 1024, nullptr, true };
     cache_meta = ggml_init(meta_params);
@@ -8562,9 +8955,12 @@ bool llama_layer_streaming::begin_row_set() {
     // T-GPLR-19: retain_k tells the validators which residency rule applies --
     // 0 is the reactive slot-keyed policy (unchanged), >0 switches them to the
     // per-layer conservation rule (residency is the layer's private cache).
-    tel_rowset_init((int) slots.size(), slot_bytes, /*window_tokens=*/1, n_exp,
+    tel_rowset_init((int) slots.size(), slot_bytes, row_set_window_tokens, n_exp,
                     (int) model_ref->hparams.n_expert_used,
                     row_set_retain ? row_set_retain_k : 0);
+    if (row_set_spec_arm == LLAMA_LS_ARM_D1 && !d1_shape_emitted) {
+        tel_d1_shape();
+    }
     return true;
 }
 

@@ -1746,16 +1746,10 @@ bool llama_context::layer_streaming_prebuild(const llama_batch & batch_inp, int6
     // graph shapes: n_kv is padded to n_ctx by n_pad).
     if (tg_tokens > 0) {
         const int n_widths = 1 + (int) cparams.n_rs_seq;
-        // T-GPLR-13: row-set TG keeps the plain width-1 prebuilt set (MUL_MAT_ID
-        // without the draft rows' changed selection shape). A draft head on this
-        // path would execute the two-part MoE graph at width > 1, which the
-        // reactive one-token window is not built for: refuse before any build.
-        if (ls->row_set_requested && n_widths > 1) {
-            LLAMA_LOG_ERROR("%s: row-set TG requires a width-1 TG set (n_rs_seq %u; disable --mtp)\n",
-                            __func__, (unsigned) cparams.n_rs_seq);
-            ret = GGML_STATUS_FAILED;
-            return false;
-        }
+        // T-GPLR-13/T-GPLR-59: the functional two-part row-set graph is
+        // width-generic. Past-only mode-2 arms use the same executor and issue
+        // after each target demand stage; D1 alone publishes at the earlier MTP
+        // pre-verify boundary. Neither distinction changes graph construction.
         // each variant's apply leaves its cells in the memory module until the
         // final clear(false), so every successive apply must start strictly
         // after the previous one's last position (X < Y contiguity check)

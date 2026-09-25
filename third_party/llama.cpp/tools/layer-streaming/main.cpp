@@ -67,9 +67,9 @@ static void usage(const char * prog) {
         "  --handoff-partial N   T-GPLR-16: NCMOE-style partial handoff (migrate banks il >= N; first N\n"
         "                         layers' expert banks stay host-resident for mixed-placement TG)\n"
         "  --residency-tg       T-GPLR-13: moe-row-set TG policy -- stage only the deduplicated routed\n"
-        "                         expert ROWS each token's router selects (reactive; requires\n"
-        "                         --residency moe-expert-bank and --tg-tokens > 0; incompatible with\n"
-        "                         --handoff*/--mtp; emits rowset_* telemetry)\n"
+        "                         expert ROWS each target row's router selects (reactive; requires\n"
+        "                         --residency moe-expert-bank and --tg-tokens > 0; MTP verify\n"
+        "                         widths are supported; emits rowset_* telemetry)\n"
         "  --residency-tg-spec <0|1|2>\n"
         "                       T-GPLR-58: speculative placement of GUESSED expert rows on the\n"
         "                         retention path (requires --residency-tg-retain). 0 = off (default),\n"
@@ -78,9 +78,9 @@ static void usage(const char * prog) {
         "                         A guessed row is claimed resident only after its own copy\n"
         "                         completes, demands never wait on it, and a demand's capacity is\n"
         "                         never taken (emits spec telemetry)\n"
-        "  --residency-tg-spec-arm <coact|bar09|fusion>\n"
-        "                       T-GPLR-58 A1: which of the three pre-registered arms proposes\n"
-        "                         (mode 2 only; required, so a leg always names its own arm)\n"
+        "  --residency-tg-spec-arm <coact|bar09|fusion|d1>\n"
+        "                       T-GPLR-58 A1: which past-only arm proposes, or T-GPLR-59 D1's\n"
+        "                         MTP proposed-token table (mode 2 only; d1 requires --mtp)\n"
         "  --residency-tg-spec-null <0|1>\n"
         "                       T-GPLR-58 A1: replace the arm's PROPOSALS with the count-matched\n"
         "                         structure-free null (mode 2 only). The arm is still computed: it\n"
@@ -1261,7 +1261,7 @@ static int check_telemetry(const std::string & path) {
     // requires a generation bump; coverage resets when the owner changes).
     bool rowset_mode = false;
     bool rowset_ever = false;          // any rowset_* event seen (default-off immunity)
-    long long rowset_n_expert = -1, rowset_top_k = -1;
+    long long rowset_n_expert = -1, rowset_top_k = -1, rowset_window_tokens = 1;
     struct rowset_slot_state {
         long long gen = -1;          // generation the coverage was counted for
         long long owner = -1;        // last layer staged on this slot
@@ -1697,9 +1697,9 @@ static int check_telemetry(const std::string & path) {
             if (!f || rowset_top_k <= 0) {
                 err("rowset_init missing valid top_k");
             }
-            const long long wt = json::integer(line, "window_tokens", &f);
-            if (f && wt != 1) {
-                err("rowset_init window_tokens != 1 (W>1 is not implemented)");
+            rowset_window_tokens = json::integer(line, "window_tokens", &f);
+            if (!f || rowset_window_tokens < 1) {
+                err("rowset_init missing valid window_tokens");
             }
             // T-GPLR-19: 0/absent = reactive slot-keyed policy (unchanged);
             // >0 declares per-layer retention at that K
@@ -1737,9 +1737,17 @@ static int check_telemetry(const std::string & path) {
                                                   nret, bs, bank)) {
                 err(pe.c_str());
             }
-            // W=1 identity (schema 4.2): top-k of distinct indices per token.
-            if (rowset_top_k >= 0 && ru != rowset_top_k) {
-                err("rowset_fetch route_union != top_k at W=1");
+            // The union is top-k for W=1, and at most W*top-k for an MTP verify
+            // window (duplicates across target rows can make it smaller).
+            if (rowset_top_k >= 0 && rowset_window_tokens >= 1) {
+                const long long max_union = std::min(rowset_n_expert,
+                                                      rowset_window_tokens * rowset_top_k);
+                const bool valid_union = rowset_window_tokens == 1
+                    ? ru == rowset_top_k
+                    : ru >= 1 && ru <= max_union;
+                if (!valid_union) {
+                    err("rowset_fetch route_union outside declared window*top_k bound");
+                }
             }
             // accounting identity (schema 4.3): n_rows_resident is real-cache only.
             if (ru != nf + nr + pool_rows) {
@@ -2269,7 +2277,7 @@ static int validate_telemetry(const std::string & path) {
     // coverage for the generation-lifecycle rule.
     bool rowset_mode = false;
     bool rowset_ever = false;          // any rowset_* event seen (default-off immunity)
-    long long rowset_n_expert = -1, rowset_top_k = -1;
+    long long rowset_n_expert = -1, rowset_top_k = -1, rowset_window_tokens = 1;
     struct rowset_slot_state {
         long long gen = -1;
         long long owner = -1;
@@ -2591,8 +2599,8 @@ static int validate_telemetry(const std::string & path) {
                 if (!f || rowset_top_k <= 0) err("rowset_init missing valid top_k");
                 // same rule as check_telemetry: the two validators must stay
                 // identical on rowset events (T-GPLR-13 validator parity)
-                const long long wt = json::integer(line, "window_tokens", &f);
-                if (f && wt != 1) err("rowset_init window_tokens != 1 (W>1 is not implemented)");
+                rowset_window_tokens = json::integer(line, "window_tokens", &f);
+                if (!f || rowset_window_tokens < 1) err("rowset_init missing valid window_tokens");
                 // T-GPLR-19: 0/absent = reactive slot-keyed policy (unchanged)
                 rowset_retain_k = json::integer(line, "retain_k", &f);
                 if (f && rowset_retain_k < 0) err("rowset_init retain_k must not be negative");
@@ -2622,8 +2630,15 @@ static int validate_telemetry(const std::string & path) {
                                                       nret, bs, bank)) {
                     err(pe.c_str());
                 }
-                if (rowset_top_k >= 0 && ru != rowset_top_k) {
-                    err("rowset_fetch route_union != top_k at W=1");
+                if (rowset_top_k >= 0 && rowset_window_tokens >= 1) {
+                    const long long max_union = std::min(rowset_n_expert,
+                                                          rowset_window_tokens * rowset_top_k);
+                    const bool valid_union = rowset_window_tokens == 1
+                        ? ru == rowset_top_k
+                        : ru >= 1 && ru <= max_union;
+                    if (!valid_union) {
+                        err("rowset_fetch route_union outside declared window*top_k bound");
+                    }
                 }
                 if (ru != nf + nr + pool_rows) {
                     err("rowset_fetch route_union != real fetched + real resident + pool hits");
@@ -3348,8 +3363,9 @@ int main(int argc, char ** argv) {
             if      (arm_name == "coact")  { residency_tg_spec_arm = 0; }
             else if (arm_name == "bar09")  { residency_tg_spec_arm = 1; }
             else if (arm_name == "fusion") { residency_tg_spec_arm = 2; }
+            else if (arm_name == "d1")     { residency_tg_spec_arm = 3; }
             else {
-                fprintf(stderr, "error: --residency-tg-spec-arm expects coact, bar09 or fusion (got \"%s\")\n",
+                fprintf(stderr, "error: --residency-tg-spec-arm expects coact, bar09, fusion or d1 (got \"%s\")\n",
                         arm_name.c_str());
                 return 2;
             }
@@ -3993,7 +4009,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if (!forced_off && residency_tg_spec == 2 && residency_tg_spec_arm < 0) {
-        fprintf(stderr, "error: --residency-tg-spec 2 needs --residency-tg-spec-arm <coact|bar09|fusion> "
+        fprintf(stderr, "error: --residency-tg-spec 2 needs --residency-tg-spec-arm <coact|bar09|fusion|d1> "
                         "(a mode-2 run with no proposer is refused rather than run: an arm that proposes "
                         "nothing on purpose and an arm that was never configured must not look alike)\n");
         return 2;
@@ -4018,6 +4034,19 @@ int main(int argc, char ** argv) {
     if (!forced_off && residency_tg_spec_pool != 0 && residency_tg_spec_budget == 0) {
         residency_tg_spec_budget = 12;
     }
+    if (!forced_off && residency_tg_spec_arm == 3 && !mtp) {
+        fprintf(stderr, "error: --residency-tg-spec-arm d1 requires --mtp (D1 is keyed by the token proposed by the MTP draft head)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec_arm == 3 && residency_tg_spec_pool != 0) {
+        fprintf(stderr, "error: --residency-tg-spec-arm d1 currently uses the real per-layer cache; drop --residency-tg-spec-pool\n");
+        return 2;
+    }
+    if (!forced_off && mtp && residency_tg && residency_tg_spec_arm == 3 && residency_tg_retain < 2 + mtp_draft) {
+        fprintf(stderr, "error: MTP D1 --residency-tg requires --residency-tg-retain >= %d (the %d-row target union plus one free speculative position per layer)\n",
+                2 + mtp_draft, 1 + mtp_draft);
+        return 2;
+    }
     if (!forced_off && residency_tg_spec != 2 && residency_tg_spec_arm >= 0) {
         fprintf(stderr, "error: --residency-tg-spec-arm is only meaningful with --residency-tg-spec 2 "
                         "(mode 1 proposes from its script)\n");
@@ -4036,10 +4065,6 @@ int main(int argc, char ** argv) {
     if (!forced_off && residency_tg_spec == 0 && residency_tg_spec_budget != 0) {
         fprintf(stderr, "error: --residency-tg-spec-budget is only meaningful with --residency-tg-spec "
                         "(got budget %d with the mode off)\n", residency_tg_spec_budget);
-        return 2;
-    }
-    if (!forced_off && residency_tg && mtp) {
-        fprintf(stderr, "error: --residency-tg is incompatible with --mtp (MTP batch verify needs width > 1 TG sets; row-set TG is width-1 only)\n");
         return 2;
     }
     // T-GPLR-16: the split point must name real trunk layers.
@@ -4658,6 +4683,11 @@ int main(int argc, char ** argv) {
     // mid-generation. The refusal goes out as a structured run refusal, like the
     // row-cache refusals below.
     if (residency_tg_spec != 0) {
+        if (!ls.set_row_set_window_tokens(mtp ? 1 + mtp_draft : 1)) {
+            fprintf(stderr, "error: row-set window configuration refused: %s\n", ls.error_msg.c_str());
+            ls.tel_run_refused("rowset_window_config", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
         if (!ls.set_row_set_spec(residency_tg_spec, residency_tg_spec_budget, residency_tg_spec_script)) {
             fprintf(stderr, "error: speculative TG placement refused: %s\n", ls.error_msg.c_str());
             ls.tel_run_refused("tg_spec_config", ls.error_msg.c_str(), 1, 0, 0, "none");
@@ -5689,6 +5719,21 @@ int main(int argc, char ** argv) {
                 }
                 batch.n_tokens = rmax;
 
+                // T-GPLR-59 D1: the draft head has produced the proposed
+                // futures, so publish their table rows BEFORE target decode.
+                // The engine settles these copies before returning; no demand
+                // wait can cover a speculative completion.
+                if (residency_tg_spec_arm == 3) {
+                    std::vector<int32_t> d1_tokens(draft.begin(), draft.end());
+                    if (!ls.d1_issue_preverify(d1_tokens)) {
+                        fprintf(stderr, "error: D1 pre-verify publication failed: %s\n", ls.error_msg.c_str());
+                        ls.tel_rowset_refused(0, 0, 0, "d1_preverify", ls.error_msg.c_str());
+                        ls.failed = true;
+                        exit_status = 1;
+                        break;
+                    }
+                }
+
                 const int ret = llama_decode(ctx, batch);
                 if (ret != 0) {
                     fprintf(stderr, "error: MTP batch verify decode failed with %d: %s\n", ret, ls.error_msg.c_str());
@@ -5749,6 +5794,21 @@ int main(int argc, char ** argv) {
                     A = j + 1;
                 }
                 const int committed = std::min(A, tg_tokens - g0);
+
+                if (residency_tg_spec_arm == 3) {
+                    std::vector<uint8_t> d1_accepted((size_t) nd, 0);
+                    for (int j = 0; j < nd && j < committed - 1; ++j) {
+                        d1_accepted[(size_t) j] = gold[j] == draft[j] ? 1 : 0;
+                    }
+                    std::vector<int32_t> d1_tokens(draft.begin(), draft.end());
+                    if (!ls.d1_observe_round(d1_tokens, d1_accepted)) {
+                        fprintf(stderr, "error: D1 route observation failed: %s\n", ls.error_msg.c_str());
+                        ls.tel_rowset_refused(0, 0, 0, "d1_observe", ls.error_msg.c_str());
+                        ls.failed = true;
+                        exit_status = 1;
+                        break;
+                    }
+                }
 
                 for (int j = 0; j < committed; ++j) {
                     generated.push_back(gold[j]);
@@ -5850,10 +5910,10 @@ int main(int argc, char ** argv) {
                         memcpy(dbatch.embd + (size_t) n_rows * n_embd_out, h, row_bytes);
                         n_rows++;
                     }
-                    if (exit_status != 0) {
-                        break;
-                    }
-                    dbatch.n_tokens = n_rows;
+                if (exit_status != 0) {
+                    break;
+                }
+                dbatch.n_tokens = n_rows;
                     const int mrc = llama_decode(ctx_dft, dbatch);
                     if (mrc != 0) {
                         fprintf(stderr, "error: MTP batch mirror fill failed (%d)\n", mrc);
@@ -5960,6 +6020,10 @@ int main(int argc, char ** argv) {
         // T-Q38HG-02: tear down the handoff buffer after TG completes
         if (handoff && exit_status == 0) {
             ls.end_handoff();
+        }
+
+        if (residency_tg_spec_arm == 3 && exit_status == 0) {
+            ls.d1_emit_summary();
         }
 
         // T-GPLR-13: deactivate row-set staging and free the row-set buffers
