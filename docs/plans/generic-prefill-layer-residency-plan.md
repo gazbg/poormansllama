@@ -2970,7 +2970,7 @@ companion to it, not a second mechanism); T-GPLR-19 (the row cache and the K lad
 classes feed); the MTP draft head (T-GPLR-12 / T-Q38HG-06: `--mtp`, `--mtp-draft`, the `mtp`
 telemetry event) for class D; the recorded model inventory `build/llama-cuda/q36-moe-inventory.json`
 for the shape facts below. Not blocking: T-GPLR-53/T-GPLR-56 (untouched).
-Commit: nested e62b32427 (shared prediction-pool/validator substrate); class-D/E experiment implementation and its verdict commit remain unfilled.
+Commit: nested e62b32427 + outer 31b07ab (shared prediction-pool/validator substrate); class-D/E experiment implementation and its verdict commit remain unfilled.
 
 Goal. Answer the two questions T-GPLR-58 deliberately leaves out, each with a gate that can
 FAIL on its own terms: (D) does a predictor that reads a PROPOSED FUTURE - the tokens the MTP
@@ -4115,7 +4115,7 @@ Result (2026-09-24, host-only, no GPU/model run): implemented as `tools/analyze-
 
 ### T-GPLR-60 (draft, planning only): context-conditioned, miss-aware, cost-aware prediction research
 
-Status: CLOSED (owner decision, 2026-09-25; host-only G0/G1 complete; STOP). G2/G3 are not authorized and this predictor family is not advanced. Commit: nested e62b32427 (shared substrate); outer closure commit pending; scientific result already complete. Dependencies: T-GPLR-58/T-GPLR-59 evidence, the recorded Qwen3.6 demand stream, and the existing host replay; this block does not supersede the T-GPLR-59 MTP/hidden-state draft.
+Status: CLOSED (owner decision, 2026-09-25; host-only G0/G1 complete; STOP). G2/G3 are not authorized and this predictor family is not advanced. Commit: nested e62b32427 + outer 31b07ab (shared substrate and closure metadata); scientific result already complete. Dependencies: T-GPLR-58/T-GPLR-59 evidence, the recorded Qwen3.6 demand stream, and the existing host replay; this block does not supersede the T-GPLR-59 MTP/hidden-state draft.
 
 Goal. Test whether a predictor can improve as generated-token history accumulates by predicting only cache misses, conditioning on the current request/layer state, and charging for wasted prefetch. The falsifiable hypothesis is that a context-conditioned miss predictor beats an equal-row retention-only cache and a count-matched null on marginal miss hits without reducing net throughput; a failure is a useful stop result.
 
