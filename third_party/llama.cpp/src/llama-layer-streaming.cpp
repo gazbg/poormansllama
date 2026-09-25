@@ -8149,7 +8149,6 @@ bool llama_layer_streaming::d1_observe_round(const std::vector<int32_t> & draft_
             error_msg = "d1_observe_round: accepted flag is not boolean";
             return false;
         }
-        const bool is_accepted = accepted[j] != 0;
         if (d1_last_routes[j + 1].size() != (size_t) n_layer ||
             d1_last_candidates[j].size() != (size_t) n_layer) {
             error_msg = "d1_observe_round: captured layer vectors do not match the layer count";
@@ -8162,6 +8161,12 @@ bool llama_layer_streaming::d1_observe_round(const std::vector<int32_t> & draft_
                             " != top_k " + std::to_string(top_k) + " at layer " + std::to_string(il);
                 return false;
             }
+        }
+    }
+    for (size_t j = 0; j < draft_tokens.size(); ++j) {
+        const bool is_accepted = accepted[j] != 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & ids = d1_last_routes[j + 1][(size_t) il];
             const auto & predicted = d1_last_candidates[j][(size_t) il];
             tel_d1_pair((int) d1_round, (int) j, draft_tokens[j], il, is_accepted,
                         ids.data(), (int) ids.size(), predicted.data(), (int) predicted.size());
@@ -8220,6 +8225,11 @@ void llama_layer_streaming::spec_reset() {
     // the proposer's own state is large (n_layer x n_expert^2 per family table):
     // the run is over, so it is released rather than kept for a later run
     spec_pred.reset();
+    d1_state.reset();
+    d1_last_routes.clear();
+    d1_last_candidates.clear();
+    d1_shape_emitted = false;
+    d1_round = 0;
     spec_null_rng         = 0;
     spec_stage_submitted  = 0;
     spec_fills_last.clear();
@@ -8709,8 +8719,8 @@ void llama_layer_streaming::tel_d1_shape() {
     d1_shape_emitted = true;
     tel_write(tel_out,
         "{\"event\":\"d1_shape\",\"run_id\":%llu,\"source\":\"d1\",\"n_expert\":%d,\"top_k\":%d,"
-        "\"window_tokens\":%d,\"draft_depth\":%d,\"budget\":%d,\"null\":%s,\"predicted_ids\":true,\"t_us\":%lld}",
-        (unsigned long long) run_id, d1_state->n_expert,
+        "\"n_layer\":%d,\"window_tokens\":%d,\"draft_depth\":%d,\"budget\":%d,\"null\":%s,\"predicted_ids\":true,\"t_us\":%lld}",
+        (unsigned long long) run_id, d1_state->n_expert, (int) model_ref->hparams.n_layer(),
         (int) model_ref->hparams.n_expert_used, row_set_window_tokens,
         row_set_window_tokens > 0 ? row_set_window_tokens - 1 : 0,
         row_set_spec_budget, row_set_spec_null ? "true" : "false",
