@@ -1122,6 +1122,185 @@ int main() {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // T-GPLR-59: the separate prediction-pool policy. This is deliberately
+    // host-only: it proves cross-pool duplicate suppression and READY-only
+    // replacement without a CUDA allocation or a model.
+    printf("\nT-GPLR-59 - separate prediction pool policy\n");
+    {
+        const int cap = 12;
+        ggml_init_params meta = { 1024u * 1024u, nullptr, true };
+        ggml_context * ctx = ggml_init(meta);
+        ggml_tensor * qrow = ctx ? ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_K, 256, 3, 16, 1) : nullptr;
+        const size_t slab = llama_ls_expert_slab_bytes(GGML_TYPE_Q4_K, 256, 3);
+        check("pool slab arithmetic preserves the exact quantized Q4_K bytes", [&] {
+            return ctx != nullptr && qrow != nullptr && slab > 0 && slab * 16 == ggml_nbytes(qrow);
+        }());
+        if (ctx) {
+            ggml_free(ctx);
+        }
+        int32_t real[4] = { 100, -1, -1, -1 };
+        uint8_t real_st[4] = { LLAMA_LS_SPEC_READY, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE };
+        int32_t pool[12];
+        uint8_t pool_st[12];
+        int64_t pool_r[12];
+        for (int p = 0; p < cap; ++p) {
+            pool[p] = -1;
+            pool_st[p] = LLAMA_LS_SPEC_FREE;
+            pool_r[p] = -1;
+        }
+        int32_t props[13] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1 };
+        llama_ls_pool_plan p = llama_ls_pool_plan_make(real, real_st, 4, pool, pool_st, pool_r, cap, 256, 12, props, 13);
+        check("12 positions admit 12 distinct proposals", p.n_issue == 12 && p.refused_capacity == 0);
+        check("a duplicate inside one publication is skipped", p.skipped_dup == 1);
+
+        int32_t over[13] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+        const llama_ls_pool_plan budget = llama_ls_pool_plan_make(
+            real, real_st, 4, pool, pool_st, pool_r, cap, 256, 12, over, 13);
+        check("a 13th admissible publication is refused by the 12-item budget", [&] {
+            return budget.n_issue == 12 && budget.refused_budget == 1 && budget.stop == 1;
+        }());
+        const int32_t invalid[3] = { -1, 12, 13 };
+        const llama_ls_pool_plan invalid_plan = llama_ls_pool_plan_make(
+            real, real_st, 4, pool, pool_st, pool_r, cap, 12, 12, invalid, 3);
+        check("negative and out-of-range expert ids are skipped as invalid", [&] {
+            return invalid_plan.n_issue == 0 && invalid_plan.skipped_invalid == 3;
+        }());
+
+        pool[0] = 1; pool_st[0] = LLAMA_LS_SPEC_READY; pool_r[0] = 20;
+        pool[1] = 2; pool_st[1] = LLAMA_LS_SPEC_PENDING; pool_r[1] = 21;
+        check("real, prediction-pool, and duplicate skips have separate reasons", [&] {
+            const int32_t x[4] = { 100, 1, 2, 3 };
+            const llama_ls_pool_plan q = llama_ls_pool_plan_make(real, real_st, 4, pool, pool_st, pool_r, cap, 256, 12, x, 4);
+            return q.n_issue == 1 && q.issue[0] == 3 &&
+                   q.skipped_real == 1 && q.skipped_pool == 2 && q.skipped_dup == 0;
+        }());
+        check("a repeat is duplicate even when the first copy was already skipped", [&] {
+            // Own pool arrays: the shared fixture pool already holds experts 1
+            // and 2, and plan_make checks the pool BEFORE the real cache, so the
+            // first copy must live in `already` alone to land on skipped_real.
+            const int32_t already[1] = { 1 };
+            uint8_t already_st[1] = { LLAMA_LS_SPEC_READY };
+            int32_t solo_pool[2] = { -1, -1 };
+            uint8_t solo_st[2] = { LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE };
+            int64_t solo_r[2] = { -1, -1 };
+            const int32_t repeated[3] = { 1, 1, 3 };
+            const llama_ls_pool_plan q = llama_ls_pool_plan_make(
+                already, already_st, 1, solo_pool, solo_st, solo_r, 2, 256, 12, repeated, 3);
+            return q.n_issue == 1 && q.issue[0] == 3 && q.skipped_real == 1 && q.skipped_dup == 1;
+        }());
+
+        const int32_t real_ready[4] = { 7, -1, -1, -1 };
+        const uint8_t real_ready_st[4] = { LLAMA_LS_SPEC_READY, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE };
+        const int32_t real_pending[4] = { 8, -1, -1, -1 };
+        const uint8_t real_pending_st[4] = { LLAMA_LS_SPEC_PENDING, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE, LLAMA_LS_SPEC_FREE };
+        const int32_t one[1] = { 7 };
+        const int32_t two[1] = { 8 };
+        check("a proposal in real READY is skipped", llama_ls_pool_plan_make(
+            real_ready, real_ready_st, 4, pool, pool_st, pool_r, cap, 256, 12, one, 1).skipped_real == 1);
+        check("a proposal in real PENDING is skipped", llama_ls_pool_plan_make(
+            real_pending, real_pending_st, 4, pool, pool_st, pool_r, cap, 256, 12, two, 1).skipped_real == 1);
+
+        // A READY pool row is replaceable; PENDING is not. Use a fresh policy
+        // view so the fixture state is not mutated by the pure function.
+        for (int p = 0; p < cap; ++p) {
+            pool[p] = 100 + p;
+            pool_st[p] = LLAMA_LS_SPEC_READY;
+            pool_r[p] = p;
+        }
+        const int32_t fresh = 99;
+        const llama_ls_pool_plan ready = llama_ls_pool_plan_make(real, real_st, 4, pool, pool_st, pool_r, cap, 256, 1, &fresh, 1);
+        check("a full pool evicts its oldest READY row", ready.n_issue == 1 && ready.evicted == 1 && ready.issue_pos[0] == 0);
+        for (int p = 0; p < cap; ++p) {
+            pool_st[p] = LLAMA_LS_SPEC_PENDING;
+        }
+        const llama_ls_pool_plan pending = llama_ls_pool_plan_make(real, real_st, 4, pool, pool_st, pool_r, cap, 256, 1, &fresh, 1);
+        check("a full all-PENDING pool refuses without a wait", pending.n_issue == 0 && pending.refused_capacity == 1 && pending.stop == 2);
+
+        int32_t lifecycle[3] = { 4, 5, -1 };
+        uint8_t lifecycle_st[3] = { LLAMA_LS_SPEC_PENDING, LLAMA_LS_SPEC_PENDING, LLAMA_LS_SPEC_FREE };
+        int64_t lifecycle_r[3] = { 1, 2, -1 };
+        uint32_t lifecycle_g[3] = { 7, 7, 0 };
+        check("PENDING demand is reported, not served", [&] {
+            const llama_ls_pool_lookup q = llama_ls_pool_lookup_expert(
+                lifecycle, lifecycle_st, lifecycle_g, 3, 7, 4);
+            return q.ready_pos < 0 && q.pending_pos == 0;
+        }());
+        check("PENDING demand fallback is marked cancelled without a completion wait", [&] {
+            llama_ls_pool_lookup q = llama_ls_pool_lookup_expert(
+                lifecycle, lifecycle_st, lifecycle_g, 3, 7, 4);
+            if (q.pending_pos != 0) {
+                return false;
+            }
+            lifecycle_st[0] = LLAMA_LS_SPEC_CANCELLED;
+            q = llama_ls_pool_lookup_expert(lifecycle, lifecycle_st, lifecycle_g, 3, 7, 4);
+            return q.ready_pos < 0 && q.pending_pos < 0 && lifecycle[0] == 4;
+        }());
+        check("stale READY cannot satisfy the current generation", [&] {
+            lifecycle_st[0] = LLAMA_LS_SPEC_READY;
+            lifecycle_g[0] = 6;
+            const llama_ls_pool_lookup q = llama_ls_pool_lookup_expert(
+                lifecycle, lifecycle_st, lifecycle_g, 3, 7, 4);
+            return q.ready_pos < 0 && q.stale_pos == 0;
+        }());
+        lifecycle_st[0] = LLAMA_LS_SPEC_READY;
+        lifecycle_g[0] = 7;
+        // A second row for the SAME demanded expert (4): with both a current
+        // READY row and a PENDING duplicate present, the lookup must select the
+        // READY row and report the PENDING one so the demand serves without
+        // cancelling anything. Position 1 keeps its bytes for the phase-cancel
+        // check below.
+        lifecycle[1] = 4;
+        lifecycle_st[1] = LLAMA_LS_SPEC_PENDING;
+        lifecycle_g[1] = 7;
+        check("READY demand selects exactly one current row", [&] {
+            const llama_ls_pool_lookup q = llama_ls_pool_lookup_expert(
+                lifecycle, lifecycle_st, lifecycle_g, 3, 7, 4);
+            return q.ready_pos == 0 && q.pending_pos == 1;
+        }());
+        check("READY demand retires exactly one completed pool row", llama_ls_pool_retire_ready(
+            lifecycle, lifecycle_st, lifecycle_r, lifecycle_g, 3, 7, 0) &&
+            lifecycle[0] == -1 && lifecycle_st[0] == LLAMA_LS_SPEC_FREE);
+        check("phase cancellation marks PENDING without releasing bytes", [&] {
+            const int n = llama_ls_pool_cancel_pending(lifecycle_st, 3);
+            return n == 1 && lifecycle_st[1] == LLAMA_LS_SPEC_CANCELLED && lifecycle[1] == 4;
+        }());
+        // Keep the other positions occupied as well. The preceding check
+        // deliberately freed position 0; a FREE position would correctly admit
+        // the new proposal, so make it an event-owned CANCELLED position too.
+        lifecycle[0] = 9;
+        lifecycle_st[0] = LLAMA_LS_SPEC_CANCELLED;
+        lifecycle_r[0] = 4;
+        lifecycle[2] = 8;
+        lifecycle_st[2] = LLAMA_LS_SPEC_CANCELLED;
+        lifecycle_r[2] = 3;
+        check("a cancelled row stays occupied until its completion event", [&] {
+            const llama_ls_pool_plan plan = llama_ls_pool_plan_make(real, real_st, 4, lifecycle, lifecycle_st,
+                                                                     lifecycle_r, 3, 256, 1, &fresh, 1);
+            return plan.n_issue == 0 && plan.stop == 2;
+        }());
+        check("completion releases CANCELLED and READY is consumable only for its generation", [&] {
+            lifecycle_st[1] = LLAMA_LS_SPEC_CANCELLED;
+            const int complete = llama_ls_pool_complete(lifecycle, lifecycle_st, lifecycle_r,
+                                                        lifecycle_g, 3, 1);
+            return complete == 2 && lifecycle[1] == -1 && lifecycle_st[1] == LLAMA_LS_SPEC_FREE;
+        }());
+        check("a new generation clears old READY rows but marks PENDING rows cancelled", [&] {
+            int32_t gen_expert[3] = { 5, 6, 7 };
+            uint8_t gen_state[3] = { LLAMA_LS_SPEC_READY, LLAMA_LS_SPEC_PENDING, LLAMA_LS_SPEC_READY };
+            int64_t gen_recency[3] = { 1, 2, 3 };
+            uint32_t gen_generation[3] = { 1, 1, 2 };
+            const int changed = llama_ls_pool_begin_generation(gen_expert, gen_state, gen_recency,
+                                                                 gen_generation, 3, 2);
+            const bool current_pending_stays = llama_ls_pool_begin_generation(
+                gen_expert, gen_state, gen_recency, gen_generation, 3, 2) == 0 &&
+                gen_state[1] == LLAMA_LS_SPEC_CANCELLED;
+            return changed == 2 && gen_expert[0] == -1 && gen_state[0] == LLAMA_LS_SPEC_FREE &&
+                   gen_state[1] == LLAMA_LS_SPEC_CANCELLED && gen_expert[2] == 7 &&
+                   gen_state[2] == LLAMA_LS_SPEC_READY && current_pending_stays;
+        }());
+    }
+
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

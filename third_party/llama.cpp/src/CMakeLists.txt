@@ -69,7 +69,10 @@ endif()
 
 # private research: experimental CUDA-only layer streaming (default OFF)
 if (LLAMA_LAYER_STREAMING)
-    target_sources(llama PRIVATE llama-layer-streaming.cpp)
+    target_sources(llama PRIVATE
+        llama-layer-streaming.cpp
+        llama-layer-streaming-pool.cpp
+    )
     # T-GPLR-36 follow-up: the host-memory sampler is a separate TU because it
     # needs <windows.h> (min/max/small macros) and llama-layer-streaming.cpp
     # uses std::min/std::max and locals named `small`.

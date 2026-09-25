@@ -20,6 +20,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-layer-streaming.h"
+#include "telemetry-json.h"
+#include "telemetry-pool.h"
 
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -36,6 +38,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace json = ls_json;
 
 static void usage(const char * prog) {
     fprintf(stderr,
@@ -81,8 +85,13 @@ static void usage(const char * prog) {
         "                       T-GPLR-58 A1: replace the arm's PROPOSALS with the count-matched\n"
         "                         structure-free null (mode 2 only). The arm is still computed: it\n"
         "                         supplies the count the null is matched to (default 0)\n"
+        "  --residency-tg-spec-pool N\n"
+        "                       T-GPLR-59: separate prediction-only row pool with N positions per\n"
+        "                         logical layer (first arm: 12). Requires mode 2; 0 = off.\n"
+        "                         READY predictions may serve exact demand; PENDING never waits.\n"
         "  --residency-tg-spec-budget N\n"
-        "                       T-GPLR-58 A0: max pending speculative fills per layer (default: top_k)\n"
+        "                       T-GPLR-58 A0: max pending speculative fills per layer (default: top_k;\n"
+        "                         the first T-GPLR-59 pool arm uses 12)\n"
         "  --residency-tg-spec-script <path>\n"
         "                       T-GPLR-58 A0: the scripted sequence, one line per entry:\n"
         "                         <layer> <ordinal> <expert> [<expert> ...]\n"
@@ -655,94 +664,6 @@ static void ls_vram_budget_refresh(llama_ls_vram_budget & b, int device) {
 // --check-telemetry: host-side JSONL scheduler-invariant validator (no GPU)
 // ---------------------------------------------------------------------------
 
-static std::string json_str(const std::string & line, const char * key) {
-    const std::string pat = std::string("\"") + key + "\":";
-    const size_t pos = line.find(pat);
-    if (pos == std::string::npos) {
-        return "";
-    }
-    size_t s = pos + pat.size();
-    while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) {
-        s++;
-    }
-    if (s < line.size() && line[s] == '"') {
-        s++;
-        size_t e = s;
-        while (e < line.size() && line[e] != '"') {
-            e++;
-        }
-        return line.substr(s, e - s);
-    }
-    size_t e = s;
-    while (e < line.size() && line[e] != ',' && line[e] != '}') {
-        e++;
-    }
-    return line.substr(s, e - s);
-}
-
-// T-GPLR-58: a JSON array of non-negative integers, e.g. the `fill_ids` a `spec` event
-// carries. `*found` distinguishes an absent key from a present empty array, which the
-// retention cache model needs: an empty array means the stage issued nothing, an absent
-// key means the trace predates the field.
-static std::vector<long long> json_int_list(const std::string & line, const char * key, bool * found) {
-    std::vector<long long> out;
-    const std::string pat = std::string("\"") + key + "\":[";
-    const size_t pos = line.find(pat);
-    if (pos == std::string::npos) {
-        if (found) {
-            *found = false;
-        }
-        return out;
-    }
-    if (found) {
-        *found = true;
-    }
-    size_t s = pos + pat.size();
-    while (s < line.size()) {
-        while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) {
-            s++;
-        }
-        if (s >= line.size() || line[s] == ']') {
-            break;
-        }
-        bool neg = false;
-        if (line[s] == '-') {
-            neg = true;
-            s++;
-        }
-        if (s >= line.size() || line[s] < '0' || line[s] > '9') {
-            break; // not an integer array: stop, the caller sees what was parsed
-        }
-        long long v = 0;
-        while (s < line.size() && line[s] >= '0' && line[s] <= '9') {
-            v = v * 10 + (line[s] - '0');
-            s++;
-        }
-        out.push_back(neg ? -v : v);
-        while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) {
-            s++;
-        }
-        if (s < line.size() && line[s] == ',') {
-            s++;
-        }
-    }
-    return out;
-}
-
-static long long json_ll(const std::string & line, const char * key, bool * found) {
-    const std::string v = json_str(line, key);
-    if (v.empty()) {
-        if (found) {
-            *found = false;
-        }
-        return 0;
-    }
-    if (found) {
-        *found = true;
-    }
-    return atoll(v.c_str());
-}
-
 // T-GPLR-10: runner-captured expected handoff migrate event values for the
 // in-process trace self-check (captured right after begin_handoff succeeds;
 // 0 = no expectation, e.g. standalone --check-telemetry PATH runs).
@@ -755,7 +676,7 @@ static long long g_check_handoff_bytes = 0;
 // (duplicate run_start, run_end required, phase aggregates) stays with each
 // validator.
 static bool ls_line_is_off_audit(const std::string & line) {
-    return json_str(line, "policy") == "off" || json_str(line, "residency") == "off";
+    return json::value(line, "policy") == "off" || json::value(line, "residency") == "off";
 }
 
 // run_start metadata rule: pp/tg/ctx must be present and sane in off audit
@@ -763,9 +684,9 @@ static bool ls_line_is_off_audit(const std::string & line) {
 // lambda).
 static void ls_check_off_run_start(const std::string & line, int line_no, const char * tag, int & errors) {
     bool found = false;
-    const long long pp_m = json_ll(line, "pp_tokens", &found);
-    const long long tg_m = json_ll(line, "tg_tokens", &found);
-    const long long ctx_m = json_ll(line, "ctx_size", &found);
+    const long long pp_m = json::integer(line, "pp_tokens", &found);
+    const long long tg_m = json::integer(line, "tg_tokens", &found);
+    const long long ctx_m = json::integer(line, "ctx_size", &found);
     if (!found || pp_m <= 0 || tg_m < 0 || ctx_m <= 0) {
         fprintf(stderr, "%s: line %d: off run_start missing valid pp_tokens/tg_tokens/ctx_size\n", tag, line_no);
         errors++;
@@ -850,13 +771,13 @@ struct ls_retention_model {
 static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const std::string & line) {
     std::vector<std::string> out;
     bool have_layer = false;
-    const long long layer = json_ll(line, "layer", &have_layer);
+    const long long layer = json::integer(line, "layer", &have_layer);
     if (!have_layer || layer < 0) {
         out.push_back("spec missing layer");
         return out;
     }
     bool have_fills = false;
-    const std::vector<long long> fills = json_int_list(line, "fill_ids", &have_fills);
+    const std::vector<long long> fills = json::integer_list(line, "fill_ids", &have_fills);
 
     // Mode 2 admission telemetry is additive: older traces have no candidate_ids and
     // remain replayable only through their legacy path. A trace with any new field must
@@ -876,10 +797,10 @@ static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const
             }
         }
         bool have_candidates = false;
-        const std::vector<long long> candidates = json_int_list(line, "candidate_ids", &have_candidates);
+        const std::vector<long long> candidates = json::integer_list(line, "candidate_ids", &have_candidates);
         bool have_stop = false;
-        const long long stop = json_ll(line, "stop", &have_stop);
-        const std::string stop_reason = json_str(line, "stop_reason");
+        const long long stop = json::integer(line, "stop", &have_stop);
+        const std::string stop_reason = json::value(line, "stop_reason");
         if (have_candidates && have_stop) {
             if (stop < 0 || stop > 4) {
                 out.push_back("spec admission stop is outside the planner enum");
@@ -893,7 +814,7 @@ static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const
                 out.push_back("spec admission stop_reason does not match stop");
             }
             bool have_prop = false;
-            const long long prop = json_ll(line, "prop", &have_prop);
+            const long long prop = json::integer(line, "prop", &have_prop);
             if (!have_prop || prop != (long long) candidates.size()) {
                 out.push_back("spec candidate_ids length does not match prop");
             }
@@ -906,7 +827,7 @@ static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const
             }
         }
         if (have_fills) {
-            const long long submitted = json_ll(line, "submitted", nullptr);
+            const long long submitted = json::integer(line, "submitted", nullptr);
             if (submitted != (long long) fills.size()) {
                 out.push_back("spec fill_ids length does not match submitted");
             }
@@ -924,8 +845,8 @@ static std::vector<std::string> ls_spec_errors(ls_retention_model & model, const
         // `submitted` is PER-STAGE since T-GPLR-58 A2, so only a positive `submitted_total`
         // (or a pre-A2 cumulative `submitted`) proves fills were issued at all. The reap still
         // happened either way, so the layer stays staged.
-        const long long submitted = json_ll(line, "submitted", nullptr);
-        const long long total     = json_ll(line, "submitted_total", nullptr);
+        const long long submitted = json::integer(line, "submitted", nullptr);
+        const long long total     = json::integer(line, "submitted_total", nullptr);
         if (submitted > 0 || total > 0) {
             model.unreplayable = true;
             model.unreplayable_stages++;
@@ -959,6 +880,7 @@ static std::vector<std::string> ls_retention_errors(
         ls_retention_model & model,
         long long layer, long long generation, long long phase,
         long long route_union, long long n_rows_resident,
+        const std::vector<long long> & pool_hit_ids,
         const std::string & ids, long long n_retained, long long n_retired,
         long long retain_k, long long n_expert, long long top_k) {
     std::vector<std::string> out;
@@ -1019,6 +941,7 @@ static std::vector<std::string> ls_retention_errors(
     //    superseded. Eviction never displaces a row this window needs, so this is also the
     //    reported resident count both before and after the eviction step below.
     long long resident = 0;
+    std::unordered_set<long long> resident_ids;
     for (long long x : uniq) {
         auto it = model.rows.find(layer_hi | (long long) (unsigned) x);
         if (it == model.rows.end()) {
@@ -1026,8 +949,14 @@ static std::vector<std::string> ls_retention_errors(
         }
         if (llama_ls_spec_is_hit(it->second.spec_state)) {
             ++resident;
+            resident_ids.insert(x);
         } else if (it->second.spec_state == LLAMA_LS_SPEC_PENDING) {
             it->second.spec_state = LLAMA_LS_SPEC_CANCELLED; // demand duplicate
+        }
+    }
+    for (long long id : pool_hit_ids) {
+        if (resident_ids.count(id)) {
+            out.push_back("rowset_fetch reports a pool hit for an id already resident in the real cache");
         }
     }
     long long occupied = 0;
@@ -1036,7 +965,7 @@ static std::vector<std::string> ls_retention_errors(
             ++occupied; // physical occupancy: an in-flight fill holds its position
         }
     }
-    const long long need = (long long) uniq.size() - resident;
+    const long long need = (long long) uniq.size() - resident - (long long) pool_hit_ids.size();
 
     // 2. recency eviction, BEFORE placement -- the same rule the runtime applies, so the
     //    trace cannot describe a cache the runtime could not have held: a speculative row is
@@ -1081,6 +1010,9 @@ static std::vector<std::string> ls_retention_errors(
     std::vector<long long> asc = uniq;
     std::sort(asc.begin(), asc.end());
     for (long long x : asc) {
+        if (std::find(pool_hit_ids.begin(), pool_hit_ids.end(), x) != pool_hit_ids.end()) {
+            continue; // a pool hit is temporary slot input, never real-cache retention
+        }
         const long long k = layer_hi | (long long) (unsigned) x;
         auto it = model.rows.find(k);
         if (it != model.rows.end() && it->second.spec_state == LLAMA_LS_SPEC_CANCELLED) {
@@ -1174,13 +1106,21 @@ static std::vector<std::string> ls_retention_errors(
 // field without the other is rejected, since that is a half-migrated producer.
 static std::vector<std::string> ls_byte_account_errors(
         long long bounded, long long residency_budget_mib,
-        bool have_row_cache, long long row_cache, bool have_cap, long long cap) {
+        bool have_row_cache, long long row_cache,
+        bool have_prediction_pool, long long prediction_pool,
+        bool have_cap, long long cap) {
     std::vector<std::string> out;
-    if (!have_row_cache) {
+    if (!have_row_cache && !have_prediction_pool) {
         return out; // pre-field trace
     }
+    if (have_row_cache && row_cache < 0) {
+        out.push_back("byte_account: row_cache must not be negative");
+    }
+    if (have_prediction_pool && prediction_pool <= 0) {
+        out.push_back("byte_account: prediction_pool must be positive when present");
+    }
     if (!have_cap) {
-        out.push_back("byte_account: row_cache present without residency_cap");
+        out.push_back("byte_account: cache bytes present without residency_cap");
         return out;
     }
     // The cap field must be the flag it claims to be, in bytes; 0 means the run
@@ -1189,8 +1129,10 @@ static std::vector<std::string> ls_byte_account_errors(
     if (cap != expect_cap) {
         out.push_back("byte_account: residency_cap != --residency-budget-mib in bytes");
     }
-    if (cap > 0 && bounded + row_cache > cap) {
-        out.push_back("byte_account: bounded residency + row_cache exceeds the total residency cap");
+    const long long cache_bytes = (have_row_cache ? row_cache : 0) +
+                                  (have_prediction_pool ? prediction_pool : 0);
+    if (cap > 0 && bounded + cache_bytes > cap) {
+        out.push_back("byte_account: bounded residency + real cache + prediction pool exceeds the total residency cap");
     }
     return out;
 }
@@ -1267,13 +1209,13 @@ static bool ls_parse_run_refused(const std::string & event, const std::string & 
         return false;
     }
     f.saw = true;
-    f.reason = json_str(line, "reason");
-    f.detail = json_str(line, "detail");
-    f.cap    = json_str(line, "cap_source");
+    f.reason = json::value(line, "reason");
+    f.detail = json::value(line, "detail");
+    f.cap    = json::value(line, "cap_source");
     bool found = false;
-    f.exit_status   = json_ll(line, "exit_status", &found);
-    f.bytes_needed  = json_ll(line, "bytes_needed", &found);
-    f.bytes_allowed = json_ll(line, "bytes_allowed", &found);
+    f.exit_status   = json::integer(line, "exit_status", &found);
+    f.bytes_needed  = json::integer(line, "bytes_needed", &found);
+    f.bytes_allowed = json::integer(line, "bytes_allowed", &found);
     f.reason_ok = ls_run_refusal_reason_ok(f.reason);
     return true;
 }
@@ -1331,6 +1273,7 @@ static int check_telemetry(const std::string & path) {
     // T-GPLR-58: the per-layer retention cache model (rows, recency, and the staged
     // speculative fills of the `spec` events that precede each rowset_fetch).
     ls_retention_model rowset_retention;
+    ls_pool_validator pool_validator;
     long long rowset_rounds = 0;
     // T-GPLR-19: byte_account's row_cache figure, held until rowset_init has
     // been read so the record can be tied to the policy it claims.
@@ -1384,28 +1327,34 @@ static int check_telemetry(const std::string & path) {
             continue;
         }
 
-        const std::string event = json_str(line, "event");
+        const std::string event = json::value(line, "event");
         if (event == "run_start") {
+            if (have_run_start) {
+                err("duplicate run_start");
+            }
             // T-GPLR-05: `--residency off` emits an audit record (policy
             // "off") with run metadata only; the streaming-scheduler fields
             // (n_slots/n_layer/schedule) are absent by design. Fork the
             // validation per trace class instead of erroring on the schema.
             const bool off_audit = ls_line_is_off_audit(line);
             bool found = false;
-            n_slots = (int) json_ll(line, "n_slots", &found);
+            n_slots = (int) json::integer(line, "n_slots", &found);
             if (!off_audit && (!found || n_slots <= 0)) {
                 err("run_start missing valid n_slots");
             }
-            n_layer = (int) json_ll(line, "n_layer", &found);
+            n_layer = (int) json::integer(line, "n_layer", &found);
             if (!off_audit && (!found || n_layer <= 0)) {
                 err("run_start missing valid n_layer");
             }
-            schedule = json_str(line, "schedule");
+            for (const auto & pe : pool_validator.run_start_errors(line)) {
+                err(pe.c_str());
+            }
+            schedule = json::value(line, "schedule");
             if (off_audit) {
                 off_audit_trace = true;
                 ls_check_off_run_start(line, line_no, "check-telemetry", errors);
             }
-            const long long chunk_stride = json_ll(line, "telemetry_chunk_stride", &found);
+            const long long chunk_stride = json::integer(line, "telemetry_chunk_stride", &found);
             if (found && chunk_stride <= 0) {
                 err("run_start has invalid telemetry_chunk_stride");
             } else if (found) {
@@ -1416,11 +1365,11 @@ static int check_telemetry(const std::string & path) {
             // are validated when present, so a run can be classified as
             // explicit-vs-defaulted from the trace alone (AC5); traces from
             // before this key existed stay admissible.
-            const long long pbp = json_ll(line, "pp_prebuild_per_pass", &found);
+            const long long pbp = json::integer(line, "pp_prebuild_per_pass", &found);
             if (found && (pbp < 0 || pbp > 1)) {
                 err("run_start has invalid pp_prebuild_per_pass");
             }
-            const std::string pbp_src = json_str(line, "pp_prebuild_per_pass_source");
+            const std::string pbp_src = json::value(line, "pp_prebuild_per_pass_source");
             if (!pbp_src.empty() && pbp_src != "explicit" && pbp_src != "default") {
                 err("run_start has invalid pp_prebuild_per_pass_source");
             }
@@ -1429,13 +1378,13 @@ static int check_telemetry(const std::string & path) {
             // traces; when present, a 0 match is FATAL - a run must never
             // carry a staging_source that disagrees with its label (the F5
             // concern, now enforceable from the trace alone).
-            const std::string stage_src = json_str(line, "staging_source");
+            const std::string stage_src = json::value(line, "staging_source");
             if (!stage_src.empty()) {
                 if (stage_src != "direct" && stage_src != "pinned" &&
                     stage_src != "mmap-registered" && stage_src != "mmap-registered-churn") {
                     err("run_start has invalid staging_source");
                 }
-                const long long stage_match = json_ll(line, "staging_source_match", &found);
+                const long long stage_match = json::integer(line, "staging_source_match", &found);
                 if (!found) {
                     err("run_start has staging_source without staging_source_match");
                 } else if (stage_match != 1) {
@@ -1445,7 +1394,7 @@ static int check_telemetry(const std::string & path) {
             // T-GPLR-37: provenance of the resolved copy source; same contract
             // as the rebuild key above (optional for legacy traces, validated
             // when present).
-            const std::string cs_src = json_str(line, "copy_source_source");
+            const std::string cs_src = json::value(line, "copy_source_source");
             if (!cs_src.empty() && cs_src != "explicit" && cs_src != "default") {
                 err("run_start has invalid copy_source_source");
             }
@@ -1455,7 +1404,7 @@ static int check_telemetry(const std::string & path) {
             // trace (enforced at run_end below).
             bool rt_valid = false;
             bool rt_must_be_absent = false;
-            const long long rt = json_ll(line, "route_telemetry", &found);
+            const long long rt = json::integer(line, "route_telemetry", &found);
             if (found) {
                 if (rt < 0 || rt > 1) {
                     err("run_start has invalid route_telemetry");
@@ -1464,7 +1413,7 @@ static int check_telemetry(const std::string & path) {
                     rt_must_be_absent = (rt == 0);
                 }
             }
-            const std::string rt_src = json_str(line, "route_telemetry_source");
+            const std::string rt_src = json::value(line, "route_telemetry_source");
             if (!rt_src.empty() && rt_src != "explicit" && rt_src != "default") {
                 err("run_start has invalid route_telemetry_source");
             }
@@ -1478,7 +1427,7 @@ static int check_telemetry(const std::string & path) {
                 if (off_audit_trace) {
                     err("off-audit run_start carries handoff_mode (off runs have no handoff decision)");
                 } else {
-                    const std::string hm = json_str(line, "handoff_mode");
+                    const std::string hm = json::value(line, "handoff_mode");
                     if (hm != "on" && hm != "off" && hm != "auto-on" && hm != "auto-off") {
                         err("run_start has invalid handoff_mode");
                     } else {
@@ -1496,8 +1445,8 @@ static int check_telemetry(const std::string & path) {
             // T-Q38CTX-01: parse the chunk manifest ["start:width", ...]
             if (!off_audit && schedule == "layer-major") {
                 bool f_ppn = false;
-                const long long pp_tokens_m = json_ll(line, "pp_tokens", &found);
-                lm_pp_n_chunks = (int) json_ll(line, "pp_n_chunks", &f_ppn);
+                const long long pp_tokens_m = json::integer(line, "pp_tokens", &found);
+                lm_pp_n_chunks = (int) json::integer(line, "pp_n_chunks", &f_ppn);
                 if (f_ppn) {
                     if (!found || lm_pp_n_chunks <= 0 || pp_tokens_m <= 0) {
                         err("run_start has an invalid chunk manifest");
@@ -1588,16 +1537,16 @@ static int check_telemetry(const std::string & path) {
             // T-GPLR-10: validate the migrate event's migration list. The
             // release (peak-order slot/slab release before buf_handoff) and
             // teardown actions carry no layer fields.
-            const std::string action = json_str(line, "action");
+            const std::string action = json::value(line, "action");
             if (action != "migrate" && action != "release" && action != "teardown") {
                 err("handoff event with unknown action");
             }
             if (action == "migrate") {
                 bool f = false;
-                const long long layers = json_ll(line, "layers", &f);
-                const long long total_bytes = json_ll(line, "total_bytes", &f);
-                const bool attn_only = json_str(line, "attention_only") == "true";
-                const bool mtp_flag = json_str(line, "mtp") == "true";
+                const long long layers = json::integer(line, "layers", &f);
+                const long long total_bytes = json::integer(line, "total_bytes", &f);
+                const bool attn_only = json::value(line, "attention_only") == "true";
+                const bool mtp_flag = json::value(line, "mtp") == "true";
                 if (!f) {
                     err("handoff migrate event missing layers/total_bytes");
                 } else {
@@ -1615,7 +1564,7 @@ static int check_telemetry(const std::string & path) {
                     const bool is_partial = line.find("\"partial\":true") != std::string::npos;
                     if (is_partial) {
                         bool fp = false;
-                        const long long pf_ = json_ll(line, "partial_from", &fp);
+                        const long long pf_ = json::integer(line, "partial_from", &fp);
                         if (!fp || pf_ <= 0 || pf_ >= n_layer) {
                             err("partial handoff migrate has invalid partial_from");
                         } else if (layers != n_layer - pf_) {
@@ -1633,7 +1582,7 @@ static int check_telemetry(const std::string & path) {
                     // peak = total - free_vram) must be sane; absent on
                     // legacy traces is accepted (field added this task)
                     bool ff = false;
-                    const long long free_vram_ho = json_ll(line, "free_vram", &ff);
+                    const long long free_vram_ho = json::integer(line, "free_vram", &ff);
                     if (ff && free_vram_ho <= 0) {
                         err("handoff migrate event has invalid free_vram");
                     }
@@ -1651,14 +1600,14 @@ static int check_telemetry(const std::string & path) {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.
             bool f = false;
-            const long long full = json_ll(line, "full_model_plus_runtime", &f);
-            const long long bounded = json_ll(line, "bounded_window", &f);
-            const long long st_ = json_ll(line, "static", &f);
-            const long long pl = json_ll(line, "per_layer", &f);
-            const long long sw = json_ll(line, "slot_window", &f);
-            const long long kvb = json_ll(line, "kv", &f);
-            const long long stt = json_ll(line, "state", &f);
-            const long long free_b = json_ll(line, "free_vram", &f);
+            const long long full = json::integer(line, "full_model_plus_runtime", &f);
+            const long long bounded = json::integer(line, "bounded_window", &f);
+            const long long st_ = json::integer(line, "static", &f);
+            const long long pl = json::integer(line, "per_layer", &f);
+            const long long sw = json::integer(line, "slot_window", &f);
+            const long long kvb = json::integer(line, "kv", &f);
+            const long long stt = json::integer(line, "state", &f);
+            const long long free_b = json::integer(line, "free_vram", &f);
             if (!f) {
                 err("byte_account missing fields");
             } else if (st_ + pl + sw + kvb + stt != bounded) {
@@ -1675,13 +1624,18 @@ static int check_telemetry(const std::string & path) {
             // deferred to the end of the trace because this event precedes
             // rowset_init. Fields are absent on pre-field traces, accepted.
             {
-                bool fb = false, fc = false, fcap = false;
-                const long long budget_mib = json_ll(line, "residency_budget_mib", &fb);
-                const long long row_cache_b = json_ll(line, "row_cache", &fc);
-                const long long cap_b = json_ll(line, "residency_cap", &fcap);
+                bool fb = false, fc = false, fp = false, fcap = false;
+                const long long budget_mib = json::integer(line, "residency_budget_mib", &fb);
+                const long long row_cache_b = json::integer(line, "row_cache", &fc);
+                const long long pool_b = json::integer(line, "prediction_pool", &fp);
+                const long long cap_b = json::integer(line, "residency_cap", &fcap);
                 ba_row_cache_seen = fc;
                 ba_row_cache = row_cache_b;
-                for (const auto & be : ls_byte_account_errors(bounded, budget_mib, fc, row_cache_b, fcap, cap_b)) {
+                for (const auto & be : ls_byte_account_errors(bounded, budget_mib, fc, row_cache_b,
+                                                               fp, pool_b, fcap, cap_b)) {
+                    err(be.c_str());
+                }
+                for (const auto & be : pool_validator.byte_account_errors(line)) {
                     err(be.c_str());
                 }
             }
@@ -1691,7 +1645,7 @@ static int check_telemetry(const std::string & path) {
                 continue;
             }
             bool found = false;
-            const long long graph_builds = json_ll(line, "graph_builds", &found);
+            const long long graph_builds = json::integer(line, "graph_builds", &found);
             // T-Q38HG-02: graph_builds > 0 is acceptable after a handoff event.
             if (found && graph_builds != 0 && !handoff_seen) {
                 err("phase_summary.graph_builds != 0 (graph construction in timed region)");
@@ -1701,18 +1655,18 @@ static int check_telemetry(const std::string & path) {
             have_phase_summary = true;
 
             phase_data pd;
-            pd.name = json_str(line, "phase");
+            pd.name = json::value(line, "phase");
             bool f = false;
-            pd.tokens       = json_ll(line, "tokens", &f);
-            pd.ubatches     = json_ll(line, "ubatches", &f);
-            pd.wall_us      = json_ll(line, "wall_us", &f);
-            pd.transfer_us  = (double) json_ll(line, "total_transfer_us", &f);
-            pd.wait_us      = (double) json_ll(line, "total_wait_us", &f);
-            pd.compute_us   = (double) json_ll(line, "total_compute_us", &f);
-            pd.layers_run   = json_ll(line, "layers_run", &f);
-            pd.evictions    = json_ll(line, "evictions", &f);
-            pd.graph_builds = json_ll(line, "graph_builds", &f);
-            pd.bytes        = json_ll(line, "bytes_transferred", &f);
+            pd.tokens       = json::integer(line, "tokens", &f);
+            pd.ubatches     = json::integer(line, "ubatches", &f);
+            pd.wall_us      = json::integer(line, "wall_us", &f);
+            pd.transfer_us  = (double) json::integer(line, "total_transfer_us", &f);
+            pd.wait_us      = (double) json::integer(line, "total_wait_us", &f);
+            pd.compute_us   = (double) json::integer(line, "total_compute_us", &f);
+            pd.layers_run   = json::integer(line, "layers_run", &f);
+            pd.evictions    = json::integer(line, "evictions", &f);
+            pd.graph_builds = json::integer(line, "graph_builds", &f);
+            pd.bytes        = json::integer(line, "bytes_transferred", &f);
             // T-GPLR-10: the phase right after a handoff migrate is the hybrid
             // TG -- stock llama_decode with the banks already resident, so no
             // bank copies exist by construction: bytes_transferred must be ~0.
@@ -1721,26 +1675,35 @@ static int check_telemetry(const std::string & path) {
                 err("post-handoff TG phase transferred bytes (hybrid TG runs stock llama_decode; expected 0 bank bytes)");
             }
             phases.push_back(pd);
+        } else if (event == "spec_pool_init") {
+            for (const auto & pe : pool_validator.init_errors(line)) {
+                err(pe.c_str());
+            }
+        } else if (event == "spec_pool") {
+            for (const auto & pe : pool_validator.event_errors(line)) {
+                err(pe.c_str());
+            }
         } else if (event == "rowset_init") {
             // T-GPLR-13: policy header. n_expert/top_k scope the ID range and
             // cardinality checks of every following rowset_fetch.
             rowset_ever = true;
             bool f = false;
-            rowset_n_expert = json_ll(line, "n_expert", &f);
+            rowset_n_expert = json::integer(line, "n_expert", &f);
+            pool_validator.set_n_expert(rowset_n_expert);
             if (!f || rowset_n_expert <= 0) {
                 err("rowset_init missing valid n_expert");
             }
-            rowset_top_k = json_ll(line, "top_k", &f);
+            rowset_top_k = json::integer(line, "top_k", &f);
             if (!f || rowset_top_k <= 0) {
                 err("rowset_init missing valid top_k");
             }
-            const long long wt = json_ll(line, "window_tokens", &f);
+            const long long wt = json::integer(line, "window_tokens", &f);
             if (f && wt != 1) {
                 err("rowset_init window_tokens != 1 (W>1 is not implemented)");
             }
             // T-GPLR-19: 0/absent = reactive slot-keyed policy (unchanged);
             // >0 declares per-layer retention at that K
-            rowset_retain_k = json_ll(line, "retain_k", &f);
+            rowset_retain_k = json::integer(line, "retain_k", &f);
             if (f && rowset_retain_k < 0) {
                 err("rowset_init retain_k must not be negative");
             }
@@ -1749,33 +1712,46 @@ static int check_telemetry(const std::string & path) {
             if (!rowset_mode) {
                 err("rowset_fetch in a run whose run_start carries no rowset marker");
             }
-            bool f = false;
-            const long long layer = json_ll(line, "layer", &f);
-            const long long slot  = json_ll(line, "slot", &f);
-            const long long gen   = json_ll(line, "generation", &f);
-            const long long ru    = json_ll(line, "route_union", &f);
-            const long long nf    = json_ll(line, "n_rows_fetched", &f);
-            const long long nr    = json_ll(line, "n_rows_resident", &f);
-            const long long bs    = json_ll(line, "bytes_staged", &f);
-            if (!f || layer < 0 || slot < 0 || ru < 0 || nf < 0 || nr < 0) {
+            bool f = false, rf = false, bf = false;
+            const long long layer = json::integer(line, "layer", &f);
+            const long long slot  = json::integer(line, "slot", &f);
+            const long long gen   = json::integer(line, "generation", &f);
+            const long long ru    = json::integer(line, "route_union", &f);
+            const long long nf    = json::integer(line, "n_rows_fetched", &f);
+            const long long nr    = json::integer(line, "n_rows_resident", &f);
+            const long long bs    = json::integer(line, "bytes_staged", &f);
+            const long long ub    = json::integer(line, "ubatch", &rf);
+            const long long nret  = json::integer(line, "n_rows_retained", &rf);
+            const long long nrtd  = json::integer(line, "n_rows_retired", &rf);
+            const long long bank  = json::integer(line, "bytes_full_bank", &bf);
+            const long long phase = json::integer(line, "phase", nullptr);
+            if (!f || !rf || !bf || layer < 0 || slot < 0 || ru < 0 || nf < 0 || nr < 0 ||
+                ub < 1 || nret < 0 || nrtd < 0 || bank < 0) {
                 err("rowset_fetch missing required fields");
                 continue;
+            }
+            const std::vector<long long> pool_ids = json::integer_list(line, "pool_hit_ids", nullptr);
+            const bool pool_enabled = pool_validator.enabled();
+            const long long pool_rows = pool_enabled ? (long long) pool_ids.size() : 0;
+            for (const auto & pe : pool_validator.fetch_errors(line, layer, gen, ub, ru, nf, nr,
+                                                  nret, bs, bank)) {
+                err(pe.c_str());
             }
             // W=1 identity (schema 4.2): top-k of distinct indices per token.
             if (rowset_top_k >= 0 && ru != rowset_top_k) {
                 err("rowset_fetch route_union != top_k at W=1");
             }
-            // accounting identity (schema 4.3)
-            if (ru != nf + nr) {
-                err("rowset_fetch route_union != n_rows_fetched + n_rows_resident");
+            // accounting identity (schema 4.3): n_rows_resident is real-cache only.
+            if (ru != nf + nr + pool_rows) {
+                err("rowset_fetch route_union != real fetched + real resident + pool hits");
             }
             if ((bs > 0) != (nf > 0)) {
                 err("rowset_fetch bytes_staged/n_rows_fetched mismatch");
             }
             // hash integrity (schema 4.6): FNV-1a-64 over union_ids bytes
             {
-                const std::string ids = json_str(line, "union_ids");
-                const std::string hash_s = json_str(line, "hash");
+                const std::string ids = json::value(line, "union_ids");
+                const std::string hash_s = json::value(line, "hash");
                 if (ids.empty() || hash_s.empty()) {
                     err("rowset_fetch missing union_ids/hash");
                 } else {
@@ -1795,19 +1771,11 @@ static int check_telemetry(const std::string & path) {
             // declared retention and the per-layer conservation rule runs
             // instead. Default-off is byte-for-byte the old behaviour.
             if (rowset_retain_k > 0) {
-                bool rf = false;
-                const long long ub   = json_ll(line, "ubatch", &rf);
-                const long long nret = json_ll(line, "n_rows_retained", &rf);
-                const long long nrtd = json_ll(line, "n_rows_retired", &rf);
-                if (!rf || ub < 1 || nret < 0 || nrtd < 0) {
-                    err("rowset_fetch missing retention fields under a retain_k policy");
-                } else {
-                    for (const auto & e : ls_retention_errors(rowset_retention,
-                             layer, gen, json_ll(line, "phase", nullptr), ru, nr,
-                             json_str(line, "union_ids"), nret, nrtd, rowset_retain_k,
-                             rowset_n_expert, rowset_top_k)) {
-                        err(e.c_str());
-                    }
+                for (const auto & e : ls_retention_errors(rowset_retention,
+                         layer, gen, phase, ru, nr, pool_ids,
+                         json::value(line, "union_ids"), nret, nrtd, rowset_retain_k,
+                         rowset_n_expert, rowset_top_k)) {
+                    err(e.c_str());
                 }
             } else {
             // generation lifecycle (schema 4.5): coverage lives per slot;
@@ -1840,8 +1808,8 @@ static int check_telemetry(const std::string & path) {
             // this ratio, never a claimed speedup.
             rowset_ever = true;
             bool f = false;
-            const long long bs = json_ll(line, "bytes_staged", &f);
-            const long long bb = json_ll(line, "bytes_full_bank", &f);
+            const long long bs = json::integer(line, "bytes_staged", &f);
+            const long long bb = json::integer(line, "bytes_full_bank", &f);
             if (!f || bs < 0 || bb <= 0) {
                 err("rowset_round missing required fields");
             } else {
@@ -1853,10 +1821,10 @@ static int check_telemetry(const std::string & path) {
             // structured loud refusal (schema 4: reason enum) -- always
             // followed by the loud failed run_end path.
             rowset_ever = true;
-            const std::string reason = json_str(line, "reason");
+            const std::string reason = json::value(line, "reason");
             err((std::string("rowset_refused: ") +
                  (reason.empty() ? "<no reason>" : reason) + " (" +
-                 json_str(line, "detail") + ")").c_str());
+                 json::value(line, "detail") + ")").c_str());
         } else if (event == "spec" && rowset_retain_k > 0) {
             // T-GPLR-58: the speculative fills this stage issued. They are STAGED
             // here and replayed by ls_retention_errors after the rowset_fetch of the
@@ -1867,7 +1835,7 @@ static int check_telemetry(const std::string & path) {
         } else if (ls_parse_run_refused(event, line, refusal)) {
         } else if (event == "run_end") {
             bool found = false;
-            const long long exit_status = json_ll(line, "exit_status", &found);
+            const long long exit_status = json::integer(line, "exit_status", &found);
             if (found && exit_status != 0) {
                 err("run_end.exit_status != 0");
             }
@@ -1877,7 +1845,7 @@ static int check_telemetry(const std::string & path) {
             if (!rowset_mode && rowset_ever) {
                 err("rowset events in a run whose run_start carries no rowset marker");
             }
-            peak_vram = json_ll(line, "peak_vram_bytes", &found);
+            peak_vram = json::integer(line, "peak_vram_bytes", &found);
             // T-GPLR-12: a run whose run_start declared on/auto-on must have
             // emitted handoff events by run_end. Use handoff_ever, not
             // handoff_seen (the latter is reset by each phase_summary).
@@ -1886,8 +1854,8 @@ static int check_telemetry(const std::string & path) {
             }
         } else if (event == "slot_request") {
             bool f_layer = false, f_slot = false;
-            const long long layer = json_ll(line, "layer", &f_layer);
-            const long long slot  = json_ll(line, "slot",  &f_slot);
+            const long long layer = json::integer(line, "layer", &f_layer);
+            const long long slot  = json::integer(line, "slot",  &f_slot);
 
             if (off_audit_trace) {
                 ls_err_off_streaming_event(line_no, "check-telemetry", errors);
@@ -1910,9 +1878,9 @@ static int check_telemetry(const std::string & path) {
         } else if (event == "copy_submit" || event == "copy_complete" ||
                    event == "layer_ready_wait" || event == "layer_compute") {
             bool f_layer = false, f_slot = false, f_gen = false;
-            const long long layer = json_ll(line, "layer", &f_layer);
-            const long long slot  = json_ll(line, "slot",  &f_slot);
-            const long long gen   = json_ll(line, "generation", &f_gen);
+            const long long layer = json::integer(line, "layer", &f_layer);
+            const long long slot  = json::integer(line, "slot",  &f_slot);
+            const long long gen   = json::integer(line, "generation", &f_gen);
 
             if (off_audit_trace) {
                 ls_err_off_streaming_event(line_no, "check-telemetry", errors);
@@ -1955,15 +1923,15 @@ static int check_telemetry(const std::string & path) {
                 if (st.pending_gen != gen || st.pending_layer != layer) {
                     err("copy_complete has no matching copy_submit");
                 }
-                const std::string host_submit = json_str(line, "host_submit_us");
-                const std::string ready_latency = json_str(line, "ready_latency_us");
+                const std::string host_submit = json::value(line, "host_submit_us");
+                const std::string ready_latency = json::value(line, "ready_latency_us");
                 if (!host_submit.empty() || !ready_latency.empty()) {
                     if (host_submit.empty() || ready_latency.empty()) {
                         err("copy_complete has partial timing split");
                     } else {
                         const double submit_us = atof(host_submit.c_str());
                         const double ready_us = atof(ready_latency.c_str());
-                        const double total_us = atof(json_str(line, "transfer_us").c_str());
+                        const double total_us = atof(json::value(line, "transfer_us").c_str());
                         if (submit_us < 0.0 || ready_us < 0.0 || total_us < 0.0 ||
                             std::abs((submit_us + ready_us) - total_us) > 0.2) {
                             err("copy_complete timing split is invalid");
@@ -1990,10 +1958,10 @@ static int check_telemetry(const std::string & path) {
                 // ordinal (ubatch), not a PP chunk id; the phase == 0 gate
                 // below keeps the PP chunk rules off the TG events.
                 bool f_phase = false;
-                const long long phase = json_ll(line, "phase", &f_phase);
+                const long long phase = json::integer(line, "phase", &f_phase);
                 if (schedule == "layer-major" && f_phase && phase == 0) {
                     bool f_chunk = false;
-                    const long long chunk = json_ll(line, "chunk", &f_chunk);
+                    const long long chunk = json::integer(line, "chunk", &f_chunk);
                     if (!f_chunk) {
                         err("layer-major layer_compute missing chunk");
                     } else {
@@ -2017,9 +1985,9 @@ static int check_telemetry(const std::string & path) {
             // layer-major: act-slab binds must be non-aliasing per slab
             if (schedule == "layer-major") {
                 bool f_off = false, f_bytes = false, f_slab = false;
-                const long long off   = json_ll(line, "off_bytes", &f_off);
-                const long long bytes = json_ll(line, "n_bytes",   &f_bytes);
-                const long long slab  = json_ll(line, "slab",      &f_slab);
+                const long long off   = json::integer(line, "off_bytes", &f_off);
+                const long long bytes = json::integer(line, "n_bytes",   &f_bytes);
+                const long long slab  = json::integer(line, "slab",      &f_slab);
                 if (!f_off || !f_bytes || !f_slab) {
                     err("act_bind missing off_bytes/n_bytes/slab");
                     continue;
@@ -2042,7 +2010,7 @@ static int check_telemetry(const std::string & path) {
                 // and each chunk gets exactly one bind per slab.
                 if (lm_pp_n_chunks > 0) {
                     bool f_chunk = false;
-                    const long long bchunk = json_ll(line, "chunk", &f_chunk);
+                    const long long bchunk = json::integer(line, "chunk", &f_chunk);
                     if (!f_chunk || bchunk < 0 || bchunk >= lm_pp_n_chunks) {
                         err("act_bind chunk is outside the pp_chunks manifest");
                     } else {
@@ -2069,9 +2037,9 @@ static int check_telemetry(const std::string & path) {
             }
         } else if (event == "slot_evict") {
             bool f_layer = false, f_slot = false, f_gen = false;
-            const long long layer = json_ll(line, "layer", &f_layer);
-            const long long slot  = json_ll(line, "slot",  &f_slot);
-            const long long gen   = json_ll(line, "generation", &f_gen);
+            const long long layer = json::integer(line, "layer", &f_layer);
+            const long long slot  = json::integer(line, "slot",  &f_slot);
+            const long long gen   = json::integer(line, "generation", &f_gen);
             if (!f_layer || !f_slot || !f_gen) {
                 err("slot_evict missing layer/slot/generation");
                 continue;
@@ -2154,6 +2122,9 @@ static int check_telemetry(const std::string & path) {
     // replayed fails ONCE, with the cause named, instead of once per later fetch.
     for (const auto & se : ls_spec_replay_errors(rowset_retention)) {
         err(se.c_str());
+    }
+    for (const auto & pe : pool_validator.final_errors(refusal.saw)) {
+        err(pe.c_str());
     }
 
     // T-GPLR-22: the three rules below describe a run that started; a refusal
@@ -2310,6 +2281,7 @@ static int validate_telemetry(const std::string & path) {
     // T-GPLR-58: the per-layer retention cache model (rows, recency, and the staged
     // speculative fills of the `spec` events that precede each rowset_fetch).
     ls_retention_model rowset_retention;
+    ls_pool_validator pool_validator;
     // T-GPLR-19: byte_account's row_cache figure, held until rowset_init has
     // been read so the record can be tied to the policy it claims.
     bool ba_row_cache_seen = false;
@@ -2341,7 +2313,7 @@ static int validate_telemetry(const std::string & path) {
         }
         n_events++;
 
-        const std::string event = json_str(line, "event");
+        const std::string event = json::value(line, "event");
 
         if (event == "run_start") {
             if (have_run_start) {
@@ -2351,24 +2323,27 @@ static int validate_telemetry(const std::string & path) {
             // T-GPLR-05: off-mode audit traces carry run metadata only.
             const bool off_audit = ls_line_is_off_audit(line);
             bool found = false;
-            n_slots = (int) json_ll(line, "n_slots", &found);
+            n_slots = (int) json::integer(line, "n_slots", &found);
             if (!off_audit && (!found || n_slots <= 0)) err("run_start missing valid n_slots");
-            n_layer = (int) json_ll(line, "n_layer", &found);
+            n_layer = (int) json::integer(line, "n_layer", &found);
             if (!off_audit && (!found || n_layer <= 0)) err("run_start missing valid n_layer");
+            for (const auto & pe : pool_validator.run_start_errors(line)) {
+                err(pe.c_str());
+            }
             if (off_audit) {
                 off_audit_trace = true;
                 ls_check_off_run_start(line, line_no, "validate-telemetry", errors);
                 continue;
             }
-            model_name = json_str(line, "model");
-            arch       = json_str(line, "arch");
-            total_vram = json_ll(line, "total_vram_bytes", &found);
+            model_name = json::value(line, "model");
+            arch       = json::value(line, "arch");
+            total_vram = json::integer(line, "total_vram_bytes", &found);
             if (!found) err("run_start missing total_vram_bytes");
-            free_vram_at_start = json_ll(line, "free_vram_bytes", &found);
+            free_vram_at_start = json::integer(line, "free_vram_bytes", &found);
             if (!found) err("run_start missing free_vram_bytes");
-            slot_vram = json_ll(line, "slot_vram_bytes", &found);
+            slot_vram = json::integer(line, "slot_vram_bytes", &found);
             if (!found) err("run_start missing slot_vram_bytes");
-            device = json_ll(line, "device", &found);
+            device = json::integer(line, "device", &found);
             if (!found) err("run_start missing device");
             // T-GPLR-12: the auditable handoff decision (optional for legacy
             // traces; cross-checked against handoff events like the strict
@@ -2376,7 +2351,7 @@ static int validate_telemetry(const std::string & path) {
             ho_mode_valid = false;
             handoff_active_expected = false;
             if (line.find("\"handoff_mode\":") != std::string::npos) {
-                const std::string hm = json_str(line, "handoff_mode");
+                const std::string hm = json::value(line, "handoff_mode");
                 if (hm != "on" && hm != "off" && hm != "auto-on" && hm != "auto-off") {
                     err("run_start has invalid handoff_mode");
                 } else {
@@ -2394,14 +2369,14 @@ static int validate_telemetry(const std::string & path) {
             // unknown - a run must never carry a staging_source that
             // contradicts its declared copy_source.
             {
-                const std::string stage_src = json_str(line, "staging_source");
+                const std::string stage_src = json::value(line, "staging_source");
                 if (!stage_src.empty()) {
                     if (stage_src != "direct" && stage_src != "pinned" &&
                         stage_src != "mmap-registered" && stage_src != "mmap-registered-churn") {
                         err("run_start has invalid staging_source");
                     }
                     bool stage_found = false;
-                    const long long stage_match = json_ll(line, "staging_source_match", &stage_found);
+                    const long long stage_match = json::integer(line, "staging_source_match", &stage_found);
                     if (!stage_found) {
                         err("run_start has staging_source without staging_source_match");
                     } else if (stage_match != 1) {
@@ -2421,16 +2396,16 @@ static int validate_telemetry(const std::string & path) {
             }
             // T-GPLR-10: validate the migrate event's migration list (the
             // release/teardown actions carry no layer fields).
-            const std::string action = json_str(line, "action");
+            const std::string action = json::value(line, "action");
             if (action != "migrate" && action != "release" && action != "teardown") {
                 err("handoff event with unknown action");
             }
             if (action == "migrate") {
                 bool f = false;
-                const long long layers = json_ll(line, "layers", &f);
-                const long long total_bytes = json_ll(line, "total_bytes", &f);
-                const bool attn_only = json_str(line, "attention_only") == "true";
-                const bool mtp_flag = json_str(line, "mtp") == "true";
+                const long long layers = json::integer(line, "layers", &f);
+                const long long total_bytes = json::integer(line, "total_bytes", &f);
+                const bool attn_only = json::value(line, "attention_only") == "true";
+                const bool mtp_flag = json::value(line, "mtp") == "true";
                 if (!f) {
                     err("handoff migrate event missing layers/total_bytes");
                 } else {
@@ -2448,7 +2423,7 @@ static int validate_telemetry(const std::string & path) {
                     const bool is_partial = line.find("\"partial\":true") != std::string::npos;
                     if (is_partial) {
                         bool fp = false;
-                        const long long pf_ = json_ll(line, "partial_from", &fp);
+                        const long long pf_ = json::integer(line, "partial_from", &fp);
                         if (!fp || pf_ <= 0 || pf_ >= n_layer) {
                             err("partial handoff migrate has invalid partial_from");
                         } else if (layers != n_layer - pf_) {
@@ -2465,7 +2440,7 @@ static int validate_telemetry(const std::string & path) {
                     // right after the handoff allocation must be sane; absent
                     // on legacy traces is accepted (field added this task)
                     bool ff = false;
-                    const long long free_vram_ho = json_ll(line, "free_vram", &ff);
+                    const long long free_vram_ho = json::integer(line, "free_vram", &ff);
                     if (ff && free_vram_ho <= 0) {
                         err("handoff migrate event has invalid free_vram");
                     }
@@ -2475,14 +2450,14 @@ static int validate_telemetry(const std::string & path) {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.
             bool f = false;
-            const long long full = json_ll(line, "full_model_plus_runtime", &f);
-            const long long bounded = json_ll(line, "bounded_window", &f);
-            const long long st_ = json_ll(line, "static", &f);
-            const long long pl = json_ll(line, "per_layer", &f);
-            const long long sw = json_ll(line, "slot_window", &f);
-            const long long kvb = json_ll(line, "kv", &f);
-            const long long stt = json_ll(line, "state", &f);
-            const long long free_b = json_ll(line, "free_vram", &f);
+            const long long full = json::integer(line, "full_model_plus_runtime", &f);
+            const long long bounded = json::integer(line, "bounded_window", &f);
+            const long long st_ = json::integer(line, "static", &f);
+            const long long pl = json::integer(line, "per_layer", &f);
+            const long long sw = json::integer(line, "slot_window", &f);
+            const long long kvb = json::integer(line, "kv", &f);
+            const long long stt = json::integer(line, "state", &f);
+            const long long free_b = json::integer(line, "free_vram", &f);
             if (!f) {
                 err("byte_account missing fields");
             } else if (st_ + pl + sw + kvb + stt != bounded) {
@@ -2499,22 +2474,27 @@ static int validate_telemetry(const std::string & path) {
             // deferred to the end of the trace because this event precedes
             // rowset_init.
             {
-                bool fb = false, fc = false, fcap = false;
-                const long long budget_mib = json_ll(line, "residency_budget_mib", &fb);
-                const long long row_cache_b = json_ll(line, "row_cache", &fc);
-                const long long cap_b = json_ll(line, "residency_cap", &fcap);
+                bool fb = false, fc = false, fp = false, fcap = false;
+                const long long budget_mib = json::integer(line, "residency_budget_mib", &fb);
+                const long long row_cache_b = json::integer(line, "row_cache", &fc);
+                const long long pool_b = json::integer(line, "prediction_pool", &fp);
+                const long long cap_b = json::integer(line, "residency_cap", &fcap);
                 ba_row_cache_seen = fc;
                 ba_row_cache = row_cache_b;
-                for (const auto & be : ls_byte_account_errors(bounded, budget_mib, fc, row_cache_b, fcap, cap_b)) {
+                for (const auto & be : ls_byte_account_errors(bounded, budget_mib, fc, row_cache_b,
+                                                               fp, pool_b, fcap, cap_b)) {
+                    err(be.c_str());
+                }
+                for (const auto & be : pool_validator.byte_account_errors(line)) {
                     err(be.c_str());
                 }
             }
         } else if (event == "error") {
-            error_str = json_str(line, "message");
+            error_str = json::value(line, "message");
             err((std::string("run produced an error event: ") + error_str).c_str());
         } else if (event == "phase_summary") {
             // phase is a string: "pp" or "tg"; map to 0/1
-            const std::string ph = json_str(line, "phase");
+            const std::string ph = json::value(line, "phase");
             if (ph == "pp") {
                 current_phase = 0;
             } else if (ph == "tg") {
@@ -2531,27 +2511,27 @@ static int validate_telemetry(const std::string & path) {
             pa.have_summary = true;
             bool found = false;
             pa.phase = ph;
-            pa.tokens = json_ll(line, "tokens", &found);
+            pa.tokens = json::integer(line, "tokens", &found);
             if (!found) err("phase_summary missing tokens");
-            pa.wall_us = json_ll(line, "wall_us", &found);
+            pa.wall_us = json::integer(line, "wall_us", &found);
             if (!found) err("phase_summary missing wall_us");
-            pa.tok_s = atof(json_str(line, "tokens_per_s").c_str());
-            pa.graph_builds = json_ll(line, "graph_builds", &found);
+            pa.tok_s = atof(json::value(line, "tokens_per_s").c_str());
+            pa.graph_builds = json::integer(line, "graph_builds", &found);
             if (!found) err("phase_summary missing graph_builds");
             // T-Q38HG-02: graph_builds > 0 acceptable after handoff
             if (pa.graph_builds != 0 && !handoff_seen) err("phase_summary.graph_builds != 0");
             const bool after_handoff = handoff_seen; // T-GPLR-10: hybrid-TG bytes rule below
             handoff_seen = false; // reset per phase
-            pa.graph_prep_us = json_ll(line, "graph_prep_us", &found);
+            pa.graph_prep_us = json::integer(line, "graph_prep_us", &found);
             if (!found) err("phase_summary missing graph_prep_us");
-            pa.total_transfer_us = atof(json_str(line, "total_transfer_us").c_str());
-            pa.total_wait_us = atof(json_str(line, "total_wait_us").c_str());
-            pa.total_compute_us = atof(json_str(line, "total_compute_us").c_str());
-            pa.bytes_transferred = json_ll(line, "bytes_transferred", &found);
+            pa.total_transfer_us = atof(json::value(line, "total_transfer_us").c_str());
+            pa.total_wait_us = atof(json::value(line, "total_wait_us").c_str());
+            pa.total_compute_us = atof(json::value(line, "total_compute_us").c_str());
+            pa.bytes_transferred = json::integer(line, "bytes_transferred", &found);
             if (!found) err("phase_summary missing bytes_transferred");
-            pa.evictions = json_ll(line, "evictions", &found);
+            pa.evictions = json::integer(line, "evictions", &found);
             if (!found) err("phase_summary missing evictions");
-            pa.layers_run = json_ll(line, "layers_run", &found);
+            pa.layers_run = json::integer(line, "layers_run", &found);
             if (!found) err("phase_summary missing layers_run");
             // T-GPLR-10: the phase right after a handoff migrate is the hybrid
             // TG -- stock llama_decode with the banks already resident, so no
@@ -2560,7 +2540,7 @@ static int validate_telemetry(const std::string & path) {
                 err("post-handoff TG phase transferred bytes (hybrid TG runs stock llama_decode; expected 0 bank bytes)");
             }
         } else if (event == "tg_tokens") {
-            const std::string v = json_str(line, "n_tokens_generated");
+            const std::string v = json::value(line, "n_tokens_generated");
             tg_ids_count = v.empty() ? -1 : atoll(v.c_str());
         } else if (ls_parse_run_refused(event, line, refusal)) {
         } else if (event == "run_end") {
@@ -2574,7 +2554,7 @@ static int validate_telemetry(const std::string & path) {
                 err("rowset events in a run whose run_start carries no rowset marker");
             }
             bool found = false;
-            exit_status = json_ll(line, "exit_status", &found);
+            exit_status = json::integer(line, "exit_status", &found);
             if (!found) err("run_end missing exit_status");
             else if (exit_status != 0) err("run_end.exit_status != 0");
             // T-GPLR-12: on/auto-on must have emitted handoff events. Use
@@ -2582,11 +2562,19 @@ static int validate_telemetry(const std::string & path) {
             if (ho_mode_valid && handoff_active_expected && !handoff_ever) {
                 err("run_start declared handoff_mode on/auto-on but no handoff events followed");
             }
-            peak_vram = json_ll(line, "peak_vram_bytes", &found);
+            peak_vram = json::integer(line, "peak_vram_bytes", &found);
             if (!found) err("run_end missing peak_vram_bytes");
-            n_tokens_generated = json_ll(line, "n_tokens_generated", &found);
+            n_tokens_generated = json::integer(line, "n_tokens_generated", &found);
             if (!found) err("run_end missing n_tokens_generated");
-            error_str = json_str(line, "error");
+            error_str = json::value(line, "error");
+        } else if (event == "spec_pool_init") {
+            for (const auto & pe : pool_validator.init_errors(line)) {
+                err(pe.c_str());
+            }
+        } else if (event == "spec_pool") {
+            for (const auto & pe : pool_validator.event_errors(line)) {
+                err(pe.c_str());
+            }
         } else if (event == "rowset_init" || event == "rowset_fetch" ||
                    event == "rowset_round" || event == "rowset_refused") {
             // T-GPLR-13: row-set events require the run_start marker.
@@ -2596,42 +2584,56 @@ static int validate_telemetry(const std::string & path) {
             }
             if (event == "rowset_init") {
                 bool f = false;
-                rowset_n_expert = json_ll(line, "n_expert", &f);
+                rowset_n_expert = json::integer(line, "n_expert", &f);
+                pool_validator.set_n_expert(rowset_n_expert);
                 if (!f || rowset_n_expert <= 0) err("rowset_init missing valid n_expert");
-                rowset_top_k = json_ll(line, "top_k", &f);
+                rowset_top_k = json::integer(line, "top_k", &f);
                 if (!f || rowset_top_k <= 0) err("rowset_init missing valid top_k");
                 // same rule as check_telemetry: the two validators must stay
                 // identical on rowset events (T-GPLR-13 validator parity)
-                const long long wt = json_ll(line, "window_tokens", &f);
+                const long long wt = json::integer(line, "window_tokens", &f);
                 if (f && wt != 1) err("rowset_init window_tokens != 1 (W>1 is not implemented)");
                 // T-GPLR-19: 0/absent = reactive slot-keyed policy (unchanged)
-                rowset_retain_k = json_ll(line, "retain_k", &f);
+                rowset_retain_k = json::integer(line, "retain_k", &f);
                 if (f && rowset_retain_k < 0) err("rowset_init retain_k must not be negative");
             } else if (event == "rowset_fetch") {
-                bool f = false;
-                const long long layer = json_ll(line, "layer", &f);
-                const long long slot  = json_ll(line, "slot", &f);
-                const long long gen   = json_ll(line, "generation", &f);
-                const long long ru    = json_ll(line, "route_union", &f);
-                const long long nf    = json_ll(line, "n_rows_fetched", &f);
-                const long long nr    = json_ll(line, "n_rows_resident", &f);
-                const long long bs    = json_ll(line, "bytes_staged", &f);
-                if (!f || layer < 0 || slot < 0 || ru < 0 || nf < 0 || nr < 0) {
+                bool f = false, rf = false, bf = false;
+                const long long layer = json::integer(line, "layer", &f);
+                const long long slot  = json::integer(line, "slot", &f);
+                const long long gen   = json::integer(line, "generation", &f);
+                const long long ru    = json::integer(line, "route_union", &f);
+                const long long nf    = json::integer(line, "n_rows_fetched", &f);
+                const long long nr    = json::integer(line, "n_rows_resident", &f);
+                const long long bs    = json::integer(line, "bytes_staged", &f);
+                const long long ub    = json::integer(line, "ubatch", &rf);
+                const long long nret  = json::integer(line, "n_rows_retained", &rf);
+                const long long nrtd  = json::integer(line, "n_rows_retired", &rf);
+                const long long bank  = json::integer(line, "bytes_full_bank", &bf);
+                const long long phase = json::integer(line, "phase", nullptr);
+                if (!f || !rf || !bf || layer < 0 || slot < 0 || ru < 0 || nf < 0 || nr < 0 ||
+                    ub < 1 || nret < 0 || nrtd < 0 || bank < 0) {
                     err("rowset_fetch missing required fields");
                     continue;
+                }
+                const std::vector<long long> pool_ids = json::integer_list(line, "pool_hit_ids", nullptr);
+                const bool pool_enabled = pool_validator.enabled();
+                const long long pool_rows = pool_enabled ? (long long) pool_ids.size() : 0;
+                for (const auto & pe :pool_validator.fetch_errors(line, layer, gen, ub, ru, nf, nr,
+                                                      nret, bs, bank)) {
+                    err(pe.c_str());
                 }
                 if (rowset_top_k >= 0 && ru != rowset_top_k) {
                     err("rowset_fetch route_union != top_k at W=1");
                 }
-                if (ru != nf + nr) {
-                    err("rowset_fetch route_union != n_rows_fetched + n_rows_resident");
+                if (ru != nf + nr + pool_rows) {
+                    err("rowset_fetch route_union != real fetched + real resident + pool hits");
                 }
                 if ((bs > 0) != (nf > 0)) {
                     err("rowset_fetch bytes_staged/n_rows_fetched mismatch");
                 }
                 {
-                    const std::string ids = json_str(line, "union_ids");
-                    const std::string hash_s = json_str(line, "hash");
+                    const std::string ids = json::value(line, "union_ids");
+                    const std::string hash_s = json::value(line, "hash");
                     if (ids.empty() || hash_s.empty()) {
                         err("rowset_fetch missing union_ids/hash");
                     } else {
@@ -2648,19 +2650,11 @@ static int validate_telemetry(const std::string & path) {
                 }
                 // T-GPLR-19: same branch as check_telemetry (validator parity)
                 if (rowset_retain_k > 0) {
-                    bool rf = false;
-                    const long long ub   = json_ll(line, "ubatch", &rf);
-                    const long long nret = json_ll(line, "n_rows_retained", &rf);
-                    const long long nrtd = json_ll(line, "n_rows_retired", &rf);
-                    if (!rf || ub < 1 || nret < 0 || nrtd < 0) {
-                        err("rowset_fetch missing retention fields under a retain_k policy");
-                    } else {
-                        for (const auto & e : ls_retention_errors(rowset_retention,
-                                 layer, gen, json_ll(line, "phase", nullptr), ru, nr,
-                                 json_str(line, "union_ids"), nret, nrtd, rowset_retain_k,
-                                 rowset_n_expert, rowset_top_k)) {
-                            err(e.c_str());
-                        }
+                    for (const auto & e : ls_retention_errors(rowset_retention,
+                             layer, gen, phase, ru, nr, pool_ids,
+                             json::value(line, "union_ids"), nret, nrtd, rowset_retain_k,
+                             rowset_n_expert, rowset_top_k)) {
+                        err(e.c_str());
                     }
                 } else {
                 {
@@ -2688,8 +2682,8 @@ static int validate_telemetry(const std::string & path) {
                 }
             } else if (event == "rowset_round") {
                 bool f = false;
-                const long long bs = json_ll(line, "bytes_staged", &f);
-                const long long bb = json_ll(line, "bytes_full_bank", &f);
+                const long long bs = json::integer(line, "bytes_staged", &f);
+                const long long bb = json::integer(line, "bytes_full_bank", &f);
                 if (!f || bs < 0 || bb <= 0) {
                     err("rowset_round missing required fields");
                 }
@@ -2702,7 +2696,7 @@ static int validate_telemetry(const std::string & path) {
                 }
             } else {
                 err((std::string("rowset_refused: ") +
-                     (json_str(line, "reason").empty() ? "<no reason>" : json_str(line, "reason"))).c_str());
+                     (json::value(line, "reason").empty() ? "<no reason>" : json::value(line, "reason"))).c_str());
             }
         } else if (event == "slot_request" || event == "copy_submit" || event == "copy_complete" ||
                    event == "layer_ready_wait" || event == "layer_compute" || event == "slot_evict") {
@@ -2715,10 +2709,10 @@ static int validate_telemetry(const std::string & path) {
                 continue;
             }
             bool f_layer = false, f_slot = false, f_gen = false, f_phase = false;
-            long long layer = json_ll(line, "layer", &f_layer);
-            long long slot  = json_ll(line, "slot",  &f_slot);
-            long long gen   = json_ll(line, "generation", &f_gen);
-            const long long phase = json_ll(line, "phase", &f_phase);
+            long long layer = json::integer(line, "layer", &f_layer);
+            long long slot  = json::integer(line, "slot",  &f_slot);
+            long long gen   = json::integer(line, "generation", &f_gen);
+            const long long phase = json::integer(line, "phase", &f_phase);
             if (f_phase && phase >= 0) {
                 current_phase = (int) phase;
             }
@@ -2774,15 +2768,15 @@ static int validate_telemetry(const std::string & path) {
                     err("copy_complete has no matching copy_submit");
                     continue;
                 }
-                const std::string host_submit = json_str(line, "host_submit_us");
-                const std::string ready_latency = json_str(line, "ready_latency_us");
+                const std::string host_submit = json::value(line, "host_submit_us");
+                const std::string ready_latency = json::value(line, "ready_latency_us");
                 if (!host_submit.empty() || !ready_latency.empty()) {
                     if (host_submit.empty() || ready_latency.empty()) {
                         err("copy_complete has partial timing split");
                     } else {
                         const double submit_us = atof(host_submit.c_str());
                         const double ready_us = atof(ready_latency.c_str());
-                        const double total_us = atof(json_str(line, "transfer_us").c_str());
+                        const double total_us = atof(json::value(line, "transfer_us").c_str());
                         if (submit_us < 0.0 || ready_us < 0.0 || total_us < 0.0 ||
                             std::abs((submit_us + ready_us) - total_us) > 0.2) {
                             err("copy_complete timing split is invalid");
@@ -2792,7 +2786,7 @@ static int validate_telemetry(const std::string & path) {
                 st.pending_gen = 0;
                 st.pending_layer = -1;
                 st.last_copy_layer = layer;
-                const double tr = atof(json_str(line, "transfer_us").c_str());
+                const double tr = atof(json::value(line, "transfer_us").c_str());
                 la.n++;
                 la.transfer_us += tr;
                 la.transfer_min = std::min(la.transfer_min, tr);
@@ -2803,12 +2797,12 @@ static int validate_telemetry(const std::string & path) {
                     err("layer_ready_wait before matching copy_complete");
                     continue;
                 }
-                const double wt = atof(json_str(line, "wait_us").c_str());
+                const double wt = atof(json::value(line, "wait_us").c_str());
                 la.wait_us += wt;
                 la.wait_min = std::min(la.wait_min, wt);
                 la.wait_max = std::max(la.wait_max, wt);
                 la.n_ready_waits++;
-                if (json_str(line, "ready_at_consumption") == "true") {
+                if (json::value(line, "ready_at_consumption") == "true") {
                     la.ready_at_consumption++;
                 }
                 la.seen_wait = true;
@@ -2819,7 +2813,7 @@ static int validate_telemetry(const std::string & path) {
                     err("layer_compute before matching copy_complete");
                     continue;
                 }
-                const double cm = atof(json_str(line, "compute_us").c_str());
+                const double cm = atof(json::value(line, "compute_us").c_str());
                 la.compute_us += cm;
                 la.compute_min = std::min(la.compute_min, cm);
                 la.compute_max = std::max(la.compute_max, cm);
@@ -2853,6 +2847,10 @@ static int validate_telemetry(const std::string & path) {
     // T-GPLR-58: the deferred form of the `spec` rule (validator parity).
     for (const auto & se : ls_spec_replay_errors(rowset_retention)) {
         fprintf(stderr, "validate-telemetry: %s\n", se.c_str());
+        errors++;
+    }
+    for (const auto & pe : pool_validator.final_errors(refusal.saw)) {
+        fprintf(stderr, "validate-telemetry: %s\n", pe.c_str());
         errors++;
     }
     if (phases.empty() && !off_audit_trace && !refusal.saw) {
@@ -3064,6 +3062,7 @@ int main(int argc, char ** argv) {
     int  residency_tg_retain = 0;    // T-GPLR-19: --residency-tg-retain [N] per-layer row cache (0 = off, default; bare flag = kRowSetRetainDefault)
     int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
     int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
+    int         residency_tg_spec_pool = 0;   // T-GPLR-59: separate prediction-only positions per logical layer
     std::string residency_tg_spec_script;     // T-GPLR-58 A0: --residency-tg-spec-script <path> the scripted proposal sequence
     int         residency_tg_spec_arm = -1;   // T-GPLR-58 A1: --residency-tg-spec-arm, -1 = unset (0 coact, 1 bar09, 2 fusion)
     int         residency_tg_spec_null = 0;   // T-GPLR-58 A1: --residency-tg-spec-null <0|1> the count-matched null source
@@ -3323,6 +3322,12 @@ int main(int argc, char ** argv) {
             residency_tg_spec = atoi(arg_value(argc, argv, i, "--residency-tg-spec").c_str());
             if (residency_tg_spec < 0 || residency_tg_spec > 2) {
                 fprintf(stderr, "error: --residency-tg-spec expects 0, 1 or 2 (got %d)\n", residency_tg_spec);
+                return 2;
+            }
+        } else if (arg == "--residency-tg-spec-pool") {
+            residency_tg_spec_pool = atoi(arg_value(argc, argv, i, "--residency-tg-spec-pool").c_str());
+            if (residency_tg_spec_pool < 0 || residency_tg_spec_pool > 256) {
+                fprintf(stderr, "error: --residency-tg-spec-pool expects 0..256 (got %d)\n", residency_tg_spec_pool);
                 return 2;
             }
         } else if (arg == "--residency-tg-spec-budget") {
@@ -3844,6 +3849,8 @@ int main(int argc, char ** argv) {
         // T-GPLR-58 A0: speculative placement is likewise a streaming-module mode.
         { residency_tg_spec != 0,
           "--residency off is incompatible with --residency-tg-spec (speculative placement is a streaming-module mode)" },
+        { residency_tg_spec_pool != 0,
+          "--residency off is incompatible with --residency-tg-spec-pool (the prediction pool is a streaming-module mode)" },
         { residency_tg_retain > 0,
           "--residency off is incompatible with --residency-tg-retain (per-layer row residency is a streaming-module mode)" },
         // T-GPLR-12: pw-probe is a layer-major default now; only an explicit
@@ -3995,6 +4002,21 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: --residency-tg-spec 2 takes its proposals from the arm; drop "
                         "--residency-tg-spec-script <path> (that is mode 1's source)\n");
         return 2;
+    }
+    if (!forced_off && residency_tg_spec_pool != 0 && residency_tg_spec != 2) {
+        fprintf(stderr, "error: --residency-tg-spec-pool requires --residency-tg-spec 2 (the pool uses the engine-consumed arm)\n");
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec_pool != 0 && residency_tg_spec_pool != 12) {
+        fprintf(stderr, "error: --residency-tg-spec-pool first arm requires capacity 12 (got %d)\n", residency_tg_spec_pool);
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec_pool != 0 && residency_tg_spec_budget != 0 && residency_tg_spec_budget != 12) {
+        fprintf(stderr, "error: --residency-tg-spec-pool first arm requires --residency-tg-spec-budget 12 (got %d)\n", residency_tg_spec_budget);
+        return 2;
+    }
+    if (!forced_off && residency_tg_spec_pool != 0 && residency_tg_spec_budget == 0) {
+        residency_tg_spec_budget = 12;
     }
     if (!forced_off && residency_tg_spec != 2 && residency_tg_spec_arm >= 0) {
         fprintf(stderr, "error: --residency-tg-spec-arm is only meaningful with --residency-tg-spec 2 "
@@ -4627,6 +4649,7 @@ int main(int argc, char ** argv) {
     // loud at bring-up rather than mid-generation.
     ls.row_set_retain   = residency_tg_retain > 0;
     ls.row_set_retain_k = residency_tg_retain > 0 ? residency_tg_retain : kRowSetRetainDefault;
+    ls.row_set_spec_pool = residency_tg_spec_pool;
 
     // T-GPLR-58 A0: configure speculative placement BEFORE begin_row_cache()
     // allocates its state and long before any TG graph exists, so a bad
@@ -4728,6 +4751,18 @@ int main(int argc, char ** argv) {
                     fit, fit_bytes, vram.cache_budget, cap_note);
         }
     }
+    size_t pool_fit_bytes = 0;
+    if (ls.row_set_spec_pool > 0) {
+        pool_fit_bytes = ls.row_set_spec_pool_bytes_for(ls.row_set_spec_pool);
+        if (pool_fit_bytes == 0 || fit_bytes + pool_fit_bytes > vram.cache_budget) {
+            fprintf(stderr, "error: prediction pool capacity %d needs %zu B and the total cache allowance is %zu B (real cache %zu B + pool %zu B)\n",
+                    ls.row_set_spec_pool, pool_fit_bytes, vram.cache_budget, fit_bytes, pool_fit_bytes);
+            ls.tel_run_refused("spec_pool_fit", "real row cache plus prediction pool exceeds the cache allowance",
+                               1, (uint64_t) (fit_bytes + pool_fit_bytes), (uint64_t) vram.cache_budget,
+                               ls_vram_budget_cache_capped_by_budget(vram) ? "budget" : "free");
+            return 1;
+        }
+    }
     if (ls.row_set_retain && !ls.begin_row_cache()) {
         fprintf(stderr, "error: per-layer row-cache allocation failed: %s\n", ls.error_msg.c_str());
         ls.tel_run_refused("row_cache_alloc", ls.error_msg.c_str(), 1, fit_bytes, vram.cache_budget,
@@ -4751,6 +4786,13 @@ int main(int argc, char ** argv) {
         ls.tel_run_refused("row_cache_divergence",
                            "the allocated cache does not match the fit prediction",
                            1, (uint64_t) fit_bytes, (uint64_t) ls.row_cache_alloc_bytes, "none");
+        return 1;
+    }
+    if (ls.row_set_spec_pool > 0 && ls.row_set_spec_pool_alloc_bytes != pool_fit_bytes) {
+        fprintf(stderr, "error: prediction pool allocated %zu B but the fit predicted %zu B (prediction and allocation diverged)\n",
+                ls.row_set_spec_pool_alloc_bytes, pool_fit_bytes);
+        ls.tel_run_refused("spec_pool_divergence", "the allocated prediction pool does not match its fit prediction",
+                           1, (uint64_t) pool_fit_bytes, (uint64_t) ls.row_set_spec_pool_alloc_bytes, "none");
         return 1;
     }
     // T-GPLR-08: configure the one-layer-ahead prefetch probe. Range
@@ -4854,6 +4896,9 @@ int main(int argc, char ** argv) {
             // T-GPLR-19: the row cache and the operator's total residency cap
             // go in the same record as the bounded-window account, so the cap
             // this run enforced at bring-up is verifiable from JSONL alone.
+                        // T-GPLR-59: the pool is a separate, named VRAM class. It is
+                // omitted entirely when zero so legacy no-pool traces retain
+                // their byte-account schema.
             // residency_cap is 0 when no explicit --residency-budget-mib was
             // given: then the bounded window is its own cap and the cache is
             // free-derived, exactly as before this field existed.
@@ -4863,7 +4908,8 @@ int main(int argc, char ** argv) {
                                 vram.reserve_bytes,
                                 vram.free_start, vram.total, vram.residency_budget_mib,
                                 (uint64_t) ls.row_cache_alloc_bytes,
-                                vram.residency_budget_mib > 0 ? vram.residency_budget_bytes : 0);
+                                vram.residency_budget_mib > 0 ? vram.residency_budget_bytes : 0,
+                                (uint64_t) ls.row_set_spec_pool_alloc_bytes);
         }
     }
     ls.exec_layers = boundary_layers;

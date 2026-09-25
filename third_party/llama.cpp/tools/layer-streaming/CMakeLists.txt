@@ -1,7 +1,11 @@
 # private research: Qwen3.5 dense decoder-layer streaming runner.
 # This target exists only when LLAMA_LAYER_STREAMING=ON.
 
-add_executable(llama-layer-streaming main.cpp)
+add_executable(llama-layer-streaming
+    main.cpp
+    telemetry-json.cpp
+    telemetry-pool.cpp
+)
 target_compile_definitions(llama-layer-streaming PRIVATE LLAMA_LAYER_STREAMING)
 target_include_directories(llama-layer-streaming PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_features   (llama-layer-streaming PRIVATE cxx_std_17)
@@ -849,4 +853,65 @@ if (LLAMA_LAYER_STREAMING)
         COMMAND llama-layer-streaming --validate-telemetry
                 ${CMAKE_BINARY_DIR}/gplr54-tg-logits.jsonl
     )
+
+    # T-GPLR-59: prediction-pool telemetry fixtures (host-only, no GPU). Both
+    # host validators must accept the two positives -- the pool lifecycle trace
+    # (issue, READY hit, PENDING demand fallback, terminal closure) and the
+    # pool-less legacy trace (default-off immunity) -- and reject every
+    # negative, each of which breaks exactly one pool rule: init capacity,
+    # run_start without a valid spec_pool_init, proposal conservation,
+    # stop/refusal pairing, cumulative counters, spec-vs-fetch hit agreement,
+    # a pool hit overlapping a real resident, pool hits in a pool-off trace, a
+    # missing pool_hit_ids field, a missing spec_pool key, and an open
+    # submitted-total closure. Fixtures are copied into the build dir first:
+    # validate-telemetry writes <path>.summary.json beside its input.
+    set(POOL_FIXTURES_POSITIVE
+        pool-positive
+        pool-legacy-off
+    )
+    set(POOL_FIXTURES_NEGATIVE
+        pool-init-bad-capacity
+        pool-run-start-no-init
+        pool-conservation
+        pool-stop-mismatch
+        pool-totals-break
+        pool-hit-mismatch
+        pool-hit-resident
+        pool-off-with-hits
+        pool-fetch-missing-hits
+        pool-event-missing-key
+        pool-final-open
+        pool-duplicate-run-start
+        pool-before-rowset-init
+        pool-malformed-numeric
+    )
+    foreach(f IN LISTS POOL_FIXTURES_POSITIVE POOL_FIXTURES_NEGATIVE)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${f}.jsonl
+            ${CMAKE_BINARY_DIR}/${f}.jsonl
+            COPYONLY
+        )
+    endforeach()
+    foreach(f IN LISTS POOL_FIXTURES_POSITIVE)
+        add_test(
+            NAME layer-streaming-check-${f}
+            COMMAND llama-layer-streaming --check-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        add_test(
+            NAME layer-streaming-validate-${f}
+            COMMAND llama-layer-streaming --validate-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+    endforeach()
+    foreach(f IN LISTS POOL_FIXTURES_NEGATIVE)
+        add_test(
+            NAME layer-streaming-check-${f}
+            COMMAND llama-layer-streaming --check-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        set_tests_properties(layer-streaming-check-${f} PROPERTIES WILL_FAIL TRUE)
+        add_test(
+            NAME layer-streaming-validate-${f}
+            COMMAND llama-layer-streaming --validate-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        set_tests_properties(layer-streaming-validate-${f} PROPERTIES WILL_FAIL TRUE)
+    endforeach()
 endif()

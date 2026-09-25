@@ -20,11 +20,13 @@
 // (dynamic/imatrix models) without inflating VRAM.
 
 #include "llama-model.h"
+#include "llama-layer-streaming-pool.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -879,7 +881,8 @@ struct LLAMA_API llama_layer_streaming {
                           uint64_t kv_bytes, uint64_t state_bytes, uint64_t act_slab_bytes,
                           uint64_t reserve_bytes, uint64_t free_vram_bytes, uint64_t total_vram_bytes,
                           int64_t residency_budget_mib,
-                          uint64_t row_cache_bytes, uint64_t residency_cap_bytes);
+                          uint64_t row_cache_bytes, uint64_t residency_cap_bytes,
+                          uint64_t prediction_pool_bytes = 0);
     // T-GPLR-36 follow-up: host-memory samples, one pair per PP pass, emitted
     // under --pp-recon exactly like the T-GPLR-36 ledger (an unknown event type
     // is ignored by the checkers, so a recon-only event cannot disturb an
@@ -1236,6 +1239,66 @@ struct LLAMA_API llama_layer_streaming {
     // Free the speculative state, events included; idempotent.
     void spec_reset();
 
+    // T-GPLR-59: prediction-only row pool. This is deliberately separate from
+    // spec_state/cache_expert: a pool row is never a real-cache residency claim.
+    int  row_set_spec_pool = 0;             // positions per logical layer, 0 = off
+    std::vector<ggml_backend_buffer_ptr>    pool_bufs;
+    std::vector<std::vector<ggml_tensor *>> pool_tens;
+    ggml_context * pool_meta = nullptr;
+    std::vector<std::vector<int32_t>>       pool_expert;
+    std::vector<std::vector<uint8_t>>       pool_state;
+    std::vector<std::vector<int64_t>>       pool_recency;
+    std::vector<std::vector<uint32_t>>      pool_gen;
+    std::vector<std::vector<int32_t>>       pool_issue_ord;
+    std::vector<std::vector<void *>>        pool_ev;
+    std::vector<std::vector<int32_t>>       pool_ev_pos;
+    bool pool_events_ready = false;
+    std::vector<int>                        pool_calls;
+    size_t row_set_spec_pool_alloc_bytes = 0;
+    int64_t pool_submitted_last = 0;
+    int64_t pool_submitted = 0;
+    int64_t pool_ready = 0;
+    int64_t pool_cancelled = 0;
+    int64_t pool_cancelled_demand = 0;
+    int64_t pool_cancelled_generation = 0;
+    int64_t pool_cancelled_capacity = 0;
+    int64_t pool_stale_retired = 0;
+    int64_t pool_evicted_last = 0;
+    int64_t pool_evicted = 0;
+    int64_t pool_consumed_last = 0;
+    int64_t pool_consumed = 0;
+    int64_t pool_pending_fallbacks_last = 0;
+    int64_t pool_pending_fallbacks = 0;
+    int64_t pool_d2d_bytes_last = 0;
+    int64_t pool_d2d_bytes_total = 0;
+    int64_t pool_h2d_bytes_last = 0;
+    int64_t pool_h2d_bytes_total = 0;
+    int64_t pool_reap_wait_us_last = 0;
+    int64_t pool_reap_wait_us = 0;
+    std::vector<int32_t> pool_candidates_last;
+    std::vector<int32_t> pool_fills_last;
+    std::vector<int32_t> pool_hit_ids_last;
+    int pool_skipped_real_last = 0;
+    int pool_skipped_pool_last = 0;
+    int pool_skipped_dup_last = 0;
+    int pool_skipped_invalid_last = 0;
+    int pool_refused_budget_last = 0;
+    int pool_refused_capacity_last = 0;
+    int pool_stop_last = 0;
+
+    int pool_pending_of(int il) const;
+    int pool_ready_of(int il) const;
+    bool pool_cancel_demand(int il, int32_t expert, uint32_t generation);
+    bool pool_issue_one(int il, int32_t expert, int pos, uint32_t generation, int64_t tick);
+    void pool_reap(int il);
+    void pool_begin_generation(int il, uint32_t generation);
+    void pool_cancel_generation();
+    void pool_reset();
+    void tel_spec_pool(int il, uint32_t generation, int pending_now, int ready_now);
+    size_t row_set_spec_pool_bytes_for(int cap) const;
+    bool begin_row_pool();
+    void end_row_pool();
+
     // one `spec` event per demand stage while the mode is on
     void tel_spec(int il, int pending_now, int ready_spec_now);
     // allocate the per-layer cache storage; called only when row_set_retain is
@@ -1285,7 +1348,8 @@ struct LLAMA_API llama_layer_streaming {
                           const std::vector<int32_t> & union_ids, size_t n_rows_fetched,
                           size_t bytes_staged, size_t bytes_full_bank,
                           double host_submit_us, double transfer_us, double ready_latency_us,
-                          size_t n_rows_retained, size_t n_rows_retired);
+                          size_t n_rows_resident, size_t n_rows_retained, size_t n_rows_retired,
+                          const std::vector<int32_t> * pool_hit_ids = nullptr);
     void tel_rowset_refused(int il, int slot, uint32_t generation, const char * reason, const char * detail);
     void tel_rowset_round(int64_t round, size_t bytes_staged, size_t bytes_full_bank,
                           uint64_t n_fetched, uint64_t n_reused);
@@ -1670,13 +1734,6 @@ LLAMA_API void llama_ls_route_topk_row(const float * probs, int64_t n_expert, in
 //       never reused, and the mark is non-blocking -- which is what lets a
 //       demand stage cancel without waiting (P1).
 // ---------------------------------------------------------------------------
-enum llama_ls_spec_state : uint8_t {
-    LLAMA_LS_SPEC_FREE      = 0, // no row here
-    LLAMA_LS_SPEC_READY     = 1, // row resident; its own copy completed
-    LLAMA_LS_SPEC_PENDING   = 2, // copy in flight: reserved, never a hit, never evicted
-    LLAMA_LS_SPEC_CANCELLED = 3, // cancelled mid-flight: the reap frees it WITHOUT a residency claim
-};
-
 struct llama_ls_spec_admission {
     bool         ok     = false;
     int          pos    = -1;

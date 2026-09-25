@@ -59,6 +59,7 @@
 #endif
 #include <condition_variable>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -5716,7 +5717,9 @@ static std::string tel_run_start_head(uint64_t run_id, uint64_t t0_us) {
     if (row_set_spec_on) {
         spec_str = std::string(",\"row_spec_mode\":") + std::to_string(row_set_spec_mode) +
                    ",\"row_spec_budget\":" + std::to_string(row_set_spec_budget) +
-                   ",\"row_spec_reserve\":" + std::to_string(row_set_spec_reserve);
+                   ",\"row_spec_reserve\":" + std::to_string(row_set_spec_reserve) +
+                   ",\"row_spec_pool\":" + std::to_string(row_set_spec_pool) +
+                   ",\"row_spec_pool_bytes\":" + std::to_string(row_set_spec_pool_alloc_bytes);
         if (row_set_spec_mode == 2) {
             // MODE 2: the ARM is part of the RESOLVED configuration, not an argv echo,
             // and the null source is named separately -- a null leg must be identifiable
@@ -6199,14 +6202,17 @@ void llama_layer_streaming::tel_byte_account(uint64_t full_model_plus_runtime, u
                                              uint64_t kv_bytes, uint64_t state_bytes, uint64_t act_slab_bytes,
                                              uint64_t reserve_bytes, uint64_t free_vram_bytes, uint64_t total_vram_bytes,
                                              int64_t residency_budget_mib,
-                                             uint64_t row_cache_bytes, uint64_t residency_cap_bytes) {
+                                             uint64_t row_cache_bytes, uint64_t residency_cap_bytes,
+                                             uint64_t prediction_pool_bytes) {
+    const std::string pool_str = prediction_pool_bytes > 0
+        ? ",\"prediction_pool\":" + std::to_string(prediction_pool_bytes) : "";
     tel_write(tel_out,
         "{\"event\":\"byte_account\",\"run_id\":%llu,"
         "\"full_model_plus_runtime\":%llu,\"bounded_window\":%llu,"
         "\"static\":%llu,\"per_layer\":%llu,\"slot_window\":%llu,\"kv\":%llu,\"state\":%llu,"
         "\"act_slab\":%llu,\"reserve\":%llu,"
         "\"free_vram\":%llu,\"total_vram\":%llu,\"residency_budget_mib\":%lld,"
-        "\"row_cache\":%llu,\"residency_cap\":%llu,"
+        "\"row_cache\":%llu,\"residency_cap\":%llu%s,"
         "\"full_exceeds_free\":%s,\"bounded_within_free\":%s}",
         (unsigned long long) run_id,
         (unsigned long long) full_model_plus_runtime, (unsigned long long) bounded_window,
@@ -6217,11 +6223,9 @@ void llama_layer_streaming::tel_byte_account(uint64_t full_model_plus_runtime, u
         (unsigned long long) free_vram_bytes, (unsigned long long) total_vram_bytes,
         (long long) residency_budget_mib,
         (unsigned long long) row_cache_bytes, (unsigned long long) residency_cap_bytes,
+        pool_str.c_str(),
         full_model_plus_runtime > free_vram_bytes ? "true" : "false",
-        // T-GPLR-19: the row cache is residency too, so it belongs in the
-        // residency-within-free claim -- without it the field could read true
-        // while the cache pushed the run past the reading.
-        bounded_window + row_cache_bytes + act_slab_bytes + reserve_bytes <= free_vram_bytes ? "true" : "false");
+        bounded_window + row_cache_bytes + prediction_pool_bytes + act_slab_bytes + reserve_bytes <= free_vram_bytes ? "true" : "false");
 }
 
 // T-GPLR-36 follow-up: the engine's OWN host-side byte holdings, read from the
@@ -7239,8 +7243,401 @@ size_t llama_layer_streaming::row_cache_bytes_for(int k) const {
     return total;
 }
 
-// ---------------------------------------------------------------------------
-// T-GPLR-58 A0: speculative placement on the retention path (engine side).
+size_t llama_layer_streaming::row_set_spec_pool_bytes_for(int cap) const {
+    if (adapter == nullptr || !adapter->merge_resident || cap <= 0) {
+        return 0;
+    }
+    const int n_exp = (int) model_ref->hparams.n_expert;
+    if (cap > n_exp) {
+        return 0;
+    }
+    ggml_init_params meta_params = { (size_t) 4 * 1024 * 1024, nullptr, true };
+    ggml_context * meta = ggml_init(meta_params);
+    if (meta == nullptr) {
+        return 0;
+    }
+    size_t total = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        size_t cost = 0;
+        if (!row_cache_layer_cost(il, cap, meta, nullptr, &cost)) {
+            ggml_free(meta);
+            return 0;
+        }
+        total += cost;
+    }
+    ggml_free(meta);
+    return total;
+}
+
+bool llama_layer_streaming::begin_row_pool() {
+    if (row_set_spec_pool <= 0) {
+        return true;
+    }
+    if (row_set_spec_pool > (int) model_ref->hparams.n_expert) {
+        error_msg = "begin_row_pool: capacity exceeds the model's expert count";
+        return false;
+    }
+    if (row_set_spec_mode != 2 || !row_set_spec_on) {
+        error_msg = "begin_row_pool: the prediction pool requires configured mode 2";
+        return false;
+    }
+    if (row_set_spec_budget > row_set_spec_pool) {
+        error_msg = "begin_row_pool: proposal budget exceeds prediction-pool capacity";
+        return false;
+    }
+    if (pool_meta != nullptr) {
+        error_msg = "begin_row_pool: pool already active";
+        return false;
+    }
+    const ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
+    ggml_init_params params = { (size_t) 4 * 1024 * 1024, nullptr, true };
+    pool_meta = ggml_init(params);
+    if (pool_meta == nullptr) {
+        error_msg = "begin_row_pool: failed to create pool tensor context";
+        return false;
+    }
+    pool_bufs.resize((size_t) n_layer);
+    pool_tens.assign((size_t) n_layer, {});
+    pool_expert.assign((size_t) n_layer, std::vector<int32_t>((size_t) row_set_spec_pool, -1));
+    pool_state.assign((size_t) n_layer, std::vector<uint8_t>((size_t) row_set_spec_pool, LLAMA_LS_SPEC_FREE));
+    pool_recency.assign((size_t) n_layer, std::vector<int64_t>((size_t) row_set_spec_pool, -1));
+    pool_gen.assign((size_t) n_layer, std::vector<uint32_t>((size_t) row_set_spec_pool, 0));
+    pool_issue_ord.assign((size_t) n_layer, std::vector<int32_t>((size_t) row_set_spec_pool, -1));
+    pool_calls.assign((size_t) n_layer, 0);
+    size_t total = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        std::vector<ggml_tensor *> members;
+        size_t need = 0;
+        if (!row_cache_layer_cost(il, row_set_spec_pool, pool_meta, &members, &need)) {
+            error_msg = "begin_row_pool: failed to create pool tensor for layer " + std::to_string(il);
+            end_row_pool();
+            return false;
+        }
+        pool_tens[(size_t) il] = members;
+        pool_bufs[(size_t) il].reset(ggml_backend_buft_alloc_buffer(buft_cuda, need));
+        if (!pool_bufs[(size_t) il]) {
+            error_msg = "begin_row_pool: failed to allocate pool buffer for layer " + std::to_string(il);
+            end_row_pool();
+            return false;
+        }
+        std::vector<ggml_tensor *> real;
+        for (ggml_tensor * t : members) {
+            if (t != nullptr) {
+                real.push_back(t);
+            }
+        }
+        size_t off = 0;
+        if (!alloc_tensors(pool_bufs[(size_t) il].get(), buft_cuda, real, off)) {
+            error_msg = "begin_row_pool: failed to place pool tensors for layer " + std::to_string(il);
+            end_row_pool();
+            return false;
+        }
+        total += ggml_backend_buffer_get_size(pool_bufs[(size_t) il].get());
+    }
+    row_set_spec_pool_alloc_bytes = total;
+    tel_write(tel_out,
+        "{\"event\":\"spec_pool_init\",\"run_id\":%llu,\"capacity\":%d,\"layers\":%d,"
+        "\"bytes\":%zu,\"proposal_budget\":%d,\"t_us\":%lld}",
+        (unsigned long long) run_id, row_set_spec_pool, n_layer, total,
+        row_set_spec_budget, (long long) ggml_time_us());
+    return true;
+}
+
+void llama_layer_streaming::end_row_pool() {
+    for (auto & evs : pool_ev) {
+        for (void * ev : evs) {
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize((ggml_backend_event_t) ev);
+            }
+        }
+    }
+    for (auto & evs : pool_ev) {
+        for (void * ev : evs) {
+            if (ev != nullptr) {
+                ggml_backend_event_free((ggml_backend_event_t) ev);
+            }
+        }
+    }
+    pool_ev.clear();
+    pool_ev_pos.clear();
+    pool_events_ready = false;
+    pool_bufs.clear();
+    pool_tens.clear();
+    pool_expert.clear();
+    pool_state.clear();
+    pool_recency.clear();
+    pool_gen.clear();
+    pool_issue_ord.clear();
+    pool_calls.clear();
+    if (pool_meta != nullptr) {
+        ggml_free(pool_meta);
+        pool_meta = nullptr;
+    }
+    row_set_spec_pool_alloc_bytes = 0;
+}
+
+int llama_layer_streaming::pool_pending_of(int il) const {
+    if (il < 0 || (size_t) il >= pool_state.size()) {
+        return 0;
+    }
+    int n = 0;
+    for (uint8_t st : pool_state[(size_t) il]) {
+        n += st == LLAMA_LS_SPEC_PENDING;
+    }
+    return n;
+}
+
+int llama_layer_streaming::pool_ready_of(int il) const {
+    if (il < 0 || (size_t) il >= pool_state.size()) {
+        return 0;
+    }
+    int n = 0;
+    for (uint8_t st : pool_state[(size_t) il]) {
+        n += st == LLAMA_LS_SPEC_READY;
+    }
+    return n;
+}
+
+bool llama_layer_streaming::pool_cancel_demand(int il, int32_t expert, uint32_t generation) {
+    if (il < 0 || (size_t) il >= pool_state.size()) {
+        return false;
+    }
+    const auto & st = pool_state[(size_t) il];
+    const auto & ex = pool_expert[(size_t) il];
+    const auto & gn = pool_gen[(size_t) il];
+    for (int p = 0; p < row_set_spec_pool; ++p) {
+        if (ex[(size_t) p] == expert && st[(size_t) p] == LLAMA_LS_SPEC_PENDING &&
+            gn[(size_t) p] == generation) {
+            pool_state[(size_t) il][(size_t) p] = LLAMA_LS_SPEC_CANCELLED;
+            ++pool_cancelled;
+            ++pool_cancelled_demand;
+            ++pool_pending_fallbacks_last;
+            ++pool_pending_fallbacks;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_layer_streaming::pool_issue_one(int il, int32_t expert, int pos, uint32_t generation, int64_t tick) {
+    if (il < 0 || pos < 0 || expert < 0 || (size_t) il >= pool_state.size() ||
+        (size_t) pos >= pool_state[(size_t) il].size()) {
+        error_msg = "pool_issue_one: invalid layer, position, or expert id";
+        return false;
+    }
+    auto & st = pool_state[(size_t) il];
+    auto & ex = pool_expert[(size_t) il];
+    if (st[(size_t) pos] != LLAMA_LS_SPEC_FREE || ex[(size_t) pos] >= 0) {
+        error_msg = "pool_issue_one: target position is not FREE";
+        return false;
+    }
+    for (size_t p = 0; p < st.size(); ++p) {
+        if (p != (size_t) pos && st[p] != LLAMA_LS_SPEC_FREE && ex[p] == expert) {
+            error_msg = "pool_issue_one: duplicate live pool expert";
+            return false;
+        }
+    }
+    if (!pool_events_ready) {
+        const ggml_backend_dev_t dev = ggml_backend_get_device(backend_copy);
+        pool_ev.assign(pool_state.size(), {});
+        pool_ev_pos.assign(pool_state.size(), {});
+        for (size_t l = 0; l < pool_state.size(); ++l) {
+            pool_ev[l].assign((size_t) row_set_spec_budget, nullptr);
+            pool_ev_pos[l].assign((size_t) row_set_spec_budget, -1);
+            for (int s = 0; s < row_set_spec_budget; ++s) {
+                pool_ev[l][(size_t) s] = ggml_backend_event_new(dev);
+                if (pool_ev[l][(size_t) s] == nullptr) {
+                    error_msg = "pool_issue_one: failed to create a completion event";
+                    return false;
+                }
+            }
+        }
+        pool_events_ready = true;
+    }
+    int slot = -1;
+    for (size_t s = 0; s < pool_ev_pos[(size_t) il].size(); ++s) {
+        if (pool_ev_pos[(size_t) il][s] < 0) { slot = (int) s; break; }
+    }
+    if (slot < 0) {
+        error_msg = "pool_issue_one: no free completion-event slot";
+        return false;
+    }
+    const llama_ls_package & pkg = pkg_cache.at((size_t) il);
+    const auto & mem = pool_tens[(size_t) il];
+    if (mem.size() != pkg.members.size()) {
+        error_msg = "pool_issue_one: pool tensor descriptor does not match the package";
+        return false;
+    }
+    size_t bytes = 0;
+    int copied_members = 0;
+    for (size_t mi = 0; mi < pkg.members.size(); ++mi) {
+        const ggml_tensor * src = pkg.members[mi].src;
+        const ggml_tensor * dst = mem[mi];
+        if (src == nullptr) {
+            if (dst != nullptr) {
+                error_msg = "pool_issue_one: non-null pool tensor has no package source";
+                return false;
+            }
+            continue;
+        }
+        if (dst == nullptr || src->data == nullptr || dst->data == nullptr) {
+            error_msg = "pool_issue_one: package source or pool tensor has no storage";
+            return false;
+        }
+        const size_t slab = llama_ls_expert_slab_bytes(src->type, src->ne[0], src->ne[1]);
+        const size_t src_bytes = ggml_nbytes(src);
+        const size_t dst_bytes = ggml_nbytes(dst);
+        if (slab == 0 || expert >= src->ne[2] || slab > src_bytes || slab > dst_bytes ||
+            (size_t) expert > (src_bytes - slab) / slab ||
+            (size_t) pos > (dst_bytes - slab) / slab) {
+            error_msg = "pool_issue_one: expert slab is outside the source or destination tensor";
+            return false;
+        }
+        ggml_backend_tensor_set_async(backend_copy, (ggml_tensor *) dst,
+                                      (const char *) src->data + (size_t) expert * slab,
+                                      (size_t) pos * slab, slab);
+        bytes += slab;
+        ++copied_members;
+    }
+    if (copied_members == 0) {
+        error_msg = "pool_issue_one: package has no copyable expert members";
+        return false;
+    }
+    ex[(size_t) pos] = expert;
+    st[(size_t) pos] = LLAMA_LS_SPEC_PENDING;
+    pool_recency[(size_t) il][(size_t) pos] = tick;
+    pool_gen[(size_t) il][(size_t) pos] = generation;
+    pool_issue_ord[(size_t) il][(size_t) pos] = ++pool_calls[(size_t) il];
+    pool_ev_pos[(size_t) il][(size_t) slot] = pos;
+    ggml_backend_event_record((ggml_backend_event_t) pool_ev[(size_t) il][(size_t) slot], backend_copy);
+    ++pool_submitted_last;
+    ++pool_submitted;
+    pool_h2d_bytes_last += (int64_t) bytes;
+    pool_h2d_bytes_total += (int64_t) bytes;
+    return true;
+}
+
+void llama_layer_streaming::pool_reap(int il) {
+    if (il < 0 || (size_t) il >= pool_ev.size()) {
+        return;
+    }
+    auto & st = pool_state[(size_t) il];
+    auto & evs = pool_ev[(size_t) il];
+    auto & evp = pool_ev_pos[(size_t) il];
+    for (size_t s = 0; s < evs.size(); ++s) {
+        const int p = evp[s];
+        if (p < 0) {
+            continue;
+        }
+        if (st[(size_t) p] != LLAMA_LS_SPEC_PENDING && st[(size_t) p] != LLAMA_LS_SPEC_CANCELLED) {
+            evp[s] = -1;
+            continue;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_event_synchronize((ggml_backend_event_t) evs[s]);
+        const int64_t waited = ggml_time_us() - t0;
+        pool_reap_wait_us_last += waited;
+        pool_reap_wait_us += waited;
+        const uint8_t before = st[(size_t) p];
+        const int completed = llama_ls_pool_complete(
+            pool_expert[(size_t) il].data(), st.data(), pool_recency[(size_t) il].data(),
+            pool_gen[(size_t) il].data(), row_set_spec_pool, p);
+        if (completed == 1) {
+            ++pool_ready;
+        } else if (completed == 2) {
+            pool_issue_ord[(size_t) il][(size_t) p] = -1;
+        } else if (before == LLAMA_LS_SPEC_PENDING || before == LLAMA_LS_SPEC_CANCELLED) {
+            error_msg = "pool_reap: completion event owned an incompatible position";
+            failed = true;
+            tel_error(error_msg.c_str());
+        }
+        evp[s] = -1;
+    }
+}
+
+void llama_layer_streaming::pool_begin_generation(int il, uint32_t generation) {
+    if (il < 0 || (size_t) il >= pool_state.size()) {
+        return;
+    }
+    int stale_pending = 0;
+    int stale_ready = 0;
+    for (int p = 0; p < row_set_spec_pool; ++p) {
+        if (pool_gen[(size_t) il][(size_t) p] == generation) {
+            continue;
+        }
+        stale_pending += pool_state[(size_t) il][(size_t) p] == LLAMA_LS_SPEC_PENDING;
+        stale_ready += pool_state[(size_t) il][(size_t) p] == LLAMA_LS_SPEC_READY;
+    }
+    llama_ls_pool_begin_generation(
+        pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+        pool_recency[(size_t) il].data(), pool_gen[(size_t) il].data(),
+        row_set_spec_pool, generation);
+    pool_cancelled += stale_pending;
+    pool_cancelled_generation += stale_pending;
+    pool_stale_retired += stale_ready;
+}
+
+void llama_layer_streaming::pool_cancel_generation() {
+    for (int il = 0; il < (int) pool_state.size(); ++il) {
+        const uint32_t generation = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
+        pool_begin_generation(il, generation);
+        pool_reap(il);
+    }
+}
+
+void llama_layer_streaming::pool_reset() {
+    end_row_pool();
+    pool_submitted_last = pool_submitted = pool_ready = pool_cancelled = 0;
+    pool_cancelled_demand = pool_cancelled_generation = pool_cancelled_capacity = pool_stale_retired = 0;
+    pool_evicted_last = pool_evicted = pool_consumed_last = pool_consumed = 0;
+    pool_pending_fallbacks_last = pool_pending_fallbacks = 0;
+    pool_d2d_bytes_last = pool_d2d_bytes_total = 0;
+    pool_h2d_bytes_last = pool_h2d_bytes_total = 0;
+    pool_reap_wait_us_last = pool_reap_wait_us = 0;
+    pool_candidates_last.clear();
+    pool_fills_last.clear();
+    pool_hit_ids_last.clear();
+    pool_skipped_real_last = pool_skipped_pool_last = pool_skipped_dup_last = 0;
+    pool_skipped_invalid_last = pool_refused_budget_last = 0;
+    pool_refused_capacity_last = pool_evicted_last = pool_stop_last = 0;
+}
+
+void llama_layer_streaming::tel_spec_pool(int il, uint32_t generation, int pending_now, int ready_now) {
+    auto ids = [](const std::vector<int32_t> & v) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); ++i) { s += (i ? "," : ""); s += std::to_string(v[i]); }
+        return s;
+    };
+    tel_write(tel_out,
+        "{\"event\":\"spec_pool\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"generation\":%u,"
+        "\"capacity\":%d,\"proposal_budget\":%d,\"candidates\":[%s],\"fill_ids\":[%s],\"hit_ids\":[%s],"
+        "\"skipped_real\":%d,\"skipped_pool\":%d,\"skipped_dup\":%d,\"skipped_invalid\":%d,"
+        "\"refused_budget\":%d,\"refused_capacity\":%d,\"evicted\":%d,\"stop\":%d,"
+        "\"pending\":%d,\"ready\":%d,\"submitted\":%lld,\"submitted_total\":%lld,"
+        "\"ready_total\":%lld,\"cancelled_total\":%lld,\"evicted_total\":%lld,"
+        "\"consumed\":%lld,\"consumed_total\":%lld,\"pending_fallbacks\":%lld,"
+        "\"pending_fallbacks_total\":%lld,\"reap_wait_us\":%lld,\"reap_wait_us_total\":%lld,"
+        "\"h2d_bytes\":%lld,\"h2d_bytes_total\":%lld,\"d2d_bytes\":%lld,"
+        "\"d2d_bytes_total\":%lld,\"cancelled_demand_total\":%lld,"
+        "\"cancelled_generation_total\":%lld,\"cancelled_capacity_total\":%lld,"
+        "\"stale_retired_total\":%lld,\"allocation_bytes\":%zu,\"t_us\":%lld}",
+        (unsigned long long) run_id, (unsigned long long) n_ubatches, il, generation,
+        row_set_spec_pool, row_set_spec_budget,
+        ids(pool_candidates_last).c_str(), ids(pool_fills_last).c_str(), ids(pool_hit_ids_last).c_str(),
+        pool_skipped_real_last, pool_skipped_pool_last, pool_skipped_dup_last, pool_skipped_invalid_last,
+        pool_refused_budget_last, pool_refused_capacity_last, pool_evicted_last, pool_stop_last,
+        pending_now, ready_now, (long long) pool_submitted_last, (long long) pool_submitted,
+        (long long) pool_ready, (long long) pool_cancelled, (long long) pool_evicted,
+        (long long) pool_consumed_last, (long long) pool_consumed,
+        (long long) pool_pending_fallbacks_last, (long long) pool_pending_fallbacks,
+        (long long) pool_reap_wait_us_last, (long long) pool_reap_wait_us,
+        (long long) pool_h2d_bytes_last, (long long) pool_h2d_bytes_total,
+        (long long) pool_d2d_bytes_last, (long long) pool_d2d_bytes_total,
+        (long long) pool_cancelled_demand, (long long) pool_cancelled_generation,
+        (long long) pool_cancelled_capacity, (long long) pool_stale_retired,
+        row_set_spec_pool_alloc_bytes, (long long) ggml_time_us());
+}
+
 //
 // Default-off: with row_set_spec_mode == 0 nothing below runs, no array is
 // allocated and no event is created (P6). The decisions themselves live in the
@@ -7305,8 +7702,9 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
     const int K     = row_set_retain_k < 1 ? 1 : row_set_retain_k;
     const int cap   = std::min(n_exp, K * top_k);
     const int b     = budget > 0 ? budget : top_k;
-    if (b < 1 || b > cap) {
-        error_msg = "set_row_set_spec: budget " + std::to_string(b) + " outside [1," + std::to_string(cap) +
+    const int bmax  = row_set_spec_pool > 0 ? row_set_spec_pool : cap;
+    if (b < 1 || b > bmax) {
+        error_msg = "set_row_set_spec: budget " + std::to_string(b) + " outside [1," + std::to_string(bmax) +
                     "] for K=" + std::to_string(K) + ", top_k=" + std::to_string(top_k);
         return false;
     }
@@ -7323,7 +7721,7 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
         }
         row_set_spec_mode    = 2;
         row_set_spec_budget  = b;
-        row_set_spec_reserve = top_k;
+        row_set_spec_reserve = row_set_spec_pool > 0 ? 0 : top_k;
         row_set_spec_on      = true;
         row_set_spec_script.clear();
         spec_script.clear();
@@ -7735,6 +8133,91 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
     spec_skipped_dup_last = 0;
     spec_plan_refused_capacity_last = 0;
     spec_plan_stop_last = 0;
+
+    // The REAP lives here, on the speculation path: it is the only place a
+    // PENDING position resolves, and it runs after the demand's own wait has
+    // closed, so a fill's completion can never extend a demand's stage wait.
+    spec_reap(il);
+
+    if (row_set_spec_pool > 0 && row_set_spec_mode == 2) {
+        pool_submitted_last = 0;
+        pool_evicted_last = 0;
+        pool_h2d_bytes_last = 0;
+        pool_reap_wait_us_last = 0;
+        pool_candidates_last.clear();
+        pool_fills_last.clear();
+        pool_skipped_real_last = pool_skipped_pool_last = pool_skipped_dup_last = 0;
+        pool_skipped_invalid_last = pool_refused_budget_last = pool_refused_capacity_last = 0;
+        pool_stop_last = 0;
+        pool_reap(il);
+        if (failed) {
+            return;
+        }
+        if ((size_t) il >= pool_expert.size() || (size_t) il >= pool_state.size()) {
+            error_msg = "spec_issue_next: prediction pool is not allocated";
+            failed = true;
+            return;
+        }
+        const llama_ls_propose_result pr = llama_ls_spec_propose(
+            spec_pred.get(), row_set_spec_arm, row_set_spec_null, il, row_set_spec_budget,
+            demand_ids, n_demand, pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+            row_set_spec_pool, 0, row_set_spec_budget, pool_pending_of(il),
+            &spec_null_rng, (int) model_ref->hparams.n_expert);
+        pool_candidates_last.assign(pr.published, pr.published + pr.n_proposals);
+        const llama_ls_pool_plan pp = llama_ls_pool_plan_make(
+            cache_expert[(size_t) il].data(), spec_state[(size_t) il].data(), row_set_cap,
+            pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+            pool_recency[(size_t) il].data(), row_set_spec_pool,
+            (int) model_ref->hparams.n_expert, row_set_spec_budget,
+            pr.published, pr.n_proposals);
+        pool_skipped_real_last = pp.skipped_real;
+        pool_skipped_pool_last = pp.skipped_pool;
+        pool_skipped_dup_last = pp.skipped_dup;
+        pool_skipped_invalid_last = pp.skipped_invalid;
+        pool_refused_budget_last = pp.refused_budget;
+        pool_refused_capacity_last = pp.refused_capacity;
+        pool_stop_last = pp.stop;
+        const uint32_t gen = slots.empty() ? 0 : slots[(size_t) (il % (int) slots.size())].generation;
+        for (int i = 0; i < pp.n_issue; ++i) {
+            const int32_t e = pp.issue[i];
+            const int pos = pp.issue_pos[i];
+            if (pos < 0 || pos >= row_set_spec_pool) {
+                error_msg = "pool planner returned an invalid position";
+                failed = true;
+                break;
+            }
+            if (pool_state[(size_t) il][(size_t) pos] == LLAMA_LS_SPEC_READY) {
+                if (!llama_ls_pool_retire_ready(
+                        pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+                        pool_recency[(size_t) il].data(), pool_gen[(size_t) il].data(),
+                        row_set_spec_pool, gen, pos)) {
+                    error_msg = "pool planner selected a stale READY row";
+                    failed = true;
+                    break;
+                }
+                pool_issue_ord[(size_t) il][(size_t) pos] = -1;
+                ++pool_evicted_last;
+                ++pool_evicted;
+            } else if (pool_state[(size_t) il][(size_t) pos] != LLAMA_LS_SPEC_FREE) {
+                error_msg = "pool planner selected an occupied in-flight row";
+                failed = true;
+                break;
+            }
+            if (!pool_issue_one(il, e, pos, gen, ++cache_tick)) {
+                failed = true;
+                break;
+            }
+            pool_fills_last.push_back(e);
+        }
+        if (failed) {
+            const int slot = slots.empty() ? -1 : il % (int) slots.size();
+            tel_rowset_refused(il, slot, gen, "pool_issue", error_msg.c_str());
+            return;
+        }
+        tel_spec_pool(il, gen, pool_pending_of(il), pool_ready_of(il));
+        return;
+    }
+
     // lazy allocation of the per-layer event slots (one per budgeted fill)
     if (spec_ev.size() < spec_state.size()) {
         const ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
@@ -7752,11 +8235,6 @@ void llama_layer_streaming::spec_issue_next(int il, const int32_t * demand_ids, 
             }
         }
     }
-
-    // The REAP lives here, on the speculation path: it is the only place a
-    // PENDING position resolves, and it runs after the demand's own wait has
-    // closed, so a fill's completion can never extend a demand's stage wait.
-    spec_reap(il);
 
     const int ord = ++spec_calls[(size_t) il];
 
@@ -7981,6 +8459,11 @@ bool llama_layer_streaming::begin_row_cache() {
         allocated += need;
     }
 
+    if (row_set_spec_pool > 0 && !begin_row_pool()) {
+        end_row_cache();
+        return false;
+    }
+
     cache_active = true;
     row_cache_alloc_bytes = allocated;
     fprintf(stderr, "row-cache (T-GPLR-19, SDD section 4 shape (i)): %d layers x %d rows/layer = %.1f MiB private VRAM, K=%d, query-time retention\n",
@@ -8007,6 +8490,7 @@ void llama_layer_streaming::end_row_cache() {
     cache_tens.clear();
     cache_expert.clear();
     cache_recency.clear();
+    end_row_pool();
     cache_active = false;
     row_cache_alloc_bytes = 0;
     backend_compute = nullptr;
@@ -8059,6 +8543,13 @@ bool llama_layer_streaming::begin_row_set() {
         for (int il = 0; il < n_layer; ++il) {
             spec_cancel(il, spec_pending_of(il), "generation_boundary");
             spec_reap(il);
+        }
+    }
+    if (row_set_spec_pool > 0) {
+        pool_cancel_generation();
+        if (failed) {
+            error_msg = "begin_row_set: prediction-pool generation boundary failed";
+            return false;
         }
     }
     row_set_active = true;
@@ -8169,6 +8660,14 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         auto & exp_t = cache_expert[(size_t) il];
         auto & rec_t = cache_recency[(size_t) il];
         const int cap = row_set_cap;
+        std::vector<int32_t> pool_hit_pos(uniq.size(), -1);
+        if (row_set_spec_pool > 0) {
+            pool_hit_ids_last.clear();
+            pool_consumed_last = 0;
+            pool_pending_fallbacks_last = 0;
+            pool_d2d_bytes_last = 0;
+            pool_begin_generation(il, slot.generation);
+        }
         // -------------------------------------------------------------------
         // T-GPLR-58 A0: speculative placement state for THIS layer.
         // P4's generation boundary: a fill issued under a previous slot
@@ -8240,7 +8739,25 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         for (size_t i = 0; i < uniq.size(); ++i) {
             resident += pos_of[i] >= 0;
         }
-        const size_t need = uniq.size() - resident;
+        if (row_set_spec_pool > 0) {
+            for (size_t i = 0; i < uniq.size(); ++i) {
+                if (pos_of[i] >= 0) {
+                    continue;
+                }
+                const llama_ls_pool_lookup hit = llama_ls_pool_lookup_expert(
+                    pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+                    pool_gen[(size_t) il].data(), row_set_spec_pool, slot.generation, uniq[i]);
+                if (hit.ready_pos >= 0) {
+                    pool_hit_pos[i] = hit.ready_pos;
+                    pool_hit_ids_last.push_back(uniq[i]);
+                } else if (hit.pending_pos >= 0) {
+                    pool_cancel_demand(il, uniq[i], slot.generation);
+                }
+            }
+        }
+        const size_t pool_hits = (size_t) std::count_if(
+            pool_hit_pos.begin(), pool_hit_pos.end(), [](int32_t p) { return p >= 0; });
+        const size_t need = uniq.size() - resident - pool_hits;
 
         // 2. evict least-recently-routed positions until the fetched complement
         //    fits. A row needed by this window is never a victim, so a refusal
@@ -8305,6 +8822,9 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         //    row's recency deterministically and the in-window tie-break matches
         //    the offline analyzer's.
         for (size_t i = 0; i < uniq.size(); ++i) {
+            if (pool_hit_pos[i] >= 0) {
+                continue; // consumed below after the slot's ready event
+            }
             if (pos_of[i] >= 0) {
                 rec_t[(size_t) pos_of[i]] = ++cache_tick;
                 if (sp_fl != nullptr && (*sp_fl)[(size_t) pos_of[i]] != 0) {
@@ -8351,7 +8871,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                 spec_cancelled_demand++;
             }
         }
-        const size_t retained = uniq.size() - fetch.size();
+        const size_t retained = resident;
 
         // scratch context for the slab views the refresh needs; re-created when
         // exhausted so one window never pays a per-view allocation
@@ -8375,6 +8895,35 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         const int64_t t_submit0 = ggml_time_us();
         size_t bytes_staged = 0;
         const std::vector<ggml_tensor *> & cache_mem = cache_tens[(size_t) il];
+        std::vector<ggml_tensor *> pool_mem;
+        if (row_set_spec_pool > 0) {
+            if (pool_tens.size() <= (size_t) il) {
+                tel_rowset_refused(il, slot_idx, slot.generation, "pool_source",
+                                   "pool hit has no per-layer tensor storage");
+                error_msg = "load_row_set: prediction-pool tensor storage is not allocated";
+                failed = true;
+                return false;
+            }
+            pool_mem = pool_tens[(size_t) il];
+        }
+        if (pool_hits > 0 && pool_mem.size() != pkg.members.size()) {
+            tel_rowset_refused(il, slot_idx, slot.generation, "pool_source",
+                               "pool hit has no matching per-member tensor storage");
+            error_msg = "load_row_set: prediction-pool hit has no matching tensor storage";
+            failed = true;
+            return false;
+        }
+        if (pool_hits > 0) {
+            for (size_t mi = 0; mi < pkg.members.size(); ++mi) {
+                if (pkg.members[mi].src != nullptr && pool_mem[mi] == nullptr) {
+                    tel_rowset_refused(il, slot_idx, slot.generation, "pool_source",
+                                       "pool hit member has no prediction tensor");
+                    error_msg = "load_row_set: prediction-pool member is missing";
+                    failed = true;
+                    return false;
+                }
+            }
+        }
 
         // 4a. H2D the complement into the cache at its assigned position. The
         //     source offset is the expert's natural slab offset, so the bytes
@@ -8410,10 +8959,13 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
             }
             for (size_t i = 0; i < uniq.size(); ++i) {
                 const int32_t p = pos_of[i];
-                GGML_ASSERT(p >= 0 && "row-set retention refresh without a position");
-                ggml_tensor * v_src = ggml_view_2d(cache_view_ctx, (ggml_tensor *) cache_t,
-                                                   cache_t->ne[0], cache_t->ne[1], cache_t->nb[1],
-                                                   (size_t) p * cache_t->nb[2]);
+                const int pp = pool_hit_pos[i];
+                ggml_tensor * src_cache = p >= 0 ? (ggml_tensor *) cache_t
+                                                  : (pp >= 0 ? (ggml_tensor *) pool_mem[mi] : nullptr);
+                GGML_ASSERT(src_cache != nullptr && "row-set retention refresh without a source");
+                ggml_tensor * v_src = ggml_view_2d(cache_view_ctx, src_cache,
+                                                   src_cache->ne[0], src_cache->ne[1], src_cache->nb[1],
+                                                   (size_t) (p >= 0 ? p : pp) * src_cache->nb[2]);
                 ggml_tensor * v_dst = ggml_view_2d(cache_view_ctx, dst_t,
                                                    dst_t->ne[0], dst_t->ne[1], dst_t->nb[1],
                                                    (size_t) uniq[i] * dst_t->nb[2]);
@@ -8432,6 +8984,36 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         // host-blocking wait: the FFN graph may only consume after the copy
         // event completes (SDD lifecycle). This covers the H2D and the D2D.
         ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
+        const int64_t t_demand_ready = ggml_time_us();
+        if (row_set_spec_pool > 0) {
+            for (size_t i = 0; i < uniq.size(); ++i) {
+                if (pool_hit_pos[i] < 0) {
+                    continue;
+                }
+                int64_t hit_bytes = 0;
+                for (size_t mi = 0; mi < pkg.members.size(); ++mi) {
+                    const ggml_tensor * src = pkg.members[mi].src;
+                    if (src != nullptr) {
+                        hit_bytes += (int64_t) llama_ls_expert_slab_bytes(src->type, src->ne[0], src->ne[1]);
+                    }
+                }
+                if (!llama_ls_pool_retire_ready(
+                        pool_expert[(size_t) il].data(), pool_state[(size_t) il].data(),
+                        pool_recency[(size_t) il].data(), pool_gen[(size_t) il].data(),
+                        row_set_spec_pool, slot.generation, pool_hit_pos[i])) {
+                    tel_rowset_refused(il, slot_idx, slot.generation, "pool_retire",
+                                       "READY pool hit could not be retired after the slot ready event");
+                    error_msg = "load_row_set: prediction-pool hit could not be retired";
+                    failed = true;
+                    return false;
+                }
+                pool_issue_ord[(size_t) il][(size_t) pool_hit_pos[i]] = -1;
+                pool_d2d_bytes_last += hit_bytes;
+                pool_d2d_bytes_total += hit_bytes;
+                ++pool_consumed_last;
+                ++pool_consumed;
+            }
+        }
         // T-GPLR-58 A0: the demand's own wait is over, so P1's window closes
         // here. Everything speculative -- the reap that resolves finished and
         // cancelled fills and the issue of the next guesses -- happens AFTER
@@ -8442,11 +9024,14 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
             // the demand's ids, in the trace's order, are the arm's observation
             // for this stage (mode 2; mode 1 ignores them)
             spec_issue_next(il, ids.data(), (int) ids.size());
+            if (failed) {
+                return false;
+            }
         }
 
         const int64_t t_enq = slot.t_copy_enqueue_done_us;
         const double host_submit_us   = (double) (t_enq - t_submit0);
-        const double ready_latency_us = (double) (ggml_time_us() - t_enq);
+        const double ready_latency_us = (double) (t_demand_ready - t_enq);
         const double transfer_us      = host_submit_us + ready_latency_us;
         slot.t_copy_submit_us       = 0;
         slot.t_copy_enqueue_done_us = 0;
@@ -8459,7 +9044,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         rowset_round_bytes_staged  += bytes_staged;
         rowset_round_bytes_bank    += bytes_full_bank;
         rowset_round_rows_fetched  += fetch.size();
-        rowset_round_rows_reused   += retained;
+        rowset_round_rows_reused   += retained + pool_hits;
         rowset_round_rows_retained += retained;
         rowset_round_rows_retired  += retired;
         // T-GPLR-24 (H-A): feed the phase summary. total_bytes_transferred is
@@ -8477,7 +9062,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         tel_rowset_fetch(il, slot_idx, slot.generation, (int64_t) (n_ubatches - 1),
                          (int) model_ref->hparams.n_expert_used, uniq, fetch.size(),
                          bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
-                         retained, retired);
+                         retained, retained, retired, row_set_spec_pool > 0 ? &pool_hit_ids_last : nullptr);
         return true;
     }
     // the slot must still belong to the generation the row coverage was
@@ -8617,7 +9202,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
     tel_rowset_fetch(il, slot_idx, slot.generation, (int64_t) (n_ubatches - 1),
                      (int) model_ref->hparams.n_expert_used, uniq, fetch.size(),
                      bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
-                     /*n_rows_retained=*/0, /*n_rows_retired=*/0);
+                     uniq.size() - fetch.size(), /*n_rows_retained=*/0, /*n_rows_retired=*/0);
     return true;
 }
 
@@ -8709,7 +9294,8 @@ void llama_layer_streaming::tel_rowset_fetch(int il, int slot, uint32_t generati
                                              const std::vector<int32_t> & union_ids, size_t n_rows_fetched,
                                              size_t bytes_staged, size_t bytes_full_bank,
                                              double host_submit_us, double transfer_us, double ready_latency_us,
-                                             size_t n_rows_retained, size_t n_rows_retired) {
+                                             size_t n_rows_resident, size_t n_rows_retained, size_t n_rows_retired,
+                                             const std::vector<int32_t> * pool_hit_ids) {
     // canonical union_ids string: ascending, comma-joined, no spaces; the
     // hash is FNV-1a-64 over exactly those bytes (== _fnv1a64 in the
     // route-overlap tool)
@@ -8727,17 +9313,26 @@ void llama_layer_streaming::tel_rowset_fetch(int il, int slot, uint32_t generati
             hash *= 1099511628211ull;
         }
     }
+    std::string pool_ids_json;
+    if (pool_hit_ids != nullptr) {
+        pool_ids_json = ",\"pool_hit_ids\":[";
+        for (size_t i = 0; i < pool_hit_ids->size(); ++i) {
+            pool_ids_json += (i ? "," : "");
+            pool_ids_json += std::to_string((*pool_hit_ids)[i]);
+        }
+        pool_ids_json += "]";
+    }
     tel_write(tel_out,
         "{\"event\":\"rowset_fetch\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,"
         "\"generation\":%u,\"chunk\":%lld,\"phase\":%d,\"n_tokens\":1,\"top_k\":%d,\"route_union\":%zu,"
         "\"union_ids\":\"%s\",\"hash\":%llu,\"n_rows_fetched\":%zu,\"n_rows_resident\":%zu,"
-        "\"n_rows_retained\":%zu,\"n_rows_retired\":%zu,"
+        "\"n_rows_retained\":%zu,\"n_rows_retired\":%zu%s,"
         "\"bytes_staged\":%zu,\"bytes_full_bank\":%zu,\"host_submit_us\":%.1f,\"transfer_us\":%.1f,"
         "\"ready_latency_us\":%.1f,\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation,
         (long long) chunk, phase, top_k, union_ids.size(), ids_str.c_str(),
-        (unsigned long long) hash, n_rows_fetched, union_ids.size() - n_rows_fetched,
-        n_rows_retained, n_rows_retired,
+        (unsigned long long) hash, n_rows_fetched, n_rows_resident,
+        n_rows_retained, n_rows_retired, pool_ids_json.c_str(),
         bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
         (long long) ggml_time_us());
 }
