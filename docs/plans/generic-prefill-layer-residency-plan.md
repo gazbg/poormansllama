@@ -2970,7 +2970,7 @@ companion to it, not a second mechanism); T-GPLR-19 (the row cache and the K lad
 classes feed); the MTP draft head (T-GPLR-12 / T-Q38HG-06: `--mtp`, `--mtp-draft`, the `mtp`
 telemetry event) for class D; the recorded model inventory `build/llama-cuda/q36-moe-inventory.json`
 for the shape facts below. Not blocking: T-GPLR-53/T-GPLR-56 (untouched).
-Commit: nested e62b32427 + outer 31b07ab (shared prediction-pool/validator substrate); D1 implementation and MTP frontier wiring nested e7795905d; final outer verdict/evidence commit recorded below after validation.
+Commit: nested e62b32427 + outer 31b07ab (shared prediction-pool/validator substrate); D1 implementation and MTP frontier wiring nested e7795905d; final D-gate tools/evidence/docs outer b57e5ff.
 
 Goal. Answer the two questions T-GPLR-58 deliberately leaves out, each with a gate that can
 FAIL on its own terms: (D) does a predictor that reads a PROPOSED FUTURE - the tokens the MTP
