@@ -810,6 +810,8 @@ def run(argv):
                     help='D-gate past-only arm; repeat for every frontier family')
     ap.add_argument('--frontier-null', action='append', default=[], metavar='LABEL=PATH',
                     help='D-gate count-matched null paired with --frontier-arm')
+    ap.add_argument('--session-manifest', default=None,
+                    help='JSON manifest binding D-gate legs to clean same-session verdicts and spread')
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -830,7 +832,7 @@ def run(argv):
                 nulls = _labeled_paths(args.frontier_null, '--frontier-null')
                 if not args.d1_null:
                     raise D1Refused('missing-d1-null', 'the D-gate requires --d1-null')
-                result = dgate(args.trace[0], args.d1_null, arms, nulls)
+                result = dgate(args.trace[0], args.d1_null, arms, nulls, args.session_manifest)
             except (D1Refused, OSError) as exc:
                 code = getattr(exc, 'code', 'io-error')
                 detail = getattr(exc, 'detail', str(exc))

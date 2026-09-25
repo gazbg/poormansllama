@@ -25,6 +25,16 @@ risk tail.
 
 ## Recent entries (2026-09-23 .. 2026-09-24)
 
+## 2026-09-25: T-GPLR-59 D1 adversarial closure; parser and teardown gaps fixed
+
+**Audit finding and repair.** Host-only adversarial probes found that `tg59_d1.py` accepted out-of-order `d1_pair` records and duplicate `tg_tokens`, did not require a complete runtime lifecycle, and could score an empty runtime trace. The D1 replay now requires stable run identity, monotonic `(round, draft_index, layer)` order, and the declared layer bound when `n_layer` is present. The runtime reader now rejects malformed events, duplicate lifecycle events, missing or out-of-order run phases, negative counters, empty demand streams, and missing speculative events. The D-gate accepts a session manifest only when every leg maps to a clean same-session wrapper verdict with one source/binary/library identity and one normalized command; it cannot PASS without a measured non-negative spread.
+
+**Runtime cleanup/atomicity repair.** `d1_observe_round()` now validates every accepted flag, captured layer vector, and route width before emitting or learning any pair, so a late shape error cannot partially train the table. `spec_reset()` now releases D1 table/transient capture state at teardown. `d1_shape` now records `n_layer` for new traces. These are host/build changes; no new GPU/model run was performed.
+
+**Validation (measured).** `python tools/tg59_d1.py --selftest` and the class-D checker each passed 18 checks; the general checker passed 96 checks; mode-2 passed 7/7; focused CTest passed 3/3; Python compilation and both `git diff --check` commands passed. The broader host suite was also attempted; it stopped at the unrelated predictor-port self-test because its pinned reference `tools/predictor-screen-gplr.py` is absent, before reaching the D1 cases. The eight canonical traces still replay at D1 coverage 0.1664 and null 0.0153. The repaired D-gate with `build/llama-cuda/gplr59-d-gate-session-1536-r4.json` verified the recorded binary/provenance identity, but correctly returned FAIL with `session spread is unmeasured`; the old zero-gain result remains a FAIL, not a PASS. The generated manifest and audit JSON are build artifacts, not versioned evidence.
+
+**Residual gap.** The final session has no repeated-control spread and the required semantic-QA ladder remains unrecorded. Do not describe this D-gate as a complete positive-gate validation until both are supplied. D1 still has no demonstrated runtime benefit.
+
 ## 2026-09-25: T-GPLR-59 D1 same-session MTP frontier completes; proposal precision positive, runtime D-gate FAIL
 
 **Original goal and idea.** The owner asked whether D1, which predicts expert rows from the token proposed by Qwen3.6's MTP draft head, adds cache demand-hit value beyond the best predictor that only sees past routes. The pre-registered D-gate required D1 to beat the same-session past-only frontier by more than session spread under count-matched nulls. This mattered because proposal accuracy alone is useless if the capacity planner cannot turn predictions into staged rows.
