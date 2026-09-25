@@ -313,7 +313,11 @@ $suites = @{
         # host-only, with no GPU and no model.
         # T-GPLR-07: the semantic-QA checker CLI self-test runs here too, so
         # --tg-text argparse/exit/verdict wiring is covered without CUDA/model.
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict)'
+        # T-GPLR-59: the prediction-pool telemetry fixtures join here -- both
+        # host validators must accept the pool-lifecycle and pool-off legacy
+        # positives and reject the 11 single-rule negatives (check-pool-* /
+        # validate-pool-*), all host-only (no GPU, no model).
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits|check-pool|validate-pool)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -644,6 +648,40 @@ if (-not $spec.Gpu) {
     } else {
         Write-Host "[tg58-cache-counterfactual] FAILED: $screenTool not found - this guard is REQUIRED." -ForegroundColor Red
         exit 1
+    }
+}
+
+# --- T-GPLR-59 follow-up: counterfactual 12-position prediction-pool replay --
+# Replays recorded mode-2 candidate streams through a simulated 12-position,
+# per-layer pool under the ideal-next-reap completion model, over the telemetry
+# validator's own real-cache retention model (overlay parity required before any
+# pool result). Its hermetic checks pin the 12-position capacity, the 12-item
+# admission bound, real/pool/publication duplicate suppression, READY-only LRU
+# eviction, the all-PENDING refusal, the lead-2 hit floor, PENDING fallback
+# without wait, generation cancellation, no real-cache promotion, the candidate
+# and fate closures, and the contract refusals (missing candidates/fill ids,
+# mixed streams, inconsistent bytes).
+if (-not $spec.Gpu) {
+    $poolCore = Join-Path $PSScriptRoot 'tg_pool_core.py'
+    $poolTool = Join-Path $PSScriptRoot 'analyze-gplr59-pool.py'
+    $learningTool = Join-Path $PSScriptRoot 'analyze-tg60-learning.py'
+    $required = @($poolCore, $poolTool, $learningTool)
+    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+    if ($missing.Count -ne 0) {
+        Write-Host "[tg59-pool-counterfactual] FAILED: missing required module(s): $($missing -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[tg59-pool-counterfactual] prediction-pool counterfactual replay selftest (host-only fixtures)..."
+    & python $poolTool --selftest
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAILED: analyze-gplr59-pool.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    Write-Host "[tg60-learning-curve] shared pool replay and held-out predictor selftest..."
+    & python $learningTool --selftest
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAILED: analyze-tg60-learning.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+        exit $LASTEXITCODE
     }
 }
 

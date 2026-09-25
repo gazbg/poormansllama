@@ -42,26 +42,7 @@ Rules (same convention as the currentstate split, AGENT_ENVIRONMENT.md):
 - The archive's 6-line header is not original bytes; strip it when reconstructing.
 ### T-GPLR-53 (draft): attribute the pass-1 embed-step excess - the whole of the sweep's "unattributed" gap - and pre-register the first-touch decay discriminator (host-only first)
 
-Status: in-progress (2026-09-21) - A1 executed host-only; A2 executed (instrument +
-recon generation join fix, host-validated); A3 executed (PASS 2/2, CHUNK0_SPIKE on four
-independent arm-runs); the one-off itself is now ATTRIBUTED host-only (the driver-side commit
-of the 17.23 GiB registered mapping, absorbed by chunk 0's embed step before any staging copy;
-see the WHAT THE ONE-OFF IS section); A4 executed THREE times (PASS 6/6, PASS 8/8 with two added control
-modes, PASS 13/13 with a dose series). The dose curve is in: absorption of the pass-1
-excess is ~1:1 in the length of the wait, the wall is conserved at every dose, and no dose
-shortens the total - so the pre-pay can be shortened but only by leaving equally much excess
-behind, and pre-warm cannot be a wall-time win at any length. The A4 controls SETTLED the mechanism question the wrong way for this block's
-first reading: a duration-matched NO-TOUCH delay removes 93.2% of the pass-1 excess, so
-the one-off is a time-gated completion rather than the source-span page residency the
-second attempt inferred, and both pre-registered mappings (A3's CHUNK0_SPIKE -> H3 and
-A4's branch (i) -> H1) are unsupported. The pre-registered ESCALATE disposition applies:
-the hypothesis set is incomplete, nothing is adopted, and the remaining work is a
-Planner decision plus a dose-response arm, not a re-run. That Planner decision is now TAKEN
-(2026-09-23, owner directive): the band's quantity is settled as the per-chunk embed EXCESS
-(option A) and the matching reporting fix landed in tools/run-gplr53-a4-arm.ps1; host-only,
-no GPU, no re-run, and no recorded verdict re-scored. The mechanism question itself stays
-where the A4 controls left it, and the dose-response arm remains the arm that could move it. No rule, threshold or accepted
-verdict was changed by any A4 session.
+Status: CLOSED (owner decision, 2026-09-25) - A1-A4 evidence is complete and retained. The first-prefill excess is accepted as a startup/registration cost rather than a blocker for the long-lived multi-turn server target; no T-GPLR-53 lever is adopted, no A5 is authorized, and no further GPU run is required. The pass-1 wall remains conserved; the pre-registered excess-based reporting correction and all recorded verdicts remain unchanged.
 Dependencies: T-GPLR-52 (its A1/A2/A3 verdicts are inputs AND correction targets: the
 queue-behind-compute law stands, but "staging and compute are flat across passes"
 describes the LAYER sweep only - the pass-1 excess lives before it); T-GPLR-37 (the
@@ -1476,25 +1457,7 @@ and the original FAIL evidence survived only in this record's prose and in
 
 ### T-GPLR-56 (draft): take the registered-span commit OFF the first prefill's critical path - start it earlier and overlap it, or shrink the span - judged on a relocation-proof sum
 
-Status: ready (2026-09-22) - owner calls DECIDED below; A1 landed and A2 answered, both
-host-only, 2026-09-22; no GPU spent on this block, no arm run. A3 is ONE 4k mutex hold;
-its conditional 50k/200k follow-ups remain owner-invoked, one length at a time. A3's
-MECHANISM and its reading tools are IMPLEMENTED and host-validated (2026-09-23, see the
-A3 implementation subsection at the end of this block); the hold itself is BLOCKED on a
-foreign process holding the shared card, with the probe evidence recorded there and the
-one command that takes it. A1 was first recorded as UNMET - Q could not be derived from any trace
-the block would produce - and the telemetry it needed is now WRITTEN: a `proc_start` marker at
-main entry plus `load_begin`/`load_end` around the model load, default-on, buffered until the
-telemetry sink opens. Q's read is host-proven (`test-layer-streaming-tel-mark` in CTest, and
-`tools/check-gplr56-q.py --selftest` 7/7), but no arm has run, so the marker shape in a REAL
-trace is confirmed only by the arm named at the end of the A1 result - and that arm is currently
-BLOCKED on the card (foreign pid 22436 held it across nine samples on 2026-09-22; nothing was
-started, no mutex taken), while the t_us rebase it would exercise has already been checked
-against every existing gate host-only (see the A1 real-trace section). A2 answered owner call 2
-and CORRECTED the draft's premise: nothing can be registered before the model load returns, so
-"earlier" is worth a measured 66.4 ms and the real lever is pacing the registration during the
-sweep. The ESCALATION section's band question is NOT a dependency here: no arm cites that
-band, and each arm names its own quantity instead.
+Status: CLOSED (owner decision, 2026-09-25) - A1 and A2 remain host-validated evidence; A3 will not be run. The first-token registration cost is accepted as startup-only for the long-lived multi-turn server target, so no further mutex hold, 4k/50k/200k arm, default change, or performance claim is authorized by this block. The implementation checkpoint and refusal/measurement record remain historical evidence.
 
 DECIDED (owner, 2026-09-22, both change product intent and are recorded here verbatim):
 
@@ -2034,7 +1997,7 @@ by this subsection: A3 decides, and A4's 50k/200k holds stay owner-invoked one l
 
 ### T-GPLR-58: wire the TG expert predictor into the row-set path - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), judged on a NULL-CORRECTED, VRAM-normalized miss share under the exact-demand-priority invariant
 
-Status: evidence-complete (2026-09-24; owner acceptance pending) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer families, the count-matched null, the speculative planner and its port comparator) is IMPLEMENTED and host-validated the same day - see the A1 IMPLEMENTATION LANDED subsection below; the A3/A4 holds are no longer gated on any unbuilt piece: the ENGINE-CONSUMES-THE-PROPOSER WIRING (mode 2) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A1 WIRING (MODE 2) LANDED subsection below - A3 and A4 have now run; A4's seven-leg result is recorded below. A3 HAS SINCE RUN (2026-09-23, one hold): the arm proposed on 10,178 of 10,240 layer-stages and the planner placed ZERO, because the fill-room ceiling at K=2 is 0.00% - M1/M3 FAIL ON CAPACITY, the block's M3 negative fires, and the same run exposed (and fixed) a bring-up defect that had made every speculative mode inert - see the A3 SESSION RUN subsection below.
+Status: CLOSED (owner decision, 2026-09-25; evidence-complete; no predictor adoption) - the three owner calls were ANSWERED the same day and are recorded  A0 (the speculative-placement MECHANISM) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A0 IMPLEMENTATION LANDED subsection below; A2 (the verdict surface) is IMPLEMENTED and host-validated the same day - see the A2 IMPLEMENTATION LANDED subsection below; A1 (the proposer families, the count-matched null, the speculative planner and its port comparator) is IMPLEMENTED and host-validated the same day - see the A1 IMPLEMENTATION LANDED subsection below; the A3/A4 holds are no longer gated on any unbuilt piece: the ENGINE-CONSUMES-THE-PROPOSER WIRING (mode 2) is IMPLEMENTED and host-validated as of 2026-09-23 - see the A1 WIRING (MODE 2) LANDED subsection below - A3 and A4 have now run; A4's seven-leg result is recorded below. A3 HAS SINCE RUN (2026-09-23, one hold): the arm proposed on 10,178 of 10,240 layer-stages and the planner placed ZERO, because the fill-room ceiling at K=2 is 0.00% - M1/M3 FAIL ON CAPACITY, the block's M3 negative fires, and the same run exposed (and fixed) a bring-up defect that had made every speculative mode inert - see the A3 SESSION RUN subsection below.
 in the DECIDED section below; both mutex-held sessions were PRE-AUTHORIZED (owner chose the
 "both up front" option, so A4 was not conditional on A3's share outcome). GPU time has now been spent on the recorded A3, A4 and fresh K=8 evidence; A0/A1/A2 and the
 mode-2 wiring are IMPLEMENTED and host-validated. Nothing here re-opens T-GPLR-15 (closed DONE-falsified-by-evidence), T-GPLR-19 (closed
@@ -2052,6 +2015,8 @@ this block must carry its own quantities rather than inherit that gate); T-GPLR-
 (the pre-registration, falsifier and relocation discipline this contract copies). Not
 blocking: T-GPLR-54, T-GPLR-55 (their shapes are untouched).
 Commit: nested c861ab0d4 (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, tests/test-layer-streaming-tg-spec.cpp, the runner flag surface) + 7480fb5b9 (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the --dump port surface) + e3627d5f3 (mode 2 - the engine CONSUMES the A1 proposer: arm/null source selection, the prop + arm_count telemetry in the spec event, the five runner refusals, and the scripted arm fixture) + 8b3ea428 (A2/A3 replayable admission telemetry, in-flight occupancy, bring-up reset ordering, and tests); outer 8e41a52 (uncovered-margin instrument + guard), 8c01a96 (A2 checker + guard), 10b0798 (A1 port comparator + guard), db1366e (fill-room analyzer + guard), 876ef83 (mode-2 flag/refusal checker + guard), 7a00d53 + db937e4 (pin bumps) + f8c5a48 (cache counterfactual, admission checker, A3/K-probe drivers, records, and pin bump); T-GPLR-07 b784e20 (semantic-QA checker/guard, separate slice). A3 and the fresh K=8 admission leg are committed evidence; the owner authorized the outer A4 launcher/roll-up and evidence commit after validation. Outer A4 tooling/evidence commit: `4e34b85`. This plan closure is docs-only after f8c5a48.
+
+Closure (owner decision, 2026-09-25): T-GPLR-58 is closed as an evidence-complete negative/capacity result. The runtime and host framework remain available, but no predictor in this family is adopted and no additional A3/A4 work is authorized.
 
 Goal. Decide, on TWO pre-authorized mutex-held sessions (owner, 2026-09-23), whether a TG expert predictor that stages
 SPECULATIVE rows into the existing per-layer row cache produces a demand-hit gain that
@@ -2998,21 +2963,14 @@ Bands (all from A2's single owner except the two labelled below): **M1 +0.0000**
 
 ### T-GPLR-59 (draft): the two predictor source classes T-GPLR-58 excludes - an MTP draft-preview source (PROPOSED FUTURES at zero learned weights) and a hidden-state probe head (measured offline against its OWN ceiling gate) - each with its own pre-registered gate
 
-Status: draft (2026-09-23) - NOT ready: the three owner calls below are unanswered, and two of
-them are blocking (a dependency install, and an execution-mode change for class D's arms).
-Nothing is implemented, no GPU time spent, no arm run. This block REUSES T-GPLR-58's machinery
-rather than restating it: the exact-demand-priority invariant (P1-P6), the count-matched
-per-row null, the band set's shape (M1/M2/M4-M7), the control-spread rule and the refusal
-discipline all live there, and a band or invariant clause must never exist in two places with
-two owners. What is NEW here is exactly three things: class-specific GATES, the void rule class
-D needs, and class E's capture hook plus its trainer.
+Status: in-progress (2026-09-25) - shared pool/validator/replay substrate is implemented and host-validated, but the class-D/E experiment remains NOT READY: the three owner calls below are unanswered, and two of them are blocking (a dependency install, and an execution-mode change for class D's arms). No class-D or class-E arm has run, no GPU time was spent on this block, and no experiment is authorized. This block REUSES T-GPLR-58's machinery rather than restating it: the exact-demand-priority invariant (P1-P6), the count-matched per-row null, the band set's shape (M1/M2/M4-M7), the control-spread rule and the refusal discipline all live there, and a band or invariant clause must never exist in two places with two owners. What is NEW here is exactly three things: class-specific GATES, the void rule class D needs, and class E's capture hook plus its trainer.
 
 Dependencies: T-GPLR-58 (the invariant, the null and the bands - this block is a source-class
 companion to it, not a second mechanism); T-GPLR-19 (the row cache and the K ladder both
 classes feed); the MTP draft head (T-GPLR-12 / T-Q38HG-06: `--mtp`, `--mtp-draft`, the `mtp`
 telemetry event) for class D; the recorded model inventory `build/llama-cuda/q36-moe-inventory.json`
 for the shape facts below. Not blocking: T-GPLR-53/T-GPLR-56 (untouched).
-Commit: (unfilled - nothing is implemented, so there is nothing to checkpoint)
+Commit: nested e62b32427 (shared prediction-pool/validator substrate); class-D/E experiment implementation and its verdict commit remain unfilled.
 
 Goal. Answer the two questions T-GPLR-58 deliberately leaves out, each with a gate that can
 FAIL on its own terms: (D) does a predictor that reads a PROPOSED FUTURE - the tokens the MTP
@@ -4021,3 +3979,164 @@ run (it is seen by any later `-VerifyRevision`). Nothing here changes what any s
 replaces the old print-and-exit pair and adds no work to the test path. **No latency or throughput claim.**
 The nested sources under concurrent edit by another thread were not touched; the only writes inside that tree
 were the probe files, created and removed inside this pass.
+
+### T-GPLR-59 (draft): separate prediction-only expert-row pool - remove the real-cache capacity ceiling without changing its retained rows
+
+Status: implemented, host-validated (2026-09-24, uncommitted; no GPU/model run authorized). Owner direction: use a separate pool with 12 prediction positions per logical layer and 12 proposals per stage; a READY prediction may serve a later exact demand, while a PENDING prediction is ignored and the demand falls back immediately. This is a new follow-up mechanism, not a reinterpretation of T-GPLR-58. T-GPLR-58's completed zero-fill/capacity evidence and its former no-extra-VRAM framing remain historical facts.
+
+Result (2026-09-24, host-only). Steps A-F implemented; the focused host suite is green. Syntax: `--residency-tg-spec-pool 12` (the only legal nonzero value; requires `--residency-tg-spec 2`, a named arm, and the retention path; `--residency-tg-spec-budget` resolves to 12). Byte cost: layers x 12 x expert-row slab; host-derived 810 MiB on Qwen3.6-35B-A3B Q4_K_S (40 x 12 x 1,769,472 B), with the actual allocation recorded in `spec_pool_init.bytes` / `byte_account.prediction_pool`. Evidence: 20 T-GPLR-59 host policy/lifecycle checks (they caught a real inverted type guard in `llama_ls_expert_slab_bytes`), 26 pool telemetry validator cases (2 positives accepted and 11 single-rule negatives rejected by BOTH host validators), host suite 70/70. Known limits: capacity and proposal budget are fixed at 12 and refused otherwise (never silently reduced); pool hits are temporary slot input and never enter the real cache; the CUDA runtime path (pool buffers/events, H2D/D2D) has host-fixture evidence only; feasibility and performance remain unmeasured.
+
+Dependencies: T-GPLR-58 mode-2 proposer and completion-event lifecycle (evidence and host fixtures complete); T-GPLR-19 per-layer row-cache allocation and retention telemetry; the runner's strict telemetry/retention validators.
+Commit: unassigned.
+
+Goal. Determine whether the existing predictor families can create useful demand hits when they are not restricted by the real row cache's occupied capacity. The first experiment fixes a pool capacity of 12 rows for every logical layer and asks each selected mode-2 predictor for at most 12 candidates after each completed demand stage.
+
+Scope. Add one opt-in, CUDA-only experimental pool adjacent to the per-layer real cache. It owns separate GPU row storage, per-position lifecycle state, completion events, an admission policy, demand-read path, allocation byte accounting, telemetry, validators, and host tests. The pool is per logical layer; it is not 12 global positions, not 12 positions per predictor, and does not enlarge or replace the real cache. It supports the existing single selected mode-2 arm (coact, bar09, or fusion) and the count-matched null; it does not introduce a runtime ensemble.
+
+Non-goals. No default-path behavior or telemetry change when the option is absent. No change to expert IDs, router output, quantization bytes, KV/recurrent state, graph arithmetic, PP scheduling, or T-GPLR-58 records/checkers. No GPU/model acceptance run is part of implementation; any later arm requires owner authorization, the shared GPU mutex, and a fresh attributable verdict. No claim that prediction is faster, has positive precision, or improves PP.
+
+Design and failure contract.
+
+1. Configuration and preflight. The runner exposes an explicit zero-default pool capacity (the first experiment uses `--residency-tg-spec-pool 12`) and records the resolved value in `run_start`. A nonzero value is legal only with `--residency-tg-spec 2`, an already configured arm, and the existing per-layer retention path. It is refused before CUDA/model work when malformed, incompatible, or unable to fit the *sum* of real-cache and prediction-pool bytes under the selected residency cap/allowance. A named pool capacity is never silently reduced.
+2. Ownership. Each logical layer gets exactly the resolved number of private prediction-row positions and matching per-member CUDA tensors, independent of the real cache's buffers/tensors and of temporary shared slot bundles. The pool has its own expert/position map, state (`FREE`, `PENDING`, `READY`, `CANCELLED`), generation/phase marker, recency stamp, and copy-completion events. Teardown synchronizes then frees its own in-flight work. Pool state must never be encoded in the real cache's `cache_expert`, `cache_recency`, or `spec_state` arrays.
+3. Admission after demand. The predictor observes the just-served demand only after the demand's own ready wait has closed, just as mode 2 does now. Its published candidates are deduplicated in proposal order. Before an admission, skip a candidate that is READY or PENDING in the real cache, READY or PENDING in the prediction pool, or duplicated earlier in the same proposal list. Every skip has a named telemetry reason. A candidate is copied H2D from its exact quantized expert slab into a free pool position, becomes PENDING immediately, and owns a completion event.
+4. Capacity. The pool admits at most its proposal budget (12 in the first arm) and never overwrites PENDING bytes. When full, it may evict only the least-recently-issued READY prediction; the replacement copy starts only after the prior position is known complete. If no admissible READY victim exists, refuse the candidate with a structured capacity reason. No demand waits for pool completion.
+5. Demand read. Exact router demand is unchanged. The real cache is authoritative first. For each real-cache miss, a READY matching prediction may be copied D2D into the current temporary execution slot as part of the normal whole-union slot refresh; it is counted as a pool hit and then retired from the pool after the demand's ready event. A matching PENDING or CANCELLED prediction is not a hit: the engine performs the ordinary real-cache miss path and does not wait for the pool copy. A pool hit is not inserted into the real cache, so it cannot inflate real-cache hit/retention accounting.
+6. Lifecycle. A phase/generation boundary marks every in-flight pool row cancelled and reaps it before reuse; no byte is overwritten while its H2D can still be in flight. A cancelled row never produces a residency claim. Normal pool LRU eviction, generation cancellation, and demand consumption are separately counted.
+7. Telemetry and accounting. Existing `spec` and real-cache retention fields retain their old meaning. A new `spec_pool` event, emitted only when the pool is enabled, carries run/layer/stage identity, capacity and proposal budget, candidate ids, each skip/refusal class, admitted/fill ids, pool pending/ready counts, PENDING demand fallbacks, READY demand hits and ids, consumption, cancellations by cause, evictions, completion-wait total, H2D bytes, D2D refresh bytes, and pool allocation bytes. `rowset_fetch` continues to describe the real cache; a feature trace must make the pool-hit D2D path separately attributable. `byte_account` adds separately named prediction-pool bytes and the validator requires the sum of real and pool bytes under the cap. Legacy traces remain valid when no pool is enabled; a pool-enabled trace missing/contradicting new fields is refused, not downgraded.
+8. Safety. Quantized source spans and destination offsets use the same per-member slab arithmetic as the real cache. Missing source/member, buffer allocation failure, event failure, stale/mismatched generation, or an impossible D2D source is a loud structured refusal. No wrong expert, partial row, stale row, or untracked in-flight copy may reach the FFN graph.
+
+Implementation steps.
+
+A. Host-testable policy and lifecycle helpers. Add small pure helpers for cross-pool admission filtering, READY-only LRU victim choice, pool demand lookup, and lead/retirement bookkeeping. Keep their state explicit and free of CUDA handles so the fixtures can test boundary cases without a model.
+B. Runner surface and preflight. Parse and validate the opt-in capacity; resolve it beside `--residency-tg-spec` / `--residency-tg-spec-budget`; include it in the run-start record and all pre-sink refusal records. Extend the exact per-member byte arithmetic used by `row_cache_bytes_for()` with a pool-capacity query, then include it in the preflight and actual-allocation cross-checks.
+C. Engine storage and lifecycle. Allocate/deallocate pool buffers and tensors only when enabled; wire the mode-2 post-demand proposal path to the separate admission/issue/reap functions; keep the existing no-pool branch byte-for-byte in behavior and event meaning.
+D. Demand path. Integrate READY pool lookup into the retention path's missing-row handling and whole-union D2D refresh. Record PENDING fallback separately and do not call a pool completion wait from a demand window.
+E. Telemetry and validators. Add the `spec_pool` emitter, JSONL parsing, per-stage conservation checks, byte-account checking, and focused synthetic fixtures. Keep legacy schema acceptance explicit and test it.
+F. Tests and records. Extend the existing TG-spec/TG-predict host fixtures and CMake registration. Update this task's result and `docs/currentstate.md` only after host validation; do not rewrite archived or completed T-GPLR-58 blocks.
+
+Acceptance criteria (all are task-owned; each is necessary but none is owner release authorization).
+
+- Host pure-policy tests prove: capacity is exactly 12 per layer; a 12-item publication admits no more than 12; duplicate candidates are admitted once; candidates present in real READY/PENDING or pool READY/PENDING are skipped with the correct reason; a full pool evicts only its LRU READY row; a full all-PENDING pool refuses without a wait; and PENDING demand never becomes a hit.
+- Host lifecycle fixtures prove: READY demand selection retires exactly one pool row after the D2D path; a PENDING demand falls back without waiting; phase/generation cancellation blocks reuse until its event is reaped; and a stale slot/phase cannot satisfy a row.
+- Allocation/refusal fixtures prove the pool uses the same per-member slab-size arithmetic as the real cache, counts its actual bytes separately, includes both pools in the cap/preflight, and refuses an explicit capacity that does not fit rather than reducing it.
+- Telemetry fixtures prove per-stage proposal/admission/skip/refusal/eviction accounting closes; READY hits, PENDING fallbacks, cancellation causes, completion waits, H2D/D2D bytes, and pool allocation bytes are unambiguous; a feature trace with missing or contradictory pool fields is rejected; a legacy no-pool trace still passes unchanged.
+- Mode-off regression proves no pool allocation, proposal, event, demand-read branch, or byte-account field changes behavior. The existing TG-spec, TG-predict, layout, and host-suite checks remain green after all consumers of a changed public header are rebuilt.
+- No model or GPU run is started by this task. A later performance arm must separately record the exact command, model SHA/identity, hardware, resolved flags, mutex/verdict, raw JSONL path, and semantic-QA smoke result. A pool hit or telemetry PASS alone is not a predictor-quality or speedup result.
+
+Focused validation commands (implementation task; no GPU).
+
+```powershell
+cmake --build build/llama-cuda --config Release --target test-layer-streaming-tg-spec test-layer-streaming-tg-predict test-layer-streaming-layout
+ctest --test-dir build/llama-cuda -C Release -R "^(test-layer-streaming-tg-spec|test-layer-streaming-tg-predict|test-layer-streaming-layout)$" --output-on-failure
+python tools/check-tg-predict.py --selftest
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tests.ps1 -Suite host
+```
+
+Expected results: all listed builds/tests and checker self-test pass; the host suite reports SUCCESS with a saved engine revision record. If a source or binary moves during the suite, report its mandated `SUITE RESULT FLAGGED`, not a green result.
+
+Required state/document updates.
+
+- This task receives a measured result only after the focused host evidence above; add a dated entry at the top of `docs/currentstate.md` that separates policy correctness, instrumentation correctness, and any later feasibility/performance result.
+- Keep T-GPLR-58's completed observations unchanged. If a later model run uses this pool, cite this task and its raw evidence rather than rewriting T-GPLR-58's real-cache claims.
+- Update runner help and the active task status with the final opt-in syntax, resolved capacity, actual byte cost, and known limits. Do not update a generated build, trace, model, or telemetry artifact into version control.
+
+Escalate to the owner before proceeding if any of these becomes necessary: changing the 12-per-layer or 12-proposal first arm; a shared/global pool or per-predictor allocation; a dynamic multi-predictor ensemble; a dependency; an API/flag that breaks an existing accepted trace; promotion of a pool hit into the real cache; a GPU/model run; or a capacity/VRAM policy that silently reduces the named pool size. Also escalate if a correct implementation cannot avoid demand waiting on PENDING pool work, or if telemetry cannot distinguish pool activity from real-cache activity.
+
+### T-GPLR-59 follow-up design: host-only counterfactual replay of the separate prediction pool
+
+Status: implemented, host-validated and scored over recorded traces (2026-09-24; see the result note at the end of this block). This is an evidence tool, not a runtime change and not a new performance arm. It remains separate from the T-GPLR-58 real-cache replay because a pool hit is not a real-cache retention hit.
+
+Goal and hypothesis. Replay the ordered expert demand and published predictor candidates from an existing mode-2 JSONL trace through a 12-position, per-logical-layer prediction pool. The falsifiable hypothesis is that the separate pool creates useful later demand hits which the occupied real cache could not admit. The replay can measure lifecycle opportunity and logical bytes under an explicit ideal-completion model. It cannot establish CUDA behavior, transfer latency, PP speed, or a predictor-quality result.
+
+Input contract. A scored leg must have one `rowset_init`, one `rowset_fetch`, and one mode-2 `spec` record for every `(ubatch, layer)` stage. Preserve file order and expert-id order. The `spec` record is semantically the proposal made after that stage's demand; because the emitter writes the two records in the opposite line order, pair them by `(ubatch, layer)` and apply the proposal to the next occurrence of that logical layer. The last proposal is unused if there is no later occurrence.
+
+The primary replay consumes `spec.candidate_ids` as the raw proposal stream and records the source budget (`row_spec_budget`) separately from the pool budget. The first pool contract is 12 proposals, while the existing T-GPLR-58 legs normally record 8. A replay over an 8-item source is an explicit `recorded-8` lower bound, not a 12-proposal result. Never pad, repeat, or silently call it a 12-item arm. A full 12-item result requires 12 recorded candidates or a separately versioned host predictor replay; a null source additionally needs its RNG state or seed to reproduce IDs beyond the recorded list.
+
+Two evidence modes stay distinct:
+
+1. `overlay` (primary when `fill_ids` exist): replay the real cache, including recorded real speculative fills, PENDING/READY/CANCELLED transitions, generation boundaries, and capacity-LRU evictions. Require real hit and retention parity before applying the pool. The pool cannot alter that real-cache state.
+2. `demand-only` (diagnostic): ignore real speculative fills and rebuild a demand-only real cache. This permits old traces without `fill_ids`, but the result is labeled a clean-baseline diagnostic and cannot be presented as an overlay measurement.
+
+The replay is host-only and uses no model, CUDA, GPU, mutex, or network. It must not infer a role from a filename; arm/null/off roles are explicit session declarations.
+
+Real-cache overlay. Each logical layer owns the real capacity-LRU with `cap_real = min(n_expert, retain_k * top_k)`. At demand, classify real READY rows first, cancel matching real PENDING rows without waiting, protect the demanded union from eviction, place its complement, and stamp recency in ascending expert-id order. Apply recorded `fill_ids` only after that stage's demand, as the real speculative path does. Require:
+
+`route_union == real_hits + real_fetched`
+`n_rows_resident == real_hits`
+`n_rows_retained == real_hits`
+
+A mismatch refuses the pool result. Never insert a pool hit into `cache_expert`, `cache_recency`, or real speculative state, and never increase real retention counters with a pool hit.
+
+Pool state and ordering. Each logical layer owns exactly 12 private positions. Each position has its own expert id, state (`FREE`, `PENDING`, `READY`, `CANCELLED`), issue ordinal, recency, and generation. The default completion assumption is `ideal-next-reap`: a copy issued after stage `t` is PENDING during demand `t+1`, becomes READY after the end of `t+1`, and can first serve demand `t+2`. This is the measured lead floor, not a tunable convenience.
+
+For every demand stage, in this order:
+
+1. Apply the layer's generation transition. Old READY rows from another generation retire; old PENDING rows become CANCELLED and stay occupied until modeled completion. A stale row never satisfies demand.
+2. Classify the real cache. For each real miss, look up the pool. A current-generation READY row is a pool hit; a current-generation PENDING row is cancelled and takes the ordinary real-miss path immediately; CANCELLED and stale rows are never hits. PENDING never causes a wait.
+3. Refresh the temporary execution slot from real and pool hits. Retire a READY pool hit only after the demand ready point and never promote it into the real cache.
+4. After the demand ready point, reap the pool: PENDING becomes READY and CANCELLED becomes FREE. Then apply the proposal from the stage just completed. In proposal order, reject invalid ids, publication duplicates, real READY/PENDING/CANCELLED duplicates, and pool READY/PENDING/CANCELLED duplicates. Prefer FREE; otherwise evict only the least-recently-issued READY row. Never overwrite PENDING or CANCELLED bytes. A full pool without a READY victim refuses with a capacity reason and no wait.
+
+Because the proposal is issued after stage `t`'s reap, a candidate demanded at `t+1` is normally a PENDING fallback, not a hit. A candidate not demanded at `t+1` may become READY and serve a later exact demand. This carryover is a first-class result.
+
+Accounting and metrics. Close candidate identity per stage:
+
+`proposals = admitted + skipped_real + skipped_pool + skipped_dup + skipped_invalid + refused_budget + refused_capacity`
+
+Close each admitted position's terminal fate over the replay:
+
+`admitted = hits + pending_fallbacks + generation_cancellations + evictions + live_at_end`
+
+Separately report real hits/fetches, pool hits, PENDING fallbacks, stale retirements, duplicate suppression, READY evictions, capacity refusals, modeled completion waits, H2D prediction bytes, D2D refresh bytes, and final occupancy. A PENDING match is never folded into hits.
+
+Report at least:
+
+- `demand_rows`, `demand_ids`, `real_hits`, `real_fetched`, and real share;
+- `pool_proposals`, `pool_admitted`, `pool_hits`, hit rate over admitted rows, and hit rate over resolved rows (`hits + pending_fallbacks`);
+- `extra_share = pool_hits / demand_ids` and total counterfactual share `(real_hits + pool_hits) / demand_ids`;
+- next-demand fallback versus later-carryover hits;
+- logical H2D bytes (`admitted * row_bytes`), D2D bytes (`hits * row_bytes`), and `net_h2d_delta = (admitted - hits) * row_bytes`;
+- consumed-hit lead histogram, with every observed lead at least 2;
+- per-layer/stage occupancy maxima proving `occupancy <= 12` and no PENDING/CANCELLED reuse.
+
+Derive `row_bytes` from `bytes_full_bank / n_expert` and cross-check `bytes_staged / n_rows_fetched` where both exist. This is logical payload accounting, not actual CUDA allocation. Exact allocation bytes require a future `spec_pool_init` or runner byte-account field. Refuse byte metrics if the two trace ratios disagree.
+
+Arm/null comparison. Require the same ordered demand-stream signature (including `(ubatch, layer, union_ids)`), model shape, top-k, retain-k, and source budget. Roles are explicit. For an arm/null pair, report each leg and paired deltas for pool hits, extra share, admissions, pending fallbacks, evictions, and net H2D bytes. Never pool sums across unequal leg counts. A null with a different source budget is not a count-matched control for a 12-item arm.
+
+Refusals and integrity. Exit 2 with no measurement for no retention policy, incomplete stage pairing, missing raw candidates, invalid/out-of-range ids, W != 1, contradictory real-cache identity, missing `fill_ids` in overlay mode, mixed traces, mismatched arm/null demand streams, or inconsistent byte arithmetic. A closed trace with no opportunity is a measured zero; a missing source is `UNVERIFIED`, never zero. Unknown future events may be ignored, but contradictory known fields are rejected.
+
+Output and fixtures. Use a new schema such as `gplr59-pool-counterfactual/1` with input paths, stream signature, source/pool budgets, completion assumption, real-replay status, per-leg summaries, paired deltas, and evidence limitations. Print lifecycle counters before the attractive hit rate.
+
+The host self-test covers: 12-position capacity; 12-item admission bound; real/pool/list duplicate suppression; READY-only LRU eviction; all-PENDING refusal; a READY hit first at lead 2; a PENDING next-demand fallback without wait; generation cancellation; no real-cache promotion; candidate/admitted identity closure; occupancy bounds; overlay hit parity; and refusals for missing candidates/fill IDs, mixed streams, and inconsistent bytes. Wire it into the non-GPU host suite only after the fixtures pass. No model or GPU run is part of this design.
+
+Non-goals. This replay does not claim a 12-row result from 8-row traces, infer actual transfer completion, estimate wall-clock speedup, change runtime admission, or alter T-GPLR-58's completed real-cache evidence. A positive replay is a reason to authorize a fresh owner-run pool arm, not acceptance of that arm.
+
+Result (2026-09-24, host-only, no GPU/model run): implemented as `tools/analyze-gplr59-pool.py` (schema `gplr59-pool-counterfactual/1`); selftest 45/45 and wired into the host suite as `[tg59-pool-counterfactual]` (70/70). Replayed at OVERLAY PARITY 10,240/10,240 stages on all five candidate-bearing legs (validating the validator's retention model externally, evictions included). Measured: coact arm +2.18pp extra share (1,784 hits, every lead >= 2); A4 bar09 arm 6,483 hits (+7.91pp) vs null 1,123 (+1.37pp); fusion arm 5,082 (+6.20pp) vs null 921 (+1.12pp) - 4-5x the null's hits at ~1/7-1/8 its admission churn. `row_bytes` is layer-constant but not model-constant (37 x 1,769,472 B, layers 34/38/39 x 2,039,808 B; 12-row pool cost ~819 MiB, correcting the earlier 810 MiB figure). The pre-A2 null trace refuses (missing candidate_ids). Authorizing a fresh pool arm remains the owner's call.
+
+### T-GPLR-60 (draft, planning only): context-conditioned, miss-aware, cost-aware prediction research
+
+Status: CLOSED (owner decision, 2026-09-25; host-only G0/G1 complete; STOP). G2/G3 are not authorized and this predictor family is not advanced. Commit: nested e62b32427 (shared substrate); outer closure commit pending; scientific result already complete. Dependencies: T-GPLR-58/T-GPLR-59 evidence, the recorded Qwen3.6 demand stream, and the existing host replay; this block does not supersede the T-GPLR-59 MTP/hidden-state draft.
+
+Goal. Test whether a predictor can improve as generated-token history accumulates by predicting only cache misses, conditioning on the current request/layer state, and charging for wasted prefetch. The falsifiable hypothesis is that a context-conditioned miss predictor beats an equal-row retention-only cache and a count-matched null on marginal miss hits without reducing net throughput; a failure is a useful stop result.
+
+Scope. First host-only, on recorded demand: (1) learning curves by token prefix/window; (2) recency/frequency baseline; (3) request-local expert-map/cluster matching from already observed routes; (4) miss-only proposal accounting, Belady opportunity ceiling, equal-row K/P comparisons, and lead/readiness fates. No new learned sidecar or hidden-state capture is authorized here; those remain the existing T-GPLR-59 class-D/E owner decisions.
+
+Non-goals. No change to routing, model arithmetic, expert IDs, quantization, PP, or the default-off path; no new dependency; no padding/repeating candidate IDs; no claim that offline recall, host replay, logical H2D bytes, or cache hit share equals CUDA tok/s.
+
+Design contract. For each arm, report real hits, marginal pool hits on real misses, proposals, duplicates, refused/no-room candidates, READY-before-demand hits, PENDING fallbacks, lead histogram, useful/wasted H2D, equal-row retention baseline, count-matched null, and a Belady/oracle ceiling. Compare K+P against retention-only K+P/top_k at identical row budget. Evaluate at token prefixes 32/64/128/256 and, only with owner-authorized fresh runs, longer generations.
+
+Staged gates. G0 provenance/no-leak closure; G1 host learning curve must show a repeatable miss-only opportunity above null and report whether it grows with history; G2 only then a cost-aware admission replay may claim a candidate for GPU testing; G3 owner-authorized mutex-held A/B must measure tok/s, transfer overlap, peak VRAM, and semantic-QA. A host failure at G1 stops the current family; a positive host result is authorization to seek a GPU run, never acceptance.
+
+Validation commands. `python tools/analyze-gplr59-pool.py --selftest`; focused predictor-screen selftest; any new replay selftest; `python tools/resplit-currentstate.py --verify`; `python tools/check-doc-sizes.py --top 5`; `git diff --check`. A future GPU run must record exact command, model identity, hardware, flags, mutex/verdict, raw JSONL, and smoke result.
+
+Required state update. Record the learning-curve table, null/oracle margins, equal-row comparison, and stop/continue decision in `docs/currentstate.md`; do not rewrite T-GPLR-58/59 historical results.
+
+Escalate before changing the task boundary if the experiment requires hidden-state/router-logit capture, a learned sidecar, a new dependency, MTP/handoff mode, a multi-predictor runtime ensemble, routing changes, or a GPU/model run. The current evidence supports researching miss-aware/context-conditioned prediction, not assuming that more history or more fusion is automatically better.
+
+Result (2026-09-24, host-only): G0 closed. Source trace SHA-256 `c38feedc5e20a0da47a03ae88cf667295a6fe05d5c35c2d58d6446135d566196`; prompt SHA-256 `e29c2fcc0da0815554c45e49026d4f3e24df6401fa492fe1b26e6286b00011d9`; model `Qwen3.6-35B-A3B`, 256 experts, top_k 8, 10,240 stages and 81,920 demand IDs. The coact, bar09, and fusion traces have identical stream signature `2613f366136ca8ac` and demand-row signature `c284cd11b2d9dbc5`. Prefix replay used token ranks 32/64/128/256, with 8,960/7,680/5,120/0 held-out rows; H=256 is `UNVERIFIED_NO_HELDOUT`. Predictor state was trained only on rows before the prefix and frozen on the suffix; the null seed is SHA-256-derived and stable across processes.
+
+G1 result: miss-only pool hits are repeatable and far above the count-matched null (for example coact K=4: H32 2,096 vs 155; H64 1,809 vs 139; H128 1,179 vs 88), but they do not improve monotonically with history and every reported arm loses to equal-row retention. Coact K=4 total hit share is 55.90/56.45/54.87% for H32/64/128 versus 59.45/59.80/58.28% retention-only K+1; the corresponding marginal pool shares are 2.56/2.36/2.30%. The K=4 coact Belady ceiling is 77.21/77.32/76.77%, so prediction captures only a small fraction of the available oracle headroom. H32 K=4 coact also records 71,360 proposals, 2,605 admissions, 2,096 READY hits, 291 PENDING fallbacks, 0 evictions, 218 live-at-end rows, 3.50 GiB useful H2D, and 0.85 GiB wasted H2D. `tools/analyze-tg60-learning.py --selftest` is 9/9; the JSON replay is byte-repeatable after removing its timestamp. G1 therefore fails its required above-null-and-equal-row gate: STOP this family; no G2/G3 authorization follows.
+
+Adversarial follow-up (2026-09-24): focused CLI probes found and fixed four task-owned boundary defects: missing/malformed trace and the fixed calculator-prompt input now refuse with exit 2 instead of leaking an exception; the free-form prompt override was removed so an unrelated prompt cannot be recorded as provenance; the command's `--trace` is included in the required equal-demand provenance set instead of silently checking only the default; and H2D accounting now uses each stage/layer's recorded `row_bytes` (the source has 1,769,472 B rows except layers 34/38/39 at 2,039,808 B). The analyzer selftest is now 15 checks, including fixed prompt identity/mismatch refusal, empty/out-of-order rejection, layer-byte mapping, transfer closure, prefix isolation, per-stage budget, and lead-2. The corrected H32/K4 coact values are 3.50 GiB useful and 0.85 GiB wasted H2D; the hit-share decision is unchanged. No async path exists in this host-only analyzer, and no imaginary phase/async hardening was added; the existing ideal-next-reap lifecycle and GPLR-59 generation tests remain the relevant state-synchronization coverage. Final decision remains **STOP**.
+
+Architecture pass (2026-09-24, shape only; STOP unchanged). The T-GPLR-59/60 code now has three explicit boundaries. (1) `src/llama-layer-streaming-pool.{h,cpp}` owns the pure prediction-row state enum, exact expert-slab arithmetic, admission plan, generation transition, lookup, retirement, and completion policy. It has no CUDA or runner state. `llama_layer_streaming` remains the single runtime owner of pool buffers, completion events, package sources, and counters, and the large streaming implementation only orchestrates those resources through the policy API. (2) `tools/layer-streaming/telemetry-pool.{h,cpp}` owns all stateful `spec_pool*` validation; `main.cpp` only creates one validator per telemetry pass and forwards events. The minimal JSONL readers used by both validators live once in `telemetry-json.{h,cpp}`. (3) `tools/tg_pool_core.py` owns trace parsing, shared real-cache replay, pool lifecycle, fate closure, and report-data construction. `analyze-gplr59-pool.py` is now the CLI/rendering/selftest adapter, while T-GPLR-60 imports the shared real-cache fact builder, `PoolLayer`, and `replay_pool_stages`; its former duplicate replay lifecycle is deleted. The shared core emits its complete fate ledger; no policy, event schema, capacity, scientific result, or experimental decision changed in this pass. Data flow is runner flags -> engine policy/CUDA adapter -> JSONL -> state-owning validator, and recorded trace -> shared replay core -> CLI-specific scoring/presentation. Adversarial entry-point validation also added negative fixtures for duplicate `run_start`, `spec_pool` before `rowset_init`, and quoted/malformed numeric fields; these exercise the real `--check-telemetry` and `--validate-telemetry` paths. The shared reader preserves valid decimal serialization used by phase summaries while rejecting quoted, partial, non-finite, overflow, and malformed-array tokens. Runtime teardown remains event-synchronized before pool buffers/state are released; no extra async/cleanup path was added. This is validator robustness evidence only: no pool-enabled CUDA run was authorized, and the T-GPLR-60 decision remains **STOP**.
