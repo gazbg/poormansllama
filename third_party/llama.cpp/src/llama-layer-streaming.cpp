@@ -4321,23 +4321,8 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
         }
     }
     if (set == nullptr || !set->built || (set != nullptr && set->needs_rebuild)) {
-        // T-GPLR-62 S2: a prebuild/decode key mismatch is invisible from the
-        // outside -- the set is simply rebuilt in the timed region and the only
-        // symptom is graph_builds != 0. Name the key that missed and every key
-        // that exists, so the mismatch is a one-line diagnosis instead of a
-        // bisect. Gated on the S2 window so a pre-S2 run stays silent.
-        if (ls->row_set_window_width > 0) {
-            fprintf(stderr,
-                    "[ls-s2] set miss: want mode=%d n_tokens=%lld rs_z=%d n_outputs=%d chunk=%d; have:",
-                    ls->phase, (long long) ubatch.n_tokens, rs_z, n_outputs, chunk_key);
-            for (const auto & s : ls->sets) {
-                fprintf(stderr, " [mode=%d n_tokens=%lld rs_z=%d n_outputs=%d chunk=%d built=%d]",
-                        s.mode, (long long) s.n_tokens, s.rs_z, s.n_outputs, s.chunk_id, (int) s.built);
-            }
-            fprintf(stderr, "\n");
-            fflush(stderr);
-        }
-        // not prebuilt: build this variant now (counted in graph_builds telemetry)
+        // not prebuilt (or flagged stale by the S2 narrowing): build this variant
+        // now, counted in graph_builds telemetry.
         set = ls->begin_set(ls->phase, ubatch.n_tokens, rs_z, n_outputs, chunk_key);
         if (set == nullptr) {
             ls->failed = true;
@@ -9207,15 +9192,16 @@ bool llama_layer_streaming::begin_row_set() {
     // is exactly the margin by which the W=16 console figure appeared to miss
     // the preflight's 124.50 MiB. The preflight budgets worst-case-per-slot, so
     // worst-case-per-slot is what is reported here.
-    size_t slot_bytes = 0;        // worst full-bank slot
-    size_t slot_bytes_total = 0;  // sum over slots, the number actually allocated
-    for (const auto & slot : slots) {
-        size_t mx = 0;
-        for (const auto & kv : slot.layer_bytes) {
-            mx = std::max(mx, kv.second);
-        }
-        slot_bytes       = std::max(slot_bytes, mx);
-        slot_bytes_total += mx;
+    // T-GPLR-62 S2: rowset_init.slot_bytes KEEPS its original meaning -- slot 0's
+    // layer-0 bank bytes. It is a recorded telemetry field with existing
+    // consumers, so its value must not move as a side effect of fixing a console
+    // line. (An earlier pass of this work silently widened it to the worst slot;
+    // that was a compatibility break and is reverted here.) The worst-slot and
+    // all-slots figures the console needs are computed separately below and are
+    // deliberately NOT the ones recorded in the event.
+    size_t slot_bytes = 0;
+    if (!slots.empty() && slots[0].layer_bytes.count(0)) {
+        slot_bytes = slots[0].layer_bytes.at(0);
     }
     // T-GPLR-19: retain_k tells the validators which residency rule applies --
     // 0 is the reactive slot-keyed policy (unchanged), >0 switches them to the
@@ -9230,7 +9216,21 @@ bool llama_layer_streaming::begin_row_set() {
     // rowset_init.slot_bytes -- see the contract's A1-WRONG-FIELD note. Both
     // the worst slot and the slot total are printed so a reader can compare
     // like-for-like against the preflight's n_slots * ceil(largest * W / n_exp).
+    // Worst-SLOT, not slot 0: layer->slot assignment is round-robin and the
+    // largest bank in the model does not land in slot 0, so reading slot 0 alone
+    // under-reports the per-slot cost (measured 2026-09-30: it made the W=16
+    // figure appear to miss the preflight by exactly that margin).
     if (row_set_window_width > 0) {
+        size_t full_worst = 0;
+        size_t full_total = 0;
+        for (const auto & slot : slots) {
+            size_t mx = 0;
+            for (const auto & kv : slot.layer_bytes) {
+                mx = std::max(mx, kv.second);
+            }
+            full_worst = std::max(full_worst, mx);
+            full_total += mx;
+        }
         size_t compact_worst = 0;
         size_t compact_total = 0;
         for (const auto & slot : slots) {
@@ -9245,10 +9245,10 @@ bool llama_layer_streaming::begin_row_set() {
                 "layer-streaming: row-set slot window narrowed to %d experts (was %d); "
                 "worst-slot bytes %zu -> %zu (%.1f MiB freed/slot); "
                 "all-slots %zu -> %zu (%.1f MiB freed total)\n",
-                row_set_window_width, n_exp, slot_bytes, compact_worst,
-                (double) (slot_bytes - compact_worst) / (1024.0 * 1024.0),
-                slot_bytes_total, compact_total,
-                (double) (slot_bytes_total - compact_total) / (1024.0 * 1024.0));
+                row_set_window_width, n_exp, full_worst, compact_worst,
+                (double) (full_worst - compact_worst) / (1024.0 * 1024.0),
+                full_total, compact_total,
+                (double) (full_total - compact_total) / (1024.0 * 1024.0));
     }
 
     if (row_set_spec_arm == LLAMA_LS_ARM_D1 && !d1_shape_emitted) {
