@@ -1274,6 +1274,56 @@ static void ls_print_refusal_ok(const char * tool, const ls_refusal_facts & f, b
         : "PRE-WORK - no run_start, no timed phase ran, no run_end");
 }
 
+// One owner for the per-phase question "may this phase report graph
+// construction inside the timed region?", and for the run-scoped memory of
+// whether a handoff ever happened. BOTH telemetry checkers use this, so the
+// rule is written once.
+//
+// It was previously duplicated per checker, and the duplication had already
+// diverged: --check-telemetry carried the S2 narrowing allowance while
+// --validate-telemetry did not (its condition is spelled `pa.graph_builds`
+// inline, so a one-site edit missed it). The two therefore disagreed about the
+// SAME trace: on a W=16 run, --check-telemetry printed OK and
+// --validate-telemetry reported "phase_summary.graph_builds != 0". A rule that
+// decides whether a build is a violation must not have two implementations.
+struct ls_phase_build_allowance {
+    // T-Q38HG-02: a handoff event occurred during this phase.
+    bool handoff_seen = false;
+    // T-GPLR-62 S2: the compact-window narrowing replaced the slot bundle, so
+    // the phase-1 sets are re-derived once by the T-GPLR-47 fresh-context
+    // rebuild. That build is inside the timed region by construction and is
+    // expected, not a violation.
+    bool s2_narrow_seen = false;
+    // T-GPLR-12: handoff events anywhere in the run. Never reset.
+    bool handoff_ever = false;
+
+    // The single event -> state mapping, so a new topology-change event cannot
+    // be honoured at one call site and forgotten at the other.
+    void note_event(const std::string & event) {
+        if (event == "handoff") {
+            handoff_seen = true;
+            handoff_ever = true;
+        } else if (event == "rowset_narrow") {
+            s2_narrow_seen = true;
+        }
+    }
+
+    // The single rule. The build is still counted and reported either way; this
+    // only decides whether it counts as a violation.
+    bool allows_builds_in_phase() const { return handoff_seen || s2_narrow_seen; }
+
+    // T-GPLR-10 asks whether this phase followed a handoff, then the phase ends.
+    // Both flags are per-phase facts, so both are cleared here. The S2 flag is
+    // emitted once, immediately after the PP phase_summary and before any TG
+    // phase_summary, so clearing it at a phase boundary cannot change a verdict.
+    bool end_phase() {
+        const bool after_handoff = handoff_seen;
+        handoff_seen   = false;
+        s2_narrow_seen = false;
+        return after_handoff;
+    }
+};
+
 static int check_telemetry(const std::string & path) {
     FILE * f = fopen(path.c_str(), "r");
     if (f == nullptr) {
@@ -1287,15 +1337,7 @@ static int check_telemetry(const std::string & path) {
     int n_layer = -1;
     bool have_run_start = false;
     bool have_phase_summary = false;
-    bool handoff_seen = false;         // T-Q38HG-02: track handoff events (reset per phase)
-    // T-GPLR-62 S2: a compact-window narrowing replaces the slot bundle, so the
-    // phase-1 sets MUST be re-derived once (T-GPLR-47 fresh-context rebuild).
-    // That is a topology change of exactly the kind the handoff event already
-    // excuses, so graph_builds > 0 after one is expected, not a violation. It is
-    // still COUNTED and still reported: the allowance is for the build existing,
-    // never for hiding it.
-    bool s2_narrow_seen = false;
-    bool handoff_ever = false;         // T-GPLR-12: handoff events ever seen (never reset)
+    ls_phase_build_allowance build_allowance;   // T-Q38HG-02 / T-GPLR-62 S2: one owner
     bool ho_mode_valid = false;        // T-GPLR-12: run_start carried a valid handoff_mode
     bool handoff_active_expected = false; // T-GPLR-12: mode on/auto-on
     bool have_run_end = false;
@@ -1579,8 +1621,8 @@ static int check_telemetry(const std::string & path) {
         } else if (event == "handoff") {
             // T-Q38HG-02: handoff invalidates TG graphs, so graph_builds > 0
             // is expected on the next TG phase.
-            handoff_seen = true;
-            handoff_ever = true;
+            build_allowance.note_event(event);
+            // routed through the shared owner (see ls_phase_build_allowance)
             // T-GPLR-12: a run whose run_start declared off/auto-off must
             // never emit handoff events.
             if (ho_mode_valid && !handoff_active_expected) {
@@ -1654,7 +1696,7 @@ static int check_telemetry(const std::string & path) {
             // rebuild). Placed AFTER the whole handoff branch: a topology change
             // that legitimately invalidates prebuilt graphs, so the resulting
             // graph_builds > 0 is expected and still counted, never hidden.
-            s2_narrow_seen = true;
+            build_allowance.note_event(event);
         } else if (event == "byte_account") {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.
@@ -1706,11 +1748,10 @@ static int check_telemetry(const std::string & path) {
             bool found = false;
             const long long graph_builds = json::integer(line, "graph_builds", &found);
             // T-Q38HG-02: graph_builds > 0 is acceptable after a handoff event.
-            if (found && graph_builds != 0 && !handoff_seen && !s2_narrow_seen) {
+            if (found && graph_builds != 0 && !build_allowance.allows_builds_in_phase()) {
                 err("phase_summary.graph_builds != 0 (graph construction in timed region)");
             }
-            const bool after_handoff = handoff_seen; // T-GPLR-10: hybrid-TG bytes rule below
-            handoff_seen = false; // reset per phase
+            const bool after_handoff = build_allowance.end_phase(); // T-GPLR-10: hybrid-TG bytes rule below
             have_phase_summary = true;
 
             phase_data pd;
@@ -1914,9 +1955,9 @@ static int check_telemetry(const std::string & path) {
             }
             peak_vram = json::integer(line, "peak_vram_bytes", &found);
             // T-GPLR-12: a run whose run_start declared on/auto-on must have
-            // emitted handoff events by run_end. Use handoff_ever, not
-            // handoff_seen (the latter is reset by each phase_summary).
-            if (ho_mode_valid && handoff_active_expected && !handoff_ever) {
+            // emitted handoff events by run_end. Use handoff_ever, not the
+            // per-phase flag (the latter is reset by each phase_summary).
+            if (ho_mode_valid && handoff_active_expected && !build_allowance.handoff_ever) {
                 err("run_start declared handoff_mode on/auto-on but no handoff events followed");
             }
         } else if (event == "slot_request") {
@@ -2368,11 +2409,7 @@ static int validate_telemetry(const std::string & path) {
     // per-phase aggregation; phase 0 = PP, 1 = TG
     std::map<int, phase_agg> phases;
     int current_phase = -1;
-    bool handoff_seen = false;         // T-Q38HG-02 (reset per phase)
-    // T-GPLR-62 S2: a compact narrowing invalidates the phase-1 sets and forces
-    // one re-derivation; see the same-named flag in the phase checker above.
-    bool s2_narrow_seen = false;
-    bool handoff_ever = false;         // T-GPLR-12: handoff events ever seen (never reset)
+    ls_phase_build_allowance build_allowance;   // T-Q38HG-02 / T-GPLR-62 S2: one owner
     bool ho_mode_valid = false;        // T-GPLR-12: run_start carried a valid handoff_mode
     bool handoff_active_expected = false; // T-GPLR-12: mode on/auto-on
     bool off_audit_trace = false;      // T-GPLR-05: policy-off audit record schema
@@ -2498,8 +2535,8 @@ static int validate_telemetry(const std::string & path) {
         } else if (event == "handoff") {
             // T-Q38HG-02: handoff invalidates TG graphs, so graph_builds > 0
             // is expected on the next TG phase.
-            handoff_seen = true;
-            handoff_ever = true;
+            build_allowance.note_event(event);
+            // routed through the shared owner (see ls_phase_build_allowance)
             // T-GPLR-12: a run whose run_start declared off/auto-off must
             // never emit handoff events.
             if (ho_mode_valid && !handoff_active_expected) {
@@ -2563,7 +2600,7 @@ static int validate_telemetry(const std::string & path) {
             // rebuild). Placed AFTER the whole handoff branch: a topology change
             // that legitimately invalidates prebuilt graphs, so the resulting
             // graph_builds > 0 is expected and still counted, never hidden.
-            s2_narrow_seen = true;
+            build_allowance.note_event(event);
         } else if (event == "byte_account") {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.
@@ -2637,9 +2674,10 @@ static int validate_telemetry(const std::string & path) {
             pa.graph_builds = json::integer(line, "graph_builds", &found);
             if (!found) err("phase_summary missing graph_builds");
             // T-Q38HG-02: graph_builds > 0 acceptable after handoff
-            if (pa.graph_builds != 0 && !handoff_seen) err("phase_summary.graph_builds != 0");
-            const bool after_handoff = handoff_seen; // T-GPLR-10: hybrid-TG bytes rule below
-            handoff_seen = false; // reset per phase
+            if (pa.graph_builds != 0 && !build_allowance.allows_builds_in_phase()) {
+                err("phase_summary.graph_builds != 0");
+            }
+            const bool after_handoff = build_allowance.end_phase(); // T-GPLR-10: hybrid-TG bytes rule below
             pa.graph_prep_us = json::integer(line, "graph_prep_us", &found);
             if (!found) err("phase_summary missing graph_prep_us");
             pa.total_transfer_us = atof(json::value(line, "total_transfer_us").c_str());
@@ -2677,7 +2715,7 @@ static int validate_telemetry(const std::string & path) {
             else if (exit_status != 0) err("run_end.exit_status != 0");
             // T-GPLR-12: on/auto-on must have emitted handoff events. Use
             // handoff_ever (handoff_seen is reset by each phase_summary).
-            if (ho_mode_valid && handoff_active_expected && !handoff_ever) {
+            if (ho_mode_valid && handoff_active_expected && !build_allowance.handoff_ever) {
                 err("run_start declared handoff_mode on/auto-on but no handoff events followed");
             }
             peak_vram = json::integer(line, "peak_vram_bytes", &found);
