@@ -4634,24 +4634,52 @@ int main(int argc, char ** argv) {
         // with a loud notice (never a mid-run fallback); the decision is
         // recorded in run_start as handoff_mode "auto-on" / "auto-off" and
         // audited by the checker.
+        // T-GPLR-12 correction (2026-09-30): the ONE predicate that decides
+        // whether a PP->TG transition is even possible. The TG block below is
+        // guarded on `exit_status == 0 && tg_tokens > 0`; the exit_status half
+        // is not knowable before the PP runs, so the schedulable half is
+        // tg_tokens > 0, and the declaration below must key on the SAME
+        // predicate. Keeping it in one named lambda is what stops the two sites
+        // drifting apart again, which is exactly how the original bug happened.
+        const bool tg_phase_scheduled = tg_tokens > 0;
         if (handoff_auto) {
-            // T-GPLR-12 correction (2026-09-30): the auto decision was taken
-            // from the fit arithmetic ALONE, with no reference to the schedule,
-            // and that made run_start promise a handoff the run could never
-            // deliver. A handoff IS the PP->TG migration, and it is emitted
-            // only from inside the TG block, which is gated on tg_tokens > 0.
-            // So a run with no TG phase has no transition to hand off into, yet
-            // a fitting shape still resolved auto -> ON, declared
-            // handoff_mode "auto-on", and then emitted no handoff event -- which
-            // the T-GPLR-12 audit correctly read as a handoff that was declared
-            // and silently skipped. The check was right; the declaration lied.
+            // The auto decision was taken from the fit arithmetic ALONE, with no
+            // reference to the schedule, and that made run_start promise a
+            // handoff the run could never deliver. A handoff IS the PP->TG
+            // migration, emitted only from inside the TG block. So the
+            // declaration must key on that block's guard, not on the fit
+            // arithmetic alone. Two ways to promise a handoff and never emit
+            // one:
+            //
+            //   (a) tg_tokens == 0 -- no TG phase was ever scheduled. The fit
+            //       gate passed, auto resolved ON, "auto-on" was declared, and
+            //       there was no transition to hand off into. This is the
+            //       prefill-only family, and it is decidable HERE.
+            //   (b) tg_tokens > 0 but the PP phase failed (exit_status != 0),
+            //       so the TG block is skipped entirely. NOT decidable here --
+            //       run_start is written before the PP runs.
+            //
+            // Case (b) is MEASURED to be unreachable as a masking defect, and is
+            // deliberately NOT compensated for by emitting a handoff event on a
+            // dead run. A PP failure sets exit_status = 1, so the trace also
+            // reports `run_end.exit_status != 0` and is rejected on that ground
+            // alone; the handoff line is redundant, not load-bearing. Verified
+            // 2026-09-30 on a synthesised trace of exactly this shape (PP
+            // declared auto-on, no handoff event, run_end exit_status 1):
+            // `--check-telemetry` reports BOTH, `run_end.exit_status != 0`
+            // first. The variant where PP succeeds, TG is skipped and
+            // run_end reports exit_status 0 -- the only shape where this rule
+            // carries the verdict on its own -- is NOT produced by case (b) at
+            // all, and the rule still rejects it (verified: 1 violation). So
+            // emitting a migration event for a run that never migrated would
+            // cost a real 18 GB copy on a dead run to fix nothing.
             //
             // Derived from the ACTUAL SCHEDULE below. This is deliberately not
             // applied to an explicit `--handoff`: a user who asks for a handoff
             // and asks for no TG has requested something incoherent, and the
             // audit failing that trace is the right answer -- quietly rewriting
             // an explicit request would hide the mistake.
-            if (tg_tokens <= 0) {
+            if (!tg_phase_scheduled) {
                 handoff = false;
                 fprintf(stderr, "handoff: auto -> OFF (no TG phase: --tg-tokens %d, so there is no PP->TG transition to hand off into)\n",
                         tg_tokens);
@@ -5198,6 +5226,12 @@ int main(int argc, char ** argv) {
         }
     }
     // T-GPLR-12: the auditable handoff decision (post-preflight resolution).
+    // The declared mode is a PROMISE about the PP->TG transition, and the only
+    // thing that transition can be is the TG block guarded by
+    // `exit_status == 0 && tg_tokens > 0`. So the promise must be made on that
+    // basis, not on the fit result alone -- see the tg_tokens <= 0 branch in the
+    // preflight above. `handoff_auto` is retained here only to keep the
+    // "auto-" prefix that tells the checker this was resolved, not requested.
     std::string handoff_mode_tel = handoff_auto ? (handoff ? "auto-on" : "auto-off")
                                                 : handoff_mode_str; // "on" | "off"
     // T-GPLR-48: how the per-pass rebuild was resolved, and by whom.
@@ -5616,6 +5650,11 @@ int main(int argc, char ** argv) {
 
     // ------------------------------------------------------------------
     // TG: tg_tokens greedy steps immediately after PP (no state reset)
+    // The `exit_status == 0` half of the guard is the ONLY thing that can still
+    // skip this block after run_start promised a handoff (case (b) in the
+    // preflight comment). It is safe there because a PP failure also fails the
+    // run: `run_end.exit_status != 0` rejects the trace regardless, so no
+    // verdict depends on the handoff rule for that shape.
     // ------------------------------------------------------------------
     if (exit_status == 0 && tg_tokens > 0) {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
