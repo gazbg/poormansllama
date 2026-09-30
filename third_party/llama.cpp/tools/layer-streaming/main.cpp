@@ -4635,17 +4635,39 @@ int main(int argc, char ** argv) {
         // recorded in run_start as handoff_mode "auto-on" / "auto-off" and
         // audited by the checker.
         if (handoff_auto) {
-            const uint64_t handoff_need = full_model_plus_runtime + act_slab_bytes + vram.reserve_bytes;
-            if (residency == "moe-expert-bank" && handoff_need <= vram.free_start) {
-                handoff = true;
-                fprintf(stderr, "handoff: auto -> ON (T-GPLR-10 fit gate passed: %llu B <= observed free %zu B)\n",
-                        (unsigned long long) handoff_need, vram.free_start);
-            } else {
+            // T-GPLR-12 correction (2026-09-30): the auto decision was taken
+            // from the fit arithmetic ALONE, with no reference to the schedule,
+            // and that made run_start promise a handoff the run could never
+            // deliver. A handoff IS the PP->TG migration, and it is emitted
+            // only from inside the TG block, which is gated on tg_tokens > 0.
+            // So a run with no TG phase has no transition to hand off into, yet
+            // a fitting shape still resolved auto -> ON, declared
+            // handoff_mode "auto-on", and then emitted no handoff event -- which
+            // the T-GPLR-12 audit correctly read as a handoff that was declared
+            // and silently skipped. The check was right; the declaration lied.
+            //
+            // Derived from the ACTUAL SCHEDULE below. This is deliberately not
+            // applied to an explicit `--handoff`: a user who asks for a handoff
+            // and asks for no TG has requested something incoherent, and the
+            // audit failing that trace is the right answer -- quietly rewriting
+            // an explicit request would hide the mistake.
+            if (tg_tokens <= 0) {
                 handoff = false;
-                fprintf(stderr, "handoff: auto -> OFF (%s); running streaming TG (paged expert banks)\n",
-                        residency != "moe-expert-bank"
-                            ? "policy has no T-GPLR-10 fit branch; explicit --handoff remains available"
-                            : "post-handoff peak exceeds observed free VRAM");
+                fprintf(stderr, "handoff: auto -> OFF (no TG phase: --tg-tokens %d, so there is no PP->TG transition to hand off into)\n",
+                        tg_tokens);
+            } else {
+                const uint64_t handoff_need = full_model_plus_runtime + act_slab_bytes + vram.reserve_bytes;
+                if (residency == "moe-expert-bank" && handoff_need <= vram.free_start) {
+                    handoff = true;
+                    fprintf(stderr, "handoff: auto -> ON (T-GPLR-10 fit gate passed: %llu B <= observed free %zu B)\n",
+                            (unsigned long long) handoff_need, vram.free_start);
+                } else {
+                    handoff = false;
+                    fprintf(stderr, "handoff: auto -> OFF (%s); running streaming TG (paged expert banks)\n",
+                            residency != "moe-expert-bank"
+                                ? "policy has no T-GPLR-10 fit branch; explicit --handoff remains available"
+                                : "post-handoff peak exceeds observed free VRAM");
+                }
             }
         }
         // 1. Out-of-core proof: the contract requires full residency to NOT fit
@@ -4656,6 +4678,13 @@ int main(int argc, char ** argv) {
         //    exempt -- the handoff fit gate below is strictly stronger (the
         //    same terms plus the reserve), so the weaker proof is redundant
         //    there; explicit --handoff keeps today's hard-refuse semantics.
+        //    2026-09-30: an auto run with NO TG phase is no longer exempt,
+        //    and that narrowing is intentional. The exemption rests on "the
+        //    full model will be migrated at the PP->TG boundary"; a run with
+        //    no TG performs no migration, so the premise is false and the
+        //    proof applies as it would for any other non-handoff run. Such a
+        //    run that genuinely fits now prints the notice and needs
+        //    --allow-full-residency, exactly like any other fitting shape.
         if (full_model_plus_runtime + act_slab_bytes <= vram.free_start && !(handoff_auto && handoff)) {
             const char * msg = "capacity preflight: the full model plus runtime WOULD FIT in free VRAM; "
                                "this is not an out-of-core configuration"
