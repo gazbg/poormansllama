@@ -9266,6 +9266,24 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
             fetch_pos.push_back(free_p);
         }
 
+        // T-GPLR-62 S1: post-placement CONTAINMENT self-check. Every member of
+        // the union must now name exactly one source -- a cache position, a
+        // prediction-pool position, or nothing. A member with no source is the
+        // one condition under which step 4b would read a position it never
+        // wrote, i.e. compute with a DIFFERENT expert than the router selected.
+        // It is refused here, loudly, instead of being discovered at 4b.
+        for (size_t i = 0; i < uniq.size(); ++i) {
+            if (pos_of[i] >= 0 || pool_hit_pos[i] >= 0) {
+                continue;
+            }
+            tel_rowset_refused(il, slot_idx, slot.generation, "coverage_gap",
+                ("union member " + std::to_string(uniq[i]) + " of layer " + std::to_string(il) +
+                 " has no source after placement (cache miss, no pool hit)").c_str());
+            error_msg = "load_row_set: union member without a source for layer " + std::to_string(il) +
+                        " (expert " + std::to_string(uniq[i]) + ")";
+            return false;
+        }
+
         // P4 at a demand stage: a fill for a row THIS window fetches is now a
         // duplicate -- its bytes are superseded by the demand's own copy, so the
         // claim is cancelled (marked here, released by the next reap, which is
@@ -9368,7 +9386,18 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                 const int pp = pool_hit_pos[i];
                 ggml_tensor * src_cache = p >= 0 ? (ggml_tensor *) cache_t
                                                   : (pp >= 0 ? (ggml_tensor *) pool_mem[mi] : nullptr);
-                GGML_ASSERT(src_cache != nullptr && "row-set retention refresh without a source");
+                // T-GPLR-62 S1: the pre-4b containment check makes this
+                // unreachable, but a GGML_ASSERT here would ABORT the process --
+                // no telemetry, no stable reason, no clean exit. SDD section 4
+                // requires a loud structured refusal, so refuse instead.
+                if (src_cache == nullptr) {
+                    tel_rowset_refused(il, slot_idx, slot.generation, "coverage_gap",
+                        ("row-set refresh without a source: expert " + std::to_string(uniq[i]) +
+                         " of layer " + std::to_string(il) + " (member " + std::to_string(mi) + ")").c_str());
+                    error_msg = "load_row_set: row-set refresh without a source for layer " +
+                                std::to_string(il) + " (expert " + std::to_string(uniq[i]) + ")";
+                    return false;
+                }
                 ggml_tensor * v_src = ggml_view_2d(cache_view_ctx, src_cache,
                                                    src_cache->ne[0], src_cache->ne[1], src_cache->nb[1],
                                                    (size_t) (p >= 0 ? p : pp) * src_cache->nb[2]);
