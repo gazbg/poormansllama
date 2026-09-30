@@ -1129,8 +1129,12 @@ llama_ls_propose_result llama_ls_spec_propose_d1(const llama_ls_d1_state * d1,
 }
 
 // create one device tensor object with the same shape/type as the source (in
-static ggml_tensor * make_dev_tensor(ggml_context * ctx, const ggml_tensor * src) {
-    return ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+// T-GPLR-62 S2: ne2_override replaces the source's expert-axis extent, which is
+// how a compact row-set window is made narrow. 0 means "copy src->ne[2]", i.e.
+// the pre-S2 full-bank shape, so every existing caller is unchanged.)
+static ggml_tensor * make_dev_tensor(ggml_context * ctx, const ggml_tensor * src, int64_t ne2_override = 0) {
+    return ggml_new_tensor_4d(ctx, src->type, src->ne[0], src->ne[1],
+                              ne2_override > 0 ? ne2_override : src->ne[2], src->ne[3]);
 }
 
 // allocate tensors from a buffer with explicit address walking
@@ -3348,9 +3352,24 @@ bool llama_layer_streaming::init(const llama_model & model, int n_slots_, int de
         const size_t embd_bytes = schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR
             ? (size_t) n_embd_io * (size_t) pp_tokens * sizeof(float)
               + (size_t) n_chunks * (size_t) 1024u * 1024u : 0;
+        // T-GPLR-62 S2: the row-set TG companion graphs each carry TWO
+        // [n_expert_used, n_tokens] I32 host inputs -- sel_in (the router's
+        // absolute expert ids) and sel_pos_in (the same experts as window
+        // POSITIONS, T-GPLR-62 S2). They are INPUT-flagged, so finish_build's
+        // context walk allocates them from this buffer whatever the set filter
+        // later decides about the snapshot list. Budgeting them EXPLICITLY, at
+        // max_ubatch rather than the eventual token count, means they are backed
+        // from the primary buffer by design instead of surviving on incidental
+        // slack and spilling to an extra host allocation. Host memory only, so
+        // this costs no VRAM. Sized for the full trunk because every layer gets
+        // a companion graph.
+        const size_t rowset_input_bytes = row_set_requested
+            ? (size_t) 2u * (size_t) n_layer * (size_t) model_ref->hparams.n_expert_used
+              * (size_t) max_ubatch * sizeof(int32_t)
+            : 0;
         const size_t input_bytes = pw_probe
             ? (size_t) 64u * 1024u * 1024u  // per-width: fixed budget for 3 sets
-            : ((size_t) n_masks * mask_bytes + embd_bytes + 64u * 1024u * 1024u);
+            : ((size_t) n_masks * mask_bytes + embd_bytes + rowset_input_bytes + 64u * 1024u * 1024u);
         buf_inputs.reset(ggml_backend_buft_alloc_buffer(buft_cpu, input_bytes));
         if (!buf_inputs) {
             error_msg = "failed to allocate input buffer";
@@ -3755,6 +3774,7 @@ llama_layer_streaming::graph_set * llama_layer_streaming::begin_set(int mode, in
     set->ff_graphs.clear();
     set->ff_layer.clear();
     set->ff_input.clear();
+    set->ff_input_wpos.clear(); // T-GPLR-62 S2: keep the two vectors the same length
     set->built = false;
 
     // T-GPLR-44 (measured, now fixed at the root by T-GPLR-47): the warning
@@ -4398,6 +4418,17 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             ls->tel_error(ls->error_msg.c_str());
             return GGML_STATUS_FAILED;
         }
+        // T-GPLR-62 S2: the window-position vector must track ff_input exactly.
+        // A short vector here would index out of bounds when the executor fills
+        // it, so it is checked rather than assumed.
+        if (set->ff_input_wpos.size() != set->ff_input.size()) {
+            ls->error_msg = "layer_streaming_compute: row-set set has " +
+                            std::to_string(set->ff_input_wpos.size()) +
+                            " window-position inputs for " + std::to_string(set->ff_input.size()) + " FFN inputs";
+            ls->failed = true;
+            ls->tel_error(ls->error_msg.c_str());
+            return GGML_STATUS_FAILED;
+        }
         if (ls->row_set_spec_arm == LLAMA_LS_ARM_D1) {
             ls->d1_last_routes.assign((size_t) ubatch.n_tokens, {});
         }
@@ -4519,6 +4550,60 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 GGML_ASSERT((int64_t) ids_per_token[(size_t) t].size() == n_used);
                 memcpy((int32_t *) sel_in->data + t * n_used,
                        ids_per_token[(size_t) t].data(), (size_t) n_used * sizeof(int32_t));
+            }
+
+            // T-GPLR-62 S2: the SAME experts, re-expressed as positions in the
+            // window that load_row_set just staged. The table is host-side and
+            // was reset to -1 in full for this window, so a -1 here means the
+            // expert the router selected is not in the staged union -- which is
+            // the A10 subset condition, not a bookkeeping detail. It refuses
+            // loudly and NEVER falls back to a stale position from a previous
+            // window, never clamps, and never wraps.
+            //
+            // While the slot is still full-bank the graph ignores this tensor, so
+            // this is currently an audit of the mapping rather than the mechanism
+            // itself; that is deliberate, so the table can be validated before
+            // anything depends on it.
+            ggml_tensor * sel_pos = set->ff_input_wpos[(size_t) il];
+            if (sel_pos != nullptr) {
+                if (!ls->row_set_union_valid()) {
+                    ls->error_msg = "layer_streaming_compute: no union position table for layer " +
+                                    std::to_string(il) + " (load_row_set did not run)";
+                    ls->failed = true;
+                    ls->tel_error(ls->error_msg.c_str());
+                    return GGML_STATUS_FAILED;
+                }
+                if (sel_pos->data == nullptr || sel_pos->ne[0] != n_used || sel_pos->ne[1] != n_tok) {
+                    ls->error_msg = "layer_streaming_compute: row-set window-position input has the wrong "
+                                    "shape for layer " + std::to_string(il);
+                    ls->failed = true;
+                    ls->tel_error(ls->error_msg.c_str());
+                    return GGML_STATUS_FAILED;
+                }
+                const std::vector<int32_t> & upos = ls->row_set_union_pos();
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    for (int64_t k = 0; k < n_used; ++k) {
+                        const int32_t e = ids_per_token[(size_t) t][(size_t) k];
+                        if (e < 0 || (size_t) e >= upos.size()) {
+                            ls->error_msg = "layer_streaming_compute: expert " + std::to_string(e) +
+                                            " outside the union table for layer " + std::to_string(il);
+                            ls->failed = true;
+                            ls->tel_error(ls->error_msg.c_str());
+                            return GGML_STATUS_FAILED;
+                        }
+                        const int32_t p = upos[(size_t) e];
+                        if (p < 0) {
+                            ls->error_msg = "layer_streaming_compute: expert " + std::to_string(e) +
+                                            " was selected for token " + std::to_string(t) +
+                                            " but is not in the staged union for layer " + std::to_string(il) +
+                                            " (union width " + std::to_string(upos.size()) + " table)";
+                            ls->failed = true;
+                            ls->tel_error(ls->error_msg.c_str());
+                            return GGML_STATUS_FAILED;
+                        }
+                        ((int32_t *) sel_pos->data)[t * n_used + k] = p;
+                    }
+                }
             }
 
             // part B: FFN + shared experts on the staged rows (ff_graphs[il])
@@ -5035,9 +5120,9 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     // moves the build cost out of total_patch_us (it used to be charged to
     // the first launch's patch bucket); pass-2 patch_us comparisons are
     // unaffected either way, and the dump comment below records why.
-    auto ensure_patch_cache = [&](llama_layer_streaming::graph_set * set, size_t set_idx) {
+    auto ensure_patch_cache = [&](llama_layer_streaming::graph_set * set, size_t set_idx) -> bool {
         if (set == nullptr || set->patch_cache_built) {
-            return;
+            return true;
         }
         auto & cache_fa = set->fa_nodes;
         for (size_t gi = 1; gi + 1 < set->graphs.size(); ++gi) {
@@ -5051,7 +5136,14 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         // build_patch_split classifies the INPUT candidates (kept vs
         // zero-consumer, T-GPLR-45) and builds the per-graph split the dump
         // reports; one walk owns both so they cannot drift.
-        ls->build_patch_split(*set);
+        // T-GPLR-62 S2: build_patch_split is the owner of the INPUT
+        // classification AND of the guard that a row-set companion input is not
+        // in the snapshot list. Its refusal must propagate: an unbacked or
+        // double-owned input buffer is exactly the case where continuing would
+        // produce a plausible wrong answer.
+        if (!ls->build_patch_split(*set)) {
+            return false;
+        }
         set->patch_cache_built = true;
         // T-GPLR-44: report the cache composition once per set (recon only).
         // The per-graph split this dump describes was implemented and A/B
@@ -5063,6 +5155,7 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         // reuses the walk for the zero-consumer SET filter (not per-graph
         // scoping), which is the narrowed-restore lever that survived.
         ls->tel_patch_cache(*set, set_idx);
+        return true;
     };
 
     const int64_t t_led_fn0 = ggml_time_us();
@@ -5215,7 +5308,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
                 // the snapshot: snapshot capture, launch restore and the
                 // composition split all iterate the same kept-member list, so
                 // the classification cannot be allowed to arrive late.
-                ensure_patch_cache(bind_set, (size_t) c);
+                if (!ensure_patch_cache(bind_set, (size_t) c)) {
+                    ls->failed = true;
+                    return GGML_STATUS_FAILED;
+                }
                 std::vector<uint8_t> snap;
                 for (ggml_tensor * t : bind_set->input_tensors) {
                     const size_t nb = ggml_nbytes(t);
@@ -5404,8 +5500,11 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     // chunk, this patches act data pointers, restores input snapshots, and
     // rewrites the causal window. ggml's CUDA graph exec update diffs node
     // properties against the captured copy and re-instantiates on update failure.
-    auto prepare_chunk = [&](int c) {
-        if (!ls->pw_probe) return;
+    auto prepare_chunk = [&](int c) -> bool {
+        // pw_probe off: there is nothing to patch, which is a success, not a
+        // refusal. (This is the documented no-pw-probe behaviour: no act
+        // repointing, no snapshot restore, and no patch_cache dump.)
+        if (!ls->pw_probe) return true;
         const int64_t t0_patch = ggml_time_us();
 
         // 1. act slab slices: each per-width set has act tensors pointing
@@ -5433,7 +5532,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         // (graph_builds == 0 in both passes), so in practice the build
         // happens once per run per set - the T-GPLR-43 per-pass prebuild does
         // not rebuild these pw sets.
-        ensure_patch_cache(sets[c], (size_t) c);
+        if (!ensure_patch_cache(sets[c], (size_t) c)) {
+            ls->failed = true;
+            return false;
+        }
 
         // 2. restore this chunk's input values from the snapshot taken during
         // the mctx loop (where the shared rec/KV state was current)
@@ -5457,13 +5559,17 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         }
 
         ls->total_patch_us += (double)(ggml_time_us() - t0_patch);
+        return true;
     };
 
     // 1. embed every chunk (writes slab A[c]); no slot work
     const int64_t t_led_embed0 = ggml_time_us();
     for (int c = 0; c < n_chunks; ++c) {
         const int64_t t_p0 = ggml_time_us();
-        prepare_chunk(c);
+        if (!prepare_chunk(c)) {
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
         const int64_t t_p1 = ggml_time_us();
         double cu = 0.0, su = 0.0;
         const int64_t t_g0 = ggml_time_us();
@@ -5561,7 +5667,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         double layer_compute_us = 0.0, layer_setup_us = 0.0;
         for (int c = 0; c < n_chunks; ++c) {
             const int64_t t_p0 = ggml_time_us();
-            prepare_chunk(c);
+            if (!prepare_chunk(c)) {
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
             const int64_t t_p1 = ggml_time_us();
             double cu = 0.0, su = 0.0;
             const int64_t t_g0 = ggml_time_us();
@@ -6045,7 +6154,7 @@ bool llama_layer_streaming::tel_off_run(const char * tel_path_, const char * arc
 // consumed through a view - the node's src is the view, and the INPUT-flagged
 // tensor sits one hop further down. Scoping to direct sources alone would have
 // dropped that restore silently.
-void llama_layer_streaming::build_patch_split(graph_set & gs) {
+bool llama_layer_streaming::build_patch_split(graph_set & gs) {
     const size_t ng = gs.graphs.size();
 
     // ---- T-GPLR-45: classify the INPUT candidates BEFORE building the split.
@@ -6118,6 +6227,61 @@ void llama_layer_streaming::build_patch_split(graph_set & gs) {
         gs.input_tensors = std::move(kept);
     }
 
+    // ---- T-GPLR-62 S2: the row-set COMPANION inputs are outside this list by
+    // design, and that must stay true for a reason rather than by accident.
+    //
+    // The list above is the PROMPT-PROCESSING chunk snapshot / launch restore
+    // set. It exists because a kernel can clobber a shared input buffer between
+    // the chunk bind point (where shared rec/KV state is current) and the launch,
+    // so the values are saved and put back. The row-set token-generation
+    // companion graphs (`ff_graphs`, the part-B FFN) are not in `graphs`, so the
+    // transitive walk above never reaches them, and their inputs -- sel_in and
+    // sel_pos_in -- are classified as excluded. That is CORRECT and is what the
+    // existing sel_in has always relied on: the executor writes each companion
+    // input immediately before running its own graph, kernels treat it as
+    // read-only, and the scheduler's alloc_graph performs the host-to-device
+    // copy. Neither tensor needs, or has, snapshot protection.
+    //
+    // What must never happen is a companion input that is read by a graph IN
+    // this set, because then it would be snapshotted and restored as a
+    // prompt-processing input while a companion graph also writes it directly --
+    // two owners of one buffer with one running offset between them. That is the
+    // inconsistency this guard refuses. It cannot happen today; it could start
+    // happening if a future change made a companion input reachable from a PP
+    // graph (e.g. sharing it with the MTP head), which is why it is checked
+    // rather than assumed.
+    {
+        std::unordered_set<const ggml_tensor *> kept_set;
+        kept_set.reserve(gs.input_tensors.size() * 2 + 1);
+        for (ggml_tensor * t : gs.input_tensors) {
+            kept_set.insert(t);
+        }
+        for (const std::vector<ggml_tensor *> * lst : { &gs.ff_input, &gs.ff_input_wpos }) {
+            for (ggml_tensor * t : *lst) {
+                if (t == nullptr) {
+                    continue;
+                }
+                if (kept_set.count(t) != 0) {
+                    error_msg = "build_patch_split: a row-set companion input is in the "
+                                "prompt-processing snapshot list; the snapshot and the "
+                                "companion executor would both own its bytes";
+                    failed = true;
+                    return false;
+                }
+                // Backed-by-contract: finish_build's context walk allocates every
+                // INPUT-flagged tensor, so a companion input with no buffer would
+                // mean the sizing model and the allocation walk disagree, and the
+                // executor's null check would fire as a false A10 refusal.
+                if (t->data == nullptr) {
+                    error_msg = "build_patch_split: a row-set companion input is unbacked "
+                                "(no host buffer); the input sizing model is short of it";
+                    failed = true;
+                    return false;
+                }
+            }
+        }
+    }
+
     gs.graph_inputs.assign(ng, {});
     gs.graph_fa_nodes.assign(ng, {});
 
@@ -6181,6 +6345,7 @@ void llama_layer_streaming::build_patch_split(graph_set & gs) {
     }
 
     gs.patch_split_ok = true;
+    return true;
 }
 
 void llama_layer_streaming::tel_patch_cache(const graph_set & gs, size_t set_idx) {
@@ -8938,6 +9103,17 @@ bool llama_layer_streaming::begin_row_set() {
         row_set_gen[&s - &slots[0]] = s.generation;
     }
 
+    // T-GPLR-62 S2: narrow the slot bundles to the configured window BEFORE the
+    // row-set phase goes live. This is the only place the shape changes, and it
+    // is deliberately after the generation re-arm above so every copy event from
+    // the prompt-processing phase has already been fenced by the consumer-done
+    // wait. On failure the full-bank bundle and buffer are left untouched, so
+    // the run continues to refuse rather than to half-narrow.
+    if (row_set_window_width > 0 && !build_row_set_window(row_set_window_width)) {
+        return false;
+    }
+
+
     // T-GPLR-58 A0, P4's generation boundary: arming the row-set phase (or
     // re-arming it after PP) retires every queued fill. Marked, then reaped, so
     // a fill whose copy is still in flight keeps its position until the copy
@@ -8968,9 +9144,153 @@ bool llama_layer_streaming::begin_row_set() {
     tel_rowset_init((int) slots.size(), slot_bytes, row_set_window_tokens, n_exp,
                     (int) model_ref->hparams.n_expert_used,
                     row_set_retain ? row_set_retain_k : 0);
+
+    // T-GPLR-62 S2: with a compact window the slot is no longer bank-shaped, so
+    // state the width and the before/after per-slot cost on the console. The
+    // auditable number for A1 remains graph_footprint.slot_vram_bytes, NOT
+    // rowset_init.slot_bytes -- see the contract's A1-WRONG-FIELD note.
+    if (row_set_window_width > 0) {
+        size_t compact_bytes = 0;
+        if (!slots.empty()) {
+            size_t mx = 0;
+            for (const auto & kv : slots[0].layer_bytes_rowset) {
+                mx = std::max(mx, kv.second);
+            }
+            compact_bytes = mx;
+        }
+        fprintf(stderr,
+                "layer-streaming: row-set slot window narrowed to %d experts (was %d); "
+                "per-slot max bytes %zu -> %zu (%.1f MiB freed)\n",
+                row_set_window_width, n_exp, slot_bytes, compact_bytes,
+                (double) (slot_bytes - compact_bytes) / (1024.0 * 1024.0));
+    }
+
     if (row_set_spec_arm == LLAMA_LS_ARM_D1 && !d1_shape_emitted) {
         tel_d1_shape();
     }
+    return true;
+}
+
+
+bool llama_layer_streaming::build_row_set_window(int width) {
+    const int n_exp = (int) model_ref->hparams.n_expert;
+    if (width < 1 || width > n_exp) {
+        error_msg = "build_row_set_window: width " + std::to_string(width) +
+                    " outside [1," + std::to_string(n_exp) + "]";
+        return false;
+    }
+    if (width == n_exp) {
+        // Requested width equals the bank: nothing to narrow, and leaving the
+        // full-bank path alone is strictly safer than rebuilding it.
+        return true;
+    }
+
+    const ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
+
+    // PHASE 1 -- build every narrow bundle and size the compact buffer, WITHOUT
+    // touching the live bundles or the full-bank buffer. If anything fails here
+    // the slot is exactly as it was, so a refused narrowing is a clean refusal
+    // and never a half-narrowed slot that would index out of bounds.
+    struct staged_slot {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_ptr buf;
+        std::unordered_map<int, size_t> bytes;
+        std::vector<std::vector<ggml_tensor *>> tensors; // parallel to the layer list
+        std::vector<int> layers;
+        size_t need = 0;
+    };
+    std::vector<staged_slot> staged(slots.size());
+
+    for (size_t si = 0; si < slots.size(); ++si) {
+        staged_slot & st = staged[si];
+        ggml_init_params mp = { 4u*1024u*1024u, nullptr, true };
+        st.ctx = ggml_init(mp);
+        if (st.ctx == nullptr) {
+            error_msg = "build_row_set_window: failed to init the compact tensor context for slot " +
+                        std::to_string(si);
+            for (auto & done : staged) { if (done.ctx) { ggml_free(done.ctx); done.ctx = nullptr; } }
+            return false;
+        }
+        for (int il = (int) si; il < n_layer; il += n_slots) {
+            const llama_ls_package & pkg = pkg_cache[il];
+            std::vector<ggml_tensor *> ts;
+            size_t bytes = 0;
+            for (const auto & m : pkg.members) {
+                const ggml_tensor * t = m.src;
+                if (t == nullptr) {
+                    continue;
+                }
+                ggml_tensor * nt = make_dev_tensor(st.ctx, t, width);
+                if (nt == nullptr) {
+                    error_msg = "build_row_set_window: failed to create the compact tensor for "
+                                "layer " + std::to_string(il);
+                    for (auto & done : staged) { if (done.ctx) { ggml_free(done.ctx); done.ctx = nullptr; } }
+                    return false;
+                }
+                ggml_set_name(nt, t->name);
+                bytes += ggml_backend_buft_get_alloc_size(buft_cuda, nt);
+                ts.push_back(nt);
+            }
+            st.bytes[il] = bytes;
+            st.tensors.push_back(std::move(ts));
+            st.layers.push_back(il);
+            st.need = std::max(st.need, bytes);
+        }
+    }
+
+    // PHASE 2 -- allocate the compact buffers. Still nothing destructive.
+    for (size_t si = 0; si < slots.size(); ++si) {
+        staged[si].buf.reset(ggml_backend_buft_alloc_buffer(buft_cuda, staged[si].need + 4096));
+        if (!staged[si].buf) {
+            error_msg = "build_row_set_window: failed to allocate the compact slot buffer " +
+                        std::to_string(staged[si].need + 4096) + " bytes for slot " + std::to_string(si);
+            for (auto & done : staged) { if (done.ctx) { ggml_free(done.ctx); done.ctx = nullptr; } }
+            return false;
+        }
+        for (size_t li = 0; li < staged[si].tensors.size(); ++li) {
+            size_t off = 0;
+            if (!alloc_tensors(staged[si].buf.get(), buft_cuda, staged[si].tensors[li], off)) {
+                error_msg = "build_row_set_window: failed to place the compact tensors for layer " +
+                            std::to_string(staged[si].layers[li]);
+                for (auto & done : staged) { if (done.ctx) { ggml_free(done.ctx); done.ctx = nullptr; } }
+                return false;
+            }
+        }
+    }
+
+    // PHASE 3 -- commit. Every fallible step is done; from here the swap cannot
+    // fail. The narrow bundles replace the full-bank ones in place, so every
+    // consumer of slot.layers[il] sees the new shape, and THEN the full-bank
+    // buffer is released -- which is where the reservation comes from.
+    for (size_t si = 0; si < slots.size(); ++si) {
+        llama_layer_streaming_slot & slot = slots[si];
+        for (size_t li = 0; li < staged[si].layers.size(); ++li) {
+            const int il = staged[si].layers[li];
+            llama_layer & dst = slot.layers[il];
+            if (adapter->merge_resident) {
+                dst = *host_layers[il];
+            }
+            size_t k = 0;
+            for (const auto & m : pkg_cache[il].members) {
+                if (m.src == nullptr) {
+                    continue;
+                }
+                ls_dst(dst, m) = staged[si].tensors[li][k++];
+            }
+            slot.layer_bytes_rowset[il] = staged[si].bytes[il];
+        }
+        // A bank_span is sized from the FULL-bank tiling and aliases the old
+        // buffer's base, so it is stale the moment the bundles are replaced.
+        // stage_members() re-validates it against the source sizes and would
+        // fall back to per-member copies; dropping it here makes that certain
+        // rather than merely likely.
+        slot.bank_span.clear();
+        slot.ctx_rowset = staged[si].ctx;
+        slot.buf_rowset = std::move(staged[si].buf);
+        slot.buf.reset();
+    }
+
+    row_set_window_width = width;
     return true;
 }
 
@@ -9003,6 +9323,7 @@ ggml_cgraph * llama_layer_streaming::new_ff_graph(int layer) {
     cur->ff_graphs.push_back(g);
     cur->ff_layer.push_back(layer);
     cur->ff_input.push_back(nullptr); // the builder binds the INPUT right after
+    cur->ff_input_wpos.push_back(nullptr); // T-GPLR-62 S2: same, for window positions
     return g;
 }
 
@@ -9039,6 +9360,35 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         error_msg = "load_row_set: empty row set for layer " + std::to_string(il);
         return false;
     }
+
+    // -----------------------------------------------------------------------
+    // T-GPLR-62 S2: publish the union POSITION table for this window.
+    //
+    // The WHOLE table is reset to -1 first, then only the union members are
+    // written. A partial write is the bug this ordering exists to prevent: an
+    // expert absent from this window would otherwise keep the position it held
+    // in a PREVIOUS window, and the device would compute with a different
+    // expert's weights while producing a plausible answer. -1 is a refusal, not
+    // a position.
+    //
+    // Window width: 0 means the slot is still full-bank (the pre-S2 shape), so
+    // there is no width to violate and the check is skipped. Once a compact
+    // width is configured, a union wider than the window is refused here rather
+    // than truncated, because truncating would silently drop experts the router
+    // executed.
+    if (row_set_window_width > 0 && (int) uniq.size() > row_set_window_width) {
+        tel_rowset_refused(il, slot_idx, slot.generation, "window_overflow",
+            ("union of " + std::to_string(uniq.size()) + " experts exceeds the configured window width " +
+             std::to_string(row_set_window_width) + " for layer " + std::to_string(il)).c_str());
+        error_msg = "load_row_set: union wider than the slot window for layer " + std::to_string(il) +
+                    " (" + std::to_string(uniq.size()) + " > " + std::to_string(row_set_window_width) + ")";
+        return false;
+    }
+    row_set_union_pos_.assign((size_t) n_exp, -1);
+    for (size_t i = 0; i < uniq.size(); ++i) {
+        row_set_union_pos_[(size_t) uniq[i]] = (int32_t) i;
+    }
+    row_set_union_valid_ = true;
 
     // -----------------------------------------------------------------------
     // T-GPLR-19 (F2-M1) retention path -- SDD section 4 execution shape (i).
@@ -9401,9 +9751,21 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                 ggml_tensor * v_src = ggml_view_2d(cache_view_ctx, src_cache,
                                                    src_cache->ne[0], src_cache->ne[1], src_cache->nb[1],
                                                    (size_t) (p >= 0 ? p : pp) * src_cache->nb[2]);
+                // T-GPLR-62 S2: the DESTINATION slab is the union INDEX when the
+                // slot is a compact window, and the ABSOLUTE expert id when it is
+                // still bank-shaped. These two must never be mixed: addressing a
+                // narrow bundle by absolute id would write outside it, and
+                // addressing a full bank by union index would silently put expert
+                // uniq[i] at another expert's position. The switch is
+                // row_set_window_width, which is only non-zero once
+                // build_row_set_window() has actually rebuilt the bundles, so the
+                // two conditions cannot disagree.
+                const size_t dst_slab = (row_set_window_width > 0)
+                                            ? i
+                                            : (size_t) uniq[i];
                 ggml_tensor * v_dst = ggml_view_2d(cache_view_ctx, dst_t,
                                                    dst_t->ne[0], dst_t->ne[1], dst_t->nb[1],
-                                                   (size_t) uniq[i] * dst_t->nb[2]);
+                                                   dst_slab * dst_t->nb[2]);
                 if (v_src == nullptr || v_dst == nullptr) {
                     error_msg = "load_row_set: failed to create a slab view for layer " + std::to_string(il);
                     return false;
@@ -9420,6 +9782,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         // event completes (SDD lifecycle). This covers the H2D and the D2D.
         ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
         const int64_t t_demand_ready = ggml_time_us();
+
         if (row_set_spec_pool > 0) {
             for (size_t i = 0; i < uniq.size(); ++i) {
                 if (pool_hit_pos[i] < 0) {

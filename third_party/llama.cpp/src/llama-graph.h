@@ -1092,7 +1092,16 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             // T-GPLR-62 S2: index tensor for the SLOT-RESIDENT expert weight
+             // tensors, when those are a compact row-set window rather than the
+             // full bank. Null (the default, and every existing caller) means the
+             // weights are indexed by absolute expert id exactly as before, so
+             // the generated graph is byte-identical. Only the row-set path
+             // passes this. NOTE: get_rows/add_id and the ffn_moe_weights gather
+             // must keep using the ABSOLUTE ids -- only build_lora_mm_id on the
+             // window-resident weights takes this one.
+             ggml_tensor * selected_experts_weight = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1118,7 +1127,16 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             // T-GPLR-62 S2: index tensor for the SLOT-RESIDENT expert weight
+             // tensors, when those are a compact row-set window rather than the
+             // full bank. Null (the default, and every existing caller) means the
+             // weights are indexed by absolute expert id exactly as before, so
+             // the generated graph is byte-identical. Only the row-set path
+             // passes this. NOTE: get_rows/add_id and the ffn_moe_weights gather
+             // must keep using the ABSOLUTE ids -- only build_lora_mm_id on the
+             // window-resident weights takes this one.
+             ggml_tensor * selected_experts_weight = nullptr) const;
 
     //
     // inputs

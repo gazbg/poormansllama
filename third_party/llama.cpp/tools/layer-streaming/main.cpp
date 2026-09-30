@@ -161,6 +161,9 @@ static void usage(const char * prog) {
         "                        annotates the existing pick with its top-1/top-2 values; never\n"
         "                        perturbs sampling. Consumed by tools/check-gplr54-logits.py.\n"
         "  --pp-schedule S      PP schedule: batch-major (default) or layer-major (opt-in experiment)\n"
+        "  --residency-tg-window W  T-GPLR-62 S2: narrow the row-set slot window to W experts\n"
+        "                       (0 = full bank, default). W must cover the worst-case\n"
+        "                       union; a wider union refuses with 'window_overflow'.\n"
         "  --pp-prewarm N       T-GPLR-53 A4 pre-timed modality pre-warm, executed BEFORE the timed\n"
         "                       PP region: 0=off (default; no path runs), 1=CPU read-touch of the\n"
         "                       package source spans, 2=dummy GPU launch + sync, 3=both,\n"
@@ -507,7 +510,8 @@ static int run_residency_off(llama_context * ctx, llama_model * model,
 
 static bool ls_bounded_window_for_policy(const llama_ls_inventory & inv,
                                          const char * model_arch, int n_slots,
-                                         llama_ls_bounded_window & out) {
+                                         llama_ls_bounded_window & out,
+                                         int window_width = 0) {
     auto field = [&](const char * key, uint64_t & dst) {
         const std::string pat = std::string("\"") + key + "\":";
         const size_t p = inv.json.find(pat);
@@ -534,7 +538,37 @@ static bool ls_bounded_window_for_policy(const llama_ls_inventory & inv,
             return false;
         }
         out.per_layer_resident = per_layer;
-        out.slot_window        = (uint64_t) n_slots * moe_largest;
+        // T-GPLR-62 S2: the routed-expert bank is n_expert experts wide, and
+        // `moe_largest_bytes` is the WHOLE bank for the largest layer. A compact
+        // row-set window of W experts needs W/n_expert of it, so the preflight
+        // has to reserve the narrow figure or the run refuses for memory it is
+        // not going to use. Rounded UP so the estimate never under-reserves.
+        //
+        // The dense policy below is NOT narrowed: a dense layer's slot window
+        // pages the whole layer, so its extent is not an expert axis.
+        if (window_width > 0) {
+            uint64_t n_exp = 0;
+            if (!field("expert_count", n_exp) || n_exp == 0) {
+                // Cannot scale without the bank width: refuse to guess, and keep
+                // the full-bank figure so the run is over-reserved rather than
+                // under-reserved.
+                fprintf(stderr,
+                        "warning: --residency-tg-window %d requested but the inventory has no "
+                        "expert_count; preflight keeps the FULL-BANK slot window\n", window_width);
+                out.slot_window = (uint64_t) n_slots * moe_largest;
+            } else if ((uint64_t) window_width > n_exp) {
+                fprintf(stderr,
+                        "warning: --residency-tg-window %d exceeds expert_count %llu; "
+                        "preflight keeps the FULL-BANK slot window\n",
+                        window_width, (unsigned long long) n_exp);
+                out.slot_window = (uint64_t) n_slots * moe_largest;
+            } else {
+                const uint64_t numer = moe_largest * (uint64_t) window_width;
+                out.slot_window = (uint64_t) n_slots * ((numer + n_exp - 1) / n_exp);
+            }
+        } else {
+            out.slot_window        = (uint64_t) n_slots * moe_largest;
+        }
     } else {
         // dense-layer policy: all blk.* tensors page through the slot window;
         // nothing per-layer stays resident outside it.
@@ -1883,7 +1917,7 @@ static int check_telemetry(const std::string & path) {
             if (slot < 0 || slot >= n_slots) {
                 err("slot_request slot out of range");
             }
-        } else if (event == "copy_submit" || event == "copy_complete" ||
+        }  else if (event == "copy_submit" || event == "copy_complete" ||
                    event == "layer_ready_wait" || event == "layer_compute") {
             bool f_layer = false, f_slot = false, f_gen = false;
             const long long layer = json::integer(line, "layer", &f_layer);
@@ -2125,6 +2159,7 @@ static int check_telemetry(const std::string & path) {
     for (const auto & be : ls_byte_account_policy_errors(ba_row_cache_seen, ba_row_cache, rowset_retain_k)) {
         err(be.c_str());
     }
+
 
     // T-GPLR-58: the deferred form of the `spec` rule -- a trace whose fills cannot be
     // replayed fails ONCE, with the cause named, instead of once per later fetch.
@@ -3075,6 +3110,7 @@ int main(int argc, char ** argv) {
     int handoff_partial_n = -1;      // T-GPLR-16: NCMOE-style partial handoff (first N banks stay host-resident; -1 = off)
     bool residency_tg = false;       // T-GPLR-13: --residency-tg moe-row-set TG policy (reactive expert row windows)
     int  residency_tg_retain = 0;    // T-GPLR-19: --residency-tg-retain [N] per-layer row cache (0 = off, default; bare flag = kRowSetRetainDefault)
+    int  residency_tg_window = 0;    // T-GPLR-62 S2: --residency-tg-window W compact row-set slot width in experts (0 = full bank, default)
     int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
     int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
     int         residency_tg_spec_pool = 0;   // T-GPLR-59: separate prediction-only positions per logical layer
@@ -3326,6 +3362,20 @@ int main(int argc, char ** argv) {
             }
             if (residency_tg_retain < 1 || residency_tg_retain > 64) {
                 fprintf(stderr, "error: --residency-tg-retain expects 1..64 windows (got %d)\n", residency_tg_retain);
+                return 2;
+            }
+        } else if (arg == "--residency-tg-window") {
+            // T-GPLR-62 S2: narrow the row-set slot window from the full expert
+            // bank to W experts. Default 0 = the pre-S2 full-bank slot, so every
+            // existing command line is unchanged. W must be at least the
+            // worst-case union the router can demand; a union wider than W is
+            // refused at run time with the stable reason "window_overflow"
+            // rather than truncated, because truncating would silently drop
+            // experts the router executed.
+            residency_tg_window = atoi(arg_value(argc, argv, i, "--residency-tg-window").c_str());
+            if (residency_tg_window < 0 || residency_tg_window > 4096) {
+                fprintf(stderr, "error: --residency-tg-window expects 0..4096 experts (got %d)\n",
+                        residency_tg_window);
                 return 2;
             }
         } else if (arg == "--residency-tg-spec") {
@@ -4387,7 +4437,7 @@ int main(int argc, char ** argv) {
             // arithmetic path). act slabs and reserve are slot-independent.
             auto need = [&](int slots) -> uint64_t {
                 llama_ls_bounded_window w;
-                if (!ls_bounded_window_for_policy(pf, model_arch.c_str(), slots, w)) {
+                if (!ls_bounded_window_for_policy(pf, model_arch.c_str(), slots, w, residency_tg_window)) {
                     return UINT64_MAX;
                 }
                 return w.bounded + (uint64_t) act_slab_bytes + vram.reserve_bytes;
@@ -4429,7 +4479,7 @@ int main(int argc, char ** argv) {
         // Reuse the inventory's own byte classes through the shared helper so
         // this preflight cannot drift from the telemetry emission below.
         llama_ls_bounded_window pf_win;
-        if (!ls_bounded_window_for_policy(pf, model_arch.c_str(), n_slots, pf_win)) {
+        if (!ls_bounded_window_for_policy(pf, model_arch.c_str(), n_slots, pf_win, residency_tg_window)) {
             fprintf(stderr, "error: capacity preflight could not parse the inventory byte classes\n");
             refuse_before_sink(tel_path, "capacity_preflight",
                                "capacity preflight could not parse the inventory byte classes", 0, 0, "none");
@@ -4675,6 +4725,8 @@ int main(int argc, char ** argv) {
     ls.row_set_retain   = residency_tg_retain > 0;
     ls.row_set_retain_k = residency_tg_retain > 0 ? residency_tg_retain : kRowSetRetainDefault;
     ls.row_set_spec_pool = residency_tg_spec_pool;
+    // T-GPLR-62 S2: 0 leaves every existing command line on the full-bank slot.
+    ls.row_set_window_width = residency_tg_window;
 
     // T-GPLR-58 A0: configure speculative placement BEFORE begin_row_cache()
     // allocates its state and long before any TG graph exists, so a bad
@@ -4917,7 +4969,7 @@ int main(int argc, char ** argv) {
         const llama_ls_inventory pf = llama_ls_model_inventory(
             model_path.c_str(), n_ctx_total, pf_kv, vram.total, "cuda-device-total");
         llama_ls_bounded_window pf_win;
-        if (pf.ok && ls_bounded_window_for_policy(pf, model_arch.c_str(), n_slots, pf_win)) {
+        if (pf.ok && ls_bounded_window_for_policy(pf, model_arch.c_str(), n_slots, pf_win, residency_tg_window)) {
             // The window's class bytes come from the re-parsed inventory (the
             // deliberate second derivation that keeps this emission from
             // drifting from the preflight), but the bounded total, the slot
@@ -4985,7 +5037,15 @@ int main(int argc, char ** argv) {
 
     size_t slot_vram = 0;
     for (const auto & slot : ls.slots) {
-        slot_vram += slot.buf ? ggml_backend_buffer_get_size(slot.buf.get()) : 0;
+        // T-GPLR-62 S2: once a compact window is built, the full-bank buffer is
+        // RELEASED and the narrow one lives in buf_rowset. Summing only buf
+        // would report 0 B of slot VRAM for exactly the run whose A1 number
+        // matters most, so the compact buffer is counted when present.
+        if (slot.buf_rowset) {
+            slot_vram += ggml_backend_buffer_get_size(slot.buf_rowset.get());
+        } else if (slot.buf) {
+            slot_vram += ggml_backend_buffer_get_size(slot.buf.get());
+        }
     }
     // T-GPLR-12: the auditable handoff decision (post-preflight resolution).
     std::string handoff_mode_tel = handoff_auto ? (handoff ? "auto-on" : "auto-off")

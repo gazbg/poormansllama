@@ -400,8 +400,22 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
             ggml_set_name(sel_in, "rowset_selected_experts");
             ls->cur_set()->ff_input.back() = sel_in;
 
+            // T-GPLR-62 S2: the same experts as POSITIONS in the staged window.
+            // Same shape, type and lifetime as sel_in; the executor fills both
+            // from the same host ids in the same pass. It is created and
+            // populated unconditionally so the mapping is exercised and
+            // auditable, but it is passed to the FFN ONLY when the slot is
+            // actually narrower than the bank -- while the slot is full width a
+            // position index would be the wrong address and the graph must keep
+            // consuming the router's absolute ids.
+            ggml_tensor * sel_pos_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_set_input(sel_pos_in);
+            ggml_set_name(sel_pos_in, "rowset_selected_experts_pos");
+            ls->cur_set()->ff_input_wpos.back() = sel_pos_in;
+            const bool window_live = ls->row_set_window_width > 0;
+
             cur = build_norm(residual_in, layer(il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
-            cur = build_layer_ffn(cur, il, sel_in);
+            cur = build_layer_ffn(cur, il, sel_in, window_live ? sel_pos_in : nullptr);
             cb(cur, "ffn_out", il);
 
             cur = ggml_add(ctx0, cur, residual_in);
@@ -722,7 +736,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * selected_experts_in) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * selected_experts_in, ggml_tensor * selected_experts_weight_in) {
     // Check if this is an MoE layer
     GGML_ASSERT(layer(il).ffn_gate_inp != nullptr);
 
@@ -741,7 +755,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             layer(il).ffn_up_exps_s,
             layer(il).ffn_gate_exps_s,
             layer(il).ffn_down_exps_s,
-            selected_experts_in);
+            selected_experts_in,
+            selected_experts_weight_in);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

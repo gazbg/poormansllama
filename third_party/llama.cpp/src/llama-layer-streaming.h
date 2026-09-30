@@ -194,6 +194,16 @@ struct llama_layer_streaming_slot {
     // device buffer backing all per-layer bundles
     ggml_backend_buffer_ptr buf;
 
+    // T-GPLR-62 S2: the COMPACT row-set window's own tensor metadata and device
+    // buffer. Built by build_row_set_window() at begin_row_set, after the
+    // full-bank buf has been released, so the two never coexist and the ~1.99 GiB
+    // full-bank reservation is what gets handed back. The narrow bundles are
+    // written into slot.layers[il] in place of the full-bank ones, so every
+    // consumer sees one shape; layer_bytes_rowset records what they cost.
+    ggml_context * ctx_rowset = nullptr;
+    std::unordered_map<int, size_t> layer_bytes_rowset;
+    ggml_backend_buffer_ptr buf_rowset;
+
     // optional pinned host buffer for one complete package copy
     ggml_backend_buffer_ptr buf_staging;
 
@@ -519,6 +529,13 @@ struct LLAMA_API llama_layer_streaming {
         // ([n_expert_used, n_tokens] I32, written by the executor between the
         // two parts; allocated from buf_inputs by finish_build)
         std::vector<ggml_tensor *> ff_input;
+        // T-GPLR-62 S2: per-FFN-graph host INPUT tensor for the same experts
+        // expressed as WINDOW POSITIONS rather than absolute expert ids
+        // ([n_expert_used, n_tokens] I32, same layout and same lifetime as
+        // ff_input). Only meaningful once the row-set slot is narrower than the
+        // bank; while the slot is full width it is populated and audited but the
+        // graph keeps consuming absolute ids, so nothing depends on it yet.
+        std::vector<ggml_tensor *> ff_input_wpos;
         // the A/B residual crossing uses the set's FREE act slot (act[(il+1)&1]
         // at part-A time; the slot pair alternates per layer exactly as the
         // single-part graphs do): part A copies the pre-FFN residual there, and
@@ -1020,6 +1037,16 @@ struct LLAMA_API llama_layer_streaming {
     std::vector<uint32_t> row_set_gen;  // per-slot generation the coverage belongs to
     std::vector<std::vector<int32_t>> row_set_ids; // per layer, last staged union (informational)
 
+    // T-GPLR-62 S2: the union POSITION lookup table for the most recent
+    // successful load_row_set, and whether it has ever been written. Sized
+    // n_expert; every entry is -1 except the |uniq| union members, which carry
+    // their index in the union. This is the ONLY sanctioned way to turn a
+    // router-selected expert id into a slot storage position, and it is
+    // re-initialised in full on every window precisely so that a miss reads -1
+    // (a refusal) rather than a position left over from a previous window.
+    std::vector<int32_t> row_set_union_pos_;
+    bool                 row_set_union_valid_ = false;
+
     // T-GPLR-19 (F2-M1): per-layer row residency, SDD section 4 execution
     // shape (i) — "cache to slot-bundle device-side refresh before the
     // row-consuming phase". The slot buffers above are keyed by SLOT and every
@@ -1035,6 +1062,18 @@ struct LLAMA_API llama_layer_streaming {
     // arithmetic result are untouched. Default-off allocates nothing.
     bool row_set_retain   = false;  // shape (i) retention requested (default off)
     int  row_set_retain_k = 4;      // K windows retained; 4 = the default depth
+
+    // T-GPLR-62 S2: compact row-set WINDOW WIDTH, in experts. 0 (the default)
+    // is the pre-S2 full-bank slot: ne[2] stays n_expert, the staging write
+    // addresses the absolute expert id, and the graph consumes absolute ids.
+    // Setting W>0 makes begin_row_set rebuild every slot bundle at ne[2] = W
+    // into a fresh compact buffer, free the full-bank buffer, and from then on
+    // the staging write addresses the union INDEX while the graph consumes
+    // window positions gathered from row_set_union_pos(). The three changes are
+    // made together in build_row_set_window(); setting this field alone is
+    // inert, because the switch is only taken once the narrow bundles exist.
+    int  row_set_window_width = 0;
+
                                     // (32 rows/layer, ~2.19 GiB over 40 layers,
                                     // the shallowest K whose offline (b) clears
                                     // the 0.6 gate). A caller may name any 1..64.
@@ -1360,12 +1399,34 @@ struct LLAMA_API llama_layer_streaming {
     // Deactivate row-set staging and free the row-set buffers.
     void end_row_set();
 
+    // T-GPLR-62 S2: rebuild every slot's bundles at ne[2] = width, allocate the
+    // compact device buffer, and only then release the full-bank buffer. Called
+    // from begin_row_set() when row_set_window_width > 0. Returns false with a
+    // structured error and WITHOUT having released the full-bank buffer if any
+    // step fails, so a failed narrowing leaves the pre-S2 shape intact rather
+    // than a half-narrowed slot.
+    bool build_row_set_window(int width);
+
+
     // Stage the union of expert rows in ids[il] into the layer's row-set
     // slot (copying only rows not resident for the slot's current
     // generation). Emits one rowset_fetch event; returns false with a
     // structured error on any inconsistency (never silently runs foreign
     // rows).
     bool load_row_set(int il, const std::vector<int32_t> & ids);
+
+    // T-GPLR-62 S2: union position lookup table written by the LAST successful
+    // load_row_set. Sized n_expert, ALL entries set to -1, then
+    // row_set_union_pos[uniq[i]] = i for every union member. An expert absent
+    // from the window reads -1, which the executor must treat as a loud
+    // refusal and never as a position. Re-initialising the whole table every
+    // window is the contract's hard requirement: a partial write leaves a
+    // stale position from a previous window pointing at a different expert,
+    // which computes silently and wrongly.
+    const std::vector<int32_t> & row_set_union_pos() const { return row_set_union_pos_; }
+    // True once load_row_set has populated the table at least once.
+    bool                     row_set_union_valid() const { return row_set_union_valid_; }
+    // Configured compact window width is the public field row_set_window_width.
 
     // Host-side exact top-k derivation from the router's live selection
     // probs (the same stable descending sort the CUDA router uses; shared
@@ -1536,7 +1597,11 @@ struct LLAMA_API llama_layer_streaming {
     // T-GPLR-44: per-graph slices of the patch caches, from one transitive src
     // walk. RECON ONLY after the scoping A/B failed identity (see graph_set):
     // consumed by the dump, never by the launches.
-    void build_patch_split(graph_set & gs);
+    // T-GPLR-62 S2: returns false when the INPUT classification would leave a
+    // row-set companion input in a state the snapshot contract cannot describe
+    // (see the guard in the body). The caller MUST honour the return: a guard
+    // that cannot stop the run is decoration, not a check.
+    bool build_patch_split(graph_set & gs);
 
     // T-GPLR-44: patch-cache composition dump. Emitted once per graph
     // set at patch-cache build time, host-only and self-gated on --pp-recon.
