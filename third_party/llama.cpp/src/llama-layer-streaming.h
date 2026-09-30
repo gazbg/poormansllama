@@ -480,6 +480,14 @@ struct LLAMA_API llama_layer_streaming {
         int                mode = -1;
         int32_t            chunk_id = -1; // >= 0: layer-major PP chunk identity
         bool               built = false;
+        // T-GPLR-62 S2: set when the set's baked weight pointers were invalidated
+        // from under it -- build_row_set_window() replaced the slot bundle after
+        // this set was built. The set is still `built` (its ctx, res and act
+        // regions are all still valid and are REPLAYED, not re-derived), but its
+        // graphs must be re-derived against the new bundle before next use. The
+        // executor treats this exactly like a build-on-miss so the T-GPLR-47
+        // fresh-context replacement runs and re-binds every pointer.
+        bool               needs_rebuild = false;
 
         // graphs[0] = embed, graphs[1+il] = layer il, graphs[1+n_layer] = output.
         // graph_layer[i] is -1 (embed), il, or -2 (output).
@@ -705,6 +713,14 @@ struct LLAMA_API llama_layer_streaming {
     // by assignment, so every stored graph_set* survives. Fails loudly
     // (error_msg, null) on any invariant violation; the old set stays live.
     bool replace_set_with_fresh_rebuild(graph_set & old, int64_t max_nodes);
+
+    // T-GPLR-62 S2: flag every phase-1 (TG) set as needing a fresh-context
+    // rebuild, and arm rebuild_replacement so the executor's next build-on-miss
+    // for one of them performs the replacement. Called by begin_row_set() right
+    // after build_row_set_window() commits. Returns false (loudly) if any phase-1
+    // set is not in a finished-build state, because the replacement refuses to
+    // touch one.
+    bool mark_row_set_sets_stale();
 
     // begin a streaming graph build for the given ubatch size and recurrent
     // state-zero variant; returns the set's io context (ctx0 for the builder).
@@ -1073,6 +1089,33 @@ struct LLAMA_API llama_layer_streaming {
     // made together in build_row_set_window(); setting this field alone is
     // inert, because the switch is only taken once the narrow bundles exist.
     int  row_set_window_width = 0;
+
+    // T-GPLR-62 S2 (lifetime): a compact window replaces every slot bundle
+    // tensor inside build_row_set_window(), which runs in begin_row_set() AFTER
+    // the bring-up prebuild. The phase-1 (TG) sets were built before that and
+    // had the FULL-BANK pointers baked into their MoE ops, so the swap left them
+    // reading a released buffer -- a dangling reference, observed as an illegal
+    // memory access in part B of layer 0.
+    //
+    // The fix is the T-GPLR-47 fresh-context replacement, NOT a deferred
+    // prebuild. Deferring was tried and is wrong: llama_context::
+    // layer_streaming_prebuild advances recurrent session state (each variant
+    // calls vmctx->apply() and the pass ends in memory->clear(false)), so
+    // running it after prefill made the timed TG decode observe rs_z=0 (fresh)
+    // where it must observe -1 (continuing), and it generated from the wrong
+    // recurrent state. A graph-shape probe must not mutate session state.
+    //
+    // So the TG sets are still prebuilt at bring-up, and immediately after the
+    // narrowing commits, mark_row_set_sets_stale() flags every phase-1 set.
+    // The executor then re-derives each flagged set through
+    // replace_set_with_fresh_rebuild(): new ctx and result object, act regions
+    // REPLAYED onto the same device addresses, graphs rebuilt against the
+    // compact bundle, and the whole set move-assigned back into the same vector
+    // slot so no graph_set pointer ever moves. That re-binds every pointer with
+    // no state advance and no buffer reuse.
+    //
+    // No-op at W=0: build_row_set_window() is never called, nothing is flagged,
+    // and every pre-S2 command line is unaffected.
 
     // T-GPLR-62 S2 (A9, the LOAD-BEARING gate): byte-level recon of the staged
     // window. OFF by default; when on, every staged slot slab is read back and

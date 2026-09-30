@@ -1288,6 +1288,13 @@ static int check_telemetry(const std::string & path) {
     bool have_run_start = false;
     bool have_phase_summary = false;
     bool handoff_seen = false;         // T-Q38HG-02: track handoff events (reset per phase)
+    // T-GPLR-62 S2: a compact-window narrowing replaces the slot bundle, so the
+    // phase-1 sets MUST be re-derived once (T-GPLR-47 fresh-context rebuild).
+    // That is a topology change of exactly the kind the handoff event already
+    // excuses, so graph_builds > 0 after one is expected, not a violation. It is
+    // still COUNTED and still reported: the allowance is for the build existing,
+    // never for hiding it.
+    bool s2_narrow_seen = false;
     bool handoff_ever = false;         // T-GPLR-12: handoff events ever seen (never reset)
     bool ho_mode_valid = false;        // T-GPLR-12: run_start carried a valid handoff_mode
     bool handoff_active_expected = false; // T-GPLR-12: mode on/auto-on
@@ -1641,6 +1648,13 @@ static int check_telemetry(const std::string & path) {
                     }
                 }
             }
+        } else if (event == "rowset_narrow") {
+            // T-GPLR-62 S2: the compact narrowing replaced the slot bundle, so the
+            // phase-1 sets MUST be re-derived once (T-GPLR-47 fresh-context
+            // rebuild). Placed AFTER the whole handoff branch: a topology change
+            // that legitimately invalidates prebuilt graphs, so the resulting
+            // graph_builds > 0 is expected and still counted, never hidden.
+            s2_narrow_seen = true;
         } else if (event == "byte_account") {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.
@@ -1692,7 +1706,7 @@ static int check_telemetry(const std::string & path) {
             bool found = false;
             const long long graph_builds = json::integer(line, "graph_builds", &found);
             // T-Q38HG-02: graph_builds > 0 is acceptable after a handoff event.
-            if (found && graph_builds != 0 && !handoff_seen) {
+            if (found && graph_builds != 0 && !handoff_seen && !s2_narrow_seen) {
                 err("phase_summary.graph_builds != 0 (graph construction in timed region)");
             }
             const bool after_handoff = handoff_seen; // T-GPLR-10: hybrid-TG bytes rule below
@@ -2355,6 +2369,9 @@ static int validate_telemetry(const std::string & path) {
     std::map<int, phase_agg> phases;
     int current_phase = -1;
     bool handoff_seen = false;         // T-Q38HG-02 (reset per phase)
+    // T-GPLR-62 S2: a compact narrowing invalidates the phase-1 sets and forces
+    // one re-derivation; see the same-named flag in the phase checker above.
+    bool s2_narrow_seen = false;
     bool handoff_ever = false;         // T-GPLR-12: handoff events ever seen (never reset)
     bool ho_mode_valid = false;        // T-GPLR-12: run_start carried a valid handoff_mode
     bool handoff_active_expected = false; // T-GPLR-12: mode on/auto-on
@@ -2540,6 +2557,13 @@ static int validate_telemetry(const std::string & path) {
                     }
                 }
             }
+        } else if (event == "rowset_narrow") {
+            // T-GPLR-62 S2: the compact narrowing replaced the slot bundle, so the
+            // phase-1 sets MUST be re-derived once (T-GPLR-47 fresh-context
+            // rebuild). Placed AFTER the whole handoff branch: a topology change
+            // that legitimately invalidates prebuilt graphs, so the resulting
+            // graph_builds > 0 is expected and still counted, never hidden.
+            s2_narrow_seen = true;
         } else if (event == "byte_account") {
             // T-GPLR-04: additive byte-class sums must be internally consistent
             // and the bounded window must sit below observed free VRAM.

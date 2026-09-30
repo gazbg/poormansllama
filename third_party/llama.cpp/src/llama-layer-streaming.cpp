@@ -3526,7 +3526,14 @@ bool llama_layer_streaming::replace_set_with_fresh_rebuild(graph_set & old, int6
     // the move (they were captured in the moved-from object).
     ggml_context *     old_ctx = old.ctx;
     llm_graph_result * old_res = old.res;
+    // T-GPLR-62 S2: carry the rebuild-pending flag across the move. The caller
+    // still has to re-derive the graphs (that is what the move made necessary),
+    // so the replacement must NOT clear it -- finish_build clears it on success
+    // and a failed build leaves it set for a retry. Explicit so the semantics do
+    // not depend on `fresh`'s defaults happening to match the old set's.
+    const bool was_flagged = old.needs_rebuild;
     old = std::move(fresh);
+    old.needs_rebuild = was_flagged;
     // INV4: bounded per-set pool -- the old state is fully released here. The
     // old ctx is a no-alloc pool (tensor objects only), so ggml_free touches
     // no device memory; the slab/act buffers are module-owned and outlive it.
@@ -3875,6 +3882,11 @@ bool llama_layer_streaming::finish_build() {
     }
 
     set.built = true;
+    // T-GPLR-62 S2: the graphs now bind the CURRENT bundle (the compact one
+    // when a narrowing happened), so the rebuild-pending flag is satisfied.
+    // Cleared here, at successful build completion, and nowhere earlier, so a
+    // build that fails leaves the set flagged and the next decode retries.
+    set.needs_rebuild = false;
     build_generation++;
     return true;
 }
@@ -4293,7 +4305,38 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
     // sets are selected only by the layer-major controller.
     const int32_t chunk_key = -1;
     auto * set = ls->find_set(ls->phase, ubatch.n_tokens, rs_z, n_outputs, chunk_key);
-    if (set == nullptr || !set->built) {
+    // T-GPLR-62 S2: a set flagged by mark_row_set_sets_stale() is `built` (its
+    // ctx, result object and act regions are all still valid and get REPLAYED)
+    // but its graphs were baked against the pre-narrowing bundle, so it must be
+    // re-derived before this execution reads it. Routing it through the same
+    // build-on-miss path is what makes begin_set take its T-GPLR-47 replacement
+    // branch; without the flag the executor would silently reuse dangling
+    // pointers, which is the illegal access this whole mechanism exists to stop.
+    if (set != nullptr && set->needs_rebuild) {
+        if (!ls->rebuild_replacement) {
+            ls->error_msg = "layer_streaming_compute: set is flagged for rebuild but replacement is not armed";
+            ls->failed = true;
+            ls->tel_error(ls->error_msg.c_str());
+            return GGML_STATUS_FAILED;
+        }
+    }
+    if (set == nullptr || !set->built || (set != nullptr && set->needs_rebuild)) {
+        // T-GPLR-62 S2: a prebuild/decode key mismatch is invisible from the
+        // outside -- the set is simply rebuilt in the timed region and the only
+        // symptom is graph_builds != 0. Name the key that missed and every key
+        // that exists, so the mismatch is a one-line diagnosis instead of a
+        // bisect. Gated on the S2 window so a pre-S2 run stays silent.
+        if (ls->row_set_window_width > 0) {
+            fprintf(stderr,
+                    "[ls-s2] set miss: want mode=%d n_tokens=%lld rs_z=%d n_outputs=%d chunk=%d; have:",
+                    ls->phase, (long long) ubatch.n_tokens, rs_z, n_outputs, chunk_key);
+            for (const auto & s : ls->sets) {
+                fprintf(stderr, " [mode=%d n_tokens=%lld rs_z=%d n_outputs=%d chunk=%d built=%d]",
+                        s.mode, (long long) s.n_tokens, s.rs_z, s.n_outputs, s.chunk_id, (int) s.built);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
         // not prebuilt: build this variant now (counted in graph_builds telemetry)
         set = ls->begin_set(ls->phase, ubatch.n_tokens, rs_z, n_outputs, chunk_key);
         if (set == nullptr) {
@@ -9113,6 +9156,18 @@ bool llama_layer_streaming::begin_row_set() {
         return false;
     }
 
+    // T-GPLR-62 S2 (lifetime): the swap above just replaced every slot bundle
+    // tensor and released the full-bank buffer, so every phase-1 set built at
+    // bring-up now holds DANGLING MoE weight pointers. Flag them; the executor
+    // re-derives each one through the T-GPLR-47 fresh-context replacement before
+    // it is next executed, which re-binds every pointer against the compact
+    // bundle without touching recurrent state (unlike re-running the prebuild,
+    // which advances it -- measured: that produced rs_z=0 at the timed decode
+    // and a wrong answer).
+    if (row_set_window_width > 0 && !mark_row_set_sets_stale()) {
+        return false;
+    }
+
     // T-GPLR-62 S2 / A9: declare the mode BEFORE any window is staged, so a
     // trace that declares it and then produces no recon evidence is detectable
     // as "recon was requested but never ran" rather than passing as a clean run.
@@ -9143,10 +9198,24 @@ bool llama_layer_streaming::begin_row_set() {
     }
     row_set_active = true;
 
-    // one row-set slot == one existing full-bank-shaped slot buffer
-    size_t slot_bytes = 0;
-    if (!slots.empty() && slots[0].layer_bytes.count(0)) {
-        slot_bytes = slots[0].layer_bytes.at(0);
+    // T-GPLR-62 S2: one row-set slot == one existing full-bank-shaped slot
+    // buffer, but the slot BUDGET must cover the WORST slot, not slot 0. The
+    // layer->slot assignment is round-robin and the largest bank in the model
+    // (the q6_K layers) does not land in slot 0, so reading slots[0] alone
+    // under-reports the per-slot cost. Measured 2026-09-30: slot 0 reported a
+    // 452,984,832 B bank while the true worst slot holds 522,190,848 B, which
+    // is exactly the margin by which the W=16 console figure appeared to miss
+    // the preflight's 124.50 MiB. The preflight budgets worst-case-per-slot, so
+    // worst-case-per-slot is what is reported here.
+    size_t slot_bytes = 0;        // worst full-bank slot
+    size_t slot_bytes_total = 0;  // sum over slots, the number actually allocated
+    for (const auto & slot : slots) {
+        size_t mx = 0;
+        for (const auto & kv : slot.layer_bytes) {
+            mx = std::max(mx, kv.second);
+        }
+        slot_bytes       = std::max(slot_bytes, mx);
+        slot_bytes_total += mx;
     }
     // T-GPLR-19: retain_k tells the validators which residency rule applies --
     // 0 is the reactive slot-keyed policy (unchanged), >0 switches them to the
@@ -9158,21 +9227,28 @@ bool llama_layer_streaming::begin_row_set() {
     // T-GPLR-62 S2: with a compact window the slot is no longer bank-shaped, so
     // state the width and the before/after per-slot cost on the console. The
     // auditable number for A1 remains graph_footprint.slot_vram_bytes, NOT
-    // rowset_init.slot_bytes -- see the contract's A1-WRONG-FIELD note.
+    // rowset_init.slot_bytes -- see the contract's A1-WRONG-FIELD note. Both
+    // the worst slot and the slot total are printed so a reader can compare
+    // like-for-like against the preflight's n_slots * ceil(largest * W / n_exp).
     if (row_set_window_width > 0) {
-        size_t compact_bytes = 0;
-        if (!slots.empty()) {
+        size_t compact_worst = 0;
+        size_t compact_total = 0;
+        for (const auto & slot : slots) {
             size_t mx = 0;
-            for (const auto & kv : slots[0].layer_bytes_rowset) {
+            for (const auto & kv : slot.layer_bytes_rowset) {
                 mx = std::max(mx, kv.second);
             }
-            compact_bytes = mx;
+            compact_worst = std::max(compact_worst, mx);
+            compact_total += mx;
         }
         fprintf(stderr,
                 "layer-streaming: row-set slot window narrowed to %d experts (was %d); "
-                "per-slot max bytes %zu -> %zu (%.1f MiB freed)\n",
-                row_set_window_width, n_exp, slot_bytes, compact_bytes,
-                (double) (slot_bytes - compact_bytes) / (1024.0 * 1024.0));
+                "worst-slot bytes %zu -> %zu (%.1f MiB freed/slot); "
+                "all-slots %zu -> %zu (%.1f MiB freed total)\n",
+                row_set_window_width, n_exp, slot_bytes, compact_worst,
+                (double) (slot_bytes - compact_worst) / (1024.0 * 1024.0),
+                slot_bytes_total, compact_total,
+                (double) (slot_bytes_total - compact_total) / (1024.0 * 1024.0));
     }
 
     if (row_set_spec_arm == LLAMA_LS_ARM_D1 && !d1_shape_emitted) {
@@ -9407,6 +9483,51 @@ bool llama_layer_streaming::build_row_set_window(int width) {
     }
 
     row_set_window_width = width;
+    return true;
+}
+
+// T-GPLR-62 S2 (lifetime): flag every phase-1 (TG) set for a fresh-context
+// rebuild. The sets themselves are untouched here -- only the flag and the
+// replacement arm -- so this cannot fail after the commit and cannot leave a
+// half-flagged executor. It DOES refuse loudly if a phase-1 set exists that is
+// not a finished build, because replace_set_with_fresh_rebuild() rejects those
+// and the failure would otherwise surface as a confusing mid-TG error.
+bool llama_layer_streaming::mark_row_set_sets_stale() {
+    int n_flagged = 0;
+    for (auto & set : sets) {
+        if (set.mode != 1) {
+            continue;
+        }
+        if (!set.built || set.ctx == nullptr || set.res == nullptr) {
+            error_msg = "mark_row_set_sets_stale: phase-1 set (n_tokens " +
+                        std::to_string(set.n_tokens) + ", rs_z " + std::to_string(set.rs_z) +
+                        ") is not a finished build; the narrowing cannot re-derive it";
+            return false;
+        }
+        set.needs_rebuild = true;
+        ++n_flagged;
+    }
+    if (n_flagged == 0) {
+        error_msg = "mark_row_set_sets_stale: no phase-1 graph set exists to rebuild after the "
+                    "narrowing; the two-part TG graphs would run against a replaced bundle";
+        return false;
+    }
+    // Arm the replacement so the executor's build-on-miss takes begin_set's
+    // T-GPLR-47 fresh-context branch. Stays armed: it is consumed per set, and
+    // a rebuild triggered by anything else later is equally correct.
+    rebuild_replacement = true;
+
+    // Emitted so the trace records WHY a graph build is about to occur inside
+    // the TG region. The validator treats this exactly like a handoff event
+    // (T-Q38HG-02): a topology change legitimately invalidates prebuilt graphs,
+    // and the resulting graph_builds > 0 is expected rather than a violation.
+    tel_write(tel_out,
+        "{\"event\":\"rowset_narrow\",\"run_id\":%llu,\"window_width\":%d,\"sets_flagged\":%d,"
+        "\"mechanism\":\"t-gplr-47-fresh-context-rebuild\",\"t_us\":%lld}",
+        (unsigned long long) run_id, row_set_window_width, n_flagged, (long long) ggml_time_us());
+    fprintf(stderr,
+            "T-GPLR-62 S2: flagged %d phase-1 graph set(s) for fresh-context rebuild "
+            "(their weight pointers were baked against the replaced bundle)\n", n_flagged);
     return true;
 }
 

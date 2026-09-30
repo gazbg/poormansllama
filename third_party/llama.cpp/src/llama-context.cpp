@@ -1744,6 +1744,11 @@ bool llama_context::layer_streaming_prebuild(const llama_batch & batch_inp, int6
     // mtp_draft tokens, so every width in range can occur at runtime. Each
     // variant continues the same sequence (the position values do not affect
     // graph shapes: n_kv is padded to n_ctx by n_pad).
+    // T-GPLR-62 S2: the phase-1 (TG) sets are still built HERE, at bring-up,
+    // exactly as before. They bake the full-bank slot pointers, and
+    // begin_row_set() later flags them for a T-GPLR-47 fresh-context rebuild
+    // once the compact bundle exists. The prebuild is NOT re-run after prefill:
+    // it advances recurrent session state, which would corrupt the decode.
     if (tg_tokens > 0) {
         const int n_widths = 1 + (int) cparams.n_rs_seq;
         // T-GPLR-13/T-GPLR-59: the functional two-part row-set graph is
