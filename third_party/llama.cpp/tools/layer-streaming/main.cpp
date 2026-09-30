@@ -5240,13 +5240,17 @@ int main(int argc, char ** argv) {
     const char * copy_source_src = copy_source_explicit ? "explicit" : "default";
     // T-GPLR-39: how the route-diagnostic switch was resolved, and by whom.
     const char * route_telemetry_src = route_telemetry_explicit ? "explicit" : "default";
+    // T-GPLR-63 B: record the resolved TG budget next to the handoff promise it
+    // qualifies. tg_phase_scheduled (the tg_tokens > 0 predicate both handoff
+    // sites consult) is the same fact, so the trace cannot declare auto-on and
+    // then look TG-capable when it was not.
     ls.tel_run_start(*model, 0, slot_vram, vram.free_start, vram.total,
                      schedule_name, copy_source.c_str(), kv_cache.c_str(), act_slab_bytes,
                      (int64_t) pp_tokens, ls.chunks, act_slab_dtype, (int64_t) n_ctx_total,
                      handoff_mode_tel.c_str(), residency_tg,
                      pp_prebuild_per_pass, pp_prebuild_per_pass_src, copy_source_src,
                      route_telemetry, route_telemetry_src,
-                     tg_logit_margin);
+                     tg_logit_margin, tg_tokens);
 
     ctx->set_layer_streaming(&ls);
 

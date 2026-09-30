@@ -914,4 +914,57 @@ if (LLAMA_LAYER_STREAMING)
         )
         set_tests_properties(layer-streaming-validate-${f} PROPERTIES WILL_FAIL TRUE)
     endforeach()
+
+    # T-GPLR-63 A: the handoff-assertion fixtures. The T-GPLR-12 rule --
+    # "run_start declared handoff_mode on/auto-on but no handoff events followed" --
+    # was enforced in both validators and pinned by NOTHING: the only two violating
+    # traces on disk (gplr43-diag.jsonl, gplr49-4k-nopw-control.jsonl) are recorded
+    # artifacts of past GPU sessions, not CTest arms, so deleting both assertion sites
+    # would have failed no test in this suite. These two arms are that pin.
+    #
+    # A positive/negative PAIR, and the positive half is not optional bookkeeping.
+    # Both fixtures are the SAME recorded prefill-only trace (gen-gplr63-fixtures.py
+    # changes handoff_mode "auto-off"->"auto-on", adds tg_tokens:0, and drops any
+    # handoff event). The control must be ACCEPTED, which proves three things at once:
+    # the negative is rejected because of the lie and not because of the fixture's
+    # shape, each negative failure is a single isolated violation rather than an
+    # unrelated rule firing first, and the T-GPLR-63 B `tg_tokens` key is
+    # forward-compatible with both readers (measured forward-compatibility, not
+    # assumed). Regenerate with the generator's docstring; the source trace must
+    # itself pass both validators.
+    set(HANDOFF_FIXTURES_POSITIVE
+        handoff-declared-on-control
+    )
+    set(HANDOFF_FIXTURES_NEGATIVE
+        handoff-declared-on-no-event
+    )
+    foreach(f IN LISTS HANDOFF_FIXTURES_POSITIVE HANDOFF_FIXTURES_NEGATIVE)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${f}.jsonl
+            ${CMAKE_BINARY_DIR}/${f}.jsonl
+            COPYONLY
+        )
+    endforeach()
+    foreach(f IN LISTS HANDOFF_FIXTURES_POSITIVE)
+        add_test(
+            NAME layer-streaming-check-${f}
+            COMMAND llama-layer-streaming --check-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        add_test(
+            NAME layer-streaming-validate-${f}
+            COMMAND llama-layer-streaming --validate-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+    endforeach()
+    foreach(f IN LISTS HANDOFF_FIXTURES_NEGATIVE)
+        add_test(
+            NAME layer-streaming-check-${f}
+            COMMAND llama-layer-streaming --check-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        set_tests_properties(layer-streaming-check-${f} PROPERTIES WILL_FAIL TRUE)
+        add_test(
+            NAME layer-streaming-validate-${f}
+            COMMAND llama-layer-streaming --validate-telemetry ${CMAKE_BINARY_DIR}/${f}.jsonl
+        )
+        set_tests_properties(layer-streaming-validate-${f} PROPERTIES WILL_FAIL TRUE)
+    endforeach()
 endif()

@@ -5892,7 +5892,7 @@ static std::string tel_run_start_head(uint64_t run_id, uint64_t t0_us) {
                                           int pp_prebuild_per_pass_, const char * pp_prebuild_per_pass_source_,
                                           const char * copy_source_source_,
                                           int route_telemetry_, const char * route_telemetry_source_,
-                                          int tg_logit_margin_) {
+                                          int tg_logit_margin_, int tg_tokens_) {
     // T-GPLR-54 A2 (wiring fix, A3 session 2026-09-22): the emitter gates on
     // the MEMBER, not on this setter's parameter - recording the depth in the
     // run_start string alone left the member at 0 and the trace silent while
@@ -5973,6 +5973,20 @@ static std::string tel_run_start_head(uint64_t run_id, uint64_t t0_us) {
         tlm_str = std::string(",\"tg_logit_margin\":") + std::to_string(tg_logit_margin_) +
                  ",\"tg_logit_margin_source\":\"" + "explicit" + "\"";
     }
+    // T-GPLR-63 B: the resolved TG budget. 0 is a real, common value (every
+    // prefill-only run, including every CTest arm) and is exactly the fact
+    // that run_start previously did not record, so a reader asking "did this
+    // run have a TG phase?" had only run_end.n_tokens_generated -- which is 0
+    // for a run that failed before generating anything, so it cannot
+    // distinguish "prefill-only by schedule" from "prefill-only by failure".
+    // The T-GPLR-12 handoff promise is a promise ABOUT the TG phase, so the
+    // schedule witness belongs in the same record as the promise. No
+    // _source key: --tg-tokens has no default/explicit distinction to record
+    // (an explicit 0 and the implicit default 0 mean the same thing).
+    std::string tgt_str;
+    if (tg_tokens_ >= 0) {
+        tgt_str = ",\"tg_tokens\":" + std::to_string(tg_tokens_);
+    }
     // T-GPLR-58 A2: the RESOLVED speculative-placement mode, budget and reserve,
     // read from the module's own members -- set_row_set_spec() has already run at
     // this point, so these are the values the run will actually use, not an echo of
@@ -5998,14 +6012,14 @@ static std::string tel_run_start_head(uint64_t run_id, uint64_t t0_us) {
     const std::string start_head = tel_run_start_head(run_id, t0_us);
     tel_write(tel_out,
         "%s\"model\":\"%s\",\"arch\":\"%s\",\"n_layer\":%d,\"n_slots\":%d,\"device\":%d,"
-        "\"schedule\":\"%s\",\"copy_source\":\"%s\",\"kv_cache\":\"%s\",\"implicit_causal_mask\":%s,\"telemetry_chunk_stride\":%d,\"act_slab_bytes\":%zu,\"act_slab_dtype\":\"%s\"%s%s%s%s%s%s%s%s%s%s,"
+        "\"schedule\":\"%s\",\"copy_source\":\"%s\",\"kv_cache\":\"%s\",\"implicit_causal_mask\":%s,\"telemetry_chunk_stride\":%d,\"act_slab_bytes\":%zu,\"act_slab_dtype\":\"%s\"%s%s%s%s%s%s%s%s%s%s%s,"
         "\"static_vram_bytes\":%zu,\"slot_vram_bytes\":%zu,\"free_vram_bytes\":%zu,\"total_vram_bytes\":%zu}",
         start_head.c_str(),
         model.name.c_str(), llm_arch_name(model.arch), n_layer, n_slots, device,
         schedule ? schedule : "batch-major", copy_source ? copy_source : "direct", kv_cache ? kv_cache : "f16",
         use_implicit_causal_mask ? "true" : "false", telemetry_chunk_stride, act_slab_bytes,
         act_slab_dtype_ == GGML_TYPE_BF16 ? "bf16" : "f32", stage_str.c_str(), chunks_str.c_str(), ctx_str.c_str(),
-        ho_mode_str.c_str(), rowset_str.c_str(), pbp_str.c_str(), cs_src_str.c_str(), rt_str.c_str(), tlm_str.c_str(),
+        ho_mode_str.c_str(), tgt_str.c_str(), rowset_str.c_str(), pbp_str.c_str(), cs_src_str.c_str(), rt_str.c_str(), tlm_str.c_str(),
         spec_str.c_str(),
         static_vram, slot_vram, free_vram, total_vram);
 }
@@ -9092,6 +9106,32 @@ void llama_layer_streaming::end_row_cache() {
     backend_compute = nullptr;
 }
 
+// T-GPLR-63 G: the worst-slot and all-slots cost of one per-slot byte map.
+//
+// ONE owner for the reduction. begin_row_set() needs it twice -- once for the
+// full-bank map (layer_bytes) and once for the compact row-set map
+// (layer_bytes_rowset) -- to print "was -> now" in the window-narrowed console
+// line. Those were two hand-copied loops that differed only in which map they
+// read, which is the same two-owner hazard the host checkers had (T-GPLR-63
+// checker partial merge): a later edit to one copy leaves the console reporting
+// a before/after pair computed by two different reductions. The field is a
+// pointer-to-member so the two call sites differ in the ARGUMENT, not in the
+// code. Behaviour is unchanged -- the identical reduction, run twice.
+static void ls_slot_byte_totals(const std::vector<llama_layer_streaming_slot> & slots,
+                                const std::unordered_map<int, size_t> llama_layer_streaming_slot::* field,
+                                size_t & worst, size_t & total) {
+    worst = 0;
+    total = 0;
+    for (const auto & slot : slots) {
+        size_t mx = 0;
+        for (const auto & kv : slot.*field) {
+            mx = std::max(mx, kv.second);
+        }
+        worst = std::max(worst, mx);
+        total += mx;
+    }
+}
+
 bool llama_layer_streaming::begin_row_set() {
     if (row_set_active) {
         error_msg = "begin_row_set: row-set staging already active";
@@ -9223,24 +9263,12 @@ bool llama_layer_streaming::begin_row_set() {
     if (row_set_window_width > 0) {
         size_t full_worst = 0;
         size_t full_total = 0;
-        for (const auto & slot : slots) {
-            size_t mx = 0;
-            for (const auto & kv : slot.layer_bytes) {
-                mx = std::max(mx, kv.second);
-            }
-            full_worst = std::max(full_worst, mx);
-            full_total += mx;
-        }
+        ls_slot_byte_totals(slots, &llama_layer_streaming_slot::layer_bytes,
+                           full_worst, full_total);
         size_t compact_worst = 0;
         size_t compact_total = 0;
-        for (const auto & slot : slots) {
-            size_t mx = 0;
-            for (const auto & kv : slot.layer_bytes_rowset) {
-                mx = std::max(mx, kv.second);
-            }
-            compact_worst = std::max(compact_worst, mx);
-            compact_total += mx;
-        }
+        ls_slot_byte_totals(slots, &llama_layer_streaming_slot::layer_bytes_rowset,
+                           compact_worst, compact_total);
         fprintf(stderr,
                 "layer-streaming: row-set slot window narrowed to %d experts (was %d); "
                 "worst-slot bytes %zu -> %zu (%.1f MiB freed/slot); "

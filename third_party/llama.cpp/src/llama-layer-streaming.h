@@ -819,6 +819,15 @@ struct LLAMA_API llama_layer_streaming {
     // pp_tokens / pp_n_chunks / pp_chunks are the layer-major manifest (0 and
     // empty for batch-major); the host checker cross-checks act_bind chunk ids
     // and widths against it (T-Q38CTX-01).
+    //
+    // tg_tokens_ (T-GPLR-63 B) is the RESOLVED token-generation budget, and 0 is
+    // a REAL value here, not a "unset" sentinel: it means the run has no TG
+    // phase at all, which is the prefill-only case every CTest arm exercises.
+    // It is recorded because run_end.n_tokens_generated cannot answer "did this
+    // run have a TG phase" -- that counter is 0 for a run that FAILED before
+    // generating anything, so using it as a schedule witness makes a crashed
+    // prefill run look prefill-only for the wrong reason. -1 (a legacy caller
+    // that never resolves the flag) leaves the key absent.
     void tel_run_start(const llama_model & model, size_t static_vram, size_t slot_vram, size_t free_vram, size_t total_vram,
                        const char * schedule, const char * copy_source, const char * kv_cache, size_t act_slab_bytes,
                        int64_t pp_tokens_, const std::vector<llama_ls_chunk> & chunks_,
@@ -827,7 +836,7 @@ struct LLAMA_API llama_layer_streaming {
                        int pp_prebuild_per_pass_ = -1, const char * pp_prebuild_per_pass_source_ = "",
                        const char * copy_source_source_ = "",
                        int route_telemetry_ = -1, const char * route_telemetry_source_ = "",
-                       int tg_logit_margin_ = -1);
+                       int tg_logit_margin_ = -1, int tg_tokens_ = -1);
     void tel_run_end(int exit_status, size_t peak_vram, int64_t n_tokens_generated, const char * err);
     // T-GPLR-22: a run-level refusal is a structured, TERMINAL record -- the
     // trace's last event, which closes the sink -- so a refused run (whether it

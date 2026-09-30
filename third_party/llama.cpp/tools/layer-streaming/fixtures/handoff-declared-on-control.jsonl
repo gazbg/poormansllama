@@ -1,0 +1,61 @@
+{"event": "proc_start", "seq": 0, "detail": "", "pre_run": 1, "t_us": 2}
+{"event": "load_begin", "seq": 1, "detail": "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf", "pre_run": 1, "t_us": 1107633}
+{"event": "load_end", "seq": 2, "detail": "ok", "pre_run": 1, "t_us": 3084124}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 0, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150841}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 1, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150847}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 2, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150850}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 3, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150852}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 4, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150854}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 5, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150856}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 6, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150858}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 7, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150860}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 8, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150863}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 9, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150865}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 10, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150867}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 11, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150869}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 12, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150871}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 13, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150873}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 14, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150875}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 15, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150878}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 16, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150880}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 17, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150882}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 18, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150884}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 19, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150886}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 20, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150889}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 21, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150891}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 22, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150893}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 23, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150906}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 24, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150909}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 25, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150912}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 26, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150914}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 27, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150916}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 28, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150918}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 29, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150920}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 30, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150922}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 31, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150925}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 32, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150927}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 33, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150929}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 34, "cls": "moe-expert-bank", "members": 3, "bytes": 522190848, "t_us": 3150931}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 35, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150933}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 36, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150935}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 37, "cls": "moe-expert-bank", "members": 3, "bytes": 452984832, "t_us": 3150937}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 38, "cls": "moe-expert-bank", "members": 3, "bytes": 522190848, "t_us": 3150939}
+{"event": "pkg_member", "run_id": 3150839, "adapter": "qwen35moe", "policy": "moe-expert-bank", "layer": 39, "cls": "moe-expert-bank", "members": 3, "bytes": 522190848, "t_us": 3150941}
+{"event": "async_feed_init", "run_id": 3150839, "depth": 1, "n_slots": 3, "t_us": 3151023}
+{"event": "byte_account", "run_id": 3150839, "full_model_plus_runtime": 21454332416, "bounded_window": 4198590976, "static": 957530112, "per_layer": 1597483520, "slot_window": 1566572544, "kv": 11141120, "state": 65863680, "act_slab": 8388608, "reserve": 536870912, "free_vram": 22226665472, "total_vram": 25650855936, "residency_budget_mib": 0, "row_cache": 0, "residency_cap": 0, "full_exceeds_free": false, "bounded_within_free": true}
+{"event": "run_start", "run_id": 3150839, "t0_us": 3150839, "model": "Qwen3.6-35B-A3B", "arch": "qwen35moe", "n_layer": 40, "n_slots": 3, "device": 0, "schedule": "layer-major", "copy_source": "mmap-registered", "kv_cache": "q8", "implicit_causal_mask": true, "telemetry_chunk_stride": 10, "act_slab_bytes": 8388608, "act_slab_dtype": "bf16", "staging_source": "mmap-registered", "staging_source_match": 1, "pp_tokens": 1024, "pp_n_chunks": 2, "pp_chunks": ["0:512", "512:512"], "ctx_size": 1024, "handoff_mode": "auto-off", "pp_prebuild_per_pass": 0, "pp_prebuild_per_pass_source": "default", "copy_source_source": "default", "route_telemetry": 0, "route_telemetry_source": "default", "tg_logit_margin": 0, "tg_logit_margin_source": "explicit", "static_vram_bytes": 0, "slot_vram_bytes": 1566584832, "free_vram_bytes": 22226665472, "total_vram_bytes": 25650855936}
+{"event": "act_bind", "run_id": 3150839, "chunk": 0, "slab": 0, "off_bytes": 0, "n_bytes": 2097152, "t_us": 3202079}
+{"event": "act_bind", "run_id": 3150839, "chunk": 0, "slab": 1, "off_bytes": 0, "n_bytes": 2097152, "t_us": 3202087}
+{"event": "act_bind", "run_id": 3150839, "chunk": 1, "slab": 0, "off_bytes": 2097152, "n_bytes": 2097152, "t_us": 3202089}
+{"event": "act_bind", "run_id": 3150839, "chunk": 1, "slab": 1, "off_bytes": 2097152, "n_bytes": 2097152, "t_us": 3202092}
+{"event": "graph_footprint", "run_id": 3150839, "n_graph_sets": 2, "total_graphs": 84, "io_ctx_reserved_bytes": 201326592, "io_ctx_used_bytes": 56394209808, "host_input_bytes": 67108864, "host_input_used_bytes": 8982592, "act_slab_bytes": 8388608, "slot_vram_bytes": 1566584832, "graph_budget_mib": -1, "t_us": 3207664}
+{"event": "mmap_register", "run_id": 3150839, "mode": "init-once", "layer": 0, "bytes": 457322496, "members": 3, "merged": 0, "base": 2098532356096, "t_us": 3207856}
+{"event": "mmap_register_init", "run_id": 3150839, "bytes": 457322496, "us": 175.0, "layers": 40, "t_us": 3207862}
+{"event": "copy_submit", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "bytes": 452984832, "af_inflight": 0, "submit_batch": 0, "phase": 0, "t_us": 3253585}
+{"event": "slot_request", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "phase": 0, "bytes": 452984832, "t_us": 3253609}
+{"event": "copy_complete", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "transfer_us": 31556.0, "host_submit_us": 13.0, "ready_latency_us": 31543.0, "phase": 0, "t_us": 3285129}
+{"event": "layer_ready_wait", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "wait_us": 31515.0, "ready_at_consumption": false, "phase": 0, "t_us": 3285153}
+{"event": "layer_compute", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "chunk": 0, "compute_us": 80605.0, "setup_us": 122.0, "phase": 0, "t_us": 3365918}
+{"event": "layer_compute", "run_id": 3150839, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "chunk": 1, "compute_us": 3348.0, "setup_us": 48.0, "phase": 0, "t_us": 3369370}
+{"event": "phase_summary", "run_id": 3150839, "phase": "pp", "tokens": 1024, "ubatches": 2, "wall_us": 161718, "tokens_per_s": 6332.01, "bytes_transferred": 452984832, "evictions": 0, "total_transfer_us": 31556.0, "total_wait_us": 31515.0, "total_compute_us": 83953.0, "layers_run": 1, "graph_prep_us": 8666, "graph_builds": 0}
+{"event": "run_end", "run_id": 3150839, "exit_status": 0, "peak_vram_bytes": 3424190464, "n_tokens_generated": 0, "failed": false, "error": "none", "total_patch_us": 81.0}
