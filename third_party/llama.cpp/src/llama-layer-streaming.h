@@ -1074,6 +1074,20 @@ struct LLAMA_API llama_layer_streaming {
     // inert, because the switch is only taken once the narrow bundles exist.
     int  row_set_window_width = 0;
 
+    // T-GPLR-62 S2 (A9, the LOAD-BEARING gate): byte-level recon of the staged
+    // window. OFF by default; when on, every staged slot slab is read back and
+    // byte-compared against the checkpoint slab for the expert that position is
+    // SUPPOSED to hold. A mismatch refuses the run with the stable reason
+    // "recon_mismatch" rather than merely reporting, because a wrong expert in
+    // the window produces a plausible answer and the run's output would be
+    // worthless. This is the gate that route parity cannot replace: parity only
+    // detects nondeterminism, and a deterministic mapping error passes it.
+    bool row_set_recon = false;
+    // A9 counters, reported at the end of the run.
+    uint64_t rowset_recon_windows  = 0;
+    uint64_t rowset_recon_members  = 0;
+    uint64_t rowset_recon_compared = 0;
+    uint64_t rowset_recon_bad      = 0;
                                     // (32 rows/layer, ~2.19 GiB over 40 layers,
                                     // the shallowest K whose offline (b) clears
                                     // the 0.6 gate). A caller may name any 1..64.
@@ -1407,6 +1421,14 @@ struct LLAMA_API llama_layer_streaming {
     // than a half-narrowed slot.
     bool build_row_set_window(int width);
 
+    // T-GPLR-62 S2 / gate A9: byte-compare every staged slot slab against the
+    // checkpoint slab for the expert that position is specified to hold. Called
+    // from load_row_set AFTER the copy-ready event is synchronized, so it reads
+    // exactly the bytes the FFN is about to consume. Returns false on any
+    // mismatch, having emitted a "recon_mismatch" refusal. Diagnostics only:
+    // does nothing unless row_set_recon is set.
+    bool recon_row_set_window(int il, const llama_ls_package & pkg, llama_layer & dst,
+                              const std::vector<int32_t> & uniq, uint32_t gen);
 
     // Stage the union of expert rows in ids[il] into the layer's row-set
     // slot (copying only rows not resident for the slot's current

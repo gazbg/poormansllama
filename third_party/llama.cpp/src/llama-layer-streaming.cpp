@@ -9113,6 +9113,16 @@ bool llama_layer_streaming::begin_row_set() {
         return false;
     }
 
+    // T-GPLR-62 S2 / A9: declare the mode BEFORE any window is staged, so a
+    // trace that declares it and then produces no recon evidence is detectable
+    // as "recon was requested but never ran" rather than passing as a clean run.
+    if (row_set_recon) {
+        tel_write(tel_out,
+            "{\"event\":\"rowset_recon_begin\",\"run_id\":%llu,\"window_width\":%d,"
+            "\"n_expert\":%d,\"policy\":\"byte-compare-slot-vs-checkpoint\",\"t_us\":%lld}",
+            (unsigned long long) run_id, row_set_window_width,
+            (int) model_ref->hparams.n_expert, (long long) ggml_time_us());
+    }
 
     // T-GPLR-58 A0, P4's generation boundary: arming the row-set phase (or
     // re-arming it after PP) retires every queued fill. Marked, then reaped, so
@@ -9171,6 +9181,112 @@ bool llama_layer_streaming::begin_row_set() {
     return true;
 }
 
+// T-GPLR-62 S2 / gate A9: prove, BY BYTES, that every position of the staged
+// window holds the expert that position is specified to hold.
+//
+// WHY THIS IS NOT A RESTATEMENT OF THE WRITE PATH. The obvious implementation
+// bug is to compare the destination slab against the checkpoint using the SAME
+// expression the writer used to choose it, which would make the check agree
+// with the bug by construction -- the same tautology that made --why-victim
+// worthless. So the expected bytes are re-derived here from the SPEC:
+//
+//   compact window (ne[2] == W):  slot position i      must hold expert uniq[i]
+//   full bank    (ne[2] == n_exp): slot position uniq[i] must hold expert uniq[i]
+//
+// Each is the mode's own contract, stated independently of how the staging loop
+// computed its offset. A wrong source slab, a stale row that was never
+// overwritten, a mis-sized view, or an off-by-one in the offset arithmetic all
+// show up here as a byte difference.
+//
+// RESIDUAL, stated honestly: this verifies the BYTES are where the mode says
+// they are. It does not independently verify that the MODE is the one the
+// operator intended -- that is what the width flag being off by default is for.
+bool llama_layer_streaming::recon_row_set_window(int il, const llama_ls_package & pkg,
+                                                llama_layer & dst,
+                                                const std::vector<int32_t> & uniq,
+                                                uint32_t gen) {
+    const bool compact = row_set_window_width > 0;
+    ggml_init_params vp = { /*mem_size=*/ 64u * 1024u, /*mem_buffer=*/ nullptr, /*no_alloc=*/ true };
+    ggml_context * vctx = ggml_init(vp);
+    if (vctx == nullptr) {
+        error_msg = "recon_row_set_window: failed to init the view context for layer " + std::to_string(il);
+        return false;
+    }
+
+    std::vector<uint8_t> want, got;
+    bool   ok = true;
+    size_t bad_offset = 0;
+    size_t bad_slab_bytes = 0;
+    int32_t bad_expert = -1;
+    int     bad_member = -1;
+
+    for (size_t mi = 0; mi < pkg.members.size() && ok; ++mi) {
+        const llama_ls_member & m = pkg.members[mi];
+        const ggml_tensor * src = m.src;
+        ggml_tensor * dt = ls_dst(dst, m);
+        if (src == nullptr || dt == nullptr) {
+            continue;
+        }
+        // A compact bundle must never be asked for a position it does not have.
+        const int64_t pos_extent = compact ? (int64_t) row_set_window_width : dt->ne[2];
+        for (size_t i = 0; i < uniq.size() && ok; ++i) {
+            // the SPEC's position for union member i (see the note above)
+            const int64_t pos = compact ? (int64_t) i : (int64_t) uniq[i];
+            if (pos < 0 || pos >= pos_extent) {
+                tel_rowset_refused(il, (int) (il % (int) std::max<size_t>(n_slots, 1)), gen,
+                                   "recon_mismatch",
+                                   ("recon: union member " + std::to_string(i) + " maps to slot position " +
+                                    std::to_string(pos) + " outside [0," + std::to_string(pos_extent) + ")")
+                                       .c_str());
+                error_msg = "recon_row_set_window: union position out of range for layer " + std::to_string(il);
+                ok = false;
+                break;
+            }
+            ggml_tensor * vs = ggml_view_2d(vctx, (ggml_tensor *) src,
+                                             src->ne[0], src->ne[1], src->nb[1],
+                                             (size_t) uniq[i] * src->nb[2]);
+            ggml_tensor * vd = ggml_view_2d(vctx, dt,
+                                             dt->ne[0], dt->ne[1], dt->nb[1],
+                                             (size_t) pos * dt->nb[2]);
+            if (vs == nullptr || vd == nullptr) {
+                error_msg = "recon_row_set_window: failed to build a slab view for layer " + std::to_string(il);
+                ok = false;
+                break;
+            }
+            const size_t n = ggml_nbytes(vs);
+            if (got.size() < n) { want.resize(n); got.resize(n); }
+            bad_slab_bytes = n;
+            // The copy-ready event has already been synchronized by the caller,
+            // so these read the bytes the FFN is about to consume.
+            ggml_backend_tensor_get(vs, want.data(), 0, n);
+            ggml_backend_tensor_get(vd, got.data(),  0, n);
+            ++rowset_recon_members;
+            rowset_recon_compared += n;
+            if (std::memcmp(want.data(), got.data(), n) != 0) {
+                size_t at = 0;
+                while (at < n && want[at] == got[at]) { ++at; }
+                ++rowset_recon_bad;
+                bad_offset = at; bad_expert = uniq[i]; bad_member = (int) mi;
+                ok = false;
+            }
+        }
+    }
+    ++rowset_recon_windows;
+    ggml_free(vctx);
+
+    if (!ok && bad_expert >= 0) {
+        const std::string why =
+            "recon: slot bytes do NOT match the checkpoint at layer " + std::to_string(il) +
+            " member " + std::to_string(bad_member) + " expert " + std::to_string(bad_expert) +
+            " (first differing byte at offset " +            std::to_string(bad_offset) + " of " +
+            std::to_string(bad_slab_bytes) + ")";
+        tel_rowset_refused(il, (int) (il % (int) std::max<size_t>(n_slots, 1)), gen,
+                           "recon_mismatch", why.c_str());
+        error_msg = "load_row_set: " + why;
+        return false;
+    }
+    return ok;
+}
 
 bool llama_layer_streaming::build_row_set_window(int width) {
     const int n_exp = (int) model_ref->hparams.n_expert;
@@ -9783,6 +9899,15 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
         const int64_t t_demand_ready = ggml_time_us();
 
+        // T-GPLR-62 S2 / A9: the bytes are now landed and ordered against the
+        // compute stream, so this reads EXACTLY what the FFN is about to
+        // consume. A mismatch refuses the run: a wrong expert in the window
+        // yields a plausible answer, and a run whose answer cannot be trusted
+        // is worse than a run that stops.
+        if (row_set_recon && !recon_row_set_window(il, pkg, dst, uniq, slot.generation)) {
+            failed = true;
+            return false;
+        }
         if (row_set_spec_pool > 0) {
             for (size_t i = 0; i < uniq.size(); ++i) {
                 if (pool_hit_pos[i] < 0) {
@@ -10074,6 +10199,23 @@ void llama_layer_streaming::rowset_round_end() {
     tel_rowset_round((int64_t) (n_ubatches - 1), rowset_round_bytes_staged,
                      rowset_round_bytes_bank, rowset_round_rows_fetched,
                      rowset_round_rows_reused);
+    // T-GPLR-62 S2 / A9: per-round byte-recon evidence. A mismatch refuses the
+    // run inside load_row_set, so a round_end that REACHED this point has
+    // bad == 0 by construction -- the event is the proof, not a report. The
+    // validator also requires the event to be present at all when the mode was
+    // declared, so "recon was on but nothing was checked" cannot pass silently.
+    if (row_set_recon) {
+        tel_write(tel_out,
+            "{\"event\":\"rowset_recon\",\"run_id\":%llu,\"chunk\":%lld,\"windows\":%llu,"
+            "\"members\":%llu,\"compared_bytes\":%llu,\"mismatches\":%llu,"
+            "\"window_width\":%d,\"t_us\":%lld}",
+            (unsigned long long) run_id, (long long) (n_ubatches - 1),
+            (unsigned long long) rowset_recon_windows,
+            (unsigned long long) rowset_recon_members,
+            (unsigned long long) rowset_recon_compared,
+            (unsigned long long) rowset_recon_bad,
+            row_set_window_width, (long long) ggml_time_us());
+    }
     rowset_round_bytes_staged = 0;
     rowset_round_bytes_bank   = 0;
     rowset_round_rows_fetched = 0;

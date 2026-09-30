@@ -164,6 +164,9 @@ static void usage(const char * prog) {
         "  --residency-tg-window W  T-GPLR-62 S2: narrow the row-set slot window to W experts\n"
         "                       (0 = full bank, default). W must cover the worst-case\n"
         "                       union; a wider union refuses with 'window_overflow'.\n"
+        "  --residency-tg-recon   T-GPLR-62 S2 A9: byte-compare every staged slot slab against\n"
+        "                       the checkpoint bytes for that position. Slow; a mismatch\n"
+        "                       refuses the run with 'recon_mismatch'.\n"
         "  --pp-prewarm N       T-GPLR-53 A4 pre-timed modality pre-warm, executed BEFORE the timed\n"
         "                       PP region: 0=off (default; no path runs), 1=CPU read-touch of the\n"
         "                       package source spans, 2=dummy GPU launch + sync, 3=both,\n"
@@ -1309,6 +1312,14 @@ static int check_telemetry(const std::string & path) {
     ls_retention_model rowset_retention;
     ls_pool_validator pool_validator;
     long long rowset_rounds = 0;
+    // T-GPLR-62 S2 / A9: the byte-level staged-window recon. Declared at
+    // rowset_recon_begin, evidenced per round by rowset_recon. Two failure
+    // modes are enforced, not merely reported: any mismatch, and "declared but
+    // no evidence at all" (which is what a run that silently skipped the check
+    // would look like).
+    bool     a9_declared = false;
+    long long a9_rounds_seen = 0;
+    long long a9_windows = 0, a9_members = 0, a9_compared = 0, a9_mismatches = 0;
     // T-GPLR-19: byte_account's row_cache figure, held until rowset_init has
     // been read so the record can be tied to the policy it claims.
     bool ba_row_cache_seen = false;
@@ -1917,7 +1928,34 @@ static int check_telemetry(const std::string & path) {
             if (slot < 0 || slot >= n_slots) {
                 err("slot_request slot out of range");
             }
-        }  else if (event == "copy_submit" || event == "copy_complete" ||
+        } else if (event == "rowset_recon_begin") {
+            // T-GPLR-62 S2 / A9: the mode was declared. The evidence is checked
+            // at the end of the trace, because a refusal (the correct outcome of
+            // a mismatch) legitimately produces no per-round evidence.
+            a9_declared = true;
+        } else if (event == "rowset_recon") {
+            bool f_w = false, f_m = false, f_cb = false, f_mm = false;
+            const long long w  = json::integer(line, "windows", &f_w);
+            const long long m  = json::integer(line, "members", &f_m);
+            const long long cb = json::integer(line, "compared_bytes", &f_cb);
+            const long long mm = json::integer(line, "mismatches", &f_mm);
+            if (!f_w || !f_m || !f_cb || !f_mm) {
+                err("rowset_recon missing windows/members/compared_bytes/mismatches");
+            } else {
+                a9_rounds_seen += 1;
+                a9_windows     += w;
+                a9_members     += m;
+                a9_compared    += cb;
+                a9_mismatches  += mm;
+                if (mm > 0) {
+                    err(("A9: staged slot bytes do NOT match the checkpoint for " +
+                         std::to_string(mm) + " member(s) -- the window holds the WRONG expert").c_str());
+                }
+                if (w > 0 && cb <= 0) {
+                    err("A9: rowset_recon claims windows but compared zero bytes");
+                }
+            }
+        } else if (event == "copy_submit" || event == "copy_complete" ||
                    event == "layer_ready_wait" || event == "layer_compute") {
             bool f_layer = false, f_slot = false, f_gen = false;
             const long long layer = json::integer(line, "layer", &f_layer);
@@ -2160,6 +2198,19 @@ static int check_telemetry(const std::string & path) {
         err(be.c_str());
     }
 
+    // T-GPLR-62 S2 / A9: the deferred half. A trace that DECLARED the recon must
+    // carry evidence, and must have compared a non-trivial number of bytes. A
+    // refusal trace is exempt: a refusal is the correct outcome, and a mismatch
+    // refuses BEFORE the round ever ends, so the absence of evidence there is the
+    // gate working rather than the gate being skipped.
+    if (a9_declared && !refusal.saw) {
+        if (a9_rounds_seen == 0) {
+            err("A9: rowset_recon_begin present but no rowset_recon evidence -- "
+                "the byte-level check never ran");
+        } else if (a9_mismatches == 0 && a9_compared <= 0) {
+            err("A9: recon evidence present but zero bytes were compared");
+        }
+    }
 
     // T-GPLR-58: the deferred form of the `spec` rule -- a trace whose fills cannot be
     // replayed fails ONCE, with the cause named, instead of once per later fetch.
@@ -3111,6 +3162,7 @@ int main(int argc, char ** argv) {
     bool residency_tg = false;       // T-GPLR-13: --residency-tg moe-row-set TG policy (reactive expert row windows)
     int  residency_tg_retain = 0;    // T-GPLR-19: --residency-tg-retain [N] per-layer row cache (0 = off, default; bare flag = kRowSetRetainDefault)
     int  residency_tg_window = 0;    // T-GPLR-62 S2: --residency-tg-window W compact row-set slot width in experts (0 = full bank, default)
+    bool residency_tg_recon  = false; // T-GPLR-62 S2 A9: --residency-tg-recon byte-level staged-window recon (off by default)
     int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
     int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
     int         residency_tg_spec_pool = 0;   // T-GPLR-59: separate prediction-only positions per logical layer
@@ -3378,6 +3430,12 @@ int main(int argc, char ** argv) {
                         residency_tg_window);
                 return 2;
             }
+        } else if (arg == "--residency-tg-recon") {
+            // T-GPLR-62 S2 / gate A9: byte-compare every staged slot slab
+            // against the checkpoint slab for the expert that position is
+            // specified to hold. Diagnostics only, off by default, and SLOW: it
+            // reads back each staged slab. A mismatch refuses the run.
+            residency_tg_recon = true;
         } else if (arg == "--residency-tg-spec") {
             // T-GPLR-58: opt-in SPECULATIVE placement of guessed expert rows on the
             // retention path. Default-off. Mode 1 = scripted proposals (the A0 test
@@ -4727,6 +4785,7 @@ int main(int argc, char ** argv) {
     ls.row_set_spec_pool = residency_tg_spec_pool;
     // T-GPLR-62 S2: 0 leaves every existing command line on the full-bank slot.
     ls.row_set_window_width = residency_tg_window;
+    ls.row_set_recon = residency_tg_recon;
 
     // T-GPLR-58 A0: configure speculative placement BEFORE begin_row_cache()
     // allocates its state and long before any TG graph exists, so a bad
