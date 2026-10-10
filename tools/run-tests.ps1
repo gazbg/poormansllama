@@ -108,6 +108,15 @@ param(
     # so a later reader can tell whether a green still describes this tree.
     # Exit 0 CURRENT / 1 stale / 2 cannot-evaluate -- the arm convention, from
     # the shared decision rule in tools/source-revision.ps1.
+    # Forward -AllowBusy to with-gpu-lock.ps1 so a suite can run while a
+    # non-model process (e.g. a desktop app's GPU rendering context) holds
+    # the device. with-gpu-lock REFUSES with exit 125 whenever ANY compute
+    # process is visible, so without this the suite is unrunnable while such a
+    # process lives. Default OFF: the refusing behaviour stays the default for
+    # every existing caller, the run is still recorded in the verdict as
+    # gpu_pre/gpu_post, and the wrapper still prints its contamination WARNING.
+    [switch] $AllowBusy,
+
     [string] $VerifyRevision = ''
 )
 
@@ -274,7 +283,7 @@ $suites = @{
     }
     'boundary' = @{
         Gpu = $true
-        Include = 'qwen38-layer-boundary|layer-slot-lifecycle'
+        Include = 'qwen38-layer-boundary|layer-slot-lifecycle|layer-streaming-host2-preflight'
         Exclude = ''
         TimeoutSeconds = 300
     }
@@ -317,7 +326,7 @@ $suites = @{
         # host validators must accept the pool-lifecycle and pool-off legacy
         # positives and reject the 11 single-rule negatives (check-pool-* /
         # validate-pool-*), all host-only (no GPU, no model).
-        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits|check-pool|validate-pool)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict)'
+        Include = 'layer-streaming-(lm40|tail513|tail1025|byte-account|run-refused|make-unsupported-fixture|probe-unsupported|refuse-unsupported|check-off-audit|refuse-mtp-handoff-moe|lm-tg-cap|lm-tg-cap-lift|dense-mtp-handoff-legal|dense-attn-only-legal|dense-mtp-auto-refusal|check-gplr53-embed-chunk|validate-gplr53-embed-chunk|check-gplr54-tg-logits|validate-gplr54-tg-logits|check-pool|validate-pool)(-|$)|test-layer-streaming-(layout|model-inspect|tel-mark|tg-spec|tg-predict|tg-view|expert-split)'
         Exclude = 'tail513-(lm|bm)(-run)?$'
         TimeoutSeconds = 300
     }
@@ -953,8 +962,13 @@ elseif ($spec.Direct) {
     $trace = Join-Path $buildDirResolved $spec.DirectTrace
     $DirectCmd = "`"$exe`" --model `"$ModelPath`" $($spec.DirectArgs) --telemetry `"$trace`""
     Write-Host "Running direct experiment under GPU mutex: $DirectCmd"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
-        -TimeoutSeconds $spec.TimeoutSeconds -Command $DirectCmd
+    $lockArr = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $lock,
+                   '-TimeoutSeconds', $spec.TimeoutSeconds, '-Command', $DirectCmd)
+    # Array splatting passes raw tokens, so a SWITCH reaches the child as a bare
+    # token. A hashtable splat would render '-AllowBusy True', which the child's
+    # -File binding rejects (SwitchParameter cannot take a string).
+    if ($AllowBusy) { $lockArr += '-AllowBusy' }
+    & powershell @lockArr
     $exitCode = $LASTEXITCODE
 }
 elseif ($spec.QaSmoke) {
@@ -1037,8 +1051,13 @@ elseif ($spec.QaSmoke) {
         $runCmd = "`"$exe`" --model `"$ModelPath`" --prompt-file `"$prompt`" --ubatch $ubatch --tg-tokens 96 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 $modeFlags --allow-full-residency --telemetry `"$trace`" --tg-text `"$tgtext`" > `"$log`" 2>&1"
         Write-Host "[qa-smoke] $len tokens: mode=$SmokeMode"
         Write-Host "[qa-smoke] $len tokens: runner under GPU mutex (log $log)..."
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
-            -TimeoutSeconds $spec.TimeoutSeconds -Command $runCmd
+        $lockArr = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $lock,
+                       '-TimeoutSeconds', $spec.TimeoutSeconds, '-Command', $runCmd)
+        # Array splatting passes raw tokens, so a SWITCH reaches the child as a bare
+        # token. A hashtable splat would render '-AllowBusy True', which the child's
+        # -File binding rejects (SwitchParameter cannot take a string).
+        if ($AllowBusy) { $lockArr += '-AllowBusy' }
+        & powershell @lockArr
         $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
             Write-Host "FAILED: $len-token run exited $exitCode" -ForegroundColor Red
@@ -1084,8 +1103,13 @@ elseif ($spec.QaSmoke) {
 }
 elseif ($spec.Gpu) {
     Write-Host "Running under GPU mutex (waits if another process holds it)..."
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $lock `
-        -TimeoutSeconds $spec.TimeoutSeconds -Command $ctestCommand
+    $lockArr = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $lock,
+                   '-TimeoutSeconds', $spec.TimeoutSeconds, '-Command', $ctestCommand)
+    # Array splatting passes raw tokens, so a SWITCH reaches the child as a bare
+    # token. A hashtable splat would render '-AllowBusy True', which the child's
+    # -File binding rejects (SwitchParameter cannot take a string).
+    if ($AllowBusy) { $lockArr += '-AllowBusy' }
+    & powershell @lockArr
     $exitCode = $LASTEXITCODE
 } else {
     Write-Host "Running without GPU mutex (host-only tests)..."

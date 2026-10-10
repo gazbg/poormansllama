@@ -146,7 +146,17 @@ try {
             }
 
             & cmd.exe /d /s /c $Command
-            $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+            # A native cmd.exe always sets $LASTEXITCODE. Null means it was never run
+            # as a native command -- measured 2026-09-30: with PATHEXT lacking .EXE
+            # (an agent shell passed PATHEXT=.CPL) PowerShell shell-executes cmd.exe
+            # detached, the command never runs, and the old `null -> 0` mapping wrote
+            # a 0.6 s PASS. Refuse loudly instead.
+            if ($null -eq $LASTEXITCODE) {
+                [Console]::Error.WriteLine("Command did not run as a native process (no exit code; PATHEXT=[$env:PATHEXT]). Treating as FAILED.")
+                $exitCode = 126
+            } else {
+                $exitCode = $LASTEXITCODE
+            }
             # The command EXECUTED. Only such a run can be attested, and only such a run
             # may be refused for want of provenance: a busy refusal (125) and a mutex
             # timeout (124) describe the WRAPPER's decision, not the arm, and their codes

@@ -54,7 +54,8 @@ inside the answer region, D < D_MIN), refusal (a stream with no tg_tokens).
 
 USAGE
   python tools/analyze-gplr54-ubatch-identity.py --selftest
-  python tools/analyze-gplr54-ubatch-identity.py TAG REF            # one pair
+  python tools/analyze-gplr54-ubatch-identity.py TAG REF            # one pair:
+      # candidate TAG against reference REF (exit 1 when the verdict is FAIL)
   python tools/analyze-gplr54-ubatch-identity.py                    # the
       recorded default set: u512 vs u1024, u2048, u4096 (+ C4 skip note)
   python tools/analyze-gplr54-ubatch-identity.py --repeat TAG_A TAG_B
@@ -71,7 +72,9 @@ EXIT CODES
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 # --- pre-registered constants (plan block T-GPLR-54, "Established facts") ----
 
@@ -218,7 +221,24 @@ def run_selftest():
     bad += 0 if ref_ok else 1
     print('[selftest] missing-trace        want=refusal          got=%s %s' %
           (ref_reason, 'ok' if ref_ok else 'MISMATCH'))
-    print('[selftest] %d/%d as expected' % (len(cases) + 2 - bad, len(cases) + 2))
+    # pair mode end to end: the documented TAG REF order and a FAIL verdict
+    # that exits 1 (both were wrong until 2026-10-01: args were taken REF-first
+    # and an evaluated FAIL exited 0)
+    tmp = tempfile.mkdtemp(prefix='gplr54-selftest-')
+    try:
+        for tag, ids in (('ref', ref), ('ins', ins), ('content', cases[2][1])):
+            with io.open(os.path.join(tmp, tag + '.jsonl'), 'w', encoding='utf-8') as f:
+                f.write(json.dumps({'event': 'tg_tokens', 'ids': ids}) + '\n')
+        for name, cand_tag, want in (('pair-insertion', 'ins', 0),
+                                     ('pair-content', 'content', 1),
+                                     ('pair-missing', 'nope', 2)):
+            got = run_pair(cand_tag, 'ref', tmp)
+            bad += 0 if got == want else 1
+            print('[selftest] %-18s want=exit %-12d got=exit %-12d %s' %
+                  (name, want, got, 'ok' if got == want else 'MISMATCH'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('[selftest] %d/%d as expected' % (len(cases) + 5 - bad, len(cases) + 5))
     return 1 if bad else 0
 
 
@@ -253,6 +273,16 @@ def check_pair(ref_tag, cand_tag, root, expect=None):
     return ('EVAL' if ok else 'CHKFAIL'), row
 
 
+def run_pair(cand_tag, ref_tag, root):
+    """Pair mode, documented order TAG REF: 0 IDENTICAL/BOUNDED-INSERTION,
+    1 FAIL, 2 cannot evaluate."""
+    verdict, row = check_pair(ref_tag, cand_tag, root)
+    if verdict == 'SKIP':
+        return 2
+    print('RESULT: %s' % ('FAIL' if row['verdict'] == 'FAIL' else 'PASS'))
+    return 1 if row['verdict'] == 'FAIL' else 0
+
+
 def main(argv):
     args = [a for a in argv if a != '--json']
     as_json = '--json' in argv
@@ -274,9 +304,7 @@ def main(argv):
                'disagree' if verdict == 'CHKFAIL' else 'agree'))
         return 0 if verdict == 'EVAL' else (2 if verdict == 'SKIP' else 1)
     if len(args) == 2:
-        verdict, row = check_pair(args[0], args[1], root)
-        rows.append(row)
-        return 0 if verdict in ('EVAL',) else (2 if verdict == 'SKIP' else 1)
+        return run_pair(args[0], args[1], root)
     if not args:
         # the recorded default set: F1 (K=0 pairs) then F2/F3 (the u4096 shape)
         checks = [(REF, 'gplr38-u1024',

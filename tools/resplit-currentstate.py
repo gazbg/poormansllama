@@ -38,9 +38,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LIVE = ROOT / "docs" / "currentstate.md"
 SHARD_DIR = ROOT / "docs" / "currentstate"
-MANIFEST = SHARD_DIR / "resplit-manifest-2026-09-24.json"
-RESPLIT_DATE = "2026-09-24"
-LIVE_CUTOFF = date(2026, 9, 23)
+MANIFEST = SHARD_DIR / "resplit-manifest-2026-10-10.json"
+RESPLIT_DATE = "2026-10-10"
+# 2026-10-10 bump: the 2026-09-25 cutoff grew back to 497,896 B (LF; 504,027 B on
+# disk), again over the band. Measured day sizes in that window: 2026-10-02 alone
+# is 263,582 B over 38 entries, so the cut is now taken at 2026-10-03, keeping
+# 2026-10-03..2026-10-10 live (117,329 B of entries).
+# 2026-10-10 cleanup (owner-directed, BEFORE the cut): two stray entries had been
+# appended BELOW the risk tail by the earlier damage/restore -- a date heading whose
+# separator is an em dash ("Nested engine rebuild and host-suite provenance
+# recheck"), which DATE_HEADING_RE cannot match, and a colon-form "T-GPLR-07 CUDA
+# SEMANTIC-QA SMOKE TIER PASS (50/512)". The colon-form one IS parsed by
+# parse_entries even though it sits in the verbatim tail, so it would have collided
+# with the existing 2026-09-24.md shard; its live copy was dropped (byte-identical
+# copies survive in that shard) and the em-dash block was moved VERBATIM into it.
+# T-GPLR-77: the 2026-09-24 cutoff let the live file grow back over the FAIL band
+# (480,985 B vs the 480,000 B cap) because every session since then has written
+# to 2026-09-25..2026-10-02. The cutoff is a POLICY choice, not a derived value,
+# so it is bumped deliberately here rather than silently by a dry run.
+LIVE_CUTOFF = date(2026, 10, 3)
 HEADER_LINES = 8
 TAIL_MARKER = "## Known gaps / risks (current)"
 INDEX_HEADING = "## Index of archived entries"
@@ -117,11 +133,11 @@ def shard_header(covers: str) -> str:
     return (
         f"# currentstate.md archive shard -- {covers}\n"
         "\n"
-        "Verbatim archive of the 2026-09-24 resplit of `docs/currentstate.md`.\n"
+        f"Verbatim archive of the {RESPLIT_DATE} resplit of `docs/currentstate.md`.\n"
         "Entries keep their original text and order. The live current state and\n"
         "derived index remain in `docs/currentstate.md`. Split ranges, entry\n"
         "hashes and the apply-time source hash are recorded in\n"
-        "`docs/currentstate/resplit-manifest-2026-09-24.json`.\n"
+        f"`docs/currentstate/{MANIFEST.name}`.\n"
     )
 
 
@@ -208,7 +224,7 @@ risk tail.
 - The split is mechanically checked with
   `python tools/resplit-currentstate.py --verify`. The apply-time source hash,
   entry hashes, shard bodies and dispositions are recorded in
-  `docs/currentstate/resplit-manifest-2026-09-24.json`. Prefer `rg` across
+  `docs/currentstate/{MANIFEST.name}`. Prefer `rg` across
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries ({live_from} .. {live_to})
@@ -285,6 +301,34 @@ def main_apply(
             and not overwrite_resplit
         ):
             raise SystemExit(f"ABORT: target shard already exists: {path}")
+    # T-GPLR-77 (DATA LOSS GUARD). --overwrite may supersede a manifest, but it
+    # must NEVER let a run clobber a shard that a PREVIOUS run of this tool
+    # generated. Measured 2026-10-02: applying twice in a row re-read the
+    # already-shrunk live file, found one leftover entry from the cut day, and
+    # rewrote docs/currentstate/2026-09-24.md from 17 entries (57,602 B) to 1
+    # entry (4,443 B) -- destroying 16 entries of historical record, which
+    # --verify still reported as PASS because the manifest described the
+    # damaged state it had just written. The guard refuses to overwrite any
+    # shard the previous manifest lists under new_shards. Recovering a lost
+    # shard requires an explicit, separate restore -- not a re-apply.
+    if overwrite_resplit and MANIFEST.exists():
+        try:
+            prior = json.loads(load(MANIFEST))
+        except Exception:
+            prior = {}
+        prior_generated = {
+            shard.get("file") for shard in prior.get("new_shards", []) if shard.get("file")
+        }
+        collisions = sorted(prior_generated & new_rel)
+        if collisions:
+            raise SystemExit(
+                "ABORT: refusing to overwrite shard(s) a previous resplit generated: "
+                + ", ".join(collisions)
+                + " Re-applying from an already-split file would rewrite them from"
+                + " the shrunken live block and LOSE entries (measured: 16 lost, while"
+                + " --verify still passed). Restore from git or a backup, or raise"
+                + " LIVE_CUTOFF so the cut is taken from a source that still holds them."
+            )
     tail_pos = source.find(TAIL_MARKER)
     assert tail_pos >= 0
     old_header = source.find("## How this file is organised")
@@ -372,7 +416,15 @@ def main_apply(
         "new_shards": new_shards,
         "preexisting_shards": preexisting,
         "live": {
-            "recent_heading": "## Recent entries (2026-09-23 .. 2026-09-24)",
+            # Derived, not hardcoded: the window moves every time LIVE_CUTOFF is
+            # bumped, and a pinned literal made --verify fail on the next re-cut.
+            "recent_heading": (
+                "## Recent entries ("
+                + min(entry["date"] for entry in live_entries)
+                + " .. "
+                + max(entry["date"] for entry in live_entries)
+                + ")"
+            ),
             "apply_time_entry_count": len(live_entries),
             "apply_time_bytes_lf": byte_count(live_text),
             "tail_marker": TAIL_MARKER,
@@ -394,8 +446,16 @@ def main_apply(
     for rel, text in shard_texts.items():
         if not text.startswith(shard_header(Path(rel).stem)):
             raise RuntimeError(f"bad planned header: {rel}")
-    if live_text.count("## Recent entries (2026-09-23 .. 2026-09-24)") != 1:
-        raise RuntimeError("planned live recent heading missing")
+    _live_dates = [entry["date"] for entry in live_entries]
+    _expected_heading = (
+        "## Recent entries ("
+        + (min(_live_dates) if _live_dates else "none")
+        + " .. "
+        + (max(_live_dates) if _live_dates else "none")
+        + ")"
+    )
+    if live_text.count(_expected_heading) != 1:
+        raise RuntimeError(f"planned live recent heading missing: {_expected_heading}")
     if TAIL_MARKER not in live_text:
         raise RuntimeError("planned live tail missing")
     for rel, text in shard_texts.items():
@@ -512,10 +572,19 @@ def main() -> None:
         help="rebuild this resplit from a committed pre-split source, then verify",
     )
     group.add_argument("--verify", action="store_true", help="verify the applied split")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "allow --apply to supersede an existing manifest and re-shard shards it "
+            "would regenerate. Shards NOT regenerated by this run are recorded as "
+            "preexisting and verified byte-exact, so this is a re-cut, not a merge."
+        ),
+    )
     parser.add_argument("--git-ref", default="HEAD", help="git ref used by --repair-from-git")
     args = parser.parse_args()
     if args.apply:
-        main_apply()
+        main_apply(overwrite_resplit=args.overwrite)
     elif args.repair_from_git:
         if not MANIFEST.exists():
             raise SystemExit("ABORT: --repair-from-git requires the failed resplit manifest")
