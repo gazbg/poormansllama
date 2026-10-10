@@ -1333,6 +1333,10 @@ struct LLAMA_API llama_layer_streaming {
     // 2=ABSENT). ABSENT cannot occur post-staging; the default of 2 makes a
     // read before any load fail loudly instead of pretending READY.
     std::vector<std::vector<uint8_t>> row_set_state;
+    // per layer, per expert: 1 when the slot slab holds this expert for the consume
+    // that follows the layer's last load. Independent of row_set_state on purpose:
+    // the executor checks it for every row the device leg reads
+    std::vector<std::vector<uint8_t>> row_set_fresh;
     // T-GPLR-61 S4: the ls_evaluate_gate verdict for the layer's last load,
     // stashed so the executor's ls_plan_split and the layer_compute record
     // see the SAME evaluation the wait decision used.

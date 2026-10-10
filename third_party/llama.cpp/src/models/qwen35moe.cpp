@@ -532,6 +532,10 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                 }
                 cb(w_full, "ffn_moe_weights_split", il);
 
+                // kept alive and named so the executor can scan the activation both legs read
+                ggml_set_name(cur, "split_ffn_in");
+                ggml_set_output(cur);
+
                 // T-GPLR-82 FALSIFIER: WHICH SIDE OF THE ROW EACH LEG TAKES. The shipped
                 // split is head-at-0 plus a host tail in the SUFFIX. A suffix view cannot be
                 // expressed here: ggml bounds-checks a view as data_size + view_offs <=
@@ -558,6 +562,8 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                     : nullptr;
 
                 ggml_tensor * dev_out = build_layer_ffn(cur, il, sel_head, pos_head, w_dev, dev_rows);
+                ggml_set_name(dev_out, "split_dev_out");
+                ggml_set_output(dev_out);
                 ggml_tensor * host_out;
                 if (tail_device) {
                     // T-GPLR-82 FALSIFIER: the SAME positional suffix, weights, and
@@ -586,10 +592,31 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                         ggml_view_3d(ctx0, w_full, 1, host_rows, n_tokens,
                                      w_full->nb[1], w_full->nb[2], (size_t) dev_rows * w_full->nb[1]),
                         host_rows);
+                    // diagnostic: recompute the same suffix rows on the device next to the CPU leg; observed only, never summed
+                    static const bool host_shadow = getenv("LLAMA_LS_HOST_SHADOW") != nullptr;
+                    if (host_shadow && n_tokens == 1) {
+                        ggml_tensor * sel_sfx = ggml_view_2d(ctx0, sel_in, host_rows, n_tokens, sel_in->nb[1], (size_t) dev_rows * sel_in->nb[0]);
+                        ggml_tensor * w_sfx = ggml_view_3d(ctx0, w_full, 1, host_rows, n_tokens, w_full->nb[1], w_full->nb[2], (size_t) dev_rows * w_full->nb[1]);
+                        ggml_tensor * shadow = build_moe_tail_leg_device(cur, il, sel_sfx, nullptr, w_sfx, host_rows);
+                        ggml_set_name(shadow, "split_shadow_out");
+                        ggml_set_output(shadow);
+                        ggml_build_forward_expand(gf, shadow);
+                        ggml_set_name(host_out, "split_host_out");
+                        ggml_set_output(host_out);
+                        ggml_tensor * ref_full = build_layer_ffn(cur, il, sel_in, nullptr);
+                        ggml_set_name(ref_full, "split_ref_out");
+                        ggml_set_output(ref_full);
+                        ggml_build_forward_expand(gf, ref_full);
+                    }
                 }
                 cur = ggml_add(ctx0, dev_out, host_out);
                 cb(cur, "ffn_out", il);
             } else {
+                static const bool flow_diag = getenv("LLAMA_LS_HOST_SHADOW") != nullptr;
+                if (flow_diag) {
+                    ggml_set_name(cur, "split_ffn_in");
+                    ggml_set_output(cur);
+                }
                 cur = build_layer_ffn(cur, il, sel_in, window_live ? sel_pos_in : nullptr);
                 cb(cur, "ffn_out", il);
             }

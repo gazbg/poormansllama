@@ -4567,6 +4567,105 @@ static ggml_status ls_shape_failure(llama_layer_streaming * ls, std::string msg)
 // aggregate cannot attribute a bad value to a row, so the scan is per row
 // and the expert ID is read back from the hsel input that selected it.
 // Flag absent -> no stash, no read, no sync: AC6 inertness.
+// A persistent graph keeps the node addresses of its first allocation (ggml-alloc treats data != NULL as external),
+// but the scheduler plans its CPU<->device copy tensors fresh on every run and can place them over those frozen nodes.
+// Clearing the computed nodes lets every run plan the whole graph again
+static void ls_reset_graph_allocs(ggml_cgraph * g) {
+    for (int i = 0; i < g->n_nodes; ++i) {
+        ggml_tensor * t = g->nodes[i];
+        if (t->view_src == nullptr && t->op != GGML_OP_NONE && !(t->flags & GGML_TENSOR_FLAG_INPUT)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+    }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        ggml_tensor * t = g->nodes[i];
+        if (t->view_src != nullptr && t->view_src->data == nullptr) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+    }
+}
+
+// first non-finite element of a named F32 tensor in the layer's FFN graph; empty when all finite or the tensor is absent
+static std::string ls_first_nonfinite(ggml_cgraph * g, const char * name) {
+    ggml_tensor * t = g != nullptr ? ggml_graph_get_tensor(g, name) : nullptr;
+    if (t == nullptr || t->buffer == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+        return std::string();
+    }
+    std::vector<float> buf((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+    for (size_t i = 0; i < buf.size(); ++i) {
+        if (!std::isfinite(buf[i])) {
+            return std::string(name) + " col " + std::to_string(i % (size_t) t->ne[0]) + " token " + std::to_string(i / (size_t) t->ne[0]);
+        }
+    }
+    return std::string();
+}
+
+// diagnostic (LLAMA_LS_HOST_SHADOW): compare the CPU leg with a device recompute of the same rows
+static void ls_report_host_shadow(llama_layer_streaming * ls, ggml_cgraph * g, int il) {
+    ggml_tensor * h = ggml_graph_get_tensor(g, "split_host_out");
+    ggml_tensor * s = ggml_graph_get_tensor(g, "split_shadow_out");
+    if (h == nullptr || s == nullptr || h->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 ||
+        ggml_nelements(h) != ggml_nelements(s) || !ggml_is_contiguous(h) || !ggml_is_contiguous(s)) {
+        return;
+    }
+    std::vector<float> a((size_t) ggml_nelements(h)), b((size_t) ggml_nelements(s));
+    ggml_backend_tensor_get(h, a.data(), 0, a.size() * sizeof(float));
+    ggml_backend_tensor_get(s, b.data(), 0, b.size() * sizeof(float));
+    double dmax = 0.0, rmax = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dmax = std::max(dmax, (double) std::fabs(a[i] - b[i]));
+        rmax = std::max(rmax, (double) std::fabs(b[i]));
+        dot += (double) a[i] * b[i];
+        na  += (double) a[i] * a[i];
+        nb  += (double) b[i] * b[i];
+    }
+    const double rel  = rmax > 0.0 ? dmax / rmax : dmax;
+    const double cosv = (na > 0.0 && nb > 0.0) ? dot / std::sqrt(na * nb) : 1.0;
+    static int64_t cur_ub = -1;
+    static double  ub_rel = 0.0, ub_cos = 1.0;
+    static int     ub_layer = -1, n_detail = 0;
+    const int64_t ub = (int64_t) ls->n_ubatches;
+    if (ub != cur_ub) {
+        cur_ub = ub; ub_rel = 0.0; ub_cos = 1.0; ub_layer = -1;
+    }
+    if (rel > ub_rel) {
+        ub_rel = rel; ub_layer = il;
+    }
+    ub_cos = std::min(ub_cos, cosv);
+    if ((rel > 0.05 || ub <= 4) && n_detail < 320 && (il % 8 == 0)) {
+        n_detail++;
+        LLAMA_LOG_WARN("host-shadow detail ubatch %lld layer %d rel %.3e cos %.6f |host| %.3e |dev| %.3e\n",
+                       (long long) ub, il, rel, cosv, std::sqrt(na), std::sqrt(nb));
+    }
+    if (il % 8 == 0 && ub <= 5) {
+        auto rd = [&](const char * nm, std::vector<float> & v) {
+            ggml_tensor * t = ggml_graph_get_tensor(g, nm);
+            if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) { return false; }
+            v.resize((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+            return true;
+        };
+        std::vector<float> rf, dv;
+        if (rd("split_ref_out", rf) && rd("split_dev_out", dv) && rf.size() == dv.size() && rf.size() == a.size()) {
+            auto cosf = [&](const std::vector<float> & x, const std::vector<float> & y) {
+                double d = 0, nx = 0, ny = 0;
+                for (size_t i = 0; i < x.size(); ++i) { d += (double) x[i] * y[i]; nx += (double) x[i] * x[i]; ny += (double) y[i] * y[i]; }
+                return (nx > 0 && ny > 0) ? d / std::sqrt(nx * ny) : 0.0;
+            };
+            std::vector<float> sh(a.size()), sd(a.size());
+            double nref = 0;
+            for (size_t i = 0; i < a.size(); ++i) { sh[i] = dv[i] + a[i]; sd[i] = dv[i] + b[i]; nref += (double) rf[i] * rf[i]; }
+            LLAMA_LOG_WARN("ref-check ubatch %lld layer %d |ref| %.4e cos(ref,dev+host) %.6f cos(ref,dev+shadow) %.6f cos(ref,dev) %.6f\n", (long long) ub, il, std::sqrt(nref), cosf(rf, sh), cosf(rf, sd), cosf(rf, dv));
+        }
+    }
+    if (il == ls->n_layer - 1) {
+        LLAMA_LOG_WARN("host-shadow ubatch %lld max_rel %.3e at layer %d min_cos %.6f\n", (long long) ub, ub_rel, ub_layer, ub_cos);
+    }
+}
+
 static ggml_status scan_host_expert_outputs(llama_layer_streaming * ls, llama_layer_streaming::graph_set * set,
                                             int il, int64_t n_tok, int & host_finite) {
     ggml_tensor * hex = nullptr;
@@ -4590,6 +4689,17 @@ static ggml_status scan_host_expert_outputs(llama_layer_streaming * ls, llama_la
         return ls_shape_failure(ls, "layer_streaming_compute: host-leg id input missing at scan for layer " +
                                     std::to_string(il));
     }
+    // the CPU quantized matmul turns a NaN activation block into zeros, so the output rows alone cannot see a bad input
+    static const char * const kGuardedTensors[2] = { "split_ffn_in", "split_dev_out" };
+    for (const char * nm : kGuardedTensors) {
+        const std::string where = ls_first_nonfinite(set->ff_graphs[(size_t) il], nm);
+        if (!where.empty()) {
+            ls->error_msg = "layer_streaming_compute: non-finite split FFN tensor " + where + " at layer " + std::to_string(il);
+            host_finite = 1;
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+    ls_report_host_shadow(ls, set->ff_graphs[(size_t) il], il);
     const int64_t ne0 = hex->ne[0], ne1 = hex->ne[1];
     std::vector<float> rowbuf;
     const float * rows = nullptr;
@@ -4925,6 +5035,22 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             if (!should_exec(il)) {
                 continue;
             }
+            // diagnostic (LLAMA_LS_HOST_SHADOW): norm of the activation slots entering this layer
+            static const bool act_diag = getenv("LLAMA_LS_HOST_SHADOW") != nullptr;
+            if (act_diag && (il == 0 || il == 1) && ls->n_ubatches <= 5) {
+                for (int ai = 0; ai < 2; ++ai) {
+                    ggml_tensor * at = set->act[ai];
+                    double nrm = -1.0;
+                    if (at != nullptr && at->type == GGML_TYPE_F32) {
+                        std::vector<float> v((size_t) ggml_nelements(at));
+                        ggml_backend_tensor_get(at, v.data(), 0, v.size() * sizeof(float));
+                        nrm = 0.0;
+                        for (float x : v) { nrm += (double) x * x; }
+                        nrm = std::sqrt(nrm);
+                    }
+                    LLAMA_LOG_WARN("act-check ubatch %llu before layer %d act[%d] type %d |x| %.4e\n", (unsigned long long) ls->n_ubatches, il, ai, at ? (int) at->type : -1, nrm);
+                }
+            }
             // part A: attention + residual + post-norm + router (graphs[1+il])
             double attn_compute_us = 0.0, attn_setup_us = 0.0;
             const auto st_a = run_graph_plain(graphs[1 + il], attn_compute_us, attn_setup_us);
@@ -5111,6 +5237,25 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                        ids_per_token[(size_t) t].data(), (size_t) n_used * sizeof(int32_t));
             }
 
+            // the device leg reads the first n_used - experts_host_n positions: each must hold a slab this round wrote
+            if (host_leg_built) {
+                const int64_t n_dev = n_used - ls->experts_host_n;
+                const std::vector<uint8_t> & fresh = ls->row_set_fresh[(size_t) il];
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    for (int64_t k = 0; k < n_dev; ++k) {
+                        const int32_t e = ids_per_token[(size_t) t][(size_t) k];
+                        if (e < 0 || (size_t) e >= fresh.size() || !fresh[(size_t) e]) {
+                            ls->error_msg = "layer_streaming_compute: expert " + std::to_string(e) + " of layer " +
+                                            std::to_string(il) + " token " + std::to_string(t) + " position " +
+                                            std::to_string(k) + " would be read by the device leg but its slot slab was not written this round";
+                            ls->failed = true;
+                            ls->tel_error(ls->error_msg.c_str());
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                }
+            }
+
             // T-GPLR-62 S2: the SAME experts, re-expressed as positions in the
             // window that load_row_set just staged. The table is host-side and
             // was reset to -1 in full for this window, so a -1 here means the
@@ -5241,8 +5386,43 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 experts_host = experts_total;
             }
 
+            if (act_diag && (il == 0 || il == 8) && ls->n_ubatches <= 5) {
+                ggml_tensor * rt = set->act[(il + 1) & 1];
+                double nrm = -1.0;
+                if (rt != nullptr && rt->type == GGML_TYPE_F32) {
+                    std::vector<float> v((size_t) ggml_nelements(rt));
+                    ggml_backend_tensor_get(rt, v.data(), 0, v.size() * sizeof(float));
+                    nrm = 0.0;
+                    for (float x : v) { nrm += (double) x * x; }
+                    nrm = std::sqrt(nrm);
+                }
+                LLAMA_LOG_WARN("resid-check ubatch %llu layer %d |residual before part B| %.4e\n", (unsigned long long) ls->n_ubatches, il, nrm);
+                if (nrm > 0.0) {
+                    std::vector<float> xv((size_t) ggml_nelements(rt));
+                    ggml_backend_tensor_get(rt, xv.data(), 0, xv.size() * sizeof(float));
+                    const ggml_tensor * wt = ls->model_ref->layers[il].attn_post_norm;
+                    if (wt != nullptr && wt->type == GGML_TYPE_F32 && (size_t) ggml_nelements(wt) == xv.size()) {
+                        std::vector<float> wv(xv.size());
+                        ggml_backend_tensor_get(wt, wv.data(), 0, wv.size() * sizeof(float));
+                        double ms = 0.0;
+                        for (float x : xv) { ms += (double) x * x; }
+                        ms /= (double) xv.size();
+                        for (int e = 0; e < 3; ++e) {
+                            const double eps = e == 0 ? 1e-6 : (e == 1 ? 1e-2 : 1.0);
+                            const double sc = 1.0 / std::sqrt(ms + eps);
+                            double acc = 0.0;
+                            for (size_t k = 0; k < xv.size(); ++k) { const double y = (double) xv[k] * sc * wv[k]; acc += y * y; }
+                            LLAMA_LOG_WARN("norm-predict ubatch %llu layer %d eps %.0e -> |cur| %.4e\n", (unsigned long long) ls->n_ubatches, il, eps, std::sqrt(acc));
+                        }
+                    }
+                }
+            }
             // part B: FFN + shared experts on the staged rows (ff_graphs[il])
             double ffn_compute_us = 0.0, ffn_setup_us = 0.0;
+            static const bool no_reset = getenv("LLAMA_LS_TEST_NO_ALLOC_RESET") != nullptr;
+            if (host_leg_built && !no_reset) {
+                ls_reset_graph_allocs(set->ff_graphs[(size_t) il]);
+            }
             const auto st_b = run_graph_plain(set->ff_graphs[(size_t) il], ffn_compute_us, ffn_setup_us);
             if (st_b != GGML_STATUS_SUCCESS) {
                 ls->tel_error(ls->error_msg.c_str());
@@ -5250,6 +5430,80 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             }
             const int ffn_dev = ls_classify_graph_backend(set->ff_graphs[(size_t) il]);
             ls->accum_graph_ops(set->ff_graphs[(size_t) il], false);
+            // diagnostic (LLAMA_LS_HOST_SHADOW): the ids the graph SAW in hsel after compute versus the ids written before it
+            static const bool host_ids_check = getenv("LLAMA_LS_HOST_SHADOW") != nullptr;
+            if (host_ids_check) {
+                const int64_t hn = host_leg_built ? ls->experts_host_n : 0;
+                ggml_tensor * hs = host_leg_built ? set->ff_input_hsel[(size_t) il] : nullptr;
+                std::vector<int32_t> got((size_t) (hn * n_tok));
+                if (host_leg_built) {
+                    ggml_backend_tensor_get(hs, got.data(), 0, got.size() * sizeof(int32_t));
+                }
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    for (int64_t k = 0; k < hn; ++k) {
+                        const int32_t want = ids_per_token[(size_t) t][(size_t) (n_used - hn + k)];
+                        if (got[(size_t) (t * hn + k)] != want) {
+                            LLAMA_LOG_WARN("host-ids MISMATCH ubatch %llu layer %d token %lld k %lld want %d got %d hsel->data=%p buf=%p\n",
+                                           (unsigned long long) ls->n_ubatches, il, (long long) t, (long long) k, want,
+                                           got[(size_t) (t * hn + k)], (void *) hs->data, (void *) hs->buffer);
+                        }
+                    }
+                }
+                if (il % 8 == 0 && ls->n_ubatches <= 5) {
+                    char wn[64];
+                    snprintf(wn, sizeof(wn), "ffn_moe_weights_split-%d", il);
+                    ggml_cgraph * fg = set->ff_graphs[(size_t) il];
+                    ggml_tensor * tin = ggml_graph_get_tensor(fg, "split_ffn_in");
+                    ggml_tensor * tw  = ggml_graph_get_tensor(fg, wn);
+                    ggml_tensor * tdo = ggml_graph_get_tensor(fg, "split_dev_out");
+                    double nin = -1.0, ndo = -1.0;
+                    float ws[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+                    if (tin != nullptr && tin->type == GGML_TYPE_F32) {
+                        std::vector<float> v((size_t) ggml_nelements(tin));
+                        ggml_backend_tensor_get(tin, v.data(), 0, v.size() * sizeof(float));
+                        nin = 0.0;
+                        for (float x : v) { nin += (double) x * x; }
+                        nin = std::sqrt(nin);
+                    }
+                    if (tdo != nullptr && tdo->type == GGML_TYPE_F32) {
+                        std::vector<float> v((size_t) ggml_nelements(tdo));
+                        ggml_backend_tensor_get(tdo, v.data(), 0, v.size() * sizeof(float));
+                        ndo = 0.0;
+                        for (float x : v) { ndo += (double) x * x; }
+                        ndo = std::sqrt(ndo);
+                    }
+                    if (tw != nullptr && tw->type == GGML_TYPE_F32 && ggml_nelements(tw) >= 8) {
+                        ggml_backend_tensor_get(tw, ws, 0, sizeof(ws));
+                    }
+                    LLAMA_LOG_WARN("flow-check ubatch %llu layer %d |cur| %.4e |dev_out| %.4e w %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                                   (unsigned long long) ls->n_ubatches, il, nin, ndo, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], ws[6], ws[7]);
+                }
+                // compare the CPU leg's bank bytes with the slot bytes for the suffix experts of token 0
+                if (host_leg_built && il % 8 == 0 && ls->n_ubatches <= 5) {
+                    const llama_layer & sl = ls->slot_layer(il);
+                    const llama_layer & hl = ls->model_ref->layers[il];
+                    const ggml_tensor * hm[3] = { hl.ffn_gate_exps, hl.ffn_up_exps, hl.ffn_down_exps };
+                    const ggml_tensor * sm[3] = { sl.ffn_gate_exps, sl.ffn_up_exps, sl.ffn_down_exps };
+                    for (int64_t k = 0; k < hn; ++k) {
+                        const int32_t e = ids_per_token[0][(size_t) (n_used - hn + k)];
+                        for (int mi = 0; mi < 3; ++mi) {
+                            if (hm[mi] == nullptr || sm[mi] == nullptr) {
+                                continue;
+                            }
+                            const size_t slab = ggml_row_size(hm[mi]->type, hm[mi]->ne[0]) * (size_t) hm[mi]->ne[1];
+                            std::vector<uint8_t> hb(256), sb(256);
+                            const bool host_ok = hm[mi]->buffer != nullptr && ggml_backend_buffer_is_host(hm[mi]->buffer);
+                            if (host_ok) {
+                                memcpy(hb.data(), (const uint8_t *) hm[mi]->data + (size_t) e * slab, 256);
+                            }
+                            ggml_backend_tensor_get(sm[mi], sb.data(), (size_t) e * slab, 256);
+                            LLAMA_LOG_WARN("bank-check ubatch %llu layer %d expert %d member %d host_ptr=%p host_ok=%d slab_match=%d\n",
+                                           (unsigned long long) ls->n_ubatches, il, e, mi, (void *) hm[mi]->data, (int) host_ok,
+                                           (int) (host_ok && memcmp(hb.data(), sb.data(), 256) == 0));
+                        }
+                    }
+                }
+            }
 
             // slot lifecycle: part B consumed this slot generation; part A's
             // attention weights are model-resident (no slot ownership)
@@ -9886,6 +10140,7 @@ bool llama_layer_streaming::begin_row_set() {
     // allocation is loud here, mid-run would be worse.
     row_set_outstanding.assign(slots.size(), std::vector<uint8_t>(n_exp, 0));
     row_set_state.assign(n_layer, std::vector<uint8_t>((size_t) n_exp, 2)); // ABSENT until a load writes it
+    row_set_fresh.assign(n_layer, std::vector<uint8_t>((size_t) n_exp, 0));
     row_set_gate_open.assign(n_layer, 0);
     row_set_gate_host_us.assign(n_layer, 0.0);
     row_set_gate_wait_us.assign(n_layer, 0.0);
@@ -10829,6 +11084,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         }
         cache_view_used += n_views;
 
+        std::fill(row_set_fresh[(size_t) il].begin(), row_set_fresh[(size_t) il].end(), 0);
         ggml_backend_event_record((ggml_backend_event_t) slot.ev_copy_start, backend_copy);
         const int64_t t_submit0 = ggml_time_us();
         size_t bytes_staged = 0;
@@ -10950,6 +11206,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                     return false;
                 }
                 ggml_backend_tensor_copy_async(backend_copy, backend_compute, v_src, v_dst);
+                row_set_fresh[(size_t) il][(size_t) uniq[i]] = 1;
             }
         }
 
@@ -10993,8 +11250,12 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
             std::vector<uint8_t> & stt = row_set_state[(size_t) il];
             std::fill(stt.begin(), stt.end(), (uint8_t) 2);
             const std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+            // a row admitted to the host leg had its slot refresh skipped, whatever a later wait did to outst
+            // LLAMA_LS_TEST_LEGACY_S3_STATE restores the old outst-only rule so the freshness guard can be shown to fire
+            static const bool legacy_state = getenv("LLAMA_LS_TEST_LEGACY_S3_STATE") != nullptr;
             for (int32_t e : uniq) {
-                stt[(size_t) e] = outst[(size_t) e] ? (uint8_t) 1 : (uint8_t) 0;
+                const bool skipped = !legacy_state && s3_split_run && s3_host_row[(size_t) e] && !s3_wait_row[(size_t) e];
+                stt[(size_t) e] = (skipped || outst[(size_t) e]) ? (uint8_t) 1 : (uint8_t) 0;
             }
         }
 
@@ -11255,8 +11516,11 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         std::vector<uint8_t> & stt = row_set_state[(size_t) il];
         std::fill(stt.begin(), stt.end(), (uint8_t) 2);
         const std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+        std::vector<uint8_t> & fresh = row_set_fresh[(size_t) il];
+        std::fill(fresh.begin(), fresh.end(), 0);
         for (int32_t e : uniq) {
             stt[(size_t) e] = outst[(size_t) e] ? 1 : (have[(size_t) e] ? 0 : 2);
+            fresh[(size_t) e] = stt[(size_t) e] == 0 ? 1 : 0;
         }
     }
 
