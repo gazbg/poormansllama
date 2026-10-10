@@ -1,17 +1,17 @@
 # Current State
 
-## How this file is organised (resplit 2026-09-24)
+## How this file is organised (resplit 2026-10-10)
 
 This is the canonical current-state record. The initial split on 2026-09-18
 moved old entries into searchable shards after `docs/currentstate.md` passed
-lean-ctx's per-file search cap. The 2026-09-24 resplit applies the same
+lean-ctx's per-file search cap. The 2026-10-10 resplit applies the same
 rule again: recent dated entries stay live, older dated entries move verbatim
 into per-day shards, and this file keeps a derived index plus the non-entry
 risk tail.
 
-- **Recent entries** (2026-09-23 .. 2026-09-24) stay in this file, below.
-- **Everything older** (2026-08-18 .. 2026-09-22) lives in the indexed shards:
-  `docs/currentstate/2026-08-18-and-earlier.md`, `docs/currentstate/2026-08-20..2026-09-11.md`, `docs/currentstate/2026-09-12..2026-09-13.md`, `docs/currentstate/2026-09-14.md`, `docs/currentstate/2026-09-15..2026-09-16.md`, `docs/currentstate/2026-09-17.md`, `docs/currentstate/2026-09-18.md`, `docs/currentstate/2026-09-19.md`, `docs/currentstate/2026-09-20.md`, `docs/currentstate/2026-09-21.md`, `docs/currentstate/2026-09-22.md`.
+- **Recent entries** (2026-10-03 .. 2026-10-10) stay in this file, below.
+- **Everything older** (2026-08-18 .. 2026-10-02) lives in the indexed shards:
+  `docs/currentstate/2026-08-18-and-earlier.md`, `docs/currentstate/2026-08-20..2026-09-11.md`, `docs/currentstate/2026-09-12..2026-09-13.md`, `docs/currentstate/2026-09-14.md`, `docs/currentstate/2026-09-15..2026-09-16.md`, `docs/currentstate/2026-09-17.md`, `docs/currentstate/2026-09-18.md`, `docs/currentstate/2026-09-19.md`, `docs/currentstate/2026-09-20.md`, `docs/currentstate/2026-09-21.md`, `docs/currentstate/2026-09-22.md`, `docs/currentstate/2026-09-23.md`, `docs/currentstate/2026-09-24.md`, `docs/currentstate/2026-09-25.md`, `docs/currentstate/2026-10-01.md`, `docs/currentstate/2026-10-02.md`.
 - **Current state that is not an entry** -- "Known gaps / risks" and
   "Blocked / escalated" -- stays at the bottom of this file.
 - New entries are added at the top of the "Recent entries" block. Existing
@@ -20,562 +20,1539 @@ risk tail.
 - The split is mechanically checked with
   `python tools/resplit-currentstate.py --verify`. The apply-time source hash,
   entry hashes, shard bodies and dispositions are recorded in
-  `docs/currentstate/resplit-manifest-2026-09-24.json`. Prefer `rg` across
+  `docs/currentstate/resplit-manifest-2026-10-10.json`. Prefer `rg` across
   `docs/currentstate/` when the date is unknown.
 
-## Recent entries (2026-09-23 .. 2026-09-24)
+## Recent entries (2026-10-03 .. 2026-10-10)
 
-## 2026-09-25: T-GPLR-59 D1 adversarial closure; parser and teardown gaps fixed
+## 2026-10-10 (host-only, no GPU hold): `docs/currentstate.md` resplit into verbatim shards -- search no longer skips it; `--verify` PASS, 69 entries hash-exact
 
-**Audit finding and repair.** Host-only adversarial probes found that `tg59_d1.py` accepted out-of-order `d1_pair` records and duplicate `tg_tokens`, did not require a complete runtime lifecycle, and could score an empty runtime trace. The D1 replay now requires stable run identity, monotonic `(round, draft_index, layer)` order, and the declared layer bound when `n_layer` is present. The runtime reader now rejects malformed events, duplicate lifecycle events, missing or out-of-order run phases, negative counters, empty demand streams, and missing speculative events. The D-gate accepts a session manifest only when every leg maps to a clean same-session wrapper verdict with one source/binary/library identity and one normalized command; it cannot PASS without a measured non-negative spread.
+**Why.** `docs/currentstate.md` was 499,217 B, past the guard's 480,000 B FAIL band and at/over the observed per-file `ctx_search` cap, so a search for text known to be in the file returned "1 large file skipped" instead of matches -- the canonical current-state record was invisible to search.
 
-**Runtime cleanup/atomicity repair.** `d1_observe_round()` now validates every accepted flag, captured layer vector, and route width before emitting or learning any pair, so a late shape error cannot partially train the table. `spec_reset()` now releases D1 table/transient capture state at teardown. `d1_shape` now records `n_layer` for new traces. These are host/build changes; no new GPU/model run was performed.
+**What was done.** `tools/resplit-currentstate.py` with cutoff `2026-10-03`: entries dated 2026-10-03 .. 2026-10-10 stay live; **51 older entries moved verbatim** into three new per-day shards (`2026-09-25.md`, `2026-10-01.md`, `2026-10-02.md`); the live file keeps a derived index (281 rows) plus the non-entry "Known gaps / risks" and "Blocked / escalated" tail, unchanged. Manifest `docs/currentstate/resplit-manifest-2026-10-10.json`; method recorded in `docs/AGENT_ENVIRONMENT.md`, "Where current state lives".
 
-**Validation (measured).** `python tools/tg59_d1.py --selftest` and the class-D checker each passed 18 checks; the general checker passed 96 checks; mode-2 passed 7/7; focused CTest passed 3/3; Python compilation and both `git diff --check` commands passed. The broader host suite was also attempted; it stopped at the unrelated predictor-port self-test because its pinned reference `tools/predictor-screen-gplr.py` is absent, before reaching the D1 cases. The eight canonical traces still replay at D1 coverage 0.1664 and null 0.0153. The repaired D-gate with `build/llama-cuda/gplr59-d-gate-session-1536-r4.json` verified the recorded binary/provenance identity, but correctly returned FAIL with `session spread is unmeasured`; the old zero-gain result remains a FAIL, not a PASS. The generated manifest and audit JSON are build artifacts, not versioned evidence.
+**Leftover disposition (owner-approved; recorded because it touched history).** The live file still held two 2026-09-24 entries and `docs/currentstate/2026-09-24.md` already existed, so the archiver would either ABORT or (with `--overwrite`) regenerate that shard from only those two entries and destroy the other 16. Measured at body level first: the live `T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS` copy was **byte-identical** (sha `577d1141bc9c8ba7`, 4,078 B) to the shard's copies, so the live duplicate was **dropped** and the shard's own duplicate copy removed with it; `2026-09-24 - Nested engine rebuild and host-suite provenance recheck` (sha `3ea1eb9535bd9080`, 3,116 B) existed **only** in the live file and was carried into the shard **verbatim**. Reconciliation: 57,602 B -> 56,640 B = **-4,078 + 3,116**, exact.
 
-**Residual gap.** The final session has no repeated-control spread and the required semantic-QA ladder remains unrecorded. Do not describe this D-gate as a complete positive-gate validation until both are supplied. D1 still has no demonstrated runtime benefit.
+**Evidence.** `python tools/resplit-currentstate.py --verify` -> **PASS, exit 0**: apply-time source 492,021 B sha `982362a4a8464310c94b48bedbfce6b0296571617a998fe61ede875434cffeb4`; 13 preexisting shards byte-exact; 3 new shards body-exact; **69 entries present and hash-exact**; 281 index rows derived from every shard; live **171,620 B** (LF-normalised, the figure `--verify` prints). On disk the live file is 173,416 B in CRLF (1,796 lines, so the same content; the repo line-ending convention is preserved) -- **35.8% of the FAIL band**. **Search verified through the interface, not inferred:** `ctx_search` now returns the 2026-10-10 A2 lead paragraph at `docs/currentstate.md:28`, returns the moved `Nested engine rebuild` entry at `docs/currentstate/2026-09-24.md:185`, and an unscoped search no longer lists a skipped large file.
 
-## 2026-09-25: T-GPLR-59 D1 same-session MTP frontier completes; proposal precision positive, runtime D-gate FAIL
+**Guard.** `python tools/check-doc-sizes.py` still exits 1, but no longer because of this file: `docs/currentstate.md` is out of the band (FAIL and WARN both cleared). The remaining **FAIL** is `docs/plans/generic-prefill-layer-residency-plan.md` (485,036 B) and the new **WARN** is `docs/plans/generic-prefill-layer-residency-archive.md` (353,234 B) -- both pre-existing and outside this change, both with a documented splitter (`tools/resplit-gplr-plan.py`).
 
-**Original goal and idea.** The owner asked whether D1, which predicts expert rows from the token proposed by Qwen3.6's MTP draft head, adds cache demand-hit value beyond the best predictor that only sees past routes. The pre-registered D-gate required D1 to beat the same-session past-only frontier by more than session spread under count-matched nulls. This mattered because proposal accuracy alone is useless if the capacity planner cannot turn predictions into staged rows.
+**Known gaps / residual risk.** (1) The 3 new shards and both resplit manifests are **untracked** (only the 13 older shards are tracked), so the guard's 241-tracked-file scan does not cover them and a stray clean would delete them; no commit was authorised. (2) `docs/currentstate/2026-10-02.md` is **266,625 B** -- the largest shard, above the 250,000 B WARN band; a future re-cut should re-cut that day rather than assume it is safe. (3) The superseded `resplit-manifest-2026-10-02.json` still records `docs/currentstate/2026-09-24.md` at 57,602 B (stale after the dedupe) and stores **no** new-shard body hash, so its own `--verify` would fail on that row without naming the cause; `resplit-manifest-2026-10-10.json` is the live record.
 
-**How it works.** *D1* is a sparse online table keyed by proposed token and layer. *MTP* is the draft-head/target-verification loop. The *frontier* is the best measured past-only arm (`coact`, `bar09`, or `fusion`). A *count-matched null* publishes as many candidates as its paired arm but selects them without the arm's structure. *Demand-hit share* is resident demanded rows divided by all demanded rows. *Coverage* is correct predicted expert IDs divided by demand IDs; coverage is kept separate from demand-hit share.
 
-**Final GPU evidence (measured).** The final binary ran eight legs under `Global\AI-GPU-EXCLUSIVE-v1`: D1 arm/null plus `coact`, `bar09`, and `fusion` arm/null, all at 885 prompt tokens, 256 TG tokens, ctx 1,536, `--mtp --mtp-draft 2`, Q8 KV, K=4, budget 8, four slots, and `mmap-registered` staging. Every wrapper verdict passed with clean GPU pre/post; engine digest `20AE6C20E23C6B77`, runner `FC2D2F3CFDF02A1C`, `llama.dll C94E2FC79514EFA7`. Canonical traces and verdicts use `build/llama-cuda/gplr59-frontier-*-1536-r4.*`; the D-gate JSON is `build/llama-cuda/gplr59-d-gate-1536-r4.json`. All legs have identical MTP counters (174 drafted, 168 accepted), generated ids and row-demand stream.
+## 2026-10-10: T-GPLR-82 arm A2 corruption LOCALIZED -- the host leg is FINITE everywhere; the split moves step-0 logits by 0.16% and greedy decoding amplifies that into total divergence
 
-**D1 proposal evidence (measured, not a runtime win).** The pairing rate was 0.965517, above the 0.60 void rule. D1 replay published 29,120 candidates and hit 9,263 (0.1664 coverage); its count-matched null published 29,120 and hit 852 (0.0153), a +0.1511 coverage advantage. This confirms that proposed-token identity carries route signal.
+**Session** `gplr82-ac1-post` (exe `4412cc4a60309fd3`, `llama.dll` `2e96ab55278a9c9c` -- the binary with both halves of the S3 split-shape fix). Traces `build/llama-cuda/gplr82-ac1-post-arm-{A0,A0b,A2,A2d}.jsonl`, verdict `gplr82-ac1-post-verdict.json`. All from the recorded traces; **no new GPU arm was run**.
 
-**Runtime D-gate (measured FAIL).** Every arm submitted, consumed, cancelled, matched and waited on zero speculative rows. D1 arm/null, coact arm/null, bar09 arm/null and fusion arm/null all tied at 30,387 resident hits / 36,865 fetched rows = 0.451838 demand-hit share, 65,975,820,288 TG staged bytes, and 8,658,681,856 peak VRAM. Therefore D1's runtime gain and the best measured past-only runtime gain were both 0.000000. The host D-gate correctly returns exit 1 / `FAIL`: D1's proposal precision did not become cache demand-hit value and did not beat the frontier. D1 stops at 1,720 `no_free` stages and 1,760 proposal-exhausted stages; the past-only arms are similarly capacity-bound. Canonical report: `build/llama-cuda/gplr59-d-gate-1536-r4.json`.
+**1. The asked question -- which ops sit on which side (per layer, x40 layers, from the `graph_backend_ops` event).** A2's part B: HOST = `MUL_MAT_ID` x3 (gate/up/down for the 2 host rows) + `GLU` x1 + the host-side 6-element view of `sel_in` (`dst_off=24`, i.e. `dev_rows` ints); DEVICE = everything else, **including the whole weight derivation** (`GET_ROWS`, `SUM_ROWS`, `CLAMP`, `DIV` x1 each) and every weighting/sum (`MUL` x4, `ADD` x9, `VIEW` x10, `RESHAPE` x5, `RMS_NORM`, `SOFT_MAX`, `CPY`). `part_a_*` is **identical between A0 and A2**, so the attention path is untouched by the split. A0/A2d have `part_b_host == {}` -- no host leg at all.
 
-**Implementation and failure found.** Two stale restrictions had admitted only D1: the runner flag gate and an equivalent `llama-context.cpp` prebuild guard. Both were removed without changing routing, MTP acceptance or graph topology; past-only mode 2 continues to issue after each target demand, while D1 alone publishes pre-verify. The first coact r3 attempt failed before PP at the second guard, was not used as evidence, and was superseded by r4. The generic T-GPLR-58 checker now accepts D1's documented aggregate `prop <= arm_count` asymmetry while continuing to require exact equality for other arms.
+**2. The host leg is not the source. `host_finite = 0` (= every host per-row output FINITE; `bad.empty() ? 0 : 1`) on all 20,480 `layer_compute` records**, and the `host_finite == 1` abort never fired. It is 0 even on the **18,456** records where `experts_host == 0` (the plan admitted no host row), which is direct proof the fixed-width host leg executed with filler rows on every record. So no NaN/inf enters through the host leg, and the corruption lies OUTSIDE the region that guard covers.
 
-**Pros, cons, recommendation.** **Measured benefit:** D1 clearly learns useful proposed-future routing structure, the pairing gate is healthy, and the final gate prevents that signal from being overstated as runtime benefit. **Measured cost:** no speculative row was admitted, so D1 adds no cache hits or transfer reduction and the W=3/K=4 reserve leaves no usable opportunity. **Unproven:** a different capacity shape, prompt/model, or changed admission schedule might admit rows, but that would be a new pre-registered experiment. **Recommendation: discard D1 in this shape and do not adopt it.** Preserve the implementation and negative gate as evidence; do not increase retention or alter admission merely to force a positive result. Gates are soft, so the owner makes the final acceptance decision.
+**3. The divergence is numeric and present at step 0, with a measured drift floor of 0.0.** Step-0 readouts are **bit-identical** across A0, A0b and A2d (`top1_id 248046`, `top1_logit 16.194481`, `margin 0.524198`); **A2** reads the same `top1_id` with `top1_logit 16.167877`, `margin 0.511299` -- a **0.026604 (0.164%)** logit shift. Step 1 then leaves the control entirely (A0 `id 198 @ 33.641617` vs A2 `id 220 @ 13.967248`), and 506 of 512 steps go non-finite. Magnitude ~1.6e-3 is a *precision* signature, not a wrong-row or NaN signature (a wrong expert row moves logits by O(10%)).
 
-**Glossary.** *D-gate* means the pre-registered runtime comparison. *Frontier* means the best same-session past-only predictor. *Speculative row* means an expert weight copied into the row cache before a demand needs it. *Resident hit* means a demanded expert row already present in that cache. *Staged bytes* means host-to-device expert-row bytes actually transferred. *Peak VRAM* is maximum observed device-memory use during the run.
+**4. The row-cache collapse is an EFFECT, not the cause (checked to avoid a wrong attribution).** A2 fetches only **3,893** rows against A0/A2d's **94,671**, and reports **159,947** resident against 69,169 -- but token 0's fetch pattern is identical to A0 (320 fetched / 0 resident), tokens 1-5 differ only mildly (175 vs 152, 146 vs 234, ...), and the zero-fetch pattern (A2 **19,186/20,480** vs A0 232/20,480) accumulates only after the logits degenerate. Routing collapses because the hidden state blew up.
 
-## 2026-09-25: T-GPLR-59 D1 authorized MTP handoff arm/null run; pairing gate PASS, D-gate not yet established
+**5. Two hypotheses killed cheaply (recorded so they are not re-derived).** (a) *Omitted router bias*: this model has **no** `ffn_gate_inp_b` / `ffn_exp_probs_b` (no loader key exists; qwen35moe.cpp never binds one), so the split's `h_probs` and the unsplit path's `probs` are the same softmax; (b) *different weight derivation*: the split's gather/norm/scale is line-for-line the same order and the same `6.103515625e-5` clamp as `build_moe_ffn`'s `norm_w` block and the same `expert_weights_scale`, and both legs view ONE `w_full`.
 
-**Goal and execution mode.** The owner authorized one mutex-held D1 MTP handoff experiment after the host/runtime slice. Both legs used the same Qwen3.6-35B-A3B MTP model, 885-token prompt, 256 TG tokens, context 1,536, `--mtp --mtp-draft 2`, Q8 KV, four slots, `mmap-registered` staging, batch-major PP, and D1 retention K=4 with proposal budget 8. The `handoff_mode` resolved to `off` because MTP row-set TG owns the streaming executor; this is the supported MoE MTP path, not a plain-TG T-GPLR-58 leg, so those historical plain-TG results are not pooled with it. The first context-1,280 attempt was refused by the memory allocator after 87 MTP rounds and is superseded; the admissible evidence below is the context-1,536 pair.
+**Leading hypothesis (unproven, and the next check is named):** the split computes 2 of the 8 routed rows with the **CPU** dequant/accumulation and 6 with CUDA's, for a Q4_K_S bank; those are not bit-identical, so the split is not numerically equivalent to the unsplit FFN, and AC1's near-tie rule with a measured drift floor of **0.0** cannot excuse any of it. **Cheapest falsifier:** one arm executing the SAME 6/2 partition entirely on the device (or two device legs). Step-0 logits returning to `16.194481` exactly would confirm the CPU accumulation; a persistent shift would instead mean the host rows get wrong weights/ids. Note the contract consequence: if this holds, AC1 as written and a CPU host leg are in conflict.
 
-**What ran and identity.** Arm trace: `build/llama-cuda/gplr59-d1-arm-1536-r2.jsonl`; wrapper verdict `gplr59-d1-arm-1536-r2.verdict.json` PASS (0). Null trace: `build/llama-cuda/gplr59-d1-null-1536-r2.jsonl`; wrapper verdict `gplr59-d1-null-1536-r2.verdict.json` PASS (0). Both were run under `Global\AI-GPU-EXCLUSIVE-v1`; mutex acquired; GPU pre/post `clean`; source digest `6167A0D3B7302BE8`; runner `A5E43BDE5D0157A1`; `llama.dll` `E32332FEAB29B45B`; model artifact `C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`. The complete command is recorded in each verdict. The two legs produced identical `mtp` counters (174 drafted, 168 accepted, 0.9655), identical generated-token SHA-256 `9681e7060cce8256d9a15483b9c2ba498cfefd394c95cb992bc67aebd30aec9c`, and identical row-demand SHA-256 `022fab865f18662f034867fc1a244001ea72ceed28122d5f500961cc52a38e43`; output identity and demand stream therefore agree across arm/null.
+## 2026-10-10 (GPU held, mutex `Global\AI-GPU-EXCLUSIVE-v1`, gpu_pre/post clean): T-GPLR-82 -- the SPLIT POINT is fixed: the split graph is now built only when the mechanism can admit a row, restoring the closed-gate property (A2d becomes IDENTICAL to the control over 512 tokens); the remaining host-leg execution defect is thereby ISOLATED
 
-**D1 evidence (measured).** Each trace contains 87 MTP rounds, 6,960 `(draft token, layer)` pair rows, 2,548 rejected rows and 6,720 accepted rows: acceptance/pairing rate `0.965517`, above the pre-registered 0.60 void bar. The D1 host replay reports arm `29,120` published candidates, `9,263` hits, overall coverage `0.1664`, paired coverage `0.1723`; the count-matched null reports the same `29,120` published candidates, `852` hits, overall coverage `0.0153`, paired coverage `0.0158`. The arm-minus-null paired-coverage difference is `+0.1565` (`+15.65` percentage points), and the arm hit count is 10.87x the null hit count at the same recorded publication count. This is a strong D1-versus-count-matched-null signal for this one prompt/model/shape, not yet the D-gate: the D-gate requires comparison against the best past-only arm in the same MTP handoff session, and no such past-only MTP leg was run.
+**Task.** Owner-directed, following the AC1 FAIL of the previous entry and the falsification of the ordering/pairing hypothesis: make the graph's device/host split follow the plan's disposition instead of the configured width, so a closed gate reproduces the unsplit device leg, with a failing-first host-only test. Scope: the vendored tree, opt-in `--experts-host` path only.
 
-**Runtime/timing evidence (measured, soft).** Both legs exited 0, emitted `d1_shape`, `d1_pair`, `d1_summary`, `mtp`, `phase_summary`, and `run_end`, and reported `run_end.exit_status=0`, `failed=false`, peak VRAM `8,658,681,856` bytes. Each leg reported 256 generated tokens, 88 TG row-set rounds, 3,520 `rowset_fetch` events, and 3,480 `spec` events. Arm TG wall was 9.160 s (27.949 tok/s), null TG wall was 9.006 s (28.427 tok/s); this single pair is not a performance verdict. PP was 5.072 s arm / 5.092 s null. Both legs reported 65,975,820,288 staged bytes and the same byte-account configuration, including 2,291,531,776 bytes for the row cache. The D1 arm had no demand waits on speculative copies (`waited_by_demand=0`), and the pre-verify settle completed before target verification. The D1 generic `spec` event was corrected during this run so its aggregate `candidate_ids` is unique and its `prop` length matches that aggregate list; per-draft duplicates remain preserved in `d1_pair.predicted_ids`, and `arm_count` remains the pre-dedup count used by the count-matched null.
+**Mechanism, in one paragraph.** The split FFN graph fixed its widths at BUILD (`dev_rows = n_expert_used - host_rows`, `host_rows = ls->experts_host_n`, qwen35moe.cpp:435,441) and filled the host leg's id input UNCONDITIONALLY from the tail of the row. Whatever the plan decided, the shape committed `host_rows` rows per (layer, token) to the CPU. The plan needs `experts_host_budget_us > 0` before it can admit a single row (`s3`, load_row_set:10437-10443), so with the budget at its default 0 the split changed the arithmetic while the ledger honestly reported zero host rows. The fix makes the builder ask the same question the executor asks, via a new pure predicate.
 
-**Validation and decision boundary.** Focused rebuild passed; `test-layer-streaming-tg-predict`, layout, and TG-spec CTests passed; Python compilation, D1 checker self-test (9 checks), existing predictor self-test (92 checks), and both real D1 trace replays passed. The first two telemetry attempts were not treated as evidence: one had the aggregate duplicate-candidate schema defect, and one was the undersized-context failure. D2 and Class E remain parked. D1 is now **runtime-feasible and count-matched-null positive on the measured pairing/coverage slice**, but **not adopted and not D-gate complete** until a same-session past-only frontier comparison and a decision on whether the timing difference is meaningful are recorded.
+**Changes.** (1) `src/llama-expert-split-policy.h`: new `ls_split_enable` + pure `ls_split_in_play(e)`, carrying exactly the executor's admission conjuncts (width, budget, recon, spec_on, spec_mode, spec_arm, spec_pool) minus `per_token != nullptr`, which is a call-site property unknowable at build. (2) `src/models/qwen35moe.cpp`: the split branch is gated on that predicate, records `row_set_split_built[il]` behind a loud bounds check, and emits one `LLAMA_LOG_WARN` when the flag is set but the mechanism is off. (3) `src/llama-layer-streaming.{h,cpp}`: `row_set_split_built` sized in `init()`; the executor's four `experts_host_n > 0` gates and five telemetry ternaries now read that flag, so the two halves cannot disagree. (4) `tests/test-layer-streaming-expert-split.cpp`: three new test functions.
 
-**Glossary.** *D1* is the proposed-token expert predictor. *MTP* is the draft-head target-verification loop. *Pairing* means a drafted token has an accepted target draft and therefore contributes an accepted route pair. *Count-matched null* means a structure-free control publishing the same number of candidates as D1. *Coverage* is the fraction of demanded expert IDs predicted correctly. *D-gate* is the pre-registered comparison against the best past-only predictor in the same session. *Handoff* is the execution mode that retains the MTP streaming executor; the recorded MoE row-set MTP path resolved `handoff_mode=off` and is not the plain-TG handoff path.
+**Failing-first evidence (recorded).** With the predicate transcribed as the shipped rule (`host_w > 0` alone): build 0, test **exit 1**, `AC1 FAIL (6 failures)` -- the zero-budget case and all five arm gates failed, while the two "in play" controls passed. After the fix: build 0, test **exit 0**, `AC1 PASS (0 failures)`. Contract form: `ctest --test-dir build/llama-cuda -C Release -R test-layer-streaming-expert-split --output-on-failure` -> `1/1 Passed`, `100% tests passed, 0 tests failed`. Both touched TUs compile with zero warnings (the `%d`/`size_t` warnings at llama-layer-streaming.cpp:5485-5602 are pre-existing and untouched).
 
+**Two intermediate failures, both instructive and both fixed.** (a) With only the builder half in place, A2d **aborted loudly**: `layer_streaming_compute: host-leg id input missing or misshaped for layer 0 (expected [2, 1])` -- the executor still demanded an input an unsplit graph never creates. That is why the fix is two halves; it also confirmed the guard works. (b) Sizing `row_set_split_built` in `begin_row_set()` and again in `set_pp_prefetch_ahead()` produced an **access violation (0xC0000005) during "building persistent graphs"**: `begin_row_set()` runs AFTER the persistent graphs are built, and `set_pp_prefetch_ahead()` may never run at all. Sizing now lives in `init()` (line ~3181, immediately after `n_layer` is set) and the builder write is bounds-checked with a named `GGML_ABORT`.
 
-## 2026-09-25: T-GPLR-59 D1 adversarial replay/lifecycle fixes
+**Post-fix measurement (session gplr82-ac1-post, exe 4412cc4a60309fd3, dll 2e96ab55278a9c9c; pre-fix evidence preserved as `gplr82-ac1-pre-*`).** A0 `--experts-host 0` and A0b (repeat) unchanged: QA PASS, agreement 1.0 over 512 steps, drift floor 0.0, host share 0.000000, ~15.6 tok/s. **A2d (`--experts-host 2`, budget at its default) is now IDENTICAL to the control: QA PASS (positive 0 / negative 1 as designed), top-1 agreement 1.0 over 512 steps, first divergence `None`, `ffn_dev = 1` on all 20,480 records** (pre-fix: `ffn_dev = 2` on all 20,480, agreement 0.00195, token salad from step 1). `check-telemetry` rc=0 on all four arms. The run states the outcome out loud, exactly once, in the A2d log and in no other arm: `T-GPLR-82: --experts-host 2 is NOT in play (budget 0.0 us/token, recon 0, ...) -- building the UNSPLIT FFN graph for every layer of this run, exactly as with the flag absent`. **A2 (`--experts-host 2 --experts-host-budget inf`) is UNCHANGED**: host share 0.020654, agreement 0.001953, 511 unexplained divergences, 506 non-finite logit steps from step 6, `ffn_dev = 2`. AC1 as written therefore still **FAILs**, on the split arm only.
 
-**Defects fixed.** The D1 host replay previously scored every trace with the learned D1 table, including `null: true` traces whose runtime `predicted_ids` were the count-matched null. It now uses recorded null proposals and retains table replay only for arm traces. The replay now refuses a second `d1_shape`, a `d1_pair` before shape, non-boolean `predicted_ids` shape metadata, null traces without recorded proposals, and runtime proposals over the declared budget. The row-set executor now refuses a router-row count that differs from the MTP ubatch instead of indexing captured route state unsafely, and D1 observation checks captured layer-vector widths before indexing them.
+**Why this matters beyond the flag.** The fix separates two defects that were previously indistinguishable. The *shape* defect (now fixed, measured) was: a graph that splits when the mechanism admits nothing. The *remaining* defect is the host leg's execution: with the split genuinely in play (2.07% of rows host-computed, 2,024 host-scan records all reporting `host_finite = 0`, i.e. every host per-row output FINITE), the logits still go non-finite at step 6 and stay non-finite for 506 of 512 steps, so the corruption is NOT inside the region the existing finiteness guard covers. That is now the single next thing to diagnose, and it has a clean A/B (A2 vs A0) with a same-binary control.
 
-**Validation.** D1 replay and checker self-tests passed 8/8; valid arm and null CLI traces both exited 0; duplicate-shape CLI input exited 2 with `duplicate-d1-shape`. The focused C++ build and layout/TG-spec/TG-predict CTests passed. The real-binary mode-2 contract passed 16/16 without model or CUDA. The full host suite passed 76/76 at engine digest `80EC2C86F848FFE7`; Python compilation, currentstate split verification, and both-tree `git diff --check` passed. The host wrapper self-test again printed its known busy-GPU/mutex refusal while the suite exited 0.
+**Scope, risks, recommendation. Measured:** the RED/GREEN test, the ctest form, the A2d identity, the loud warning, `ffn_dev` histograms, and that A2 is unchanged. **Unproven:** the remaining host-leg execution defect (cause unknown; the 512-logit non-finite onset and the finite-host-output scan are the two facts any explanation must fit). **Not run:** AC5/AC6/AC7, the 50-token rung, the host suite beyond the split target. **Doc guard:** `python tools/check-doc-sizes.py` still FAILs -- `docs/currentstate.md` is now 499,917 B as measured by the guard at the time this entry was written (the guard reports the live size; it grows with each entry) and `docs/plans/generic-prefill-layer-residency-plan.md` 485,036 B, both past the 480,000 B band; this entry adds ~8 KB to a file that needs the documented shard split (pre-existing, not caused here). **Recommendation:** keep experimenting. The split-point fix is adoptable as written (it only makes the flag safer: with the budget at its default the run is now bit-identical to the flag-absent path, and it says so). Do NOT read A2's 20.64 tok/s as a speedup -- that arm is numerically corrupt. Evidence: `build/llama-cuda/gplr82-ac1-post-verdict.json`, `gplr82-ac1-post-launch.log`, `gplr82-ac1-post-arm-*.{jsonl,log,txt}`, `verdicts/gplr82-ac1-post.done`; pre-fix `gplr82-ac1-pre-*`; intermediate `gplr82-ac1-half-*`, `gplr82-ac1-crash*-*`.
 
-**Boundary.** No model, CUDA, GPU, mutex, or MTP handoff run was performed. The D1 runtime route/observation path is compiled and guarded, but real D1 behavior, D-gate, transfer, VRAM, throughput, and output-quality results remain unproven.
+## 2026-10-10 (GPU held, mutex `Global\AI-GPU-EXCLUSIVE-v1`, gpu_pre/post clean): T-GPLR-82 AC1 run as written -- the gate FAILS, and it separates TWO defects: the split is wrong even with ZERO host rows, and with host rows it goes non-finite while the engine's own guard stays silent
 
-**Glossary.** *Arm trace* is a D1 trace scored against the learned table. *Null trace* is a count-matched structure-free control whose recorded proposals must be scored directly. *Route capture* is the per-target-row, per-layer router ID set retained for D1 observation.
+**Task.** T-GPLR-82 **AC1**, owner-directed. AC1 has never had evidence: `tools/run-tests.ps1` never passes `--experts-host`, so the 2026-10-05 ladder that "passed for the host-leg fix" exercised the fix's regression test, not this mechanism. AC1 requires semantic-QA aggregate PASS at 50 and 512 tokens on the 512 anchor, `check-telemetry` OK, negative control FAILing as designed, top-1 agreement **>= 99%** against the control over **>= 512** tokens, and **every** divergence explained as a near-tie (top-2 gap below the measured drift).
 
-## 2026-09-25: T-GPLR-59 D1 runtime wiring reaches host validation; real MTP run still pending
+**Recorded command.** `powershell -NoProfile -ExecutionPolicy Bypass -File tools/with-gpu-lock.ps1 -Command "\"C:/Program Files/Python313/python.exe\" C:/Development/AI/qwen38GZI/tools/run-gplr82-ac1.py" -VerdictTag gplr82-ac1 -TimeoutSeconds 2400 -AllowUnprovenanced`. New session runner `tools/run-gplr82-ac1.py` (host-only re-grade: `--grade-only`, no GPU, no mutex). Four arms, one binary, 512 anchor, `--tg-tokens 512`, `--tg-logit-margin 512`: **A0** `--experts-host 0`; **A2** `--experts-host 2 --experts-host-budget inf`; **A2d** `--experts-host 2` alone; **A0b** control repeat. Shape matches the T-GPLR-62 reference session (`--ubatch 512 --pp-no-logits --pp-schedule batch-major --residency moe-expert-bank --kv-cache q8 --allow-full-residency --no-handoff --residency-tg --residency-tg-retain 2`). Provenance: exe `66b4eb9eb3d1a1b6`, `llama.dll` `1eef7d4f24fa822d`, anchor `d5bfd34a8a795e49` (byte-identical to the calibrated copy whose item list `N1,N2,N3,N4,K1` the T-GPLR-62 session validated). Peak VRAM 6,483.56 MiB; session wall 210.4 s; `check-telemetry` rc=0 on all four arms.
 
-**Goal and decision.** The owner selected Class D1, the MTP proposed-token source. D1 predicts expert rows from the token proposed by the draft head and learns only from accepted draft/target pairs. D2 and hidden-state Class E remain parked.
+**AC1 result: FAIL, on four independent counts.** Drift floor **0.0** (A0 vs A0b agree at 512/512 steps, top-1 agreement 1.0). A2 vs A0: **agreement 0.00195 over 512 steps, 511 divergent, 511 unexplained** -- the finite divergences (steps 1-5) carry control top-2 gaps of 16.49 / 17.10 / 1.04 / 0.34 / 18.44, i.e. confident disagreements, and a floor of 0.0 makes every one unexplainable. Semantic QA: A0 and A0b PASS with the negative control failing as designed; **A2 FAILs, A2d FAILs**. The 50-token rung was **not run**; AC1 requires PASS at both lengths, so the 512 failure already decides the gate.
 
-**What changed.** The C++ policy remains a sparse `(draft_token, layer)` table with accepted-only updates, deterministic count/id ranking, the 60-percent pairing gate, and the shared speculative planner/count-matched null. The runtime slice now wires that policy into the MTP loop: the runner calls D1 after drafting and before target verification; the row-set executor captures each target row's exact per-layer router IDs; `d1_pair` records include the demand routes and the runtime `predicted_ids`; rejected pairs contribute to overall coverage but do not train; speculative copies are settled before target decode so a demand wait cannot cover a speculative completion. MTP row-set width is declared as `1 + mtp_draft`, the two validators accept the declared `W*top_k` union bound, and D1 requires retention depth at least `W+1` so the demand union fits while at least one speculative position remains available. D1 is refused with the separate prediction pool and with non-MTP row-set modes.
+**Two defects, separated by A2d.** (1) **The split corrupts the arithmetic with ZERO host rows.** A2d measured `host_share = 0.000000` and `sum(experts_device) == sum(experts_total) == 163,840` -- the ledger says every row went to the device -- yet its top-1 agreement vs A0 is **0.00195** (first divergence step 1, margins 1.70/3.19/4.39, confident) and it emits token salad from step 1 while `ffn_dev == 2` on **all 20,480** records (vs `ffn_dev == 1` on all 20,480 in A0). The graph is partitioned into device+host legs unconditionally when `experts_host_n > 0` (the host leg's id input is a positional copy of the router top-k suffix, `llama-layer-streaming.cpp` ~5176-5194), while the ledger reports the PLAN's disposition. So **AC2's `device + host == total` invariant holds in every arm (0 violations) while the arithmetic is wrong** -- exactly the failure `tools/run-gplr82-hostarm.ps1`'s own header warned about. (2) **With host rows, the logits go non-finite and nothing aborts.** A2 realised `host_share = 0.020654` (2024 layer/step records with host rows); its logits are `top1_logit: nan`, `top2_logit: -inf`, `top1_id: 0` from **step 6 onward -- 506 of 512 steps**. Those lines are written as bare `nan` (invalid JSON). Every one of those 2024 records reports `host_finite = 0`, which is `scan_host_expert_outputs`'s "no non-finite value found" (llama-layer-streaming.cpp:4626: `host_finite = bad.empty() ? 0 : 1`); the `host_finite == 1` abort path never ran, and the arm **exited 0**. So the corruption arises OUTSIDE the guarded region and the loud-failure contract does not cover it.
 
-**Host validation.** The focused build passed for `llama-layer-streaming`, `test-layer-streaming-tg-predict`, `test-layer-streaming-layout`, and `test-layer-streaming-tg-spec`; the three focused CTests passed. D1 replay selftest passed **5/5**, including prediction/schema mismatch refusal; the default predictor selftest remained **92/92**; the mode-2 runner refusal contract passed **16/16** on the real binary and **7/7** in its stub selftest. The full host suite passed **76/76**, including the D1 replay and mode-2 cases. Python compilation, `git diff --check`, and the currentstate split verification passed. The suite again printed the existing stubbed busy-GPU/mutex refusal during its wrapper self-test, but exited 0; that is not a D1 failure.
+**Grader defect found and fixed (recorded because it changed the answer).** The first grading pass silently dropped the 506 non-finite `tg_logits` lines (`except Exception: continue` on invalid JSON) and reported "5 divergent of 6" instead of "511 of 512", i.e. it understated a collapse as a small disagreement. `tools/run-gplr82-ac1.py` now counts unparseable lines, maps them back to their step, and grades a missing or non-finite readout as a divergence that can never be a near-tie. The superseded verdict is kept at `build/llama-cuda/gplr82-ac1-verdict-graderbug.json`. A second field-semantics bug was caught by inspection: `host_finite` is **inverted** relative to a naive reading (0 = all host outputs finite), so both counts are now recorded separately.
 
-**Boundary and next step.** This is a host/instrumentation result only. No model, CUDA, GPU, mutex, or MTP handoff run was authorized or performed; no real `d1_pair` trace, D-gate result, transfer/VRAM result, throughput result, or output-quality claim exists yet. The next task is an owner-authorized GPU-mutex MTP handoff recording, followed by the pre-registered comparison against the same-session past-only frontier and count-matched null. The implementation remains uncommitted.
+**Scope, risks, and recommendation. Measured:** AC1's four criteria on four arms at 512 tokens; the A2d zero-host-row corruption; the 506-step non-finite span; the silent guard; the ledger/execution divergence via `ffn_dev`. **Derived but not proven:** the precise injection point in defect (1) -- the leading hypothesis is that the device leg keeps only `n_used - experts_host_n` rows while the host leg's fixed 2-wide partition is not reconciled with the gate's zero approvals, so the two partials no longer reconstruct the full top-k; a failing-first test asserting id/weight pairing and partial-sum completeness under a non-identity reorder would settle it. **The ORDERING/pairing hypothesis is FALSIFIED (same session, code read, no run).** (a) `w_full` is built by `ggml_get_rows(h_probs, sel_in)` (qwen35moe.cpp:461-462) and `hsel` is a memcpy of that SAME reordered vector's tail (llama-layer-streaming.cpp:5187-5188), so each leg's weights FOLLOW their ids; the split is a partition of positions and the sum is PERMUTATION-INVARIANT, so reordering `ids_per_token` cannot change any number. (b) A2d takes the `host_pos.empty() -> continue` path, i.e. it performs NO reorder at all, and is still wrong from step 1 -- so no ordering behaviour can explain the corruption. What the compaction IS load-bearing for is MEMBERSHIP: it moves the gate-approved rows into the graph's host tail, which is why removing it would change WHICH rows go host without changing any value. **The live cause is the SPLIT POINT.** `const int host_rows = ls->experts_host_n; const int dev_rows = n_expert_used - host_rows;` (qwen35moe.cpp:435,441) fix the split at GRAPH BUILD from the CONFIGURED width and never from the plan's disposition, so a closed gate with zero host rows still hands the tail to the host leg -- exactly the measured `ffn_dev = 2` (mixed, per `ls_classify_graph_backend`: 0=all host, 1=all device, 2=mixed) alongside `host_share = 0` in A2d. `ls_plan_split`'s own `device` descriptor is full-top_k width, so the plan's device descriptor and the graph's device leg disagree in width whenever fewer rows are host-bound than `--experts-host N`. That, not the ordering, is what a fix must address. **Not claimed:** the A2 tok/s figure (20.31 vs A0 16.12) is **not** a speedup -- the run is numerically corrupt, so its timing is meaningless. **Not run:** the 50-token rung; AC2's lifecycle checks beyond the ledger; AC5/AC6/AC7. **Recommendation:** keep experimenting, but treat the split as **defective, not slow** -- no optimisation of it can be measured until defect (1) is fixed, because a mechanism that is wrong with zero host rows cannot be benchmarked as a mechanism. Evidence: `build/llama-cuda/gplr82-ac1-verdict.json`, `gplr82-ac1-grade.log`, `gplr82-ac1-arm-{A0,A2,A2d,A0b}.{jsonl,log,txt}`, `verdicts/gplr82-ac1.done`.
 
-**Glossary.** *D1* is the proposed-token predictor. *Draft* means an MTP-proposed future token. *Pairing gate* means the minimum accepted-draft fraction required before a D1 score is read. *D-gate* means the final comparison against the best past-only predictor. *Pre-verify* means after drafting but before the target verifies the draft batch. *Settle* means synchronizing speculative copies before target decode begins.
+**Workspace fact (new, 2026-10-10).** Freebuff agent edits land in a **git worktree** at `qwen38GZI/.freebuff/worktrees/b947db99-...` (branch `freebuff/in-this-project-...`, HEAD `991dd53`) which has **no `build/`**, the vendored `third_party/llama.cpp` incomplete, and a **different** `tools/semantic-qa/check-answer.py` (1,554 lines vs 1,618). The engine, model wiring, traces, anchors and the live research log are in the **main checkout** `/c/Development/AI/qwen38GZI` on branch `research/layer-residency` (HEAD `98773fe`). This AC1 session was authored and run there for that reason; anything run from the worktree would silently use a different checker.
 
-## 2026-09-24: T-GPLR-59 D1 implementation slice starts (decision recorded 2026-09-25)
+## 2026-10-08 (ONE GPU hold, session gplr61-ac3, wrapper PASS): T-GPLR-61 SPEC-gap follow-up -- `--route-telemetry 1` now MEASURED (flag echoed; `check-route-parity` gate root-caused as structurally unsatisfiable for this arm shape; TG route parity CLEAN exactly-twice from `rowset_fetch`), session restructured so walls are comparable (warm-up + counterbalanced orders), AC2 FAIL reproduced from ac3's own artifacts.
 
-**Goal and decision.** The owner selected Class D1, the MTP proposed-token source. D1 predicts expert rows from the token proposed by the draft head, then learns only from accepted draft/target pairs. D2 and the hidden-state Class E remain parked.
+**Why.** The audit of the ac2 closure named two SPEC gaps: the contract's
+probe command specifies `--route-telemetry 1` (plan L4379) and the ac2 harness
+omitted it, so routing had been ruled out by structural reasoning only; and
+ac2's fixed A->B->C order left arm A's lone cold wall (157.8 s) incomparable.
+This entry closes both. The gplr61-ac2 AC2 FAIL entry stays intact below -- ac3
+corroborates it. No design refactors; ac2 evidence untouched (fresh session
+name `gplr61-ac3`; `source_changed_during_run: False`).
 
-**What changed.** The C++ policy now owns a sparse `(draft_token, layer)` table, accepted-only updates, deterministic count/id ranking, a 60-percent pairing gate, and `llama_ls_spec_propose_d1()` through the existing speculative planner and count-matched null. `tools/tg59_d1.py` replays explicit `d1_pair` records, and `tools/check-tg-predict.py --class D` exposes the host checker without changing the default T-GPLR-58 path.
-
-**Validation.** `test-layer-streaming-tg-predict` passed. D1 host selftest passed 4/4. Existing T-GPLR-58 checker selftest remained 92/92. No model, CUDA, GPU, mutex, or MTP handoff run was used.
-
-**Boundary and next step.** This proves the D1 policy and replay mechanics only. It does not prove that the current MTP trace exposes the required draft-token/target-route pairs. The next D1 step is an owner-authorized MTP handoff recording, followed by the pre-registered comparison against the same-session past-only frontier and count-matched null. The implementation is currently uncommitted.
-
-**Glossary.** *D1* is the proposed-token predictor. *Draft* means the MTP model's proposed future token. *Pairing gate* means the minimum accepted-draft fraction required before a D1 score is read. *D-gate* means the final comparison against the best past-only predictor.
-
-## 2026-09-24: Owner closes T-GPLR-53, T-GPLR-56, T-GPLR-58, and T-GPLR-60; T-GPLR-59 remains pending owner calls (decision recorded 2026-09-25)
-
-**Original goal and decisions.** The owner accepted that the project is moving toward long-lived, multi-turn server inference. A slow first request or first prefill is therefore treated as startup cost, not as a reason to spend more GPU experiments on registration overlap. T-GPLR-53 is closed with no mechanism adopted; T-GPLR-56 is closed without running A3; T-GPLR-58 is closed as an evidence-complete capacity-bound predictor result; and T-GPLR-60 is closed at G1 with the measured STOP decision.
-
-**What the closures mean.** T-GPLR-53's first-pass registration/embed excess remains measured and real, but it is not a target for this product direction. T-GPLR-56's pacing/overlap implementation remains available as an opt-in historical checkpoint, but its 4k/50k/200k arms are not run. T-GPLR-58's null, capacity, admission, and validator framework remains recorded; no predictor is adopted. T-GPLR-60's learning-curve family remains a host-only negative result: it beat its count-matched null but lost to equal-row retention, so G2/G3 are not authorized.
-
-**Glossary.** *Startup cost* means work paid only when a server process or model session begins. *Equal-row retention* means a cache comparison with the same logical row budget. *STOP* means the measured family is not advanced to its next gate. *T-GPLR-59* is the still-open draft for MTP draft-preview and hidden-state source classes; its owner calls are not answered by these closures.
-
-**Pros, cons, recommendation.** **Measured benefit:** the backlog no longer carries completed or startup-only investigations as active work, and the negative T-GPLR-58/T-GPLR-60 evidence is preserved. **Measured cost:** the pool-enabled runtime and T-GPLR-56 A3 remain unexercised, and T-GPLR-59 remains unresolved. **Recommendation:** commit these closure decisions and the existing T-GPLR-59/60 architecture/validator work; do not start another experiment until the T-GPLR-59 owner calls are answered or that task is explicitly deferred. The shared pool/validator substrate and closure records are nested commit `e62b32427` and outer commit `31b07ab`.
-
-## 2026-09-24: T-GPLR-59/60 architecture pass separates engine pool policy, telemetry state, and host replay; behavior and STOP are unchanged
-
-**Original goal and why it mattered.** The T-GPLR-59/60 diff had placed pure pool policy inside the 10k-line streaming engine, a stateful telemetry ruleset inside the runner CLI, and a second copy of the same host pool lifecycle inside T-GPLR-60. This pass changed shape only: it gave each concern one understandable owner while preserving flags, event schemas, capacity, routing, measurements, and the T-GPLR-60 **STOP** decision.
-
-**Resulting structure and data flow.** `src/llama-layer-streaming-pool.{h,cpp}` is the pure policy module: it owns the row-state enum, exact expert-slab arithmetic, admission planning, lookup, generation transition, retirement, and completion. It has no CUDA or runner state; `llama_layer_streaming` remains the one runtime owner of pool buffers, completion events, package sources, and runtime counters. `tools/layer-streaming/telemetry-pool.{h,cpp}` is the one owner of `spec_pool*` validator state; each `--check-telemetry` or `--validate-telemetry` pass creates one validator and forwards events to it. `telemetry-json.{h,cpp}` owns the small JSONL readers shared by both validator passes. On the host, `tools/tg_pool_core.py` owns trace parsing, shared real-cache replay, pool lifecycle, fate closure, and report data; `analyze-gplr59-pool.py` is the CLI/rendering/selftest adapter; T-GPLR-60 imports the shared real-cache fact builder, `PoolLayer`, and `replay_pool_stages`, and its duplicate replay lifecycle body is deleted. Data therefore flows runner flags -> engine policy and CUDA adapter -> JSONL -> state-owning validator, or recorded trace -> shared host replay core -> experiment-specific scoring/presentation.
-
-**Measured behavior preservation.** The focused engine and runner targets rebuilt; `test-layer-streaming-tg-spec` passed; all 26 pool telemetry fixture cases passed through both host validators. The GPLR-59 replay selftest passed **45/45** and the T-GPLR-60 selftest passed **15/15**. Replaying the recorded calculator trace through the refactored T-GPLR-60 path preserves every scientific counter and decision; the shared core now reports its complete fate ledger instead of pruning zero-valued compatibility fields. The host suite passed **70/70** at engine digest `56E217436F346918`, llama.dll `DFED975EF1EA5FCB`; its existing wrapper selftest again printed a stubbed busy-GPU refusal on stderr while the suite exited 0. A full all-target build completed every task-owned target and then hit the unrelated existing `test-unicode` link failure for unresolved `unicode_regex_split`.
-
-**Real run (default pool OFF; no G2/G3 authorization).** Under `Global\AI-GPU-EXCLUSIVE-v1`, wrapper tag `tg60-architecture-smoke` ran Qwen3.6-35B-A3B-MTP-UD-Q4_K_S for 64 PP tokens and one greedy TG token, batch-major MoE expert-bank residency, one slot, async feed off, mmap-registered staging, and no prediction-pool or speculative flags. GPU pre/post were clean; the wrapper and provenance gate passed. The runner's inline checker returned `OK (570 events, 1 slots)` and standalone `--validate-telemetry` returned `OK (570 events, 1 slots, 40 layers)`. PP was 17.28 tok/s and TG was 0.77 tok/s at this deliberately tiny shape; peak VRAM was 3265.56 MiB. These timings are a smoke result only, not a performance comparison. Evidence: `build/llama-cuda/tg60-architecture-smoke.jsonl`, its `.summary.json`, and `build/llama-cuda/verdicts/tg60-architecture-smoke.verdict.json`.
-
-**Glossary.** *Policy* means the pure decision of what an expert row may do; *adapter* means code that connects policy to CUDA or a CLI; *validator state* means the accumulated facts needed to judge a telemetry stream; *replay core* means the host model of recorded demand and pool lifecycle; *fate closure* means every admitted row is counted exactly once as hit, fallback, cancellation, eviction, stale retirement, or still live. *STOP* remains the owner decision not to advance the T-GPLR-60 predictor family to G2/G3.
-
-**Pros, cons, recommendation.** **Measured benefit:** the two analyzers now share one lifecycle implementation, the runner validator is independently understandable, and pure engine policy is testable without loading the streaming object. **Measured cost:** three small C++ source modules and one host core replace code previously concentrated in three large files; the full-build `test-unicode` linker issue remains unrelated. **Unproven:** the CUDA pool runtime itself was not enabled in this shape-only pass, so this adds no pool performance or feasibility evidence. **Recommendation: adopt this structure** for later T-GPLR-59/60 work and keep the scientific decision **STOP** unchanged.
-
-## 2026-09-24: T-GPLR-59/60 validator adversarial pass fixed duplicate-start, pre-init state, and malformed-number acceptance; the STOP result is unchanged (no GPU/model run)
-
-**Audit and fixes.** Focused probes through `tools/analyze-tg60-learning.py` found: a missing trace previously exited 1 with `FileNotFoundError`; a missing companion prompt was not a deliberate refusal; the provenance set was hard-coded to the default trace rather than the command's `--trace`; and user-facing H2D metrics used the first held-out layer's row size for all layers. A follow-up adversarial probe also showed that the free-form prompt override accepted an unrelated prompt and misattributed its hash. The analyzer now refuses missing/malformed trace and the fixed calculator-prompt input with exit 2, pins that prompt to the recorded SHA-256 `e29c2fcc0da0815554c45e49026d4f3e24df6401fa492fe1b26e6286b00011d9`, has no free-form prompt override, checks the supplied trace plus both equal-demand comparators, aligns predictor rows against replay stages by `(ubatch, layer, ids)`, records `row_bytes_by_layer`, and derives real-miss/useful/wasted/net H2D from each stage's recorded bytes. The trace has 1,769,472-byte rows except layers 34/38/39 at 2,039,808 bytes. These are task-owned fixes, not runtime changes.
-
-**Boundary/state coverage.** The real CLI accepted the recorded trace and an alternate recorded bar09 trace, rejected a missing trace, the fixed calculator prompt if absent, and malformed trace with structured exit-2 refusals, and preserved the 32/64/128 scored plus H256-unverified shape. A valid but unrelated prompt is no longer accepted because the free-form override was removed. Selftest coverage is now 15 checks: fixed prompt identity and mismatch refusal, empty and out-of-order alignment rejection, layer-byte mapping, transfer closure, stable nulls, prefix isolation, Belady bounds, per-stage admission budget, and ideal-next-reap lead-2. This host tool has no async execution or resource cleanup path; no imaginary async/phase hardening was added. Existing GPLR-59 generation/lifecycle tests remain the relevant state-synchronization evidence.
-
-**Corrected accounting and decision.** For H32/K4 coact, useful H2D is 3.50 GiB and wasted H2D is 0.85 GiB after per-layer accounting; hit shares, pool/null comparisons, and the equal-row failure are unchanged. The owner decision remains **STOP**. Full replay output is regenerated at `build/llama-cuda/tg60-learning-curve.json`.
-
-**Audit follow-up.** The adversarial validator pass found and fixed three concrete entry-point defects after the architecture reduction: `--check-telemetry` now rejects duplicate `run_start`; both validators reject `spec_pool` before a positive `rowset_init`; and the shared JSONL integer reader rejects quoted counters, malformed/truncated integer arrays, and partial numeric tokens while retaining the runner's integral-valued decimal JSON fields. Three negative fixtures now exercise these cases through both real validator commands. Runtime pool teardown was code-inspected: `end_row_pool()` synchronizes every event before freeing it and clears buffers/state, while `pool_reap()` transitions pending/cancelled work only after event synchronization; no additional async or cleanup complexity was justified.
-
-**Validation.** `python -m py_compile tools/analyze-tg60-learning.py`; analyzer selftest **15/15**; default and alternate valid traces completed through the real CLI; missing/malformed trace and fixed prompt hash mismatch returned exit 2. The focused runner rebuild passed; the three new fixtures passed as expected-negative through both `--check-telemetry` and `--validate-telemetry`; GPLR-59/TG60 selftests passed **45/45** and **15/15**; the default-off `tg60-architecture-smoke.jsonl` passed both validators with 570 events; documentation split/size checks and `git diff --check` passed. The host suite passed **76/76** after the shared reader was corrected to accept the runner's valid integral-valued decimal JSON fields without accepting quoted, partial, non-finite, overflow, or malformed-array tokens. No pool-enabled CUDA run was authorized.
-
-## 2026-09-24: T-GPLR-60 G0/G1 host learning-curve experiment is COMPLETE; G1 FAILS the equal-row gate and the family is STOPPED (no GPU/model run)
-
-**Original goal and hypothesis.** T-GPLR-60 asked whether a predictor trained from increasing generated-token history can identify real cache misses early enough to improve total hits over an equal-row retention-only cache and a count-matched random null. The required decision was a host-only G0/G1 experiment, with a negative result treated as useful rather than grounds for a GPU run.
-
-**How it works.** *Prefix* means the first generated-token rows used for training; *held-out suffix* means later rows scored without retraining. *Marginal pool hit* means a prediction-pool row that later satisfies an expert ID that the real cache missed. *Equal-row retention* is a separate capacity-LRU replay with one additional eight-row window. *Count-matched null* publishes the same number of random candidates per stage. *READY* means a modeled copy is available; *PENDING fallback* means demand arrived before modeled completion and was not served speculatively. *Belady* is an oracle cache ceiling, not a deployable predictor. *H2D* means host-to-device row transfer accounting.
-
-**What was measured (G0).** The source was `build/llama-cuda/gplr58-fresh-coact-k8-admission.jsonl`, SHA-256 `c38feedc5e20a0da47a03ae88cf667295a6fe05d5c35c2d58d6446135d566196`; prompt SHA-256 `e29c2fcc0da0815554c45e49026d4f3e24df6401fa492fe1b26e6286b00011d9`; model `Qwen3.6-35B-A3B`, 256 experts, top_k 8, 10,240 `(ubatch, layer)` stages, and 81,920 demanded IDs. The coact, bar09, and fusion comparator traces have the same stream signature `2613f366136ca8ac` and demand-row signature `c284cd11b2d9dbc5`. Prefix ranks 32/64/128/256 yielded held-out rows 8,960/7,680/5,120/0; H=256 is explicitly `UNVERIFIED_NO_HELDOUT`, not zero. Predictors observed only prefix rows and remained frozen during the suffix; null IDs use a stable SHA-256-derived seed, and the full JSON result is repeatable after removing its timestamp. Evidence: `build/llama-cuda/tg60-learning-curve.json`.
-
-**What was measured (G1).** For coact K=4, marginal pool hits versus count-matched null were 2,096 vs 155 (H32), 1,809 vs 139 (H64), and 1,179 vs 88 (H128). The corresponding total hit shares were 55.90%/56.45%/54.87%, below equal-row retention at 59.45%/59.80%/58.28%; marginal shares were 2.56%/2.36%/2.30%, so improvement with more history is not monotonic. The valid Belady ceilings were 77.21%/77.32%/76.77%, showing substantial unrealized oracle headroom. At H32/K4, coact recorded 71,360 proposals, 2,605 admissions, 2,096 READY hits, 291 PENDING fallbacks, zero evictions, 218 live rows, 3.50 GiB useful H2D, and 0.85 GiB wasted H2D. The same pattern held across the bar09, fusion, super, exponential prefix-decay, and frozen-nearest-prefix Jaccard arms: the arms beat their nulls but not equal-row retention.
-
-**Pros, cons, risks, and evidence.** **Measured benefit:** route structure produces repeatable miss-only signal thousands of times above the null. **Measured cost:** the signal does not justify its extra logical pool row budget; the predictor loses 2.90-3.55 percentage points of total hit share to equal-row retention in the representative coact K=4 curve, and wastes 0.84 GB of admitted H2D at H32/K4. **Unproven:** CUDA completion overlap, transfer latency, PP/TG tok/s, physical VRAM impact, quality, and behavior on other prompts/models. **Limitations:** one calculator stream and Qwen shape; H=256 has no suffix; Belady uses future demand only for oracle victim selection; the separate eight-position pool and K+1-window LRU are logically row-matched but not a physical shared-buffer layout; `decay_frequency` is an exponential prefix score (`0.9**age`); `route_knn` is a frozen nearest-prefix Jaccard match, not a learned suffix-updated model. All gates are advisory, not acceptance.
-
-**Validation.** `python -m py_compile tools/analyze-tg60-learning.py` passed; `python tools/analyze-tg60-learning.py --selftest` passed 9/9, covering deterministic nulls, prefix isolation, per-stage admission budget, ideal-next-reap lead floor, Belady bounds/basic reuse, and null uniqueness. The replay command was `python tools/analyze-tg60-learning.py --trace build/llama-cuda/gplr58-fresh-coact-k8-admission.jsonl --json build/llama-cuda/tg60-learning-curve.json`; a second run matched byte-for-byte after timestamp removal. Existing T-GPLR-59 and predictor-screen selftests passed 45/45 and PASS respectively. The host-only suite passed **70/70** (no model/CUDA workload; its wrapper selftest emitted a busy-process refusal/timed-out-mutex line while exercising stubbed coverage, but the suite exited 0). `python tools/resplit-currentstate.py --verify` passed, `python tools/check-doc-sizes.py --top 5` passed with the existing plan-size warning, and `git diff --check` passed.
-
-**Recommendation / final decision: STOP.** Do not authorize G2 cost-aware replay or G3 GPU/model work for this family on this evidence. Preserve the measured negative result and the generated JSON as a bounded research record; a future family would need a materially different source of information and a new owner-approved task.
-
-## 2026-09-24: T-GPLR-59 FOLLOW-UP: the host-only counterfactual 12-row pool replay is IMPLEMENTED and SCORED over recorded traces (host-only; no GPU/model run) (uncommitted)
-
-**Delivered.** `tools/analyze-gplr59-pool.py` (schema `gplr59-pool-counterfactual/1`): replays the ordered demand plus `spec.candidate_ids` of a recorded mode-2 trace through a simulated 12-position per-layer prediction pool under `ideal-next-reap` (issued after t, PENDING at t+1, READY after end of t+1, first serveable t+2 - the measured lead floor). The real-cache base mirrors the telemetry validator's `ls_retention_errors` rule-for-rule (READY-only hits, demanded-PENDING supersession, `need = |uniq| - hits` accounting verbatim including its in-flight double count, P3 speculative-row-first victims then least-recently-routed, ascending-id recency stamping, reap-then-issue fills), so `n_rows_retired` is part of the parity gate. Overlay mode requires exact hit/retention/retired parity before any pool result; demand-only is labeled a clean-baseline diagnostic. Roles are explicit (`--leg arm=|null=|off=`), never filename-inferred; proposals apply after the stage's demand+reap; the last proposal of each layer is reported unused; source budget (recorded-8) is reported separately from the 12-item pool contract and never padded. Exit 2 (REFUSED, no measurement) for missing candidates/fill ids (overlay), mixed traces, W!=1, invalid ids, contradictory real-cache identity, inconsistent byte arithmetic, mismatched arm/null streams, or runtime-pool recordings (`spec_pool*`/`pool_hit_ids`).
-
-**Validation (measured, host-only).** Selftest 45/45 covering every case the plan's design block lists (12-capacity, 12-item admission bound, real/pool/publication dup suppression, READY-only LRU eviction, all-PENDING refusal, lead-2 first hit, lead-1 fallback with zero waits, generation cancellation, no real-cache promotion, candidate+fate closures, occupancy bounds, overlay parity incl. its refusal, four parse refusals). Wired into `run-tests.ps1 -Suite host` as `[tg59-pool-counterfactual]`; suite 70/70 SUCCESS (engine digest 76F437AA2C263044).
-
-**Scored over recorded traces (measured).** All five candidate-bearing legs replay at OVERLAY PARITY 10,240/10,240 stages, 0 divergent (the validator's retention model is thereby externally confirmed against the recordings, including eviction counts). `gplr58-fresh-coact-k8-admission.jsonl` (arm coact K=8, real cap 64): real share 72.73%; pool proposals 81,104 + 320 unused = 81,424 = the engine's own classification total (73,652 present + 7,772 refused) exactly; admitted 4,263; pool hits 1,784 (41.85% over admitted, 67.73% over resolved), extra share +2.18pp (total 74.90%); 850 lead-1 fallbacks; every hit lead >= 2 (histogram 2..192); net_h2d_delta +4.2 GiB. A4 pairs (retain_k=2, real cap 16): bar09 arm 6,483 hits (+7.91pp) vs null 1,123 (+1.37pp), delta +5,360 hits at 13,522 vs 64,015 admissions and 12.0 vs 107.3 GiB net H2D; fusion arm 5,082 (+6.20pp) vs null 921 (+1.12pp), delta +4,161 at 9,505 vs 73,571 admissions. Story: the predictor concentrates useful rows (4-5x the null's hits at ~1/7-1/8 its churn). `gplr58-null-k8-fillids-verified.jsonl` REFUSES exit 2 as designed (pre-A2: no `candidate_ids` - UNVERIFIED, never zero).
-
-**Facts learned.** `row_bytes` is layer-constant but NOT model-constant on Qwen3.6-35B-A3B Q4_K_S: 37 layers at 1,769,472 B/row, layers 34/38/39 at 2,039,808 B/row - the earlier 810 MiB pool-cost figure (40x12x1,769,472) is corrected to 859,078,656 B (~819 MiB). `refused_capacity` is structurally unreachable through the stage pipeline under ideal-next-reap (at proposal time every earlier row is READY), so its selftest is a unit case. The fallback lead (always 1) must never enter the consumed-hit lead histogram - the lead>=2 assert reads it as a hit otherwise (found by the selftest, fixed).
-
-**Boundary / residual risk.** No GPU/model run (not authorized; `deepseek_v4.exe` currently holds VRAM). Completion is modeled: waits are 0 by construction, no transfer latency or PP speed is claimed; byte figures are logical payload. Overlay fill lifecycle and generation transitions are fixture-validated only (real legs have 0 fills; the one trace with fills lacks candidates; generation/phase are constant per layer in all recordings). recorded-8 results are a lower bound for a 12-item arm; duplicate suppression is evaluated at proposal-time real state (rows released by the stage reap do not block - conservative). A positive replay is grounds to authorize a fresh owner-run pool arm, NOT acceptance of it.
-
-## 2026-09-24: T-GPLR-59 prediction pool is IMPLEMENTED and HOST-VALIDATED (policy + instrumentation green; no GPU/model run) (uncommitted)
-
-**Delivered.** The separate prediction-only expert-row pool (12 positions per logical layer, 12 proposals per stage; READY may serve a later exact demand, PENDING is cancelled with immediate fallback and no wait) is implemented end to end: engine storage/lifecycle (`begin_row_pool`/`pool_*`/`tel_spec_pool` in the streaming module), runner surface (`--residency-tg-spec-pool`, mode-2-only/capacity-12/budget-12 refusal gates, pool fit cross-checks), validator rules shared by both host checkers, and host fixtures. Emission contract verified at source level: `spec_pool_init -> byte_account -> run_start` is the real order (the pool is allocated inside `begin_row_cache`), matching `ls_pool_run_start_errors`' precondition.
-
-**Policy correctness (measured, host-only).** `test-layer-streaming-tg-spec` T-GPLR-59 block: 20/20 checks PASSED, covering 12-position admission, duplicate/invalid skips with named reasons, budget refusal, oldest-READY-only eviction, all-PENDING refusal without a wait, PENDING demand fallback cancellation, stale-generation refusal, READY selection/retirement, phase cancellation holding its bytes until the event reap, and generation boundaries. These fixtures caught ONE REAL DEFECT: `llama_ls_expert_slab_bytes` had an INVERTED type guard (`type < GGML_TYPE_COUNT -> 0`) returning 0 for every valid type; fixed to reject `type >= GGML_TYPE_COUNT` (cast form). Two fixture-side facts worth remembering: `llama_ls_pool_plan_make` checks the pool BEFORE the real cache (so a shared fixture pool steals the skip reason), and a READY-demand lookup only reports rows of the demanded expert (the fixture must hold a READY+PENDING pair of that expert to pin "selects exactly one").
-
-**Instrumentation correctness (measured, host-only).** 13 telemetry fixtures - 2 positives (full pool lifecycle closing 7 submitted = 1 consumed + 2 demand-cancelled + 4 live; pool-off legacy trace passing unchanged = default-off immunity) and 11 single-rule negatives (init capacity, run_start without init, proposal conservation, stop/refusal pairing, cumulative counters, spec-vs-fetch hit agreement, pool hit overlapping a real resident, pool hits in a pool-off trace, missing `pool_hit_ids`, missing `spec_pool` key, open closure) - each rejected by BOTH `--check-telemetry` and `--validate-telemetry`: 26/26 CTest cases green. These are the first traces through the T-GPLR-58 retention replay + pool fetch rules together. Tooling fact: the validator's FNV-1a-64 over `union_ids` uses basis 1469598103934665603 (NOT the standard ...37); verified to reproduce a recorded trace's hash exactly before baking fixture hashes.
-
-**Suite evidence.** Four targets rebuild clean (layout-type change discipline); ctest trio 3/3; `check-tg-predict.py --selftest` 92 checks; `run-tests.ps1 -Suite host` 70/70 with the 26 pool cases joined to the host selection, SUCCESS with saved revision record (digest 76F437AA2C263044).
-
-**Boundary / residual risk.** No GPU/model run (not authorized): the CUDA pool runtime (buffers, events, H2D/D2D, demand D2D refresh) is host-fixture-validated only, and validator-vs-runner agreement rests on source reading plus synthetic traces, not on a recorded pool run. `check-tg-predict.py` still does not parse `spec_pool` events (known gap, unchanged). Feasibility/performance UNMEASURED; the arm-zero entry's counterfactual (+6.02pp ideal / +2.09pp lead-2-7 ceiling) remains the only quantitative expectation, and it is a ceiling, not a prediction.
-
-## 2026-09-24: THE ARM-ZERO-ADMISSION QUESTION IS RESOLVED (host-only diagnosis) - a history-only predictor cannot be admitted BY CONSTRUCTION, and the null escapes only by leaving the routed history (uncommitted)
-
-**Question.** Why did every mode-2 arm place zero fills while the count-matched null placed 1,186 through the identical propose->plan->issue path? This SUPERSEDES the 2026-09-23 K-probe entry's claim that the refusal is "unexplained ... a real engine question, now the block's open item" (its entry text is left intact for the resplit manifest): there is no engine defect, and the mechanism is structural. It also sharpens the 2026-09-24 cache-aware counterfactual's structural explanation with an exact-replay proof and a measured pool opportunity.
-
-**Method (host-only, no model/CUDA/GPU/mutex).** An independent capacity-LRU replay of `build/llama-cuda/gplr58-fresh-coact-k8-admission.jsonl` (arm coact K=8, the decisive leg) and `build/llama-cuda/gplr58-null-k8-fillids-verified.jsonl`, classifying every `candidate_ids` entry against the live cache state at plan time. Validation anchors: the replay's per-stage hit count matched `n_rows_resident` on all 10,240 arm stages (0 mismatches) and reproduced the runtime classification exactly (73,652 present / 7,772 refused / 0 submitted), closing the earlier two-count ordering caveat for a fill-free leg; the lead arithmetic was validated on the null leg's real fills, where lead-1 recurrences reproduce the engine's `matched_by_demand` exactly (16 = 16).
-
-**Mechanism (all measured on the decisive leg).** (1) The arms are HISTORY-ONLY: 81,424/81,424 candidates are ids previously routed at that layer (0 outside-history) - the coact/markov/coupling tables can only score observed ids. (2) Admission room and an absent candidate are mutually exclusive: room (`n_free > reserve=8`) means occupancy <= 55 < cap 64, and a capacity-LRU that is not yet full holds the ENTIRE routed history - true on all 771 room stages (771/771 with cache == history), so every arm candidate at a room stage is `skipped_present`. (3) An arm candidate absent from cache requires history\\cache nonempty, which requires |history| > 64 = cap, which means the cache is full: all 7,772 absences sit on `no_free` stop stages (3,764), and `reserve` stops are 0. Therefore for ANY K and any history-only predictor, every candidate is either already resident (skipped) or unadmittable (refused). The null escapes only because uniform draws over 256 experts leave the routed history: 1,186/1,186 of its placed fills were NEVER-routed ids at that layer at issue time.
-
-**The opportunity T-GPLR-59's separate pool targets (counterfactual; ideal-retention CEILING, not an expectation).** The 7,772 refused candidates are exactly the class a separate pool admits (absent from the real cache, so `skipped_real` does not fire). Recurrence replay at that layer: 4,932 (63.5%) are demanded again at lead >= 2 and could become pool hits (701 at lead 2-3, 1,013 at lead 4-7, 3,218 at lead 8+); 1,222 (15.7%) recur at lead 1 (PENDING fallback - cost only); 1,618 (20.8%) never recur (pure cost). Over 81,920 demand rows the lead>=2 ceiling is +6.02pp share with perfect retention, or +2.09pp counting only lead 2-7 (1,714) as plausibly surviving a 12-row pool. The ceiling is not the expectation: in the null leg only 155 of 815 lead>=2 recurrences were actually consumed (19%) because speculative rows are the first eviction victims and cancellations intervene. The planned T-GPLR-59 counterfactual replay (pool LRU + lifecycle) is what turns this ceiling into a scored prediction.
-
-**Diagnostic consequence.** Scoring a predictor on demand-row recall inflates its apparent value against this cache: 90.5% of the arm's output duplicates rows the cache already holds (zero marginal value - those are hits anyway), and the valuable 9.5% can never enter the real cache while the reserve barrier holds. The useful objective is predicting cache MISSES, not demand rows. The planner's rules and counters are correct and exactly reproducible; no engine repair is warranted.
-
-**Boundary.** Host-only analysis of two recorded traces; no runtime code changed. Residual: 135 replay-vs-`n_rows_resident` mismatches on the NULL leg are expected (that replay models demand placement only, not fill occupancy). K=4/K=12 legs were not re-analyzed; the mechanism proof covers every K structurally. Realized pool gain and throughput remain UNPROVEN.
-
-## 2026-09-24: T-GPLR-58 A4 COMPLETED (owner-authorized, one mutex hold, seven legs) - both K=2 arms were capacity-bound at zero placements, not predictor-quality results
-
-**Run and identity.** The owner-authorized A4 session ran under `tools/with-gpu-lock.ps1` with `gplr58-a4-session`; the wrapper acquired `Global\AI-GPU-EXCLUSIVE-v1` and its pre/post GPU probes were `clean`. The model was `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`; the declared shape was 885 PP tokens, 256 TG tokens, ctx 1280, q8 KV, four slots, batch-major PP, greedy, no MTP, and `--rep-penalty 1.15`. Seven legs ran in order: `off1`, `off2`, `null-bar09`, `bar09`, `null-fusion`, `fusion`, and `retref4`. Every leg exited 0, passed `--check-telemetry` and its individual A2 checker, and has a complete attributable verdict. Binary identity: runner `D2BD131C866EDFFC`, `llama.dll` `AAF1E97736CED8DF`, engine source digest `821E503F27DF18B8`, nested HEAD `8b3ea428112b7dc830785ac1391a05118b52b376`. All seven routes have ordered digest `5de08495940289905ac9a0d229aa552f4cced9627c83ed78e6e514e70e394798`; all seven greedy token streams have SHA-256 `f10d47289b73baffbe660dbc80cddf1d4052faf51c51bbc257063dc0ff32c9f3`.
-
-**Measured result.** Both K=2 controls, both count-matched nulls, and both K=2 arms have share `0.37705078125`; the K=4 retention reference has `0.53486328125`. The paired reports therefore read share gain `0`, null-corrected margin gain `0`, M3 `-0.1578125`, and M5 `1.000x` for each arm. This is not an M1 precision result: every speculative leg submitted, consumed, cancelled, and waited on zero fills, so unique-hit M1 and M7a/M7b are not scoreable. P1, P2, P6, and P7 hold; cancellation accounting is closed, but the cancellation path was not exercised. Each K=2 leg staged `85.084 GiB`; the K=4 reference staged `63.560 GiB`. The fill-room analyzer gives every K=2 leg 0/10,240 admissible stages (0.00%) and the K=4 reference 189/10,240 (1.85%). Capacity, not arm selection, owns the zero.
-
-**Admission funnels.** `null-bar09` skips 4,467 candidates as present and refuses 66,779 on capacity; its terminal stops are `no_free=10,129`, `proposals=62`, `reserve=49`. `bar09` skips 37,067 present and refuses 34,179; stops are `no_free=9,591`, `proposals=649`. `null-fusion` skips 5,196 present and refuses 76,724; stops are `no_free=10,151`, `reserve=89`. `fusion` skips 61,881 present and refuses 20,039; stops are `no_free=8,488`, `proposals=1,752`. Duplicate refusal is zero in all four legs. These are measured capacity outcomes; they do not establish that either predictor lacks precision.
-
-**Evidence and tooling boundary.** Raw evidence is under `build/llama-cuda/gplr58-a4-*.jsonl`, `gplr58-a4-*-bands*.json`, `gplr58-a4-summary.json`, `build/llama-cuda/verdicts/gplr58-a4-*.verdict.json`, and `a4-driver-a4.out/.err`. The first session roll-up omitted the two off legs because PowerShell parsed the two tag concatenations inside `@(...)` as one combined string; the raw checker still exited 0 on the incomplete three-leg subset, after which the driver correctly refused to call the pair complete. The host-only `-RefreshPairReportsOnly` path now selects legs by role, requires the exact five-leg shape, re-verifies all seven recorded leg verdicts, reruns both paired checkers, and rewrote only the derived pair fields in the summary. It exited 0 without model, CUDA, GPU, or mutex use. The original outer wrapper verdict remains `UNCERTIFIED (10)`: its nested PowerShell command exposed no binary to the wrapper (`binary_state=not-supplied`) and its command exit was the original roll-up failure. That historical wrapper status was not overwritten; the seven inner leg verdicts carry the complete binary provenance.
-
-**Decision boundary.** A4 adds the required `bar09` and `fusion` runtime evidence and confirms the pre-registered K=2 negative: neither arm reaches the K=4 retention share, and neither receives an opportunity to show a gain. It does not bear on predictor precision, a sampled regime, a less crowded reserve/capacity ratio, or a changed admission schedule. Final task acceptance remains the owner's decision. The owner authorized the outer A4 tooling/evidence commit after validation; the task plan records its hash.
-
-## 2026-09-24: T-GPLR-58 FRESH K=8 COACT ADMISSION TRACE (owner-authorized, uncommitted)
-
-**Run and validation.** One fresh mode-2 `coact` leg was recorded at K=8 (885 PP tokens, 256 TG tokens, ctx 1280, q8 KV, four slots, batch-major PP, greedy, no MTP) with `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf` (19.91 GiB) on an RTX 5090 Laptop GPU (24,462 MiB). The full command is preserved in `build/llama-cuda/verdicts/gplr58-fresh-coact-k8-admission.verdict.json`; the wrapper verdict is PASS (exit 0), the mutex was acquired, and GPU pre/post probes were `clean`. Provenance recorded engine digest `63280E460286C26F`, runner `D2BD131C866EDFFC`, and `llama.dll` `AAF1E97736CED8DF`. `llama-layer-streaming.exe --check-telemetry` and `--validate-telemetry` both returned `OK (31689 events, 4 slots)`; the latter wrote `build/llama-cuda/gplr58-fresh-coact-k8-admission.jsonl.summary.json`. `tools/check-tg-predict.py --leg arm=...` reported `VERDICT: scored`, with P1/P2/P4/P6/P7 PASS; M7a has no evidence because no fill was consumed.
-
-**Measured admission funnel.** The trace has 10,240 `spec` stages and 81,424 candidates: 10,178 stages published eight candidates and 62 published none. The runtime classified 73,652 as `skipped_present`, zero as `skipped_dup`, and 7,772 as `plan_refused_capacity`; `submitted`, `fill_ids`, `consumed`, `matched_by_demand`, `cancelled`, and `waited_by_demand` are all zero. `stop_reason` was `no_free` on 3,764 stages (30,112 candidates; 22,340 present, 7,772 refused) and `proposals` on 6,476 stages (51,312 candidates, all present). No `pending`, `reserve`, or `budget` stop occurred. The independent room analyzer reports 771/10,240 stages with room beyond the reserve (7.53%, full by layer-stage 37); 710 room stages had candidates, 61 were empty, and **zero room-stage candidates were missing from cache**. The arm share is 0.7273 (margin 0.2727); this single arm has no same-session `off` control, so it supports no gain or throughput claim.
-
-**Comparison with the host replay.** Running the cache counterfactual on this exact fresh trace reproduces the opportunity totals: 81,424 proposals, 771 room stages, 710 proposal-at-room stages, zero missing-at-room candidates, zero fills, and 0.0000pp gain. Its aggregate split is 73,654 present / 7,770 capacity-refused versus runtime 73,652 / 7,772, so exact row-level parity is not claimed. The trace records sorted `union_ids`, while the engine predictor receives the pre-sort demand order; the runtime candidate IDs and admission fields are authoritative for this result. This recording made no new model or admission-policy change; it exercised the already-described uncommitted instrumentation. Trace: `build/llama-cuda/gplr58-fresh-coact-k8-admission.jsonl`; log: `build/llama-cuda/gplr58-fresh-coact-k8-admission.log`.
-
-## 2026-09-24: T-GPLR-58 CACHE-AWARE CANDIDATE COUNTERFACTUAL (host-only, uncommitted)
-
-**What was tested.** `tools/predictor-screen-gplr.py --mode cache` now replays the three matched K-probe retention traces (K=4/8/12) as one fixed ordered demand stream, signature `2613f366136ca8ac`. Before comparing selectors it reproduces every recorded per-stage `n_rows_resident` hit exactly and independently reports the same room counts as `analyze-gplr58-fill-room.py`: 189/771/1,588 stages. The replay owns the engine's capacity-LRU, whole-union protection, ascending-ID refresh, speculative-first eviction, reserve, PENDING/READY lifecycle, demand-duplicate cancellation, and the measured earliest-consumption lead of two stages. History is the engine's post-observation previous-set family; coact is its ordinary top-8; cache-aware asks coact for its full ranking, filters live-resident rows, then backfills up to eight without peeking at future demand.
-
-**Measured result: none of the three selectors can place a fill on this recorded stream.** History proposes 81,920 IDs at every K and every one is `skipped_present`, because it is selected after the current demand has already been served. Coact proposes 81,424 IDs; at K=4/8/12 it skips 58,423/73,654/78,686 as present and refuses 23,001/7,770/2,738 for capacity. It has non-empty proposals at 136/710/1,526 room stages, but **zero candidates missing from cache at any room stage**. Cache-aware backfills 77,728/72,470/63,306 lower-ranked missing IDs, but every one appears only after the cache is full (`no_free` at 9,793/9,185/8,170 proposal stages); it has zero room-stage proposals and zero missing-at-room candidates. Therefore all three retain the exact baseline shares (0.53486/0.72726/0.82175), place zero rows, consume zero fills, and add 0.0000 percentage points. JSON evidence: `build/llama-cuda/gplr58-candidate-counterfactual.json`.
-
-**Validation and boundary.** `py_compile` PASS; predictor selftest PASS, now including full-ranking backfill, exact LRU, reserve, lead-2, and cancellation fixtures; predictor port-equivalence selftest PASS 13 checks; a K-set mismatch is refused with exit 2. The full host suite PASS 44/44 and ran the new `[tg58-cache-counterfactual]` guard, record `build/llama-cuda/suite-runs/20260924T092021Z-host/revision.json`. The counterfactual assumes ideal copy completion and reuses recorded routed demand, so it measures the cache/admission opportunity and selector ordering, not transfer timing, CUDA behavior, or a new engine policy. No model, CUDA, GPU, or mutex was used. The result explains the historical zero structurally; the fresh instrumented trace above supplies the runtime confirmation, with its two-count ordering caveat.
-
-## 2026-09-24: T-GPLR-58 MODE-2 ADMISSION TELEMETRY (host-only, uncommitted)
-
-Mode-2 `spec` events now publish the planner's per-stage explanation, not just its fill count: `candidate_ids` is the complete arm/null proposal in publication order; `skipped_present` and `skipped_dup` count collisions; `plan_refused_capacity` counts capacity-barrier refusals; and `stop` plus `stop_reason` (`proposals`, `budget`, `pending`, `reserve`, or `no_free`) names the terminal reason. The fields are guarded by `row_set_spec_mode == 2`, so mode-0/1 event shape is unchanged. Both runner telemetry validation and `tools/check-tg-predict.py` reject partial or contradictory admission records; the offline checker also reports the per-leg skip/refusal/stop totals.
-
-**Measured host validation (no model, CUDA, GPU, or mutex):** rebuilt `llama`, `llama-layer-streaming`, `test-layer-streaming-layout`, `test-layer-streaming-tg-spec`, and `test-layer-streaming-tg-predict`; all three linked tests PASS; `python -m py_compile tools/check-tg-predict.py` PASS; `python tools/check-tg-predict.py --selftest` PASS (92 checks, including the emitter/checker key cross-check and a partial-schema refusal); `tools/run-tests.ps1 -Suite host` SUCCESS 44/44 at engine digest `63280E460286C26F`, `llama.dll` `AAF1E97736CED8DF`, record `build/llama-cuda/suite-runs/20260924T090856Z-host/revision.json`. Existing C4477 warnings are unrelated and pre-existing.
-
-**Evidence boundary.** At the time of this host-only validation no fresh model trace carried the admission schema. The earlier A2 null K=8 recording remains valid for fill-ID replay under its old schema, but the upgraded checker intentionally refuses it with `spec-missing-admission-keys` because the six admission fields are absent; that refusal is not a replay regression. The fresh owner-authorized K=8 coact recording above is the first current-schema runtime evidence and names the actual placement reasons. No admission policy changed.
-
-## 2026-09-24: T-GPLR-07 CHECKER CLI SELF-TEST HARDENED (host-only)
-
-The semantic-QA checker now rejects unknown `--items` ids instead of silently reducing coverage. Its `self-test` drives the real `check` CLI in hermetic subprocesses, covering positive grading and verdict persistence, the must-fail negative control, unknown-item refusal, and mutually exclusive input sources. `tools/run-tests.ps1` now runs this self-test as a required host-only guard.
-
-**Measured validation:** `python -m py_compile tools/semantic-qa/check-answer.py` PASS; direct checker probes PASS, including legacy trace grading; PowerShell parser check `PARSE OK`; focused CTest targets `test-layer-streaming-layout`, `model-inspect`, `tel-mark`, `tg-spec`, and `tg-predict` PASS (5/5); the host suite reached `[semantic-qa]` and reported `self-test: PASS` (21 checks). The overall host command then exited 1 in the pre-existing `test-arm-verdict.ps1` provenance cases because the current nested engine source is newer than the built artifacts; no nested source or binary was changed for this task. No GPU/model run was performed.
-
-## 2026-09-24: T-GPLR-07 `--tg-text` CHECKER MODE BEHAVIOR VERIFIED (host-only)
-
-The requested file-input mode was already present in `tools/semantic-qa/check-answer.py` at outer commit `84be194`; this verification pass required no new checker source edit. `check --tg-text FILE` reads the runner-generated text directly, does not open a GGUF vocabulary, requires exactly one of `--trace`/`--tg-text`, rejects missing or empty input, and preserves `--items`, `--answer`, `--negative`, and `--out-verdict` behavior. The legacy `--trace --model` path remains available.
-
-**Measured validation (2026-09-24, no GPU/model run):** `python -m py_compile tools/semantic-qa/check-answer.py` PASS; `python tools/semantic-qa/check-answer.py self-test` PASS (16 checks); a headless subprocess lifecycle PASS for positive file grading, verdict persistence, negative-control failure, wrong-answer negative pass, empty/missing diagnostics, source exclusivity, item selection, answer override, model independence, and the trace model gate; the recorded Qwen3.6 trace graded PASS through the legacy path; `powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tests.ps1 -Suite host` SUCCESS (44/44). These are host correctness checks, not a new GPU or semantic-quality acceptance run.
-
-## 2026-09-24: T-GPLR-58 A2 FILL-ID REPLAY IS REPAIRED - a fresh null K=8 leg passes check-telemetry with ZERO violations, and the instrumentation exposed and fixed a real cache-occupancy bug (uncommitted)
-
-**Original goal and hypothesis.** `spec.submitted` had to become a per-stage count so the budget-8 barrier could be checked directly, and `spec.fill_ids` had to make speculative cache occupancy replayable. The falsifiable hypothesis was that the old null-k8 mismatch was only a blind checker model. Recording the ids disproved that: the first replayable leg showed duplicate placements, and source tracing found that `spec_issue_one()` marked a slot `PENDING` but never stored the issued expert in `cache_expert[p]`. The cache therefore could not see its own in-flight row for duplicate admission or physical occupancy. The fix writes the expert at issue time; cancellation/reap already releases that same slot.
-
-**What changed.** `tel_spec()` now emits `submitted` for this stage, `submitted_total` for the run, and `fill_ids` in issue order. The runner's retention model stages those ids before the matching `rowset_fetch`, applies them after that demand window, and replays READY/PENDING/CANCELLED, generation and phase boundaries, demand-duplicate cancellation, and speculative-first eviction. A demand duplicate is a fetch, not a retained hit: its cancelled speculative entry is replaced by the demand row and `n_rows_resident` is compared with the pre-placement hit count. Pre-A2 traces now produce one named UNVERIFIED diagnostic instead of hundreds of false downstream mismatches, and `-AllowSpecCheckerGap` refuses to downgrade any trace carrying the new schema.
-
-**Measured runtime evidence (one RTX 5090 Laptop GPU, 24,462 MiB; model `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`, 19.91 GiB).** Final recording: `build/llama-cuda/gplr58-null-k8-fillids-verified.jsonl`; arm verdict `build/llama-cuda/verdicts/gplr58-null-k8-fillids-verified.verdict.json` is PASS (0), `gpu_pre_run=gpu_post_run=clean`, engine digest `BE4839804E1F2ADA`, llama.dll `55BF1B63828BB562`. Shape: 885 PP tokens, 256 TG tokens, null structure-free source, K=8, budget=8. The runner reports `check-telemetry: OK (31689 events, 4 slots)`: **zero invariant violations**. A2 reports 10,240 stages, 1,186 successful fills, per-stage maximum 8, per-stage sum equal to `submitted_total`, 155 consumed, 16 demand-duplicate cancellations, `waited_by_demand=0`, `lead_min=2`, demand share 0.7292, 37.020 GiB staged, and 10,169.56 MiB peak VRAM. P1/P2/P4/P6/P7/M7a all PASS; the null's late-fill rate is 0.094 and is reported, not gated. TG throughput was 23.573 tok/s. The older `gplr58-kprobe-null-k8.jsonl` is explicitly unreplayable because it has no fill ids: its former 216 mismatch diagnoses are replaced by one `UNVERIFIED` cause, not scored as zero.
-
-**Host and semantic-QA validation.** `test-layer-streaming-tg-spec` PASS; `test-layer-streaming-tg-predict` PASS; `python tools/check-tg-predict.py --selftest` PASS 87 checks (including over-budget, stage-sum mismatch, legacy-cumulative, and emitter-key fixtures); `tools/run-gplr58-kprobe.ps1 -ValidateOnly` PASS; `tools/run-tests.ps1 -Suite host` SUCCESS 44/44 at the final engine digest. The required T-GPLR-07 smoke tier also passed on the final binary: 50 tokens produced exact 50/50 calibration, `check-telemetry: OK (30547 events, 3 slots)`, answer PASS, and the negative control FAIL as designed; 512 tokens produced exact 512/512 calibration, all five answer items PASS, the same telemetry PASS, and the negative control FAIL as designed. GPU pre/post were clean; records are `build/llama-cuda/suite-runs/20260924T083429Z-qa-smoke/revision.json` and `20260924T083722Z-qa-smoke/revision.json`.
-
-**What remains unproven.** This is a NULL control and an instrumentation/lifecycle result, not a predictor-quality or speedup result. The fresh coact trace above now explains the K=8 zero-fill behavior; K=4 and K=12 still have not been re-run after the occupancy fix. The A2 residual of 1,015 is explicitly allowed as never-consumed READY rows under the current accounting contract; it is not a claim that every submitted byte was consumed. Final acceptance remains the owner's decision.
-
-## 2026-09-23: T-GPLR-58 K-SCALING PROBE (owner-directed) - retention scales cleanly to K=12, the null PLACED ~200 fills that converted to nothing, and the ARM placed ZERO everywhere - a submit-counter defect (submitted is cumulative, increments up to 306 vs budget 8) and an unexplained arm-specific admission refusal now own the question (uncommitted)
-
-**What ran.** New `tools/run-gplr58-kprobe.ps1` (A3-skeleton, off/arm pairs at K=4/8/12 + null@K8, one mutex hold, declared shape unchanged). Run 4 (kprobe3 log) is the usable session: all 7 legs exit 0, provenance 7/7 PASS, gpu pre/post clean, exe `668969213A334632` / llama.dll `6045AC4C71514BEA`.
-
-**Retention ladder (the baseline the probe was asked for; off legs, no prediction):** TG tok/s 22.17 (K=4) / 27.51 (K=8) / 31.40 (K=12); shares 0.5349 / 0.7273 / 0.8218; staged 63.56 / 37.28 / 24.36 GiB; peak VRAM 7.80 / 9.93 / 12.06 GiB (K=12 fits 24 GB with ~10 GiB margin). Run-to-run off-k8 tok/s spread 26.13-27.51 across the four attempts (~2.6% band) - the honest noise floor for every arm delta at these shapes.
-
-**The null@K8 (fills physically placed for the first time in the program):** submitted monotone-cumulative per layer reaching 1,506 on layer 0; TG bytes 40.06 vs off-k8 37.28 GiB (+2.78 = ~200 speculative rows staged); demand share 0.72711 vs 0.72726 (-0.00015); consumed 0, matched_by_demand 0, tok/s 25.84 (-1.0 vs off). The null's ~200 random guesses bought EXACTLY nothing - the correct behavior for a structure-free control.
-
-**DEFECT 1 (historical; fixed 2026-09-24).** In run 4 `spec.submitted` was reported CUMULATIVE per layer in mode 2 (monotone 0->7->313->512->774->1057 on layer 0), so A2's per-stage sums read 15,189,015 and max per-stage increment 306 vs the pre-registered budget 8. The 2026-09-24 A2 pass emits per-stage `submitted`, run-wide `submitted_total`, and `fill_ids`; the fresh null K=8 leg measured maximum 8 per stage and 1,186 total over 10,240 stages.
-
-**DEFECT 2 (historical; fixed 2026-09-24, with one engine defect found on the way).** Run 4's runner reported 216 downstream retention mismatches because its cache model replayed demand events while the old `spec` event carried no fill ids. The new event/model replay now passes the same null-K8 shape with zero violations. The first fill-id recording also exposed a separate engine bug: `spec_issue_one()` did not write the issued expert into `cache_expert`, so duplicate admission and physical occupancy were blind to an in-flight fill. That ownership update is fixed. Legacy traces remain UNVERIFIABLE, and the probe-only downgrade switch no longer applies to any trace carrying the new schema.
-
-**THE DECISIVE RESULT: the arm placed zero at every K.** arm-k4/k8/k12: proposals 81,424 on each leg (10,178/10,240 stages publishing), but submitted 0, pending 0, ready_spec 0 - at the SAME K where the null PLACED fills, with the arm's fill-room analyzer reading 771/10,240 (7.53%) admittable at K=8. Every K-pair delta share(arm)-share(off) is 0.0000 and tok/s deltas are inside the 2.6% off spread (22.10/27.34/30.61 vs 22.17/27.51/31.40). The unexplained refusal is arm-specific (prop>0, arm_count>0, but the planner admits nothing) - NOT capacity (null fills at K=8), NOT a silent no-op (null ran the identical path), NOT budget exhaustion (increments to 306). A real engine question, now the block's open item.
-
-**Charter read.** The retention curve itself is the biggest lever this probe measured: K=2->12 doubles demand share (0.377->0.822) and buys +64% TG tok/s at ~10 GiB VRAM; the predictor question remains open behind two defects, with the owner-directed answer so far: more cache slots work exactly as hoped, prediction still gets zero of them.
-
-## 2026-09-23: T-GPLR-58 A3 RAN (one mutex hold, five legs, GPU-clean) - the arm PROPOSED on 10,178 of 10,240 layer-stages and the planner PLACED ZERO; the ceiling at K=2 is 0.00%, so M1/M3 fail on CAPACITY, and the first real run exposed (and fixed) a bring-up defect that had made every speculative mode inert (uncommitted)
-
-**What ran.** The new `tools/run-gplr58-session.ps1` (one hold: busy preflight, evidence archiving, detached launch, verdict roll-up) drove the new `tools/run-gplr58-a3-arm.ps1` through the contract's five legs at the declared short shape (885-token non-echoing prompt, `--tg-tokens 256`, `--rep-penalty 1.15`): `off@K2` x2, `null@8@K2`, `arm-coact@K2`, `retref@K4`. Five legs usable, all exit 0, every integrity gate and the provenance gate PASS, gpu pre/post `clean`, 22.2-24.0 s per leg. Binary exe `668969213A334632` / llama.dll `6045AC4C71514BEA`, engine digest `DF2818188A47003F`.
-
-**THE DEFECT, and why the session was run twice.** The first attempt configured mode 2 correctly (log: `mode 2 (proposer arm) budget 8, reserve 8 of cap 16`, `proposer arm coact`) yet emitted **no `row_spec_mode` in `run_start` and ZERO `spec` events**, and A2 refused the leg - `begin_row_cache()` ran `spec_reset()` (the TEARDOWN, which clears the mode/arm/null source) AFTER the runner configured the run and BEFORE the allocation gated on `row_set_spec_on`, so a mode-2 run silently became a plain retention run. Fixed in the engine (the reset is now off-path-only), rebuilt, re-run. `tests/test-layer-streaming-tg-spec.cpp` could never catch this: it drives the pure functions and never calls `begin_row_cache()`. The defective-binary attempt is preserved under `build/llama-cuda/runs/20260923T175746Z/`; a host-only guard for the bring-up ordering is an OPEN ITEM.
-
-**The measured session.** shares: off1 0.37705, off2 0.37705 (control spread **0**), null 0.37705, arm-coact 0.37705, retref@K4 0.53486. **M1 +0.0000** (inside a zero spread) FAIL, **M2 +0.0000**, **M4/M4n +0.0000**, **M3 -0.1578** FAIL, **M7a/M7b/M7c UNMEASURED** (no fill was issued, so no lead exists), P1/P4/P6 PASS trivially. The arm leg's own telemetry is what makes the zero interpretable: **10,178 of 10,240 stages published proposals (`prop > 0`, up to the full budget 8) with `submitted == 0` everywhere**, and the fill-room analyzer on this session's traces reports **0 of 10,240 admittable stages at K=2** (each layer full by stage 4) against 189/10,240 at K=4 - the analyzer and the engine AGREE, so at K=2 the arm's ceiling is exactly ZERO and nothing about prediction has been falsified. Cross-check independent of the arm: the retention legs reproduce the recorded honest K-ladder within ~0.1pp (0.37705 vs 0.3778 at K2; 0.53486 vs 0.5355 at K4).
-
-**What it decides / does not.** The block's pre-registered negative fires for the charter band M3 (`share >= 0.5355` at K=2 is not met): predictors do NOT buy depth-equivalent hits at this headroom - at K=2, this shape, this admission rule. It says nothing about bar09/fusion, about K=4+ (room exists but <= ~2%), or about shapes with a less hostile reserve-to-capacity ratio. **A4 remains pre-authorized and NOT RUN**; a different arm cannot create capacity, so A4's live question would be the volume/VRAM bands, not M1.
-
-**Two A2 findings produced here, BOTH FIXED the same day** (host-only; `tools/check-tg-predict.py`): M5 is now a per-leg MEAN instead of a ratio of SUMS (two `off` legs against one arm leg summed to exactly `0.500x (-50.0%)` - a leg-count artifact, while every leg staged 85.084 GiB = 1.000x; the line now prints the leg counts and per-leg volumes), and M3's denominator now takes the session's K=4 retention reference, preferring an `off`-role leg and accepting this contract's `retref@K4` (keying on `off` alone printed NOT COMPUTABLE on a session that HAD the reference). Selftest **PASS 76 checks** (was 65) with the A3 session's own uneven-count shapes as fixtures; re-read on the recorded A3 traces the checker itself now prints **M3 -0.1578** and **M5 1.000x (+0.0%)**; the port comparator is still EQUAL (483,840 rows) and the host suite **SUCCESS 44/44** (digest `DF2818188A47003F`, llama.dll `6045AC4C71514BEA`). The arm driver now cross-checks the checker's M3 line rather than differencing it privately. **Nothing is committed:** the engine fix, the two new drivers and these records are uncommitted.
-
-**A2 band-arithmetic fix, detail (2026-09-23, host-only).** `check-tg-predict.py` gained one selftest group covering the two shapes the A3 session carried: two `off` legs plus one arm leg whose per-leg staged volumes are EQUAL must read `1.000x` (with the artifact string `0.500x` absent, the leg counts printed, and the "a ratio of SUMS ... reports the count" note present); an arm plus a `retref@K4` leg must compute M3 under the `retref` label; an `off`-role K=4 leg must still win the denominator when both are supplied, with DIFFERENT shares so the preference is visible in the value and not only in the label; and an arm with only a K=2 baseline must still print NOT COMPUTABLE while naming both accepted roles. `tools/run-gplr58-a3-arm.ps1` was updated to parse the checker's M3 line and record `M3_checker` / `M3_denominator_role` / `M3_driver_crosscheck` / `M3_crosscheck_agrees`, warning on disagreement; that regex was validated against the real band output before the change was accepted (denRole=retref, M3=-0.1578, agrees=True).
-
-## 2026-09-23: T-GPLR-58 MODE 2 LANDED - the engine CONSUMES the A1 proposer, and the fill-room bound says an arm's ceiling is CAPACITY, not precision (host-only, no GPU, no mutex, no arm run, no model loaded)
-
-**What changed.** Mode 2 was reserved and refused; it now runs. The engine's speculative-placement
-path calls a pure orchestration (`llama_ls_spec_propose`): observe the row the demand just served ->
-publish from the arm (or from the count-matched null) -> plan under the budget/pending/reserve rules
--> issue. Mode 1 and mode 2 now share the whole downstream path and differ only in where proposals
-come from, so the A1 policy that was proven row-equal to the offline screen is what actually runs.
-The runner gains `--residency-tg-spec 2`, `--residency-tg-spec-arm <coact|bar09|fusion>` and
-`--residency-tg-spec-null <0|1>`, with five refusals that fire after the host-only metadata read and
-BEFORE `llama_backend_init` (so the whole flag surface is testable with no CUDA, no model, no mutex).
-The `spec` event carries `"prop"` and `"arm_count"` in mode 2 ONLY - a mode-0/1 event stays
-byte-identical to every earlier recording - and `run_start` echoes the resolved arm and
-`row_spec_null`, so a leg is identifiable from its trace alone.
-
-**The measured finding, and the Planner call it forces.** A fill is admitted only while its layer
-has a free position beyond the demand reserve (`n_free > top_k`); the demand path fills to
-`cap = min(n_expert, K * top_k)` and evicts to place later misses, so post-warm-up misses are
-net-zero swaps. Rebuilt from the eight recorded retention legs: **3,405 of 69,120 layer-stages
-(4.93%) ever leave room, all in each layer's warm-up** (0.00% at K=2; 1.77/4.03/6.62% at K=4/6/8;
-4.91/7.53% honest; 4.71/17.66% qa-depth K=4/8). **PLANNER CALL:** the demand-hit gain has a ceiling
-set by capacity, not by arm precision, so (a) every arm leg must report the fill-room datum with
-`share`/`margin_share`, and (b) a low-gain arm result must be read against that ceiling before any
-arm is called rejected. The `null` control is untouched by this - it controls the proposal source at
-equal budgets.
-
-**Validation.** `test-layer-streaming-tg-spec` PASS 68 checks (20 of them the new mode-2 scripted
-arm leg: proposals on a periodic stream, real plan accounting, a saturated cache that still
-proposes but issues nothing, a cache with room that DOES issue and holds the reserve, no peeking,
-determinism, null count-matching); `test-layer-streaming-tg-predict` PASS 28 checks;
-`tools/check-gplr58-mode2.py` PASS 10/10 cases + `--selftest` 7/7 (its negative controls include a
-silent exit scored as agreement, and a model-missing exit 1 that must not read as a refusal);
-`tools/analyze-gplr58-fill-room.py --selftest` PASS 8 checks; `tools/check-tg-predict-port.py`
-still EQUAL (8 legs, 483,840 row comparisons), so the wiring did not perturb the policy;
-`run-tests.ps1 -Suite host` SUCCESS 44/44, digest `4D08CFCD186C9074`, llama.dll `38386D5B495877F5`
-(record `20260923T171456Z-host`), with both new guards registered.
-
-**Known gaps / next.** No real `spec` event exists yet: the wiring is host-only-proven, and the
-fill-room table bounds the OPPORTUNITY from the incumbent's recorded occupancy rather than measuring
-a speculative run. The work is COMMITTED as a task-split series: nested `e3627d5f3` (the wiring, its
-fixture and the runner flags), then outer `db1366e` (fill-room analyzer + guard), `876ef83` (the
-mode-2 flag/refusal checker + guard), `db937e4` (pin bump to `e3627d5f3`) and this docs commit. Both
-outer intermediate states ran the host suite green (44/44, engine digest `98A59B376F8E07DE`, nested
-head `e3627d5f3`, llama.dll `38386D5B495877F5`); the earlier `4D08CFCD186C9074` in the validation
-paragraph above was the same engine digests one nested commit earlier. The next eligible step is
-A3's first mutex-held arm leg -
-which is also the first real `spec` record A2's checker will read.
-
-## 2026-09-23: THE T-GPLR-58 WORK IS COMMITTED AS A TASK-SPLIT SERIES (four outer + two nested commits, no GPU time spent)
-
-**What was committed, and in what order.** Nested first, because the outer tree pins it: `c861ab0d4` (A0 - speculative TG expert-row placement behind a default-off mode, the A2 engine datum it carries, `tests/test-layer-streaming-tg-spec.cpp`, the runner flag surface) then `7480fb5b9` (A1 - the four proposer families, the merge operators, the count-matched null and the speculative planner as pure functions, plus the `--dump` mode the comparator reads). Outer: `8e41a52` (the uncovered-margin instrument + its host guard), `8c01a96` (the A2 verdict-surface checker + guard), `10b0798` (the A1 port comparator + guard), `7a00d53` (pin bump to `7480fb5b9`), and this docs commit carrying the plan records, the M7 restatement, the AGENTS gotchas, the T-GPLR-59 draft and the predictor-frontier findings.
-
-**The split is mechanical, not cosmetic.** The nested diff could not be separated by hunks - A0/A1/A2 share functions and even a `printf` format string - so the intermediate trees were built by island removal and then VERIFIED before committing: the A0-only tree (the final content minus every A1 island) was rebuilt as an engine (module + the `llama-layer-streaming` exe + its fixture test) and its fixture test PASSED 36 checks; the A1 tree was rebuilt with both new tests PASSING and the host suite 44/44. The outer series was staged the same way: `tools/run-tests.ps1` now has three committed states (margin guard; plus the A2 checker guard; plus the port guard and the `tg-predict` CTest pattern), each one a tree whose referenced tools actually exist at that commit, and each state was run green (SUCCESS) before it was committed.
-
-**Verification of the COMMITTED content.** Port equivalence reproduced on the committed tree: EQUAL on 8 legs, 483,840 row comparisons, the null count-exact, the findings doc's recorded rows re-derived from the reference, and the pinned reference `sha256 81c9a4afa5333bad1599d774b6488c33f9d97156c0a3cc8a826267e7150caef2` held. `check-tg-predict.py --selftest` 65 checks PASS; `check-tg-predict-port.py --selftest` 13 checks PASS; `run-tests.ps1 -Suite host` 44/44 PASS; `git diff --check` clean in both trees.
-
-**What the series does NOT carry, and one environment result that must not be read as a regression.** `tools/run-tests.ps1 -Suite all` was also run: it reports the model-run families (pp512, scheduler, lm511, tail513, boundary, slot-lifecycle, transition, layer-major, pinned, slot-mixed) as failed with `missing or empty model environment variable: Q38LS_MODEL_PATH`, and the wrapper then rewrites the run UNCERTIFIED for want of an arm's binary identity. That is an ENVIRONMENT precondition of this shell (no model path, no provenance arm), not a defect of anything committed here; the host suite is the correct validation for host-only work. Nothing in this series is a VERDICT: no arm has run, no `spec` event has ever been emitted, and the A3/A4 holds remain gated on the mode-2 wiring. The one unrelated pre-existing break, `test-unicode` failing to link (`unicode_regex_split` unresolved), is untouched.
-
-**Correction made while committing.** The A1 entry below had been inserted ABOVE this file's `# Current State` heading, so the document no longer started with its own H1; the heading is restored to the top and the A1 entry is left intact as the newest section under it.
-
-## 2026-09-23: T-GPLR-58 A1 IMPLEMENTED - the predictor POLICY (four families, the bar and vote operators, the count-matched null, the planner) is in the tree and PROVEN EQUAL to the offline screen row by row: 483,840 comparisons on the eight recorded legs, zero mismatches (host-only, no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)
-
-**What was asked.** A1: the proposer families, the two merge operators, the count-matched structure-free null and the speculative-fill planner, as pure functions in the streaming module with no new runner flag - validated by policy unit tests (determinism, budget-exactness, null demand-blindness, planner purity) and by a port comparator that requires the module's per-row proposal sequence to equal `tools/predictor-screen-gplr.py`'s on all eight recorded legs, with that tool pinned at a recorded revision.
-
-**The reference is pinned by file hash**, because the screen is live code: `tools/predictor-screen-gplr.py` `sha256 81c9a4afa5333bad1599d774b6488c33f9d97156c0a3cc8a826267e7150caef2`. The comparator IMPORTS that module and drives its own candidate classes (predict-then-observe per row) instead of restating them, so the target cannot move under the claim.
-
-**What landed.** Nested: pure `llama_ls_pred_*` (history / markov-1 / coact / coupling-copula over an explicit caller-owned `llama_ls_pred_state`), `llama_ls_pred_arm_predict` (`coact`, `bar09` = Barred(Markov1, 0.9), `fusion` = param-free vote fusion over the four sources), the xorshift32 count-matched null (`llama_ls_pred_null_seed` / `_null_fill`), and the pure planner + cancellation policy (`llama_ls_spec_plan`, `llama_ls_spec_cancel_policy`); new `tests/test-layer-streaming-tg-predict.cpp` (CTest `test-layer-streaming-tg-predict`, 28 checks) with a `--dump <trace.jsonl>` mode emitting the per-row proposal sequence. Outer: `tools/check-tg-predict-port.py` (new, registered as the `[tg-predict-port]` host guard). No new runner flag: the policy is engine-side by contract.
-
-**Measured (host-only).** The port equals the screen for all four families and all three arms on the eight recorded legs: **483,840 row comparisons, zero mismatches**, null count-exact on every row. The comparator also verifies the doc's "same stream" claim from the demand rows: echo 4 legs `1c99b7fc6cf1`, honest 2 legs `da834f794b31`, qa 2 legs `57fb9aaa6d9e`. `--tables` re-derives the findings doc's recorded rows from the reference and requires the doc to state them: echo 30.8/30.9, 39.5/39.9, 42.6/43.0, 36.1/41.7; honest 24.6/24.7, 27.4/27.7, 28.1/28.4, 25.1/29.0; qa 33.3/33.7, 35.5/36.4, 36.8/37.7 - all reproduced to the doc's tenth. Comparator selftest **PASS 13 checks** (a single flipped id, a dropped row and a short null row are each CAUGHT; a trace with no `rowset_init`, an out-of-order leg and a missing dump binary are each REFUSED). `run-tests.ps1 -Suite host` **SUCCESS 44/44** (digest `3FE379D5EE294043`) with the new guard and the new CTest target registered.
-
-**MEASURED ARTIFACT, decided rather than smoothed over.** The screen observes `list(frozenset(ids))`, so its history family carries CPython's set-iteration order while the engine sees the trace's `union_ids` order. On three streams, seven candidates each (`build/tmp-tg-a1/orderexp.py`): the order moves ONLY the fusion arm (<= 0.09pp) and coupling by one rounded tenth (0.02pp echo, 0.01pp qa); every family and bar row the doc records reproduces exactly under either order. The comparator therefore drives the reference in the TRACE's order and holds the two order-sensitive rows to the doc's tenth plus that artifact - imitating CPython's set order would have been a port of an implementation detail rather than of the screen's method.
-
-**What is NOT proven.** The engine does not CONSUME the proposer yet: mode 2 is still reserved and refused, so no arm can be run and A3 cannot start - that wiring is the remaining A1 work and the block's next step. **[SUPERSEDED the same day - see the top entry: the mode-2 wiring LANDED, so A3 is gated on a mutex window rather than on code.]** No real `spec` event has ever been emitted, so no band here is a predictor result. The doc's fusion row (29.6/29.6 held-out) is a tune/held quantity and is deliberately not gated by `--tables`. `bar09` is implemented over markov-1 because the block quotes the markov-1@bar0.9 row (25.1/29.0); coact@bar0.9 is stronger (25.8/29.8) and switching the arm is a Planner call. Files committed in the T-GPLR-58 series: nested `7480fb5b9` (`src/llama-layer-streaming.{h,cpp}`, `tests/CMakeLists.txt`, new `tests/test-layer-streaming-tg-predict.cpp`); outer `10b0798` (`tools/check-tg-predict-port.py`, `tools/run-tests.ps1`); the plan and this file in the docs commit.
-
-## 2026-09-23: M7 RESTATED (Planner call, T-GPLR-58) - the vacuous "lead median > 0" band becomes an invariant on the reap floor PLUS a late-fill-rate arm band, both host-proven (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)
-
-**What was asked.** Settle the call A2 raised: does M7 become `median >= 2` plus a `matched/(consumed+matched)` threshold? Answer: the threshold yes, the median no - and the decision is now recorded in the contract, with the checker implementing exactly what the contract says.
-
-**The decision (T-GPLR-58, M7 RESTATEMENT).** M7 is three parts. **M7a (invariant, integrity)** - `lead_min >= 2` on any leg with a consumption: a lower value is wrong ordinal bookkeeping rather than a clever schedule, so it is FAIL-INVARIANT and halts the series (already the implemented check, unchanged). **M7b (arm band, quality)** - `matched_by_demand / (consumed + matched_by_demand) <= 0.5`, equivalently `matched <= consumed`, scored on ARM legs only and only with `consumed + matched >= 8` resolved fills; below the floor the rate prints UNSCORED and cannot satisfy M7's clause, so a session with no qualifying arm leg reports M7 UNMEASURED - never PASS. **M7c (reported, never gated)** - the min/median/max/mean and the 8-bucket histogram.
-
-**Why the median half was REJECTED rather than applied.** `median >= 2` is vacuous for exactly the same structural reason as `median > 0`: the reap ordering forces every consumed fill's lead to >= 2, so any median criterion is true of every leg that is not already FAIL-INVARIANT - the restatement would have swapped one always-true gate for another. The old wording was worse than vacuous on the case M7 exists for: an arm that consumed NOTHING published no M7 reading at all, so a schedule whose guesses never land failed nothing. The band now fails exactly that arm (rate 1.000 over 9 resolved fills), which no previous criterion could see.
-
-**Why 0.5, and why it is fixed.** "More guesses land in time than arrive too late" was chosen A PRIORI from the mechanism's own ordering, not fitted to anything - no real `spec` event has ever been emitted - and it is NOT re-registered after a session's data: an arm that fails it is failed, not the threshold re-tuned. It is gated on `arm` legs only, because the count-matched `null` control draws its ids structure-free and gating its targeting would fail the control by construction; the null's rate is reported instead, as pool-growth evidence.
-
-**Implementation + validation (host-only, no GPU, no mutex).** `tools/check-tg-predict.py`: the docstring restated (M7a/M7b/M7c), `M7B_MAX_RATE = 0.5` and `M7B_MIN_RESOLVED = 8` as named constants, the band printed per leg with `[arm band <= 0.500] PASS|FAIL`, a `BAND FAIL (not an invariant, does not halt the session)` line for a failing arm, the floor line relabelled M7a (failure code `M7a`) and the median line relabelled M7c. **Selftest PASS, 65 checks (was 56)**: the scored session plus arm fixtures at 0.750 (FAIL), 0.500 (PASS - the boundary is inclusive) and 1.000 (never landed, FAIL), each asserted to keep `VERDICT: scored` because a band is not an invariant; an `arm-nofill` leg asserting the UNMEASURED path; the thin-sample UNSCORED path (7 resolved fills); and the null leg's reported-not-gated path. **Cross-tool agreement intact:** the five recorded retention legs still score share 0.4326 / 0.6260 / 0.7141 / 0.7745 / 0.6461, identical to `tools/analyze-tg-margin.py`. `run-tests.ps1 -Suite host` **SUCCESS 43/43** (revision digest `7E2EF3CEE610F678`, nested head `d8d7253a7133`), `resplit-gplr-plan.py --verify` **PASS**, `check-doc-sizes.py` **PASS** - with the plan now 320,137 B (66.7% of the FAIL band, a warning inside the safe band, unchanged in kind by this edit).
-
-**Consequence for the block.** M7a stays in the FAIL-INVARIANT list with P1 and P4; M7b joins the M1/M4/M5 band family and does NOT halt a pre-authorized session or cancel A4. No other band, arm, session or length moved. Every M-band here remains a TOOL result, never a predictor result: M7b's 0.5 is a pre-registration, not a measurement, and no real `spec` event has ever been emitted. Files touched, all committed in the T-GPLR-58 series: the contract (`docs/plans/generic-prefill-layer-residency-plan.md`, +6,384 B), `AGENTS.md` and this file in the docs commit, `tools/check-tg-predict.py` in `8c01a96`.
-
-## 2026-09-23: T-GPLR-58 A2 IMPLEMENTED - the TG predictor VERDICT SURFACE is in the tree (host-validated, refuses what it cannot justify), plus the two engine additions its bands needed (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)
-
-**What was asked.** A2: the host-only checker that turns an instrumented run into the block's pre-registered quantities - share, margin_share, M2, the per-leg VRAM and transfer medians, `lead_rows` and every P-counter - and REFUSES (exit 2, no numbers) a non-instrumented trace, a trace missing `spec_cancelled`, or a leg with no `retain_k`; `--selftest` covering each refusal, including the "cancel hook never fires" leg that must be refused rather than scored.
-
-**What landed.** `tools/check-tg-predict.py` (new, ~900 lines, registered as the `[tg-predict]` host guard), plus two engine additions the bands could not be computed without: (1) **M7's datum** - a pure `llama_ls_spec_lead` / `_lead_bucket` pair, a per-position issue ordinal (`spec_issue_ord`), and the `lead_hist` distribution emitted in the `spec` event, with 11 new checks in `tests/test-layer-streaming-tg-spec.cpp` proving the arithmetic and the bucket shape; (2) **the resolved speculative mode in `run_start`** (`row_spec_mode` / `_budget` / `_reserve`, present only when the mode is on), so an arm leg is recognisable from its TRACE rather than from a filename or a command history - the T-GPLR-48/T-GPLR-52 lesson. Both are absent in mode 0, so every recorded trace and the default path are unchanged.
-
-**Why the checker is built around refusals.** A zero is an answer and a refusal is not: a leg whose `share` cannot be computed must never read as 0. So exit 2 prints NO number and names the rule for: no `rowset_init`; a missing or 0 `retain_k` (the reactive baseline has no per-layer residency, hence no margin); no `rowset_fetch`; a leg declared arm/null with no `spec` events; a `spec` missing a required key (including `cancelled`); **submitted > 0 with `cancelled == 0`** (the cancellation hook never fired, so P4 is UNTESTED and the leg cannot testify); an off leg that carries speculation; an accounting that double counts; and a `lead_hist` that disagrees with `consumed`.
-
-**Measured (host-only).** Selftest **PASS, 56 checks**: one scored off/arm/null session with every band asserted exactly, one fixture per refusal asserting the exit code AND that no band number was printed, and two invariant-violation legs asserting exit 1 with the invariant named. An **emitter<->checker cross-check** reads `tel_spec()`'s own format string out of the engine source and fails if a key the checker requires is not emitted - the failure mode that would otherwise refuse every arm leg at the first hold. **Cross-tool agreement:** the five recorded retention legs score share 0.4326 / 0.6260 / 0.7141 / 0.7745 / 0.6461, identical to `tools/analyze-tg-margin.py`'s booking of the same recordings. `test-layer-streaming-tg-spec` **PASS** (36 + 11 checks); `run-tests.ps1 -Suite host` **SUCCESS 43/43** with the new guard running; full Release build green apart from the pre-existing unrelated `test-unicode` link failure.
-
-**MEASURED FINDING - the lead floor is 2, so M7's band as written is vacuous.** The only hot-path reap runs at the END of a demand stage (that ordering is what keeps P1 true), so a fill issued after stage t first counts as READY at the end of stage t+1 and cannot serve a demand before stage t+2. A lead below 2 is therefore impossible, and the pre-registered M7 band "lead median > 0" cannot fail while anything is consumed: the median is structurally >= 2. The informative reading of the same datum is the balance between `consumed` and `matched_by_demand` - a guess aimed at the next stage of its layer ALWAYS arrives after that stage was classified, so it pays only when the ids repeat across the two-stage gap - and the checker now FAILS a leg whose `lead_min` is below 2, because that is wrong ordinal bookkeeping rather than a clever schedule. **Planner call raised at the time (TAKEN 2026-09-23 - see the M7 RESTATED entry above):** restating M7 as `median >= 2` plus a `matched/(consumed+matched)` threshold was a band change, so it was left with the Planner; that call has since been taken, rejecting the median half as equally vacuous and adopting the threshold as the M7b arm band.
-
-**What is NOT proven, stated plainly.** No real `spec` event has ever been emitted - the mechanism has still never executed against a real cache - so the engine-to-checker integration (a recorded instrumented leg read back by this tool) is unmeasured and is exactly what the first A3 hold must show. A1's proposer and its `tools/check-tg-predict-port.py` comparator do not exist, so no arm can be run (mode 2 is refused); `tools/run-gplr58-session.ps1`, named by the block's own validation commands, does not exist yet and is an A3 prerequisite. Every M-band in this pass is a TOOL result, never a predictor result. Committed in the T-GPLR-58 series: nested `c861ab0d4` (the mechanism + `tests/test-layer-streaming-tg-spec.cpp`), outer `8c01a96` (`tools/check-tg-predict.py`, `tools/run-tests.ps1`), the plan and this file in the docs commit.
-
-## 2026-09-23: T-GPLR-58 A0 IMPLEMENTED - the speculative TG expert-row placement MECHANISM is in the tree, default-off, with its rules proven host-only and a mode-0 differential against the pre-A0 retention algorithm (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)
-
-**What was asked.** A0: the ONLY source change of the predictor block - a default-off prediction mode on the retention path, a proposal budget, speculative staging with its own completion event, capacity-boundary refusal, cancellation at the generation boundary and before a demand stage, and the P1-P6 counters - validated by host fixtures driven by a SCRIPTED proposal sequence, with the mode-off path preserved.
-
-**What landed (nested tree, committed as `c861ab0d4`: `src/llama-layer-streaming.{h,cpp}` +820, `tools/layer-streaming/main.cpp` +77, `tests/CMakeLists.txt` +8, new `tests/test-layer-streaming-tg-spec.cpp`).** The placement RULES are pure functions (`llama_ls_spec_is_hit` / `_admit` / `_free_pos` / `_may_evict` / `_victim_better` / `_cancel_plan`) so they can be proven without a GPU; the engine owns when they are asked and what a fill does to the copy stream (`spec_issue_next` / `_issue_one` / `_reap` / `_cancel` / `_reset` plus the demand-side guards inside `load_row_set`); the driver is `--residency-tg-spec <0|1|2>` (mode 1 = scripted, mode 2 RESERVED for A1 and refused), `--residency-tg-spec-budget`, `--residency-tg-spec-script <path>` with the line format `<layer> <ordinal> <expert>...`; telemetry is one `spec` event per demand stage (mode, budget, reserve, cap, pending, ready_spec, submitted, ready, cancelled + per-point capacity/demand/generation, refused_capacity, dup_refused, matched_by_demand, waited_by_demand, reap_wait_us, issued_bytes).
-
-**The three design facts worth carrying forward.** (1) P1 is enforced structurally, not promised: the reap runs only after the demand's own `ev_copy_ready` wait, and `spec_in_demand_window` COUNTS any reap taken inside that window, so `spec_waited_by_demand` is a falsifier. (2) That works because the admission rule keeps `top_k` positions FREE at all times - the demand's complement always fits without reclaiming or waiting on a speculative position. (3) This tree's ggml exposes `synchronize` but no non-blocking event query, so a reap can block; the honest reading of "the guess arrived early" is `reap_wait_us` per stage, and A1's proposer inherits that limit.
-
-**A teardown hazard closed while writing the record.** A demand stage synchronizes its own copies before returning, so nothing is outstanding at teardown - but a speculative fill has no such owner and `end_row_cache()` frees the cache buffers it is writing into. `spec_reset()` now DRAINS every fill event before freeing it: the one place where waiting on a speculative copy is correct, and provably not a demand (the drain runs after the last demand window closed).
-
-**Validation (host-only).** New nested target `test-layer-streaming-tg-spec` **PASS**, 36 scripted-sequence checks (P2 pending-is-never-a-hit and residence-only-on-completion; P3 the reserve barrier, the budget cap, no displacement, spec-first eviction; P4 oldest-first cancellation with READY never in the plan; P6 null-states = today's behaviour; plus a guess/demand walk counting the hit, the matched-but-pending and the wrong-guess outcomes). The **mode-0 differential PASSES: 1200 random windows** across three capacities where the pre-A0 retention algorithm - kept verbatim in the test as the oracle - agrees with the new decision functions on hits, fetch sets, victim choices, eviction counts, placement positions and the resulting cache. `run-tests.ps1 -Suite host` **SUCCESS 43/43** with the new target registered in the suite's include pattern, at revision digest `FC543BD631FFF9CD`. Parse-time flag refusal verified on the built runner (`--residency-tg-spec 3` -> exit 2 before any model work); the other flag preconditions sit with the existing residency preconditions, after the architecture metadata read and before any model load.
-
-**A real defect the differential caught.** Evicting a speculative row cleared `cache_expert`/`cache_recency` but NOT the row's placement state, leaving a READY state on a position whose row was gone: the demand's free-position search would then skip a physically free position and silently shrink the capacity the reserve had promised it. Fixed (an eviction clears the placement state with the row) and the free-position predicate was simplified to key on PHYSICAL occupancy. This is the failure mode the differential exists for, and it is the second time in two days that a host-side equivalence check found a defect a "looks right" review did not.
-
-**What is NOT proven, stated plainly.** The mechanism has NEVER executed against a real cache: no fill has been issued, no completion event recorded, no `spec` event emitted by a real run - so every wiring claim is a code claim with a host proof of the RULES behind it. A1's proposers do not exist (mode 2 refused) and A2's checker does not exist, so the `spec` event's shape is defined by its emitter and read back by nothing yet. Run-level byte-identity of mode 0 on runner output, and every M-band, remain unmeasured; the A3/A4 holds stay gated on A1/A2. Committed in the T-GPLR-58 series: the nested tree holds 4 modified files plus the new test (`c861ab0d4`); the docs of this and the two preceding tasks are in the docs commit.
-
-**Environment note (hit again, no new gotcha).** After the header change, `test-layer-streaming-layout` died with `Exit code 0xc0000409` in teardown while printing every assertion `ok` - exactly the stale-type-layout trap AGENTS records. A FULL build (not just the target under test) cleared it, and the suite then ran 43/43. Separately, the full build hits a pre-existing, unrelated link failure in `test-unicode` (`unicode_regex_split` unresolved) that no change here touches.
-
-## 2026-09-23: T-GPLR-58 A0/A1 SETTLED - MECHANISM IS A0 AND LIVES IN THE STREAMING MODULE, POLICY IS A1 AS PURE FUNCTIONS, AND THERE IS NO RUNNER-SIDE PROPOSER (contract text only; no code changed, no GPU, no arm run)
-
-**What was wrong.** Two defects in the drafted steps. (1) A0 and A1 both owned the P1-P5 decision tests, near-verbatim, which violates the rule this plan uses everywhere else - one rule, one owner. (2) A1 said the predictor is "ported to the runner side", an architectural claim the code does not support.
-
-**What the code allows (measured 2026-09-23, source inspection, no build).** The demand - the router's exact top-k ids for one (ubatch, layer) - is computed INSIDE the module (`src/llama-layer-streaming.cpp` ~3625 assembles `union_ids` and hands them to `load_row_set(il, union_ids)`); resident-row state is module members (`row_set_have`, `row_set_owner`, `row_set_gen`, `row_set_ids`); the per-layer retention cache and its recency policy are module-owned; and the module exposes NO callback / `std::function` / hook interface at all (grep of `src/llama-layer-streaming.h` for `std::function` and `_hook`: zero hits). The runner (`tools/layer-streaming/main.cpp`) configures the module before init/prebuild and reads its telemetry; it never sees a per-layer routing decision, so a runner-side proposer would require a NEW inversion-of-control pattern - a different task, not this block.
-
-**The settlement (four contract edits, all inside T-GPLR-58).** A new OWNERSHIP AND PLACEMENT subsection before the steps: a six-row table assigning each concern an owner, a location and a proof, with five binding rules (A0 tests may not depend on a proposer DECISION; A1 may not add a runner flag or change staging semantics - that is an A0 amendment; A2 owns neither; no runner-side proposer; and the engine-side placement is what makes P1-P3 testable host-side, hence a contract clause). The A0 step now owns enforcement, state transitions, events and counters in `src/llama-layer-streaming.{h,cpp}`, with the flag surface in `tools/layer-streaming/main.cpp` only, validated by engine-behavior fixtures under a SCRIPTED proposal sequence, new nested target `tests/test-layer-streaming-tg-spec.cpp`. The A1 step now owns the proposer families, merge operators, the count-matched null and the planner as PURE functions, validated by policy unit tests (new nested target `tests/test-layer-streaming-tg-predict.cpp`) plus a port-equivalence check run by the outer `tools/check-tg-predict-port.py` against a `--dump` mode of that target. Acceptance criteria were rewritten so each claim is attributable to exactly one step, and the focused validation commands now name both new CTest targets.
-
-**A second hole closed in the same pass.** A1's equivalence requirement originally said the port must reproduce the offline screen, but that screen (`tools/predictor-screen-gplr.py`) is LIVE code: the target could move after the fact. The contract now fixes the reference as that tool AT A RECORDED REVISION (file hash written into the A1 result), the same reasoning as the pinned-binary rule.
-
-**Measured incidental fact, recorded because it makes the validation commands executable:** CTest instance names in this build KEEP the `test-` prefix (`ctest -N` shows `test-layer-streaming-layout`, `-descriptors`, `-tel-mark`, `-route-topk`, `-host-mem`), so `-R test-layer-streaming-tg-<x>` is the correct selector shape.
-
-**What did NOT change.** No band, no gate, no arm, no counter and no A2/A3/A4 text was touched, and the block remains `ready`. Nothing is implemented: both new test targets and the port comparator do not exist yet. The settlement is bookkeeping about WHO owns WHAT and WHERE it lives; it is not evidence that any of it works. The A1 per-row equality requirement is deliberately strict (a mismatch BLOCKS A1) and is a pre-registered strictness, not a measured property: if the C++ port legitimately needs a tie-break the Python tool does not have, the correct move is to return that to the Planner rather than to loosen the check in place.
-
-## 2026-09-23: T-GPLR-58 BOUNDING PASS - the incumbent row cache's uncovered margin is MEASURED at eight recorded shapes, and the predictor ceiling is 99.7% of demands with only 0.5-3.4% of the margin unreachable (host-only, no GPU, no mutex, no source change)
-
-Tool `tools/analyze-tg-margin.py` (new; selftest 23 cases; registered as the `[tg-margin]` host guard so the suite fails if it is missing or its model of the cache stops holding) plus a BOUNDING MEASUREMENT subsection inside T-GPLR-58 in the live plan and a pointer in T-GPLR-59. Nothing was implemented in the engine, no flag changed, no arm ran, no GPU was taken. Re-run: `python tools/analyze-tg-margin.py <traces...>`; identify the cache model first with `--identify`.
-
-**Why it was needed.** T-GPLR-58's M1 band is read on the *uncovered margin* (the demands the incumbent does not already serve), so every arm's headroom is bounded by a quantity nobody had measured. This pass measures it from recorded traces only: it re-derives each leg's `n_rows_resident` from `union_ids` and refuses to score any trace its model cannot reproduce (`--max-dev`, default 2%).
-
-**Finding 1 - the retention semantics in the SDD are wrong, and the incumbent is stronger than documented.** Under four candidate models (deviation of rebuilt hits from the engine's own booking), on `gplr19-honest-k6-ab/arm-B1.jsonl` / `qa-depth-k4.jsonl` / `gplr19-k2-ab/arm-B1.jsonl`: last-K-windows **per layer** -16.92% / -17.15% / -7.53%; last-K-windows per SLOT -61.90% / -69.44% / -86.60%; capacity-LRU per SLOT -56.54% / -68.58% / -85.86%; **capacity-LRU per layer over `K x top_k` ROWS -0.21% / -0.17% / -1.14%**. So rows are evicted only under CAPACITY pressure, never merely for age: the effective horizon exceeds K tokens whenever ids repeat inside the window, and residency is per LAYER even though `slot == layer % n_slots` holds and a slot demonstrably carries several layers (measured 2026-09-23: `slot == layer % 4` True with a slot shared by >1 layer in all three legs, and both per-slot models off by 56-87%). Recorded in AGENTS.md under the vendored-engine gotchas, because anyone modelling this cache host-side will otherwise overstate the predictor margin by ~17%.
-
-**Finding 2 - the margin itself.** `share` = engine hits / demanded; the hit numerator is exactly the recorded (b) ladder's (52,930 at honest K=6, 59,432 at K=8); the denominator here counts the warm-up window too (81,920 rows = 256 tokens x 40 layers x top_k 8 vs the record's 81,600), so honest K=6 reads 0.6461 here where the record reads 0.6487 - same residency, colder denominator.
-
-| leg | K | margin | C1 same-token earlier layer | C2 same-layer >K..<=64 | C3 seen elsewhere | C4 first visit | ceiling |
-|---|---|---|---|---|---|---|---|
-| gplr19 echoed | 2 | 0.5674 | 43.4% | 49.1% | 6.9% | 0.5% | 0.9969 |
-| gplr19 echoed | 4 | 0.3740 | 42.5% | 46.1% | 10.6% | 0.8% | 0.9969 |
-| gplr19 echoed | 6 | 0.2859 | 42.0% | 43.1% | 13.8% | 1.1% | 0.9969 |
-| gplr19 echoed | 8 | 0.2255 | 40.9% | 40.2% | 17.5% | 1.4% | 0.9969 |
-| gplr19 honest | 6 | 0.3539 | 41.2% | 38.7% | 19.2% | 0.9% | 0.9969 |
-| gplr19 honest | 8 | 0.2745 | 40.7% | 33.3% | 24.8% | 1.1% | 0.9969 |
-| qa-depth | 4 | 0.3681 | 42.7% | 34.5% | 20.5% | 2.3% | 0.9917 |
-| qa-depth | 8 | 0.2479 | 42.1% | 24.0% | 30.5% | 3.4% | 0.9917 |
-
-**Finding 3 - three readings that change how T-GPLR-58's arms should be read (no band was retuned).** (a) **There is no information wall worth the name**: C4 - the rows no id-stream predictor can ever have seen - is only 0.5-3.4% of the margin (0.3-0.8% of demands), so the predictor is limited by PRECISION, not reachability: the offline screen's own recall (24.6% history, 28.1% coact at B=8 of demands) is the binding number against a margin of only ~2-3 rows per (token, layer) at the depths that matter (2.945 at qa K=4, 1.983 at qa K=8) while an arm may propose B=8 - which is why M5's `<= +5%` volume discipline is load-bearing. (b) **The margin is three levers, not one**: C1 (~41-43% at every K and vehicle) is the cross-layer region and needs an INTRA-TOKEN layer lead (a few layers ahead), so a coupling arm that stages a full token early is aimed at the wrong horizon; C2 (24-49%, shrinking as K rises) is exactly the region a DEEPER CACHE would also capture, i.e. the VRAM-vs-prediction trade M3 measures; C3 (7-31%, growing with K and context) is what only a learned cross-layer model reaches. (c) **M3's baseline is deeper than K suggests** given Finding 1, making the same-session `off @ K=4` comparison the harder and correct one.
-
-**Limits, stated plainly.** This measures the INCUMBENT and the ROOM, not any predictor: not one arm has run, so nothing here is evidence about a predictor's effect. Warm-up is NOT excluded (the first-K-token mean margin is 223.5 vs 113.5 steady-state rows at qa K=4), so the table is the whole generation, not steady state. Covered shapes are these eight TG legs only (256-token and 96-token generations; the 50k/200k TG shapes are not covered). A residual 0.06-1.14% of the capacity-LRU rebuild is unexplained (eviction tie-breaking or a first-window special case) and is printed rather than smoothed. And one tool bug was found and fixed while writing the guard: with zero engine hits the deviation formula divided by zero and reported every model as "0% off", i.e. a totally non-resident trace would have "identified" as any model - it now reports `+inf` for a model that predicts hits where the engine booked none.
-
-## 2026-09-23: THE TWO PREDICTOR SOURCE CLASSES T-GPLR-58 EXCLUDES ARE NOW DRAFTED AS T-GPLR-59 - an MTP draft-preview source (proposed futures) and a hidden-state probe head, each with its own pre-registered gate (host-only, no source change, no GPU, no arm run)
-
-Draft contract in the live plan (`T-GPLR-59`, 202 lines, immediately after T-GPLR-58 and before the archived-in-place T-GPLR-16 block). NOT ready: three owner calls are open and two are blocking (a dependency install, and the execution-mode change class D needs). Nothing implemented, no GPU time. It **reuses** T-GPLR-58's machinery deliberately - invariant P1-P6, the count-matched per-row null, the M-band shapes, the control-spread rule, the refusal discipline - so no rule has two owners; what is new is exactly the class-specific gates, class D's void rule, and class E's capture hook plus trainer.
-
-**The measurement that reshaped the design.** The recorded inventory `build/llama-cuda/q36-moe-inventory.json` (model `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`) reads `trunk_layers` 40, `total_block_count` 41, **`nextn_predict_layers` 1**, byte class `mtp_layer` **4,863,651 B**, `embedding_length` 2048, `expert_count` 256, `expert_used_count` 8, 30 recurrent + 10 attention layers. `load_block_mtp` builds that single block as a full MoE layer. So colibri's formulation - "the draft model's per-layer routing selections preview the target model's expert sets" - **does not port as written**: their drafter had depth, ours has ONE layer of 40. T-GPLR-59 is therefore built on the two axes that actually exist: **D1**, an online table keyed by the DRAFTED TOKEN ID (no new weights, no sidecar, no dependency), and **D2**, that single nextn route, carried with its reach printed and an explicitly low expectation.
-
-**What each class must clear, and why the gates differ.** Class D's gate is comparative against the **past-only frontier**, not against history: D1 must beat the best past-only arm T-GPLR-58 measures in the SAME session by more than the session spread, under the count-matched null - because the class claims proposed futures add what the past cannot, and "we re-measured history" is recorded as exactly that. Its **void rule** is pre-registered at <60% paired-accepted positions (colibri's join-rate rule) and reads the EXISTING `mtp` telemetry event (`tokens`/`mtp_drafted`/`mtp_accepted`/`accept_rate`, `llama-layer-streaming.cpp:5843-5850`), so no new counter is needed; its table is built from ACCEPTED drafts only (colibri's Atlas trap: rejected drafts' routes are noise by construction) with coverage reported both overall and paired-only. Class E's gate is a **comparative ceiling**: on a tune/held split BY TOKEN, per-layer recall (never pooled) at the same proposal budget must beat the best id-stream family, with the int8-vs-float agreement check (1pp, else widen and record why). A FAIL in either class is a named NULL, not a rerun.
-
-**Facts that constrain execution, all measured this pass.** (1) **No MTP arm has ever been recorded in this build directory** (no `mtp` event in the recorded top-level traces), so class D starts from zero evidence and its first run's acceptance rate is a void-rule input rather than a result. (2) **MTP is an execution-mode change**: `--mtp` requires `--handoff (-attention-only)` plus `--tg-tokens`, is refused with `--pp-repeat > 1` and `--pp-prebuild-per-pass`, and the recorded AGENTS constraint (layer-major refuses `--tg-tokens > 3` when handoff auto does not activate) stands - so class D's legs run in a HANDOFF session and are **not comparable** with T-GPLR-58's plain-TG legs, which the block states explicitly. (3) **Class E has no numerical library here**: `import numpy` and `import torch` both FAIL (measured), so the trainer is pure Python or an owner-approved dependency - AGENTS gates the latter, hence blocking owner call 1. (4) **The capture budget is bounded**: int8 plus a per-row scale is 2,052 B per (token, layer) row, i.e. **21.0 MB** for a 256-token x 40-layer TG cell (bf16 would be 41.9 MB), so the hook needs a sample-every rule for larger cells, not a format change. (5) **Faithfulness holds differently from T-GPLR-58's families**: a draft for t+1 is produced from tokens <= t and a probe at (t, L) reads state computed a full sweep earlier, so neither can leak the demand it predicts - which is precisely why these are the classes the past-only families cannot imitate.
-
-**Engine form, stated so nothing is implied:** class E's capture hook is the ONLY engine code in the block (default-off, capture-only, byte-identical off, no admission wiring - colibri's T-pf-01-class discipline); **putting the probe in the engine means shipping learned weights**, i.e. a sidecar, which colibri's T-opt-45 treated as a no-go - so that is owner call 2 and nothing here authorizes it. Two comparability limits are recorded with the ceiling: it is NOT comparable to colibri's reported 93%-class probe signal (different model, capture, task), and held-out recall@B is not a VRAM-normalized quantity, so a probe win justifies a follow-up block rather than adoption.
-
-**Open owner calls:** (1) BLOCKING - may the trainer use an approved numerical library (numpy) as a tools-only dependency, or must it stay pure Python? (2) BLOCKING FOR CLASS E'S FUTURE ONLY - is a trained sidecar in the engine ever in scope? (3) SHAPING - may class D force handoff to obtain MTP arms at short shapes, accepting that its legs become non-comparable with T-GPLR-58's?
-
-**Validation of this pass:** the block carries every Planner-required field (16/16 checked programmatically: status, dependencies, commit, goal, scope, non-goals, established facts, both class gates, the void rule, owner calls, steps, falsifiable acceptance criteria, exact commands, state updates, escalation); `python tools/resplit-gplr-plan.py --verify` **PASS**; `python tools/check-doc-sizes.py` **PASS**; the plan is pure CRLF and the only change in the tree is the plan plus this entry.
-
-## 2026-09-23: THE TG EXPERT-PREDICTION WIRE-IN IS DRAFTED AS T-GPLR-58 AND MARKED READY THE SAME DAY - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), the exact-demand-priority invariant, and NULL-CORRECTED acceptance quantities (host-only, no source change, no GPU, no arm run)
-
-Contract only: a Planner block in the live plan (`T-GPLR-58`, inserted before the archived-in-place T-GPLR-16 block). **Status `draft` -> `ready` on 2026-09-23** once the owner answered the three calls that were open in the first draft (recorded verbatim in the block's DECIDED section). Nothing is implemented, no flag exists, no trace was taken: A1/A2 are host-only and A3/A4 are the two holds, both now PRE-AUTHORIZED. It consumes the 2026-09-23 offline screening (`docs/findings/predictor-screen-gplr.md`, `tools/predictor-screen-gplr.py`) and reads colibri's DeepSeek-V4 baseline as a **read-only reference** (`/c/Development/AI/colibri/deepseek-v4-baseline`: `docs/findings/predictor-funnel-findings.md`, `docs/plans/predictor-funnel-plan.md` T-pf-06 bands, `currentstate.md` T-opt-27/32/33/36/49a and UPDATE101); no dependency was added and nothing was imported.
-
-**What the contract fixes, in its own words.** (1) The three arms: `arm-bar09` (rank-geometric bar 0.9 over same-layer markov-1/coact - the safety arm, offline it strictly dominates history on both axes), `arm-coact` (unbarred co-activation, B=8 - the simple arm, +3.5pp recall at equal ppb honest), `arm-fusion` (vote fusion over four sources; the portable vector `h1 m2 c1 k2` is the only allowed weighting - the ambitious arm, and the only one whose case must be made on structure-attributable margin alone). Each arm carries its own `null@B` leg: a COUNT-MATCHED, STRUCTURE-FREE proposer (same B per (token+1, layer), same admission path, same budget, ids from a fixed-seed rule that reads no demand and no router output), which is what makes "null-corrected" a pre-registered property rather than a post-hoc adjustment. (2) The exact-demand-priority invariant as a BLOCKING gate in six clauses (P1 a demand never waits on a speculative copy; P2 a speculative row is resident only after its own copy completed, on its own event; P3 speculation is a hard barrier below demand capacity and is the first victim; P4 cancellation must be EXERCISED, `spec_cancelled > 0` in a named leg; P5 no displacement of the incumbent's proposal set; P6 inert when off, loud when broken). (3) Acceptance quantities M1-M7 with the denominator lesson ported: M1 is the PRIMARY band and it is read on the UNCOVERED MARGIN and against the null leg, with the margin required to exceed the session's OWN measured control spread; M2 is the pool-growth share, printed and never credited; M3 is the charter band (arm at K=2 must reach 0.5355, the RECORDED honest K=4 share, at 1,093.0 MiB instead of 2,185.4 MiB); M4 non-inferiority; M5 proposal-volume discipline (<= +5%, colibri's L5); M6 timing honesty (report, gate only the regression direction); M7 the measured lead.
-
-**Why those shapes and not simpler ones - both are measured precedents, not preferences.** Colibri's UPDATE101 root-caused a 36-slot thrash to predicted fills sharing the per-layer hot window with exact demands (barrier set `in_use OR undrained OR fill_pending`, 88 no-slot events, 11 demands failing), and their T-opt-49a is the existing fix class ("a predicted admission is refused when only protected slots exist; exact demand keeps the full path") - so the invariant is ported as a contract with counters, not as a promise. Their T-pf-06 was RE-SCOPED away from a hits-denominator band because the incumbent union already covered 99.36% of demands, leaving a 279-demand margin (their T-32e bounds the live uncovered margin at ~6.7% of demands) - so M1 uses the margin; and their T-pf-04 merge was falsified for adding VOLUME (`+13%` proposals, absorbed by drops and charged staging at history's waste rate) - so M5 exists. Their measured NULLs (T-opt-27's logit band displacing HISTORY candidates 256->178 with a coverage regression; T-opt-36's Markov-2 all fusing onto already-admitted jobs, `bigram_matches=0`) are why P5 requires the incumbent's set to be unchanged and why attribution is unique-on-margin rather than any match counter.
-
-**Honest framing, recorded in the block itself.** This is a TG-phase residency task and CANNOT move the program's first objective (T-GPLR-26's recorded limit: no depth changes prefill); its charter footing is goals 2 and 3 (VRAM per unit of hit rate, and the crowded-VRAM case). The headroom is small by measurement (incumbent share 0.7283 at K=8; colibri's ~6.7% uncovered margin), the end-to-end prior is negative (T-pf-06's fusion advantage shrank to noise), and a NEGATIVE close is written into the acceptance criteria as the decision-useful result. Every quoted number is labeled `ours` / `colibri` / `PROJECTION` in the block, and the offline `(b)` anchor is the one that makes the engine share trustworthy at all (T-GPLR-19 criterion 2: runtime `rows_retained` equals the offline `hits_total` exactly, 52,930 at K=6 / 59,432 at K=8).
-
-**The three calls, DECIDED (owner, 2026-09-23) before any implementation or GPU time:** (1) **charter scope - proceed, and BOTH sessions up front**: the mechanism cannot move prefill (the row cache is a TG residency class), so the footing is charter goals 2/3 (VRAM per unit of TG hit rate, and the crowded case); A4 is therefore NOT conditional on A3's share outcome, and only a FAIL-INVARIANT or a refused leg halts the series. (2) **decode regime - greedy + `--rep-penalty 1.15` on the declared 885-token non-echoing prompt, identical on every leg**: the runner has no sampler chain at all (measured: no `--temp`/`--top-p`/`--seed`), but `--rep-penalty` is documented as "applied identically at every greedy pick site" and is the closest existing lever to colibri's `V4_SAMPLE_NOREPEAT=256` guard, which is what they used against the argmax repetition degeneracy (their T-opt-33: repeated tokens give "zero cross-token structure; history trivially wins"); a sampler chain stays out of scope as a separate capability. (3) **null definition - the count-matched, structure-free null gates, no duplicate-incumbent leg**: the null publishes the ARM's own published COUNT for each (token+1, layer) (a scalar read, nothing else) drawn from a fixed seed that reads no ids, no demand and no router output, so M1's structure term is corrected against the same proposal volume; the colibri-comparable duplicate-incumbent construction is cited only as the design input for M2's existence.
-
-**Two consequential contract edits the decisions forced, both recorded in the block.** (a) **M3 is now SELF-CONTAINED**: the charter band compares `share(arm @ K=2)` against the SAME session's `share(off @ K=4)` leg, because the recorded honest K=4 share (0.5355) was taken at F=1 greedy while these legs run at `--rep-penalty 1.15` - the recorded value is kept as a cross-check only, since a regime change would otherwise silently invalidate the band. (b) **The null is count-matched PER ROW, not at a fixed B**, which is what makes the bar-0.9 arm's null valid at all: that arm publishes fewer rows than B by design, so a fixed-B null would not be count-matched to it. Sessions were updated accordingly: A3 = `off@K2` x2 (the spread) + `null@8@K2` + `arm-coact@K2` + `retref@K4`; A4 = the same with `arm-bar09` and `arm-fusion`.
-
-**Validation of this pass (all host-only, no GPU, no mutex, no source change):** `python tools/resplit-gplr-plan.py --verify` **PASS** (header index intact, all 24 archived blocks in order, T-GPLR-53 live growth within allowance); `python tools/check-doc-sizes.py` **PASS** (plan still inside the safe band, warnings unchanged in kind); plan is CRLF-consistent and the block carries every Planner-required field (status, dependencies, commit, goal, scope, non-goals, invariant/design contract, arms, quantities, steps, falsifiable acceptance criteria, exact commands, state updates, escalation). Nothing else in the tree changed: `git diff --stat` shows the plan only.
-
-## 2026-09-23: THE T-53 SETTLEMENT AND THE T-56 A3 WORK ARE COMMITTED AS A TASK-SPLIT SERIES (five outer + one nested commit; the record 9e2f3ed dropped is restored in the process)
-
-Mechanical record, requested by the owner. No GPU time, no mutex, no arm run.
-
-| commit | what |
-|---|---|
-| outer `ccdd0b7` | T-GPLR-53 band settlement: the plan's contract prose (block header, A4 pre-registered bullet, the 2026-09-22 defect bullet, the ESCALATION section as SETTLED, the T-56 cross-reference) plus `tools/run-gplr53-a4-arm.ps1` (per-arm `excess removal e% (BAND) | pass-1 wall removal w% (relocation instrument)`, the `WALL CEILING` line before any branch reads a wall number, an excess-based falsifier verdict, `NOT EVALUABLE` when the ceiling cannot express the band) |
-| outer `f4e524d` | the two `Commit:` fields and the T-GPLR-53/54/56 series record that `9e2f3ed` deleted when it committed a stale worktree copy of the shared docs (see the entry above for the mechanism) |
-| nested `d8d7253a7` | T-GPLR-56 A3 engine work: `set_pp_span_pace`/`register_paced_begin`/`register_paced_ahead`, the three default-off flags with their pre-load refusals, and the fixture generator |
-| outer `9a012b5` | T-GPLR-56 A3 tooling: `tools/check-gplr56-pace.py`, `tools/run-gplr56-a3-arm.ps1`, `tools/run-gplr56-session.ps1`, the `[t56-a3]` host-suite guard, the A3 subsection in the plan, the currentstate record, and the stale-layout gotcha in `AGENTS.md` |
-| outer `c075671` | the nested pin bump to `d8d7253a7` |
-| this commit | the record above plus the series hashes written into the plan's two `Commit:` fields (the T-56 field is marked an IMPLEMENTATION CHECKPOINT: the 4k hold has not run, so no verdict commit exists yet) |
-
-How the shared files were committed: the plan and `currentstate.md` carry this session's hunks only (nothing else was pending in the tree), so each commit's blob was built by applying a **subset** of the session diff to the fixed base commit `5a383c0` and staged through git plumbing (`hash-object -w` + `update-index --cacheinfo`), then read back and compared byte-for-byte before the commit was allowed. The final A3 commit stages the whole worktree file, so the series ends with index == worktree - the failure mode `9e2f3ed` exposed cannot repeat here. Verified: each blob re-derived from the base and compared against `git show <commit>:<path>` (MATCH at O1/O2/O3), `git diff --check 5a383c0..HEAD` clean, `resplit-gplr-plan.py --verify` PASS, `check-doc-sizes.py` PASS, and `git status` clean in both trees afterwards.
-
-**A tooling defect worth recording, because it silently truncated the first attempt:** a staged series must compute each intermediate blob against the FIXED base commit. `git diff <path>` compares the worktree to the INDEX, so after the first commit the recorded diff shrinks to whatever is still unstaged - the first run of the driver rebuilt O2 from a 4-hunk diff instead of the session's 10 and was stopped by its own hunk-count guard (O1 had already landed correctly and is byte-verified above). The fix is `git diff <base> -- <path>`, which ignores the index.
-
-What this does NOT change: the T-56 A3 hold is still BLOCKED on the shared card and still NOT-STARTED; the settlement changed bookkeeping and one printed line, not physics; and none of this is acceptance evidence for any task.
-
-## 2026-09-23: T-GPLR-56 A3 IS IMPLEMENTED AND HOST-VALIDATED (`p1-pace` behind three DEFAULT-OFF flags, its own refusing analyzer, one-command session); the 4k HOLD IS BLOCKED ON THE SHARED CARD and nothing was started
-
-A3's mechanism and its reading tools are in the tree and proven host-only (no GPU, no mutex, no model); the arm itself has NOT run, so the mechanism's effect on Q is UNMEASURED and nothing here is a performance result.
-
-What landed, all default-off and additive by construction (`pp_span_pace == 0` never enters the paced state, `register_all_pkg_sources()` is untouched, and the off path's stderr line is byte-identical to before): `src/llama-layer-streaming.{h,cpp}` gained `set_pp_span_pace(mode, ahead)`, `register_paced_begin()`, `register_paced_ahead(il)` and the read-only accounts `paced_reg_group_count()/bytes_total()/bytes_issued()`. The paced path derives the SAME page-rounded address-coalesced spans the one-shot path registers, keeps them in group order, pins the FIRST group before the pass, and issues each later group from `stage_members()` when the sweep reaches `ahead` groups before it, so pending unlocked bytes stay near one group instead of 17.23 GiB; ownership stays the one-shot convention (the group's first layer owns the registration, the rest are marked covered), so `unregister_all_pkg_sources()` teardown is reused unchanged. Telemetry uses NEW event names only - `span_pace_init`, `span_pace`, `span_pace_stage` (per layer at its first staging copy, with `covered` and how many groups were already issued) and `span_pace_end` - so no existing parser sees a new shape. `tools/layer-streaming/main.cpp` gained `--pp-span-pace 0|1` (default 0), `--pp-span-pace-ahead 0..64` (default 1) and `--pp-register-site post-prebuild|early` (default = today's site) plus help text, with the FLAG-LEVEL preconditions refused BEFORE the model load so a misconfigured arm fails in seconds with no GPU and no trace: pace without `--copy-source mmap-registered`, pace combined with the early site, and `--pp-span-pace-ahead` without pace all exit 2 pre-load. A paced run prints its own arming line (`PACED registration armed - X of Y B in N groups`) because a paced call returns only the first group's bytes and the one-shot wording would understate the span.
-
-New tools: `tools/check-gplr56-pace.py` (host-only reader of the paced events: groups issued before each layer's first touch, the pacing LEAD beyond the group covering a layer, coverage, the commit window vs the pass window, per-pass `copy_complete` transfer medians against a same-session control, and the pass-1 stall proxy) and `tools/run-gplr56-a3-arm.ps1` + `tools/run-gplr56-session.ps1` (the three arms - `off` control at today's site, `early` at the earliest legal site, `pace` - inside ONE mutex hold; each arm writes `quantity: q_procstart_pass1end` into its own verdict, the 250 ms rule is applied by `check-gplr56-q.py` as its single owner, and a wall-down/Q-flat arm is printed as FAIL-RELOCATION). The launcher keeps the T-GPLR-53 safety properties: read-only busy preflight (exit 125, no mutex, no artifact), evidence archiving before clear, driver stdout/stderr captured and folded into the session verdict, launcher-side `Clear-ArmVerdict` before `Start-Process`.
-
-Host evidence (all measured today): `check-gplr56-pace.py --selftest` **13/13 PASS**, covering evaluated readings and eight refusals/failures - a layer staged with `covered = 0` is an INTEGRITY FAIL naming the layer, an unfinished commit and groups-left-unissued are REFUSED with no numbers printed, a NON-paced trace is REFUSED (which is exactly how the `p1-off`/`p1-early` arms cannot be scored as paced), and the pacing lead reads back exactly as the configured distance (1 and 3) and as 0 for `ahead 0`. Against REAL data: the recorded A1 control trace is REFUSED (exit 2, no `span_pace_init`), and a paced VARIANT of that same real trace (one-shot event replaced by `span_pace_init`, 40 groups issued across the pass-1 window, one coverage record per layer, `span_pace_end` closing it) passes the runner's `--check-telemetry` (**exit 0** - the new names are inert to the scheduler-invariant validator) and is **EVALUATED** by the analyzer; the same fixture with only 20 of 40 groups issued is REFUSED as an unfinished commit, so the refusal path is exercised on real-shaped data rather than only on hand-made fixtures. Five flag refusals exit 2 host-only with no model present. `check-gplr56-q.py --selftest` 7/7 and the new `[t56-a3]` guard are registered in the host suite: `tools/run-tests.ps1 -Suite host` **SUCCESS 42/42 CTest**, digest `9E94BA192ABBA4C3` (nested head `3de21074f5b8`, 3 tracked + 1 untracked changed - the new fixture generator), `llama.dll A8DFF5ED2A451F83`; `check-doc-sizes.py` and `resplit-gplr-plan.py --verify` PASS. Binary identity at this revision: `llama-layer-streaming.exe D252F5E1A2D48AA2`, `llama.dll A8DFF5ED2A451F83` - a NEW pair, so any older control is a different binary and this session's own `off` arm is the control.
-
-**MEASURED TRAP, recorded because it costs a suite failure to anyone who edits the engine header:** adding members to `llama_layer_streaming` changes that type's layout, so every test target linked against it must be REBUILT - the host suite's CTest step does not build. With a stale `test-layer-streaming-layout.exe` the test printed every assertion `ok` and then died in teardown with `Exit code 0xc0000409`, which reads exactly like a new defect in the change; rebuilding the test targets took it from a 3.65 s crash to a 0.08 s pass. A full build also fails on `test-unicode` (`LNK2019 unicode_regex_split`), pre-existing and unrelated.
-
-**The hold is BLOCKED, and this is NOT-STARTED, not failed.** The session launcher's fast preflight refused with `GPU busy - 2312 deepseek_v4.exe` at 11:27Z, and bounded re-probes across the next ten minutes (10 samples: 11:31:57Z-11:32:13Z pid 18524, 11:35:59Z-11:36:30Z pid 2376, 11:40:54Z-11:41:08Z pid 9368) found `deepseek_v4.exe` in every sample with a MOVED pid each window, i.e. the foreign process is actively cycling. No driver was started, no mutex was acquired, no arm artifact was written, no `-AllowBusy`. The arm is one command, recorded ready: `powershell -File tools/run-gplr56-session.ps1 -Session p1`.
-
-What this does NOT prove: no arm has run, so Q, the paced coverage and the stall are UNMEASURED; the `span_pace_*` shapes are confirmed only against a synthesised paced variant of a real trace (no real emitter has produced them yet); and the `early` arm's trace-order property (registration events ahead of `run_start`) is argued from the call-site sequence, not observed. The block's status line, its pre-registered Q margin and the A4 50k/200k authorisation are unchanged - A3 decides, and A4 stays owner-invoked one length at a time. Per the gate policy, none of the above is an acceptance: the host suite and the selftests are advisory evidence about shapes and refusals, not a claim that the mechanism works.
-
-## 2026-09-23: THE UNCOMMITTED T-GPLR-53/54/56 WORK IS COMMITTED AS A TASK-SPLIT SERIES (seven outer + five nested commits, no GPU time spent)
-
-Mechanical record of the commit pass requested after the T-54 A3 verdict and the two owner-authorized one-liners.
-
-Outer (oldest first): 8127ddd docs close-out resplit (T-37/T-52/T-54 blocks archived, the resplit header/index rule + manifest) - 050f8f9 T-53 instruments (tools) - ca1ba98 T-54 A1/A2/A3 tools - 19d7e33 T-56 A1 Q checker - ea1ab5d host-suite registrations (plan-split guard + the T-53/54/56 selftests, plus the host Include clause) - f2c385f T-53/54/56 records (plan blocks, AGENT_ENVIRONMENT sections, currentstate entries) - b716289 plan whitespace - ba63777 pin bump. Nested (oldest first): 8633f8099 T-56 A1 pre-sink markers - 3bb01baca T-54 tg_logits readout + wiring fix - 043fceedc T-53 instruments - 59073be2a the two owner-authorized one-liners (--pp-async-feed 0 ctests, recon ring ubatch label) - 36f0ae090 whitespace fixup. Pin: 36f0ae090.
-
-T-54 hashes, for the record (its block is in the frozen archive and cannot carry them): nested 3bb01baca + outer ca1ba98 (tools) / f2c385f (records).
-
-**The shared files were committed by SECTION, not wholesale.** A concurrent thread has uncommitted work in the same tree (T-16/T-55/T-57 blocks, four Arm-provenance blocks and the suite-results block in the plan; five currentstate entries plus the 2026-09-23 predictor-screening entry; the provenance and T-57 sections in AGENT_ENVIRONMENT; the suite-revision binding, the doc-size "missing checker FAILS" rule and the provenance/T-57 guards in tools/run-tests.ps1; arm-verdict.ps1, with-gpu-lock.ps1, test-arm-verdict.ps1, smoke-gpu-lock-ctxshell.ps1, source-revision.ps1, check-arm-provenance.ps1, check-gplr16-revert.py, check-tg-part-timings.py, run-gplr57-a1-ladder.ps1, predictor-screen-gplr.py, docs/findings/, the SDD edits, the 2026-09-12..13 currentstate archive and gplr13-bottlenecks-hypotheses.md). Those stay uncommitted; the committed versions of the four shared files were rebuilt from HEAD + this session's lines only, so no foreign hunk was staged.
-
-Verification: the committed versions of the plan, AGENT_ENVIRONMENT and currentstate were RE-DERIVED from the worktree by the same predicates and compared byte-for-byte (MATCH); run-tests.ps1 was parse-checked with the PowerShell parser and every block confirmed present exactly once; git diff --check is clean on both series; resplit-gplr-plan.py --verify and check-doc-sizes.py PASS. One defect was found and repaired during the pass: a text-mode read of a committed blob mangled the em-dashes on 16 plan lines in the whitespace commit - the commit was rebuilt from a UTF-8 decode (b716289) and a scan for that mojibake class over every committed blob in both series is now clean. `tools/layer-streaming/tests/gplr53-embed-chunk.jsonl.summary.json` (a --validate-telemetry byproduct of a fixture run, regenerable) was deleted, not committed.
-
-Residual: the concurrent thread's changes above, and nothing else - the nested worktree holds only the T-16 revert hunk in main.cpp.
-
-**Restored 2026-09-23.** This entry was DELETED by commit `9e2f3ed` (docs: enforcement, suite-revision, T-16 closure and T-55 retraction records), which committed the WORKTREE copies of the shared docs: the two `Commit:` hash lines this entry records sat in the plan's worktree copy as empty, and this entry was absent from the worktree copy entirely, so a wholesale commit reverted both. The hashes are re-stated above and the plan's `Commit:` fields are filled again. Nothing else in this entry was affected, and the underlying commits are untouched. Lesson recorded rather than fixed elsewhere: content that exists ONLY in a sectioned (synthetic) commit is not safe from a wholesale commit of the same file - the worktree copy must be brought level in the same pass.
-
-## 2026-09-23: T-GPLR-53 BAND-QUANTITY ESCALATION SETTLED (owner directive, OPTION A) AND THE REPORTING FIX LANDED - host-only, no GPU, no mutex, no arm re-run
-
-- **Decision (A): the pre-registered `>= 70%` band's QUANTITY is the per-chunk embed EXCESS removal** against the
-  same-session off control - `(ctrl_excess - arm_excess) / ctrl_excess` - NOT the pass-1 wall. The wall cannot
-  carry a band: pass 1 = pass 2 + the one-off, so its ceiling is `100*(1 - pass2/pass1)` - 56.2% at 4k, 10.5% at
-  50k, 0.86% at 200k - unreachable at every shape by construction. Rejected and recorded: B (a shape-relative wall
-  band = A with an indirection, because the ceiling is itself derived from the excess) and C (drop the band, prose
-  per run - least automatable). The wall is retained as the RELOCATION instrument (pre-pay + pass-1 wall read as a
-  SUM), which is the only role its numbers support.
-- **What changed.** `tools/run-gplr53-a4-arm.ps1`: the header's pre-registered reading names the excess; the
-  reporting block prints per arm `excess removal {e}% (BAND) | pass-1 wall removal {w}% (relocation instrument)`,
-  then the `WALL CEILING` line ONCE before any branch reads a wall number, then an excess-based
-  `FALSIFIER FIRED/SURVIVED` with an explicit `wall band NOT EVALUABLE ... ceiling {c}% < 70%` note when the
-  ceiling cannot express the band; the dry-run summary line was corrected the same way (it still promised
-  "pass-1 wall deltas"). Plan: the A4 contract bullet states the settlement, the 2026-09-22 defect bullet is marked
-  RECORDED/FIXED with the fix addendum, the ESCALATION heading records the settlement and the section appends the
-  decision, and T-GPLR-56's "EXPLICITLY NOT INHERITED" cross-reference now describes the settled band.
-- **What did NOT change:** the 70% threshold value, the two branches' meaning, every arm gate, and every recorded
-  verdict. No past run was re-scored, and the A3/A4 conclusions and the 12:44Z/13:10Z withdrawal stand unchanged -
-  they rest on the excess table, never on the wall line it printed.
-- **Validation (host-only, no GPU, no mutex, no model):** PowerShell parse OK; `-ValidateOnly` dry run exit 0; the
-  LANDED reporting block was extracted verbatim from the driver and replayed against the 13 recorded 13:10Z arm
-  verdicts - it reproduces the record's own numbers (pw1 99.3%/50.3%, pw2 99.9%/50.6%, pw3 99.9%/50.8%, delay
-  93.0%/47.2%, wrongtouch 86.2%, ceiling 56.2% with the excess at 50.7% of the control wall) and now prints
-  `FALSIFIER FIRED ... removes 93.0% of the EXCESS` where the 13:10Z run printed `FALSIFIER SURVIVED ... 47.2%`;
-  `resplit-gplr-plan.py --verify` PASS; `check-doc-sizes.py` PASS; `run-tests.ps1 -Suite host` 42/42 PASS
-  (revision digest 971B2356EABA4322); `git diff --check` clean.
-- **Residual/limits:** the settlement changes what an A4-family arm's PASS means (the band's unit); it moves no
-  measured number and predicts nothing new. The mechanism question stays exactly where the A4 controls left it -
-  the dose-response arm named in the block is still the arm that could move it. Uncommitted: the two edited files
-  on `research/layer-residency`.
-
-## 2026-09-23: PREDICTOR SCREENING PORTED FROM THE COLIBRI FUNNEL - coact/markov-1 beat the history baseline at every budget on every substantive stream, and coupling-copula leads unique coverage and high-budget recall (host-only, no GPU, no engine change; feasibility result, NOT a wire-in verdict). The T-GPLR-15 close left the predictive hypothesis explicitly open (ceiling 0.9385 vs retention 0.3088 at K=1); the colibri/deepseek-v4-baseline predictor-funnel (docs/findings/predictor-funnel-findings.md, DeepSeek-V4) supplied the candidate families and the replay methodology, now ported to our rowset_fetch schema as `tools/predictor-screen-gplr.py` (selftest for online faithfulness included, PASS; a predictor for (t,L) sees only tokens <t and layers <L, matching what the live engine could know). Corpus: 74 traces collapse to 7 distinct demand streams; screened one per stream (the two 256-token vehicles echo/honest, 50k-context, QA-depth; the two gplr57 rungs carry 3 TG tokens each and are reported but unconcludable). **Anchors:** history@B=8 reproduces the recorded (b) K=1 to ~1e-3 on BOTH vehicles (echo 0.3076 vs 0.3088; honest 0.2458 vs 0.2468) - the port is validated against the repo's own recordings; other shapes print anchor N/A (no recorded K=1; the first run mis-flagged 50k and the anchor was scoped to the 10240-row vehicle). **Results (recall@B / precision-per-byte / extra-hits-vs-history):** echo stream coact 42.6/43.0/16573 at B=8 vs history 30.8/30.9/0, markov-1 39.5, coupling-copula 31.9 but highest unique coverage and 77.2 recall at B=32; honest stream coact 28.1/28.4 at B=8 vs history 24.6 (same-precision +3.5pp), coupling 59.0 at B=32; 50k and QA streams repeat the ranking (coact/markov above history at every B, coupling wins B=32). **Reading:** colibri's H1 (same-layer transition structure beats history) and H2 (cross-layer coupling adds coverage, favors long context) both reproduce on Qwen3.6-35B-A3B; projection (labeled arithmetic, NOT measurement): a predictor feeding a K=2-sized window plausibly reaches what K=4-6 retention delivers - the charter's VRAM objective has a candidate lever. **Limits:** n=1 prompt per stream, no fresh capture; the (b)-projection is not a measurement; colibri's own T-pf-06 end-to-end A/B shrank fusion gains to noise on larger samples and its slot-thrash incident (UPDATE101) showed predicted fills must yield to exact demand - any wire-in needs that invariant plus a pre-registered acceptance quantity. Evidence: `docs/findings/predictor-screen-gplr.md` (method, full tables, reproduce commands); tool `tools/predictor-screen-gplr.py`; deterministic re-run verified. **Same-day extension (confidence-bar frontier + fusion, all offline):** colibri's barsweep/fusion operators ported (`--mode bar`, `--mode fusion`; selftest extended and PASS). Bar sweep: a conservative bar (0.9) strictly DOMINATES history on both axes on both streams (markov-1@0.9 = 25.1/29.0 vs history 24.6/24.7 honest; 36.1/41.7 vs 30.8/30.9 echo), but loosening to bar 0.7 collapses recall ~2.7x for a precision jump (41-57pp) - colibri's H3-disconfirm reproduces, so the bar is risk control, not frontier-pushing. Fusion (tune/held 80/20 split, grid at B=8): fusion dominates every single candidate on BOTH axes on both streams (best held: 29.6/29.6 honest vote-fusion vs history 22.7/22.7; 48.8/48.8 tuned weighted vs 27.9/27.9 echo); the colibri portable weight vector lands within 0.1pp (honest) / 2.4pp (echo) of per-stream tuning, so no per-cell tuning is needed; and the NULL-SOURCE CONTROL exposes the pool-growth share - a history-clone alone lifts held history 22.7 -> 28.0, so the structure-attributable gain is +1.6pp (honest) / +6.3pp (echo), and any wire-in case must argue against the null row, not the history row. Three measured operating points now exist for a wire-in decision: unbarred coact (+3.5pp honest, equal ppb), bar-0.9 (+0.5/+4.3, risk-free), fusion (+6.9/+6.9 honest with the null caveat). The T-pf-06 lesson stands: an offline win is a hypothesis; the engine A/B remains the verdict instrument.
-
-## 2026-09-24: T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS (50/512)
-
-**Original goal and contract.** Run the required T-GPLR-07 smoke tier after the engine rebuild: the 50-token N1 rung and the 512-token five-item anchor, each through calibrated prompt generation, the real CUDA runner, strict dedicated-JSONL telemetry checking, programmatic answer grading, and the must-fail negative control. This is a semantic answer-stability gate, not a token-identity or performance gate.
-
-**Recorded command and environment.** `powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:/Development/AI/qwen38GZI/tools/run-tests.ps1' -Suite qa-smoke -SmokeLengths 50,512 -ModelPath 'C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf'"` ran on the recorded NVIDIA GeForce RTX 5090 Laptop GPU (24,463 MiB physical VRAM; driver 610.74; CUDA UMD 13.3). Model artifact: `C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`, 21,388,319,008 bytes, `qwen35moe`, 40 trunk layers plus the recorded MTP block. Each runner leg used the canonical shape: calibrated `--prompt-file`, `--ubatch 50/512`, `--tg-tokens 96`, `--pp-no-logits`, `--pp-schedule batch-major`, `--residency moe-expert-bank`, `--kv-cache q8`, `--no-handoff`, `--allow-full-residency`, dedicated `--telemetry`, and `--tg-text`.
-
-**Graded result.** The suite exited **0**; both rungs passed. The 50-token positive verdict was `aggregate=PASS`, exit 0, with N1=`QX-7741`; its negative control returned exit 1 and `aggregate=FAIL` as required. The 512-token positive verdict was `aggregate=PASS`, exit 0, with N1=`QX-7741`, N2=`TR-2918`, N3=`MK-5501`, N4=`LD-8834`, K1=`Paris`; its negative control returned exit 1 and `aggregate=FAIL` for all five items as required. Independent checker verdict files: `build/llama-cuda/gplr07-qa-50-positive.verdict.json`, `gplr07-qa-50-negative.verdict.json`, `gplr07-qa-512-positive.verdict.json`, and `gplr07-qa-512-negative.verdict.json`.
-
-**Telemetry and lifecycle result.** Both dedicated traces report `check-telemetry: OK (30547 events, 3 slots)`, 40 layers, zero graph builds, `run_end.exit_status=0`, `failed=false`, and peak VRAM 3,424,190,464 bytes (3,265.56 MiB). The resolved run shape was batch-major PP, mmap-registered copy source, q8 KV, no handoff, 3 residency slots, and 96 generated TG tokens. 50-token timing split: PP wall 3,159.9 ms (transfer 8,615.4 ms, wait 551.0 ms, compute 750.8 ms); TG wall 123,232.8 ms (transfer 302,893.2 ms, wait 58,119.5 ms, compute 55,724.3 ms), 0.779 tok/s. 512-token timing split: PP wall 3,182.0 ms (transfer 8,598.3 ms, wait 535.2 ms, compute 830.6 ms); TG wall 123,241.4 ms (transfer 302,901.4 ms, wait 58,118.8 ms, compute 55,737.0 ms), 0.779 tok/s. These are smoke-run observations, not a benchmark or speedup claim.
-
-**Mutex and provenance evidence.** The wrapper acquired `Global\\AI-GPU-EXCLUSIVE-v1` for each leg; `gpu_pre_run=clean` and `gpu_post_run=clean`, with `gpu_probe_source=nvidia-smi`. The final 512-leg verdict is `build/llama-cuda/verdicts/llama-layer-streaming.verdict.json` (PASS, exit 0); the suite record is `build/llama-cuda/suite-runs/20260924T091342Z-qa-smoke/revision.json`. Engine digest `63280E460286C26F`, nested HEAD `e3627d5f39fc`, `llama-layer-streaming.exe` `D2BD131C866EDFFC`, `llama.dll` `AAF1E97736CED8DF`; `sources_newer_than_binary=false`, with 4 pre-existing tracked nested changes and 0 untracked changes. The run did not modify source or binary state.
-
-**Scope, risks, and recommendation.** **Measured:** the 50/512 semantic-QA smoke tier, strict telemetry, answer grading, negative controls, mutex, and provenance all pass. **Unproven:** 4k/24k/50k/100k/200k ladder rungs, long-context behavior, throughput improvement, quality equivalence beyond the programmed answer checks, and multi-project GPU contention under load. The physical GPU is shared, although this run's pre/post probes were clean. **Recommendation:** adopt this smoke-tier result as the current post-rebuild CUDA correctness baseline; keep final acceptance and performance/quality claims with the owner.
-
-## Index of archived entries (2026-08-18 .. 2026-09-22)
+**Session (MEASURED).** One `tools/with-gpu-lock.ps1` hold
+(`-VerdictTag gplr61-ac3`), wrapper exit 0, `gpu_pre=gpu_post=clean`
+(nvidia-smi), provenance source_digest `E505C29E1DEE04C4`, `llama.dll
+C6855398617D24BC` (same binary as ac2 and the host-suite 78/78 record); harness
+session wall 650.6 s (09:51:23 -> 10:02:18Z); 9/9 arms rc=0;
+`--check-telemetry` rc 0 x9; anchor sha16 `d5bfd34a8a795e49` == ac2 ==
+recorded. Post-release probe: 0 compute apps, 0 MiB used, 1% util. Harness
+`tools/run-gplr61-ac3.py`, launcher `tools/gplr61-ac3-launch.ps1`.
+
+**Structure (closes gap 2).** Cref-ref/Bref-ref replay the exact ac2 commands
+(1 PP pass; ID anchors, untimed), then A-warm (untimed), then the timed arms,
+all with `--pp-repeat 2 --route-telemetry 1` (2 PP passes + TG): p1 order
+A,B,C; p2 order C,B,A (counterbalanced). Same structure for all three timed
+arms, so their walls are mutually comparable within this session.
+
+**ID comparison (MEASURED, from ac3's own traces;
+`build/llama-cuda/gplr61-ac3-verdict-corrected.json`).** Refs byte-identical
+to ac2 (`Cref==ac2C`, `Bref==ac2B`); `Ap1==Ap2`, `Bp1==Bp2`, `Cp1==Cp2`
+(repeat determinism); `Ap1==ac2A`, `Bp1==ac2B`, `Cp1==ac2C` (repeat +
+route flags ID-neutral); `Bp1==Ap1`; `A-warm==Ap1`; `Cp1 != Bp1` first
+divergence index 1 (B=198, C=220) -- AC2 FAIL reproduced. Correction: the
+original `gplr61-ac3-verdict.json` records `Bref_eq_ac2B`/`Cref_eq_ac2C` as
+false because the harness compared `ids.get('Cref')`/`ids.get('Bref')` against
+arm keys `Cref-ref`/`Bref-ref` (None-vs-list); harness key fixed, traces
+unmodified, the corrected file carries the real comparisons.
+
+**Gap 1 -- route telemetry, measured result (MEASURED).** `--route-telemetry
+1` is on every p1/p2 and warm arm; run_start echoes `route_telemetry:1
+source:explicit` on all 7 (refs 0/default by design). `tools/check-route-parity.py`
+over the six p1/p2 traces (`build/gplr61-ac3-parity.json`) exits **2** -- zero
+`route` events in every trace, NOT a pass. Root cause, measured not reasoned:
+the sole `tel_route` call site is `llama-layer-streaming.cpp:6349`, inside
+`llama_context::layer_major_pp`, which hard-requires `--pp-schedule
+layer-major`; a repo-wide scan found **0 of 315 batch-major traces ever emitted
+a route event, all 203 route-bearing traces are layer-major**, and the checker
+itself exits 0 on the layer-major ab20 control traces (tool verified). The
+T-GPLR-61 arms cannot be run layer-major: T-GPLR-73 (`main.cpp:5073`) refuses
+every `--residency-tg*`/`--experts-host*` flag there, and layer-major caps
+`--tg-tokens <= 3` without an active handoff (arms run 96). **Spec finding for
+the Planner: the contract's step-2 gate (plan L4385, `check-route-parity
+<trace>`) is structurally unsatisfiable for this arm shape.** Note for readers:
+exit 2 here does NOT mean the run died before routing -- all 9 arms completed
+(96 tokens, check-telemetry rc 0); it means batch-major never emits `route`
+events by construction. Contract edit not made here (Planner-owned; plan file
+at 183 B headroom).
+
+**Routing evidence that exists in ac3's own artifacts (MEASURED).** TG routes
+are in `rowset_fetch` (`union_ids`+`hash`, top_k 8, route_union 8, n_tokens 1):
+3,840 fetches per arm. (a) **Cross-process TG route reproducibility**: B p1
+tuple sequence == B p2, C p1 == C p2 (3,840/3,840 each; combined exactly-twice
+3,840 distinct x2, 0 singletons, 0 over-counted) -- deterministic per arm across
+independent processes. Labeled as a cross-process reproducibility check, NOT
+the checker's pass-2 gate (that gate is PP-only; unreachable here per above).
+(b) **First-divergence localization**: B vs C route tuples are identical for
+the first 23 fetches; first divergence is TG round 1 (chunk 2), layer 23, a
+single near-tie top-1 flip (B `19,47,62,...` vs C `39,47,62,...`, remaining
+7 experts identical), with 2 layers flipped in round 1, 39/40 in round 2, all
+40 from round 3 on (3,801/3,840 total). Ordering (MEASURED): route divergence
+appears in the FIRST TG round, before the first divergent token id -- ids[0]
+is identical (248046) despite the round-1 route flips, ids[1] is the first
+divergent id (B=198, C=220), i.e. the route flip precedes and predicts the
+token divergence rather than following it. Interpretation (labeled): the route
+flip is the earliest observable symptom of the split's already-recorded
+fp-order difference propagating through hidden states -- 7/8 experts unchanged
+is a near-tie signature of ulp-level noise, not a routing-policy change; the
+router mechanism itself (top-k code, top_k, union cardinality) is unchanged in
+every fetch. What is NOT proven: PP-side route equality (batch-major emits
+none), and a causal separation between "fp noise moved the near-tie" vs "split
+altered routing logic" cannot be made from route tuples alone -- AC2's ID FAIL
+already fixes the root cause at the split.
+
+**Comparable timings (MEASURED walls, n=2 per arm, counterbalanced; walls only
+-- no performance claim, AC2 forbids speed claims).** Excluded from timing:
+Cref 29.8 s, Bref 29.3 s, A-warm 145.8 s (all rc 0). Timed walls (p1 order
+A,B,C / p2 order C,B,A; every timed arm identical structure: 2 PP passes +
+TG): **A 146.2 / 146.1 (mean 146.1); B 29.2 / 30.5 (mean 29.9); C 32.2 / 30.6
+(mean 31.4)**. (a) Cold-start gap closed: ac3's arm A ran MORE work than ac2's
+A (2 PP passes vs 1, phase_summary confirmed) yet finished faster (146.1 vs
+ac2's lone 157.8) while A-warm/A-p1/A-p2 agree within 0.4 s across process
+positions -- ac2's fixed-order first-run wall carried the cold premium.
+(b) Order effect bounded: each arm's two runs (opposite positions) within
+1.3-1.6 s. (c) B vs C: +1.5 s mean (5.0%), which is SMALLER than the
+per-arm order spread (1.3-1.6 s) -- not separable from run-to-run noise at
+n=2; no split-overhead number may be read from this. Phase detail (MEASURED,
+phase_summary): the A-B wall gap is entirely TG-phase (A TG 123.7 s vs B TG
+6.8 s; PP passes ~7.6 s + 1.4 s both arms) -- consistent with A having no
+row-set TG path, expected by construction, not a new result.
+
+## 2026-10-08 (ONE GPU hold, session gplr61-ac2, provenance PASS): T-GPLR-61 AC2 FAILED -- the per-expert split does not preserve byte-identical greedy IDs (first divergence at token index 1), while every instrumentation, inertness and falsifier check recorded exactly as designed. The task STOPS at AC2 per contract; no tuning was attempted.
+
+**Task.** Mission step 3: T-GPLR-61 (per-expert TG host/device split,
+`--experts-host` + `--experts-host-budget`), contract
+`docs/plans/generic-prefill-layer-residency-plan.md` L4183+. Pre-edit reading,
+the step-B engine edits (S3/S4), the build, the AC1 focused test and the host
+suite were completed earlier; this entry records the step-C gap closure and
+the AC2 identity session.
+
+**Step C completed first (the probe must run the final binary).**
+
+- **Non-finite abort.** `build_moe_ffn` gained a null-defaulted `experts_out`
+  out-parameter that hands back the PRE-AGGREGATION per-row outputs;
+  `build_moe_host_leg` stashes it per FFN graph (`graph_set::ff_host_experts`);
+  the executor scans after part B (host buffer read directly, else
+  `ggml_backend_tensor_get`) and aborts with a structured error naming layer,
+  token, expert ID, row and column. Flag absent -> no stash, no read, no sync
+  (AC6 inertness preserved by construction).
+- **Telemetry.** `layer_compute` gained `host_finite` (-1 = not scanned / no
+  host leg, 0 = scanned clean, 1 = caught -> recorded, then the run aborts);
+  the optional-parts buffer went 512 -> 640.
+- **MTP pre-load refusal (SDD failure contract).** `--mtp` + `--experts-host`
+  refuses at bring-up (exit 2, `run_refused experts_host_with_mtp`):
+  `graph_mtp` builds its routed FFN with plain `build_moe_ffn` (no host leg,
+  no row-set state) and T-GPLR-61 proves identity only for the target
+  forward, so draft-safety is unproven. Remove only with a draft-safety
+  argument or an MTP identity run.
+- **Validation (host-only).** Full build exit 0 (llama lib, tool, all ten
+  layer-streaming test targets); `ctest -R test-layer-streaming-expert-split`
+  PASS (AC1 unchanged); `tools/run-tests.ps1 -Suite host` **78/78 PASS**,
+  revision digest `E505C29E1DEE04C4`, `llama.dll C6855398617D24BC`.
+
+**AC2 session (fresh name `gplr61-ac2`, ONE `with-gpu-lock` hold, no recorded
+evidence overwritten).** Probes: pre-run `0 MiB / 0% / no compute apps`;
+post-run `0 MiB / no compute apps`. Wrapper verdict **PASS (0)**,
+`gpu_pre=gpu_post=clean`, provenance gate **PASS** (digest
+`E505C29E1DEE04C4`, `llama.dll C6855398617D24BC`, exe sha256-16
+`a96cc12668baa0b3`). One fresh calibrated anchor: `achieved=512
+items=N1,N2,N3,N4,K1`. Three arms, identical prompt/ubatch/tg-tokens except
+the TG placement flags:
+
+| arm | flags | rc | wall |
+|---|---|---|---|
+| A | `--no-handoff` (the recorded streaming shape) | 0 | 157.8 s (FIRST run, cold file cache) |
+| B | `--no-handoff --residency-tg` (row-set, all rows device = paired control) | 0 | 28.5 s |
+| C | B + `--experts-host 2 --experts-host-budget inf` (candidate) | 0 | 30.9 s |
+
+Walls are NOT comparable across arms (A paid the cold start) and **no timing
+claim is made**.
+
+**AC2 = FAIL (blocking).** Greedy IDs: **A == B == the recorded
+`gplr07-qa-512` control, byte-identical over all 96 tokens** -- so the paired
+control is valid and the row-set path itself is bit-clean. **C diverges at
+token index 1** (`B=198, C=220`); position 0 is identical. QA: A and B
+`aggregate=PASS` with the negative control failing as designed (rc 1,
+`aggregate=FAIL`); **C positive FAIL (rc 1)** -- the needle answer changed.
+(C's negative control on an already-failing text exits 1 without printing
+`aggregate=FAIL`; a consequence of the positive failure, not an independent
+defect.) Per contract: **the task stops here -- no placement tuning, no gate
+tuning, no rescue was attempted.**
+
+**The fp-order vs kernel-domain distinction the contract requires.** The
+session does not isolate the two mechanisms -- admission couples them -- but
+it bounds them tightly:
+
+- **Certain by construction: kernel-domain.** Host-admitted rows execute on
+  the CPU backend (ggml CPU f32/BLAS) instead of the CUDA matmul kernels that
+  computed them in arm B. Per-row outputs round differently from the first
+  multiply; that is the mechanism the task exists to evaluate.
+- **Also present by construction: fp-order.** The fixed-shape reorder changes
+  the add-chain association (device rows first; host rows + fill in the
+  suffix) relative to router order; f32 addition is non-associative, so
+  ~1e-7-level perturbations exist even if every row computed bit-identically.
+- **Ruled out: routing / weight / quantization change.** `ls_check_no_rewire`
+  was OK at every host-leg build (no GGML_ABORT),
+  `staged_bytes_avoided == experts_host x 1,769,472 B` on every record (plan
+  and graph agree), the absent / never-executed guards stayed silent, and
+  both row-set traces contain **zero** error or refusal events (8,181 events
+  each). The split reorders the selected row set; it never changes which
+  experts the router selects (SDD invariant; the graph consumes the same
+  top-k set).
+- **Not separable from these artifacts:** which mechanism crossed the argmax
+  first at token index 1. Distinguishing them needs a diagnostic arm the
+  contract does not authorize (reorder-with-all-rows-device, or per-row
+  logit-gap telemetry). Escalated to the owner below.
+
+**AC4 (instrumentation, PASS).** 3,840 row-set `layer_compute` records in C:
+`experts_device + experts_host == experts_total` **3,840/3,840, 0
+violations**; `staged_bytes_avoided` an exact multiple of 1,769,472 B on
+every record, 0 unclamped mismatches; `host_finite=0` on every record (the
+new scan ran and was clean); strict `--check-telemetry` rc 0 on all three
+traces; in-flight copies completed and retired (arm C: `copy_submit` 40 ==
+`copy_complete` 40); and `python tools/check-gplr82-ledger.py` on arm C's
+trace returned **VERDICT PASS (ledger closed)** -- 7,680/30,720 = 0.2500
+host, share histogram 0.25 x 3840, exit 0.
+
+**AC5.** NOT a did-not-fire: the mechanism fired (see AC7).
+
+**AC6 (inertness, PASS within session).** Arm B (flag absent):
+`experts_host == 0` on all 3,840 records, gate fields `-1`,
+`host_finite=-1`; ids byte-identical to arm A **and** to the recorded control.
+
+**AC7 (the falsifier, recorded).** Host share **0.2500 exactly** (7,680 host /
+30,720 total routed rows; `rows_gate_cpu=7,680` = exactly 2 of top_k 8 rows
+per token per record; `rows_gate_gpu=23,040` = 6). With `HOST_ALWAYS` and
+`--experts-host-budget inf` the gate adjudicated `gate_wait_us 171.0 >
+gate_host_us 36.5` and opened on **every** one of the 3,840 records -- a
+large host share is the input to the performance arithmetic, not a defect.
+**No performance arm is proposed: AC2 failed and the contract forbids one.**
+
+**AC3 (no hang).** All three arms rc 0; zero `cudaErrorLaunchTimeout` / TDR /
+OOM / CUDA-error needles in any arm log.
+
+**Harness attempts (recorded honestly).** Launch attempt 1 died before any
+arm (a heredoc-mangled string literal in `tools/run-gplr61-ac2.py`), attempt
+2 on a list/str unpack bug -- both released the mutex cleanly and ran NO
+engine arm. Attempt 2 is also the first to pass the provenance gate (fix:
+the exe path is now passed inside `-Command` so `Get-ProvenanceArtifacts`
+can attest). The attempt-1 wrapper record is the `REFUSED provenance (exit
+10)` verdict in `verdicts/gpu-command.*`; later attempts attest under
+`verdicts/gplr61-ac2.*`. Evidence: `build/gplr61-ac2-launch-attempt{1,2}-failed.log`,
+`build/gplr61-ac2-attempt2-verdict.json`.
+
+**Artifacts (all outside version control).**
+`build/llama-cuda/gplr61-ac2-*` (anchor, three arms x jsonl/txt/log,
+verdict.json); `build/llama-cuda/verdicts/gplr61-ac2.{started,done,verdict.json}`;
+harness `tools/run-gplr61-ac2.py`, `tools/gplr61-ac2-launch.ps1`,
+`tools/gplr61-ac2-start.ps1`.
+
+**Known gaps / residual risk.** (1) AC2 failed: the split changes generated
+ids and broke the needle answer at the 512 anchor -- mechanism unisolated
+(above), escalated. (2) Identity was measured at ONE shape (512 anchor,
+N=2, budget inf, HOST_ALWAYS); no other N/budget/shape was run and none may
+be run to "rescue" the gate. (3) MTP + `--experts-host` refuses by design
+(unproven draft-safety). (4) The plan task's `Status:` line still reads
+READY; flipping it is the Planner/owner's call. (5) The `host_finite=1`
+abort path was never exercised at runtime -- host-only construction, tests
+and review only.
+
+## 2026-10-08 (T-GPLR-71 closure validation: recipe steps 1-3 re-run on today's tree, then ONE mutex hold as session ab23 = cross-session replication): the Oct-2 TG win reproduces at +25.2% paired, VRAM byte-identical, PP non-regressing -- and today's ABSOLUTE levels are ~26% lower for BOTH arms, matching the N5 machine-state finding
+
+**Task.** Mission step 2: close T-GPLR-71 per its contract in
+`docs/plans/generic-prefill-layer-residency-plan.md` (contract, recipe, SDD and this file
+re-read before the first edit). The truthful starting state: T-GPLR-71 steps 1-5 were already
+implemented and measured on 2026-10-02 (ab20/ab21/ab22, guard proof, consolidated owner
+summary above), while the block's status header still read "READY ... **no code written yet**"
+-- stale, and what mis-queued this task. Closure therefore = re-validate the recipe gates on
+today's tree, replicate the headline A/B across a session, and reconcile the status. No
+staging, no commit. Evidence kept under a NEW session name so ab20/21/22 stay byte-intact.
+
+**Doc reconciliation (host-only).** Plan block: heading `READY -> MEASURED`, status line
+rewritten to record steps 1-5 + ab20-ab22 (2026-10-02) and the host gates + ab23 replication
+(2026-10-08), owner acceptance explicitly pending; recipe step 4's `-WaitCpuQuiet` removed --
+the reworked `tools/with-gpu-lock.ps1` no longer has that parameter and the recorded command
+FAILED at binding (`NamedParameterNotFound`) on first use today. Net plan size +28 B ->
+**479,817 B, 183 B under the 480,000 B FAIL band; `tools/check-doc-sizes.py` PASS exit 0.**
+The AGENTS.md `n_pad` gotcha (required by the contract) already exists (AGENTS.md L200-201).
+
+**Host validation (recipe steps 1-3, no mutex):**
+- **Build** (`CUDA_PATH` set, `cmake --build build/llama-cuda --config Release`): every
+  task-relevant target produced (llama.dll `3E03583A4C1D5D67`, exe mtime 2026-10-08 00:43,
+  test-layer-streaming-{tg-view,route-topk,host-mem,expert-split} all linked). **0 warnings**
+  in the whole log. Exit 1 **solely** on the documented pre-existing `test-unicode`
+  `unicode_regex_split` link failure -- classified environment/pre-existing in this file
+  (2026-10-06 triage: "upstream target, in none of the host-suite regexes, zero unicode files
+  modified"; also 2026-10-02 records). Not task-owned; not repaired here.
+- **Host suite** `tools/run-tests.ps1 -Suite host`: **exit 0, 78/78** (Oct 2 was 77/77; the
+  +1 is `test-layer-streaming-expert-split`, T-GPLR-61 step A already registered in the
+  tree). Revision digest **`23DE7D243959F8C2`** (nested head `9b90025c4f9d`, 16 tracked / 3
+  untracked changed), record `build/llama-cuda/suite-runs/20261007T225141Z-host/revision.json`.
+- **Focused ctest** `-R "test-layer-streaming-(route-topk|host-mem)$"` **2/2 exit 0**, and the
+  task's own test `-R test-layer-streaming-tg-view` **1/1 exit 0** (Test #54, 0.17 s).
+
+**GPU, exactly one mutex hold.** External pre-probe `nvidia-smi`: 0 MiB used of 24,463 MiB,
+zero compute apps; wrapper post-acquire probes `gpu_pre=clean gpu_post=clean`, mutex
+`Global\AI-GPU-EXCLUSIVE-v1` released normally. Session **ab23** = the recipe's ab20 plan
+byte-for-byte (`build/stock-levers/ab20.plan`, rep=2, route=1, tg=128, kvpad=256 on the
+candidate) with the FROZEN directories: control `t-gplr71-control` (ab19 ctl38x), candidate
+`t-gplr71-changed` -- identity confirmed in-arm: **exe `D5FD112C997C438F`, llama.dll
+`14F4E04D98F9BD6E`**, exactly the plan's recorded hashes. Both arms **exit 0** (81 s / 72 s),
+session report `ab23 VERDICT PASS`. The wrapper verdict is **UNCERTIFIED (exit 10)**,
+`binary_state=not-supplied` -- the same pre-existing provenance gate that marked ab20/21/22;
+evidence kept, only status changed; `-AllowUnprovenanced` deliberately NOT used and no second
+hold spent on the word.
+
+**Measured -- ab23 acceptance criteria, all re-derived from the artefacts on disk:**
+
+| AC | ab23 result (2026-10-08) | vs Oct-2 (ab20/21/22) |
+|---|---|---|
+| AC1 view width | candidate TG `kv_view_built = kv_view_live = **50,176**`; PP lines 262,144 (phase-0 keeps the legacy pin, by design); control binary predates step-5 telemetry so carries no kv_view field | exact match; **ctx-flatness sweep NOT re-run** -- ab21 + dip n=2 stands |
+| AC2 TG | 17.386 -> **21.765 tok/s = +25.2%** paired, target >=15% | +26.5% Oct-2 -- ratio reproduces |
+| AC3 PP | `graph_builds` **0** on every PP line, both arms; paired 2,976.6 -> 2,960.9 = **-0.53%**; absolute floor 3,089.6x0.98=3,027.8 **missed by BOTH arms** (control itself 2,976.6) | see spread below |
+| AC4 VRAM | peak dedicated **8,160,768,000 B byte-identical on both ab23 arms** = 7,782.71 MiB | and on **both ab20 arms** -- 4/4 exact |
+| AC6 rebuilds | `view_rebuilds_total` 0 at tg=128 (guard's first firing is token 177, ab22); 0 `tg_view_rebuild` events; 0 in PP; decode-set `graph_builds` 1 (build-on-miss, same as Oct-2) | consistent |
+| route parity | `check-route-parity.py` **clean both arms**: 480 events, 240 distinct, every tuple x2, 0 singletons, exit 0 | clean |
+
+**The honest cross-session spread (required by AC3's contract).** Same binaries, different
+day: control PP 3,089.0 -> **2,976.6 (-3.64%)**; control TG 23.407 -> **17.386 (-25.7%)**;
+candidate TG 29.609 -> **21.765 (-26.5%)**. Session state dominates absolutes -- consistent
+with the 2026-10-07 N5 entry, which measured today's host-expert floor +19% (12-thread) to
++149% (1-thread) slower under ~4.75 GB free RAM, and TG here runs 38/40 layers on the host
+(52.2% of the wall). **The paired ratio is what replicates: +25.2% vs +26.5% (2 sessions),
+and the AC3 paired delta -0.53% is 7x smaller than the -3.64% session drift of the control
+against itself.** This is the interleaved-pairing lesson of the dip entry, observed again.
+
+**Not re-run this session (Oct-2 evidence stands, labelled):** AC1's 4.00x ctx-flatness
+sweep, AC5 semantic-QA smoke (5/5 both paths), the ab22 tg=256 guard arm, and nsys
+kernel-level flatness. Nothing here re-measures them.
+
+**Evidence.** `build/llama-cuda/logs/ab23-{ctl38x,g71x}-a1-u1024.{jsonl,log,mem.csv,cpu.csv}`;
+`build/llama-cuda/verdicts/ab23-*.verdict.json` (+ `run-ab-session.done`);
+`build/stock-levers/ab23-console.log`, `ab20.plan` (unchanged); host suite record
+`build/llama-cuda/suite-runs/20261007T225141Z-host/revision.json`; build log of this session
+in `/tmp/build-gplr71.log` (ephemeral; findings quoted above).
+
+**Known gaps / residual risk.** (1) Provenance: both ab20 and ab23 are
+`binary_state=not-supplied` -- timing rests on directory hashes, never on attestation of the
+running process (handover S4). (2) n=1 per arm per session; cross-session replication
+exists now, but within-session replicate spread is not re-measured today. (3) The plan file
+sits 183 B under the doc-size cap -- the Planner-level split owed since the incident note
+remains open, and this entry argues it more strongly: the next edit of any size may cross.
+(4) The build's exit-1 on `test-unicode` means a bare `cmake --build` can never read exit 0;
+it is pre-existing and out of T-GPLR-71's scope, but any recipe that says "Expected: exit 0"
+without that caveat misleads.
+
+## 2026-10-07 (HOST-ONLY: no GPU, no mutex, no engine run): T-GPLR-82 N5 -- forced same-window DRAM streaming slows the host expert chain +12-25% (two reproducible arms vs four same-day controls), but the engine never overlaps byte-carrying copies with host expert compute, so impact at the recorded operating point is ~nil; and the "~20x" engine-vs-bench gap is a unit mismatch (like-for-like ~1.6x)
+
+**Task.** N5 of `docs/plans/expert-compute-staging-decoupling-work-packages.md` (contract, plan
+and this file re-read before the first edit): run the CPU-vs-copy expert-bandwidth microbench
+(`tools/expert-cpu-bench.cpp`), reconcile the "~20x" between the engine's ~682 us host layer leg
+and the bench's 35.07 us/expert, and record the conclusion in the work-packages doc. Host-only
+throughout: no GPU command ran, no mutex was taken. No staging, no commit -- everything left
+uncommitted for owner review.
+
+**What ran.** Same 72-cell grid as the 2026-10-02 revalidate (threads 1,2,4,6,8,12,16,24,32 x
+experts 1,2,4,8 x tokens 1,8; `--pool 256 --id-stride 8 --iters 200 --warmup 20`, model
+`C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`, layer 0; bench selftest
+PASS exit 0, `ggml-cpu.dll` MD5 `80be38203b0081e3d2390aa0af7a35a2` identical to the
+revalidation record, so the binary cannot have drifted):
+
+- **4 controls**, nothing else competing: `build/expert-cpu-bench/n5-control{,2,3,4}-20261007.json`.
+- **2 contention arms**: `n5-contend2-20261007.json`, `n5-contend3-20261007.json`, each with
+  three `dd` readers looping the same layer-0 expert window (byte offsets 949-1385 MiB, all
+  three `blk.0.ffn_*_exps` banks, 437 MiB/pass; 149-156 GB moved per arm; final pass 437 MiB in
+  0.138-0.146 s = 3.1-3.3 GB/s per reader). Arm shape in `n5-contend-arm.sh`; reader logs
+  `n5-contend{2,3}-dd{1,2,3}.log`.
+- **Frequency probe**: `n5-freqprobe-20261007.*`, `n5-freq2-20261007.*` -- constant 2006 MHz
+  during a bench run (clock scaling ruled out).
+
+The three readers are a **host-DRAM surrogate for the H2D copy**: same pages, same read
+traffic, but not the DMA engine.
+
+**Measured -- contention delta vs the worst of the four same-day controls, per cell:**
+
+| | arm 2 | arm 3 |
+|---|---|---|
+| median cell delta | **+11.9%** | **+14.5%** |
+| p90 | +24.6% | +27.4% |
+| worst cell | +46.7% | +51.6% |
+| cells slower than every control | 69/72 | 72/72 |
+
+Arms agree cell-by-cell (r = 0.68); **50/72 cells >+5% in both**. By shape (arm2/arm3): TG
+shape 8exp/1tok -- 4t +14.1/+17.2%, 6t +25.4/+22.3%, 8t +18.4/+21.4%, 12t +16.3/+15.9%,
+16t +15.4/+13.4%; **1 thread -0.0/+1.1%** (compute-bound, nothing to steal); PP shape 8exp/8tok
+mostly +3-15% with a 12-thread outlier +45.4/+50.8%. Controls reproduce each other (control 4
+vs mean of 1-3: +0.4% median across cells).
+
+**Measured -- run-to-run drift (does not affect the deltas above).** Today's absolute floor is
+worse than 2026-10-02 on the identical DLL: 8exp/1tok best cell 35.07 -> **41.70** us/expert
+(+19%), 1-thread 58.13 -> **144.70** (+149%), 4t 38.59 -> 50.18 (+30%). Clock is constant
+(probe above), machine had ~4.75 GB free RAM under resident load -- **machine state, not code
+drift** (attributed, not proven). All contention deltas use same-day controls; **absolute
+us/expert figures do not transfer across days.**
+
+**Measured -- engine duty cross-check (why impact is ~nil today).** Re-verified from
+`build/llama-cuda/logs/tg72-threads/tg72-thr16.jsonl`: PP staging = 40 copy submits totalling
+**18,327 MB**, t_us 5,508,755..20,615,525; TG = 5,120 copy submits with **bytes = 0** (residency
+hits), t_us 22,778,100..27,042,327 -- staging ends **2.2 s before** the first TG copy event, so
+the phases never overlap. Host expert compute (the **681.0 us** leg, 4,864 `layer_compute`
+events with `dev=0`) exists only in TG, where byte movement is zero; PP `layer_compute` is
+`dev=-1` (240 events, device-side). `build/llama-cuda/gplr82/tim-host2-a/trace.jsonl` agrees:
+all 40 copy_submits are phase 0, zero byte-carrying copies during TG. So at this operating
+point the measured contention has nothing to act on: **mechanism present when forced
+(measured), impact ~0 when the engine runs (measured).**
+
+**Reconciliation -- the "~20x" is a unit mismatch (measured arithmetic).** 682 us / 35.07 us =
+19.5 divides a **whole layer** (8 experts + attention + recurrent-state step + plumbing) by
+**one expert**. Like-for-like, using the frame already in this file (2026-10-02 entries):
+device base per layer 203.7 us + 8 x in-situ host expert 58.0 us (the +463.8 us/layer penalty
+/ 8) = **667.7 us** predicted vs **674.6-681.0 us** measured (~1-2% residual); bench optimum
+35.07 vs in-situ 58.0 = **1.65x** (this file records 1.59x against the then-current 36.5
+figure), worth 6,527 us/token = 19.3% of the wall -- size of the prize, not a promised gain.
+58.0 sits within 0.9% of the bench **1-thread** cell (58.13), and the thread lever is already
+refuted (engine host layer thread-invariant, 1.8% spread over 1/4/12/16 threads), so the
+residual ~1.65x is **parallelism the host dispatch path does not take plus ggml scheduler
+overhead** (suspect, **unproven** -- no arm isolates it). **Honest per-expert overhead:
+~1.6-1.7x, never 20x.**
+
+**Recorded.** Work-packages doc updated: section 4 now marks the contention unknown answered,
+and section 5 carries an `N5 result (measured 2026-10-07)` block with the full numbers,
+cross-check and reconciliation.
+
+**Known gaps / residual risk.** (1) The **first** contention arm's JSON was overwritten by the
+replicate (filename reused before renaming); its in-session numbers (median +11.8%, p90 +25.4%)
+are not file-backed and are excluded from every claim. (2) A reader-only baseline (120.5 GB in
+15.13 s = 7.95 GB/s, no bench) exists in-session only, no file. (3) The surrogate is not DMA:
+**+12-25% under real H2D overlap is expected, unproven** -- the authoritative test is the
+worktree-only draft `docs/plans/qwen36-staging-contention-arm.md`, which needs
+`expert-cpu-contend-probe.cu` that does not exist. (4) The ~0-impact finding covers only
+recorded operating points (tg72, h2) where staging and host compute do not overlap; any config
+that stages bytes *during* host compute (partial handoff, async-feed overlap) inherits the
++12-25% budget. (5) N5 does not answer N1's two open unknowns (scheduler acceptance,
+activation-transfer cost); the engine-side split remains never-run.
+
+## 2026-10-06 (host-only edit; GPU held for four timing arms, mutex `Global\AI-GPU-EXCLUSIVE-v1`): T-GPLR-82 audit close-out -- the `build_moe_ffn` clamp now has a RED/GREEN regression test, the two-session hunk map for a future commit is recorded, timing is measurable again on a clean GPU, and the 3847-node graph count is claimed with named sources
+
+**Task.** Close the four limitations the last audit left open, without committing anything:
+(1) the `build_moe_ffn` clamp fix had no automated regression test (the top gap); (2) `tools/run-tests.ps1`
+carries hunks from two sessions with no map for a future commit boundary, and the
+`tools/with-gpu-lock.ps1` diff is not from this work at all; (3) every GPU timing number was
+unusable because `ChatGPT.exe` (PID 24036) held the device during the recorded runs, so the
+QA results stand as correctness-only; (4) the `sched_reserve: graph nodes = 3847` observation
+was corroborated in logs but never claimed in this file. All gates below are advisory
+evidence, not release authorization. No commit was made: 0 staged, outer HEAD `98773fe`.
+
+**1 -- Top gap closed: a regression test proven to FAIL on the defect and PASS on the fix.**
+
+New CTest test `layer-streaming-host2-preflight` (Test #60) in
+`third_party/llama.cpp/tools/layer-streaming/CMakeLists.txt` (+39 lines, inserted after the
+`layer-slot-lifecycle` `TIMEOUT 900` block). It runs the exact boundary runner shape
+(`--model-env Q38LS_MODEL_PATH --residency moe-expert-bank --pp-schedule batch-major
+--residency-tg --experts-host 2 --residency-tg-retain 2 --layer-slots 2 --kv-graph-pad 256
+--kv-cache q8 --ctx-size 262144 --ubatch 1024 --tg-tokens 16 --copy-source mmap-registered`)
+plus `--graph-preflight-only`, which builds the persistent row-set graphs and exits before
+PP/TG, so the out-of-bounds view assert surfaces in ~17 s instead of needing a full
+workload. Properties: `TIMEOUT 300`, `PASS_REGULAR_EXPRESSION "persistent row-set graphs
+BUILT OK"`, `FAIL_REGULAR_EXPRESSION "GGML_ASSERT"`. The two-pattern contract is documented
+in the comment above the test from measured ctest semantics (2026-10-06): FAIL wins when it
+matches; PASS is required even at exit 0, so a vacuous run that never builds the graphs
+cannot pass; a silent non-zero exit fails both ways.
+
+Red/green cycle, exact outputs (logs persisted beside the other evidence):
+
+| Step | What ran | Result |
+|---|---|---|
+| green 1 | `ctest -C Release -R layer-streaming-host2-preflight` on the fixed binary | **PASS** -- `1/1 Test #60: layer-streaming-host2-preflight ... Passed 16.13 sec`, `100% tests passed`; verdict `gplr82-regress-green` PASS exit 0 (wrapper 22.2 s), gpu_pre/gpu_post clean |
+| RED | clamp mutated at `src/llama-graph.cpp:2340` to `const int64_t n_rows = hparams.n_expert_used;` (byte-safe Python replace, CRLF preserved 3901/3901), rebuild exit 0 | **FAIL** -- `1/1 Test #60 ...Exit code 0xc0000409***Exception: 17.23 sec` with verbatim `ggml.c:1787: GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src)) failed`, `0% tests passed, 1 tests failed out of 1`; ctest exit **8**; verdict `gplr82-regress-red` FAIL (8) (20.7 s), gpu clean |
+| green 2 | restore from the pre-mutation snapshot, sha256 `4f8bfa46316d1af0506050c9faabad033204444416627fc6dc2d211832aa7c8a` matches, 0 `RED-RUN` markers, rebuild exit 0 | **PASS** -- `1/1 Test #60 ... Passed 8.13 sec`; verdict `gplr82-regress-green2` PASS exit 0 |
+
+The red run is the point: the test discriminates the defect instead of merely observing the
+fixed binary. Evidence: `build/llama-cuda/gplr82/regress-green.log`, `regress-red.log`,
+`regress-green2.log` and `build/llama-cuda/verdicts/gplr82-regress-green.verdict.json`,
+`gplr82-regress-red.verdict.json`, `gplr82-regress-green2.verdict.json`.
+
+Suite wiring: `tools/run-tests.ps1` line 286, boundary `Include` is now
+`qwen38-layer-boundary|layer-slot-lifecycle|layer-streaming-host2-preflight`. End-to-end
+`-Suite boundary` with no flags (record
+`build/llama-cuda/suite-runs/20261006T100804Z-boundary/revision.json`): **3/3 pass** -- #58
+8.89 s, #59 19.71 s, #60 8.27 s, `100% tests passed, 0 tests failed out of 3`. Suite exit
+is **10** again, the provenance gate only (`Verdict REWRITTEN: UNCERTIFIED (10)` -- a bare
+`ctest -Command` yields `binary_state=not-supplied`, so there is no exe path to attest).
+That refusal is pre-existing structure and was deliberately NOT weakened: no
+`-AllowUnprovenanced` was added anywhere. Log: `build/llama-cuda/gplr82/boundary-suite-20261006.log`.
+Guards run: cmake reconfigure exit 0, `ctest -N` lists Test #60, `run-tests.ps1` PowerShell
+PARSE OK, both edited files LF with 0 tabs, GPU probes clean on every GPU run.
+
+**2 -- Commit-boundary hunk map: which hunks are which session's.**
+
+`git diff -U0` on `tools/run-tests.ps1` shows exactly **6 hunks**:
+
+| Hunk | Content | Owner |
+|---|---|---|
+| `@@ -110,0 +111,9 @@` | `[switch] $AllowBusy` param block (default OFF) | 2026-10-05 T-GPLR-82 ladder session |
+| `@@ -277 +286 @@` | boundary `Include` gains `layer-streaming-host2-preflight` | this session (2026-10-06) |
+| `@@ -320 +329 @@` | host-suite `Include` gains `tg-view|expert-split` | **NOT ours -- pre-existing foreign hunk; do not stage with ours** |
+| `@@ -956,2 +965,7 @@` | Direct suite: array splat + `-AllowBusy` forward | 2026-10-05 ladder session |
+| `@@ -1040,2 +1054,7 @@` | QaSmoke suite: same splat change | 2026-10-05 ladder session |
+| `@@ -1087,2 +1106,7 @@` | Gpu/ctest suite: same splat change | 2026-10-05 ladder session |
+
+So the earlier shorthand "4 mine + 1 pre-existing" was incomplete: the AllowBusy work is 4
+hunks (param + three splat sites), my test wiring is 1 more, and 1 hunk belongs to another
+line of work. `tools/with-gpu-lock.ps1` has exactly **one** hunk, `@@ -149 +149,11 @@`, the
+PATHEXT / `$LASTEXITCODE` guard dated "measured 2026-09-30" -- **not mine**, and it must not
+be swept into a commit of this work. Nested tree: `third_party/llama.cpp/tools/layer-streaming/CMakeLists.txt`
+`+39` lines is entirely the new test (mine); `src/llama-graph.cpp` is 174 insertions / 126
+deletions = pre-existing S2 `moe_weights_in` plumbing hunks PLUS this session's single-line
+clamp at line 2340 -- my edit introduced no hunk beyond that line. Nothing staged or
+committed.
+
+**3 -- Timing usable again: four clean-GPU arms, same binary, n=2 per arm.**
+
+The old numbers were unusable: the recorded full arms read `h0 = 51.2 s / h2 = 51.9 s` with
+`gpu_pre = gpu_post = 24036 ChatGPT.exe` in both verdicts. The owner authorized unrestricted
+GPU use, and every probe today was clean, so both full arms were re-run twice each through
+`with-gpu-lock.ps1` -- no `-AllowBusy` needed, no provenance waiver (0 waiver lines for
+these tags), mutex held throughout. Every arm: `gpu_pre=clean gpu_post=clean`, exit 0,
+identical launch digest `23DE7D243959F8C2` / `llama.dll 1A921B6109710233` (nested head
+`9b90025c4f9d`), `check-telemetry: OK (1705 events, 2 slots)`, peak VRAM 9279.56 MiB. The
+commands are byte-identical to the old arms except `--experts-host 2|0` and isolated
+evidence paths.
+
+| Arm | PP tok/s | PP wall | TG tok/s | TG wall | process wall |
+|---|---|---|---|---|---|
+| h2-a (`--experts-host 2`) | 71.327 | 7178.2 ms | 13.065 | 1224.6 ms | 27.4 s |
+| h2-b | 72.187 | 7092.7 ms | 13.477 | 1187.2 ms | 27.1 s |
+| h0-a (`--experts-host 0`) | 70.055 | 7308.6 ms | 15.012 | 1065.8 ms | 26.1 s |
+| h0-b | 77.142 | 6637.1 ms | 14.630 | 1093.6 ms | 26.1 s |
+
+Timing components stay distinct as the charter requires (example h2-a: PP transfer
+12125.1 ms, wait 885.4 ms, compute 1233.8 ms against PP wall 7178.2 ms -- transfer is the
+CUMULATIVE copy time across concurrent streams, legitimately larger than wall, and is never
+added to it).
+
+**Measured:** (a) the ChatGPT.exe confound inflated process wall roughly 2x -- 51.2/51.9 s
+became 26.1/27.x s on the same binary and commands, so the old timing is superseded, not
+reused; (b) wall and TG are repeatable within arm (h2 wall spread 0.3 s; h0 wall identical
+twice) and the TG arms do not overlap (max h2 13.477 < min h0 14.630 -- h0 faster on this
+16-token TG shape, n=2); (c) **PP is NOT resolvable at n=2**: h0's own spread
+(70.055..77.142, 9.7%) exceeds the between-arm gap (means 73.6 vs 71.8, 2.6%), so no PP
+arm claim is made. Evidence: `build/llama-cuda/gplr82/tim-host2-a/run.log`,
+`tim-host2-b/run.log`, `tim-host0-a/run.log`, `tim-host0-b/run.log` and verdicts
+`gplr82-tim-h2-a`, `gplr82-tim-h2-b`, `gplr82-tim-h0-a`, `gplr82-tim-h0-b` in
+`build/llama-cuda/verdicts/`. The QA results remain correctness-only as disclosed
+yesterday; no throughput number is adopted from them.
+
+**4 -- The 3847-node count is now claimed, with named sources.**
+
+`sched_reserve: graph nodes  = 3847` appears **11 times across 8 persisted logs**:
+`build/llama-cuda/gplr07-qa-512.log` (1), `build/llama-cuda/gplr07-qa-50.log` (1) -- both
+2026-10-05 QA-ladder rungs, recorded after the clamp fix; `build/llama-cuda/gplr82/boundary-suite-20261005.log`
+(2, the 2-test suite); `build/llama-cuda/gplr82/boundary-suite-20261006.log` (3, one per
+test of today's 3/3 suite); and exactly 1 in each of the four timing logs above. It exists
+only as a process-log line -- no `sched_reserve` event is emitted in `trace.jsonl`, which is
+why the earlier evidence pass could not find it there. Claim: **the persistent row-set graph
+build for this model and shape constructs 3847 nodes**, measured on the clamp-fixed binary.
+
+**Glossary (restated for this entry).** PP = prompt processing/prefill, reading the prompt;
+TG = token generation, producing new tokens; tok/s = tokens per second; wall = elapsed time
+of a phase or of the whole process; transfer/wait/compute = the three telemetry time
+components, kept separate on purpose (bytes copied, waiting for a slot/layer, kernel time);
+arm = one configured run in an A/B; verdict = the JSON result `with-gpu-lock.ps1` writes
+beside every run (status, exit code, GPU probes, provenance); provenance gate = the check
+that a run can name its source tree and binary, refusing with exit 10 (UNCERTIFIED, not a
+pass) when it cannot; PASS/FAIL_REGULAR_EXPRESSION = CTest properties that decide a test's
+verdict from its output text; red run = deliberately re-introducing the defect to prove the
+test fails; digest = recorded identity hash of source/binary at launch; slots = the bounded
+VRAM windows that hold one immutable weight package each; `--experts-host 2` = two expert
+banks placed on the CPU host (the configuration that exposed the clamp defect); graph nodes
+= nodes in the built prefill graph, printed once by `sched_reserve`; wrapper = the
+`with-gpu-lock.ps1` script that owns the GPU mutex and writes verdicts.
+
+**Pros / cons.** **Measured wins:** the regression gap is closed with a test proven in both
+directions; a future commit can be staged hunk-by-hunk from the map; timing measurement is
+restored (clean probes, reproducible walls); the 3847 claim now has 11 on-disk citations.
+**Costs/risks:** the new test adds ~8-17 s to the boundary suite and, like its siblings,
+fails loudly when `Q38LS_MODEL_PATH` is unset (intended); n=2 timing cannot support a PP
+difference claim, and the TG result is a 16-token shape observation, not a benchmark
+(measured, single shape); `ChatGPT.exe` will confound any future run that skips the
+pre-probe, so timing must keep going through `with-gpu-lock.ps1`.
+**Still open (unchanged):** boundary suite exit 10 (provenance structure, deliberately not
+weakened); 4k/24k/50k/100k/200k ladder rungs remain owner-invoked manual runs; the two
+pre-existing host-test teardown crashes (`test-layer-streaming-layout`,
+`test-layer-streaming-tg-view`, 0xc0000409) are out of scope.
+
+**Recommendation.** Adopt the regression test and the hunk map as they are; treat the timing
+table as a clean baseline to extend with more repetitions before asserting any PP/TG
+difference; keep all four items with the owner for final acceptance -- every gate here is
+soft. No commit was made, per instruction.
+
+## 2026-10-05 (GPU held; owner authorised unrestricted GPU use): T-GPLR-82 -- semantic-QA ladder executed for the host-leg fix
+
+**Task.** Mission step 4 of 4: run the semantic-QA ladder for this branch after the
+`build_moe_ffn` out-of-bounds fix, and record pass/fail per step with actual exit codes.
+Steps 1-3 of the same mission (narrow the assert, fix the view, prove a closed ledger) were
+completed earlier today and are recorded in the entry below.
+
+**Tooling change required to run the ladder at all.** `tools/run-tests.ps1` had no
+`-AllowBusy` surface, and it always drives `with-gpu-lock.ps1`, which REFUSES with exit 125
+whenever *any* compute process is visible. A desktop app's GPU rendering context (PID 24036,
+`ChatGPT.exe`) holds the device and never releases it, so **every GPU suite was unrunnable**.
+Added a **default-off** `[switch] $AllowBusy` forwarded to the wrapper.
+
+- First attempt used a **hashtable** splat and failed measurably:
+  `Cannot process argument transformation on parameter 'AllowBusy'. Cannot convert value
+  "System.String" to type "...SwitchParameter"`. Cause: splatting to a *native* command
+  renders `-AllowBusy True` on a text command line, and the child's `-File` binding receives
+  the string. Fixed by **array** splatting so the switch travels as a bare token.
+- **Default behaviour verified unchanged**: `-Suite qa-smoke` with NO flag still REFUSES with
+  `Verdict: FAIL (125) ... REFUSING to run: GPU busy`. Existing callers are unaffected.
+
+**Ladder results (actual exit codes, captured directly):**
+
+| Step | Command | Exit | Result |
+|---|---|---|---|
+| host-only suite | `-Suite host` | **8** | 5/7 pass. FAIL `test-layer-streaming-layout`, `test-layer-streaming-tg-view` (both `0xc0000409`) -- **KNOWN-FAIL, pre-existing, out of scope** |
+| telemetry suite | `-Suite telemetry` | **0** | **PASS** -- selftest OK; positive `--validate-telemetry` OK (26003 events, 4 slots, 40 layers); negative correctly rejected (exit 2) |
+| QA smoke 512 rung | `-Suite qa-smoke -AllowBusy` | **0** | **PASS** in 192 s -- `check-telemetry: OK (30547 events, 3 slots)`; N1 `QX-7741`, N2 `TR-2918`, N3 `MK-5501`, N4 `LD-8834`, K1 `Paris` all PASS; **negative control FAILs as designed**; record `20261005T162341Z-qa-smoke` |
+| QA smoke 50 rung | `-Suite qa-smoke -AllowBusy -SmokeLengths 50` | **0** | **PASS** in 198 s -- `target=50 achieved=50 items=N1`; `check-telemetry: OK (30547 events, 3 slots)`; needle `mode=needle aggregate=PASS`; **negative control FAILs as designed**; record `20261005T162718Z-qa-smoke` |
+| boundary (env unset) | `-Suite boundary -AllowBusy` | 10 | **harness error, not a test failure**: both tests failed identically with `missing or empty model environment variable: Q38LS_MODEL_PATH`. My invocation omitted the env var |
+| boundary (env set) | `-Suite boundary -AllowBusy` | **10** | **tests 100% (2/2 pass)**; suite exit 10 is the **provenance gate**, not a test result: `no binary identity was captured (binary_state=not-supplied)` because the wrapper's `-Command` is a bare `ctest` with no exe path for `Get-ProvenanceArtifacts` to attest |
+
+**Recorded revision for every suite run:** engine digest `33D97FC814749032`, nested head
+`9b90025c4f9d`, `llama.dll 8ABB934026189E8E`.
+
+**New vs pre-existing failures:**
+- **Pre-existing / known-fail (not re-investigated, as instructed):**
+  `test-layer-streaming-layout` and `test-layer-streaming-tg-view`, `0xc0000409` teardown
+  crashes that print their full success line before dying. 5/7 still pass.
+- **Pre-existing structural, not a code regression:** `boundary` suite exit 10 is the
+  provenance gate refusing an unattestable `ctest` command. `run-tests.ps1` has never passed
+  `-AllowUnprovenanced`, and my diff does not touch `-Command` content -- the same
+  `$ctestCommand` string is passed before and after, so the refusal cannot be attributed to
+  this change. **I did not add an escape hatch for it**: weakening a provenance gate to turn a
+  suite green is exactly the wrong fix.
+- **Not a failure:** the first `boundary` run failed only because `Q38LS_MODEL_PATH` was
+  unset in my shell. With it set, both tests pass.
+- **No new failures introduced** by the `build_moe_ffn` fix or by the `-AllowBusy` change.
+
+**Not run, by contract:** the 4k/24k/50k/100k/200k ladder rungs are **owner-invoked manual
+runs**, never part of `-Suite qa-smoke` (see `tools/run-tests.ps1` suite docs and T-GPLR-07).
+They were therefore not executed and are NOT claimed.
+
+**Confound, disclosed rather than hidden:** every GPU run in this ladder carried
+`gpu_pre=gpu_post=24036 ChatGPT.exe` and the wrapper printed its own
+`WARNING: ... a non-conforming compute process may have run alongside this arm; timing
+suspect.` The owner authorised unrestricted GPU use. This makes **timing suspect** on these
+runs; the QA verdicts are **correctness** results (telemetry integrity + programmatic answer
+grading + must-fail negative control) and do not depend on timing. No throughput number from
+this ladder should be quoted.
+
+## 2026-10-05 (host-only for the edit; GPU held for the two proof runs, mutex `Global\AI-GPU-EXCLUSIVE-v1`): T-GPLR-82 -- `--graph-preflight-only` added to the layer-streaming runner, and the "minutes instead of seconds" premise is WRONG
+
+**Task.** Owner-directed 2026-10-05: "add a preflight dry-run mode to the layer-streaming runner
+that builds the persistent row-set graphs without a model, so graph-construction asserts surface in
+seconds instead of minutes."
+
+**What shipped.** `--graph-preflight-only` in `tools/layer-streaming/main.cpp` (help `:174`,
+declaration `:3300`, parse `:3577`, early exit `:5621`). It runs the normal
+`llama_layer_streaming_prebuild`, prints the graph footprint, then **returns 0 before any PP or TG
+execution** -- placed after the footprint/`--graph-budget-mib` block (so a budget overrun still
+reports itself) and before the mmap-registered page-locking and the timed PP. `exit_status` is
+honoured, so a budget failure stays a failure rather than being reported as a clean prebuild.
+
+**TWO CORRECTIONS TO THE REQUEST'S PREMISE, both measured:**
+
+1. **It cannot skip the model, and the flag says so.** `llama_layer_streaming_prebuild(ctx, batch,
+   tg_tokens, st)` needs a real `llama_context` built from real tensors -- there is no shape-only
+   entry point. So this is a *dry-run*, not a model-free build. The help text states this outright
+   ("The model IS still loaded ... only EXECUTION is skipped, not the load") so the next reader does
+   not go looking for a shortcut that is not there.
+2. **The assert was never slow.** It already surfaced ~18 s after launch, because it fires during
+   the *prebuild* -- before execution ever starts. Measured wall times, this machine, same flags:
+
+| | full arm | `--graph-preflight-only` |
+|---|---|---|
+| crashing case (`--experts-host 2`) | ~18 s | **21 s** (no faster) |
+| passing case (`--experts-host 0`) | 23.7 s | **15 s** |
+
+So the speedup is ~9 s and only on the PASSING path; on the crashing path -- the case the request
+cares about -- there is **no** speedup, because model load (~6.5 s) dominates and the assert is
+already early. **Do not sell this as a speedup.**
+
+**What it IS good for** (all measured): it turns "do the row-set graphs build?" into a single
+deterministic flag with exit 0/1, independent of prompt content, token count, sampling and the
+ledger checker. It avoids the mmap page-locking and the timed PP, so a graph defect cannot be
+masked or prolonged by execution, and it is safe to re-run in a tight edit/verify loop.
+
+**Proof, both directions (same new binary, `digest 209BDF0BDC728818`, `llama.dll 6CB0A5F2F61A6A18`):**
+
+- `--experts-host 2 --graph-preflight-only` -> reproduces the defect verbatim,
+  `ggml.c:1787: GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <=
+  ggml_nbytes(view_src)) failed` during "layer-major preflight: building persistent graphs";
+  verdict FAIL, exit `-1073740791`, 21 s wall.
+- `--experts-host 0 --graph-preflight-only` -> `graph preflight: persistent row-set graphs BUILT OK
+  (2 set(s), 2 build_generation, prep 18.5 ms)` plus the footprint line (`sets=2 total_graphs=84
+  io_reserved=201326592 B io_used=46711366720 B host_input=1140850688 B`); verdict PASS, exit 0,
+  15 s wall.
+
+Both traces carry **0 `layer_compute` records** (47 and 46 records, ending at `run_start`), which
+confirms the mode's own printed warning that the demand-ledger checker is not applicable here (it
+would exit 2). That is stated in the mode's output rather than left for the next reader to trip on.
+
+**Guard on the freeze.** The rebuild went to `build/llama-cuda/bin/Release`; the N2 treatment
+binary in `build/llama-cuda/bin/unscoped-bin/s2-hostleg` was re-hashed before the build, after the
+build, and after both runs -- `sha256` prefix `5a570b6dde40d659` **unchanged throughout**, so the
+attribution evidence from the previous entry still points at the same executable.
+
+**Build.** `cmake --build build/llama-cuda --target llama-layer-streaming --config Release`, exit
+0. The four `C4477` `%d`/`size_t` warnings are PRE-EXISTING, in
+`src/llama-layer-streaming.cpp:5230/5247/5341/5347` -- untouched by this change.
+
+**Regression check (ran after the change).** `ctest -C Release -R`
+`test-layer-streaming-(layout|model-inspect|descriptors|tel-mark|route-topk|tg-view|expert-split)$`
+-> **5 passed, 2 failed**, `ctest_exit=8`: `test-layer-streaming-layout` and
+`test-layer-streaming-tg-view`, both `Exit code 0xc0000409`. Binaries were checked FRESH first
+(`main.cpp` 17:30:07 < `llama.dll` 17:31:00 < `llama-layer-streaming.exe` 17:31:11), so this is
+not the stale-binary trap.
+
+**Those two failures are PRE-EXISTING and NOT caused by this change**, established rather than
+assumed, because the fastfail is the same family as the row-set assert and looked alarming:
+
+1. `graph_preflight_only` / `--graph-preflight-only` appears **nowhere** in `third_party/llama.cpp/src/`
+   -- the edit is confined to the runner's `tools/layer-streaming/main.cpp`, which is neither part of
+   the `llama` library nor of either test target.
+2. Both tests print their full success line (`test-layer-streaming-layout: all layout checks
+   passed`) and **then** die, so this is a crash in TEARDOWN/static destruction, not a failed
+   assertion. No check regressed.
+3. A/B on the DLL: the same test exes were run in a scratch directory against the **frozen
+   11:16 `llama.dll`** (`892b24ecbfe1e956`) and the **freshly built** one (`6cb0a5f2f61a6a18`).
+   Both crash identically, so the rebuild did not introduce it either.
+
+**Left open deliberately:** which teardown path asserts. Not diagnosed here; it predates this work
+and is out of scope for a flag that touches no library code. Recorded so the next reader does not
+re-derive it.
+
+**Observation, not fixed:** invoking `with-gpu-lock.ps1` DIRECTLY on a fastfail run propagates
+exit **127** rather than the runner's `-1073740791`; the verdict JSON carries the true code and the
+`run-gplr82-hostarm.ps1` launcher reads it correctly. Read the verdict, not the wrapper's shell
+exit, when driving the wrapper by hand.
+
+## 2026-10-05 (GPU held, mutex `Global\AI-GPU-EXCLUSIVE-v1`): T-GPLR-82 N1 attribution -- the GGML_ASSERT is CAUSED BY THE HOST LEG BEING ON. It is NOT pre-existing.
+
+**Task.** Owner-directed 2026-10-05: "build a side-by-side control binary with the host expert leg
+disabled so the GGML_ASSERT crash can be attributed to step 2 versus pre-existing."
+
+**No second binary was built, and none is needed.** `--experts-host` is a **RUNTIME** gate, not a
+compile-time one: `tools/layer-streaming/main.cpp` documents it as "Default 0 = off, which builds no
+host leg at all", and `experts_host` defaults to `0`. So the FROZEN step-2 binary can be **both** arms
+and `--experts-host` becomes the single controlled variable. That is a *stronger* control than a
+rebuilt binary (no second build to drift, no rebuild risk, byte-identical executable), and it answers
+the same question. The control binary was therefore not built -- a deliberate scope decision, not an
+omission. `tools/run-gplr82-hostarm.ps1` gained an explicit `-AllowHostOff` switch for this; the
+existing N1 guard still refuses `-ExpertsHost 0` without it (verified: it throws).
+
+**The A/B.** Both arms: same frozen exe `sha256 5A570B6DDE40D659`, same `source_digest
+21ECF0325891CC00`, same model / prompt / `--tg-tokens 16` / `--residency-tg-retain 2` / `--layer-slots
+2` / `--kv-cache q8` / `--ctx-size 262144` / `--ubatch 1024` / `--copy-source mmap-registered`. The
+ONLY difference is `--experts-host 2` vs `--experts-host 0`.
+
+| | treatment `--experts-host 2` | **control `--experts-host 0`** |
+|---|---|---|
+| runner exit | `-1073740791` (`0xC0000409`) | **0** |
+| verdict | FAIL, 17.9 s | **PASS, 23.7 s** |
+| row-set `layer_compute` records | 0 | **640** |
+| `experts_device + experts_host == experts_total` | n/a (no records) | **640/640, 0 violations** |
+| host share (min/max) | unmeasured | **0.0 / 0.0** (host=0, total=5120) |
+| checker | exit 2, NOTHING TO EVALUATE | **exit 0, PASS (ledger closed), mechanism DORMANT** |
+
+**Conclusion (measured, single-variable):** the assert fires **only when the host expert leg is
+enabled**. The same executable, with the leg off, loads the model, builds all 40 layer packages,
+builds the persistent row-set graphs, runs PP and 16 TG tokens, and closes the ledger cleanly. So
+this is **a step-2 defect, not a pre-existing row-set/row-cache defect** -- the exact question the
+attribution was for. The likely locus is the host sub-op's view construction in
+`qwen35moe.cpp` (`build_moe_host_leg`, `:892-949`) or the `moe_weights_in` view it binds; the assert
+is a ggml view whose `data_size + view_offs` overruns its source. **Not yet narrowed to a line** --
+that is the next task.
+
+**Second, unplanned result: the ledger checker is now validated on REAL telemetry.** Until this arm,
+`tools/check-gplr82-ledger.py` had only been proven against synthetic fixtures. On the control's 640
+genuine `layer_compute` records it reports PASS / DORMANT with the identity holding on every record,
+and it still reports exit 2 (NOT a pass) on the treatment trace. Its two important exits are now
+confirmed against real runs in both directions.
+
+**GPU coordination.** Pre-run probe: **no compute processes**. During the run the only compute
+process was our own frozen `s2-hostleg\llama-layer-streaming.exe` (pid 22804, confirmed by path).
+Post-run probe: **no compute processes**. No foreign process appeared, so no shared-GPU poisoning
+confound applies.
+
+**Standing gap (unchanged, now with evidence):** `run_start` does **not** carry an `experts_host`
+field -- confirmed false on the control trace too, where 640 downstream records prove the leg was
+requested-and-off. So a trace alone cannot show the requested value without reaching a
+`layer_compute` record.
+
+**Cost note.** The control ran 23.7 s of GPU work for a complete answer. The equivalent rebuilt
+control binary would have cost a full CUDA rebuild of the vendored tree to prove something this run
+proved exactly.
+
+## 2026-10-05 (GPU held, mutex `Global\AI-GPU-EXCLUSIVE-v1`): T-GPLR-82 N1 -- the forced-on host-leg arm was finally FIRED, and it ABORTED. `experts_host` share is UNMEASURED, not zero.
+
+**Task.** T-GPLR-82, **N1 pass 2 of 2**, owner-directed 2026-10-05. Contract
+`docs/plans/expert-compute-staging-decoupling.md` (plan wins on any difference). One narrow
+question: **did the host expert sub-op fire at all?** If `experts_host == 0` across an arm with
+the host leg forced on, that is a valid answer ("mechanism did not fire") and placement / budget /
+K must NOT be tuned to rescue it. An abort must be recorded verbatim and the pass stops.
+
+**Headline: the question is UNANSWERED.** The arm aborted before a single row-set record existed,
+so the share was never observed -- it is *not* `experts_host == 0`, and it must not be reported
+as a zero.
+
+**The arm had never actually run before this pass.** Three defects in
+`tools/run-gplr82-hostarm.ps1` meant the previous two attempts died before the runner was ever
+executed. Each was found by inspecting artifacts, not by inference:
+
+1. **`Start-Process -ArgumentList` does not re-quote its elements.** The multi-token `-Command`
+   string arrived at the child as `$Command = '&'` with every runner argument spilled into unbound
+   positionals (proved with a parameter-dump probe: `RECEIVED[&]`, 8 stray positionals). The
+   wrapper then died on a parse error *before taking the mutex* -- no `.started` marker, no trace.
+   Symptom that would have fooled a reader: a healthy `[run ] wrapper pid N` line. Fixed by
+   quote-wrapping the value with backslash-escaped inner quotes; verified to arrive intact.
+2. **The wrapper runs `cmd.exe /d /s /c $Command` (`tools/with-gpu-lock.ps1:148`), so `$runnerCmd`
+   must be CMD syntax.** It was built with PowerShell's `&` call operator, so cmd refused it
+   verbatim: **`& was unexpected at this time.`** Runner exit 1 in 3.6 s. Fixed by dropping the
+   leading `&`.
+3. **`-WindowStyle Hidden` discarded the runner's stderr into an unreadable window**, leaving the
+   verdict's `log` field empty. The runner's stderr is the ONLY place an abort reason appears, so
+   a dying arm was undiagnosable -- exactly what happened. Fixed with `-NoNewWindow` +
+   `-RedirectStandardOutput/-RedirectStandardError` into the arm's own output dir.
+
+**Two further launcher reporting defects, found on the attribution pass and now FIXED.** Both
+affected how BOTH arms above were *displayed*; every number quoted in this entry was read from
+the verdict JSON and direct `nvidia-smi` probes, which is why they were correct even while the
+launcher's own post-run block was not:
+
+4. `[post] GPU compute apps:` rendered as `System.Object[]` at run time although the identical
+   expression returns `System.String` in isolation. Now flattened through
+   `ForEach-Object { [string]$_ }`; re-verified to return `System.String`.
+5. **Worse, and silent: the post-run verdict block read property paths that do not exist.**
+   `Read-ArmVerdict` returns the RAW parsed verdict JSON, in which the verdict word is `status`
+   and the GPU probes live under `fields`. The launcher read `.verdict` / `.gpu_pre_run` /
+   `.gpu_post_run`, so `[post] mutex verdict`, `[post] gpu_pre_run` and `[post] gpu_post_run`
+   printed **empty on every arm** -- a report that looks like it reported something and did
+   not. Now reads `$verdict.status` and `$verdict.fields.*`, verified against the real control
+   verdict file (`status = PASS`, `gpu_pre_run = clean`, `gpu_post_run = clean`).
+
+**The abort, verbatim** (`build/llama-cuda/gplr82/gplr82-n1-host2-tg16/runner.err.log`, tail):
+
+```
+row-cache (T-GPLR-19, SDD section 4 shape (i)): 40 layers x 16 rows/layer = 1093.0 MiB private VRAM, K=2, query-time retention
+layer-major preflight: building persistent graphs
+C:\Development\AI\qwen38GZI\third_party\llama.cpp\ggml\src\ggml.c:1787: GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src)) failed
+```
+
+Runner exit **`-1073740791` = `0xC0000409`** (Windows fastfail from the GGML assert): a ggml view
+whose `data_size + view_offs` overruns its source tensor, raised **while building persistent
+graphs for the row-set TG path** -- i.e. before any layer ever computed.
+
+**How far it got (from the trace):** `load_end: ok` @6.46 s, `async_feed_init`, `byte_account`,
+and all 40 `pkg_member` package records written. `run_start` confirms the flags took effect:
+`rowset = on`, `tg_tokens = 16`, `schedule = batch-major`, `n_slots = 2`, `copy_source =
+mmap-registered`. Then abort at ~6.75 s. 46 trace records total, ending at `run_start`;
+**0 `layer_compute` records**, so no record could carry `experts_total`.
+
+**Checker result** (`tools/check-gplr82-ledger.py` on that trace): **exit 2**,
+`NOTHING TO EVALUATE`, `row-set records: 0 of 0 layer_compute records`. Per this checker's
+contract, exit 2 means "nothing to evaluate" and is **NOT a pass**. The launcher correctly refused
+to call it one: `ARM FAILED (runner exit -1073740791)`.
+
+**Verdict / provenance.** Tag `gplr82-n1-host2-tg16`: `status = FAIL`, `exit_code =
+-1073740791`, `duration_s = 17.9`, `mutex_acquired = True`, `gpu_pre_run = clean`,
+`gpu_post_run = clean`, provenance gate **PASS** (digest `21ECF0325891CC00`, `llama.dll`
+`892B24ECBFE1E956`, `binary_dir = build/llama-cuda/bin/unscoped-bin/s2-hostleg`, exe sha
+`5A570B6DDE40D659`, `source_head = 9b90025c4f9dd4cd1cfe190f23e14fb7f75bf364`). Note the
+wrapper needed **no** provenance waiver once the command reached it intact; the launcher's
+`-AllowUnprovenanced` remained a recorded WAIVE, not a satisfied gate.
+
+**GPU coordination.** Pre-run probe: **no compute processes** (launcher and wrapper agree). A
+foreign `llama-layer-streaming.exe` from an unrelated `nwt2m-build` temp tree was seen on the GPU
+during the FIRST aborted attempt; it was gone before this arm, did not recur, and did **not**
+contaminate either arm reported here. Post-run probe: **no compute processes**. No shared-GPU
+poisoning confound applies to this result.
+
+**NOT ATTRIBUTED -- do not read this as a verdict on the mechanism.** The assert fires in the
+row-set graph-construction path, which is where the host leg would live, but **no control exists**:
+the only frozen binary (`s2-hostleg`) already contains the step-2 host-leg change, so there is no
+pre-change binary to A/B against, and this pass was explicitly directed not to rebuild. The
+assert is equally consistent with (a) a step-2 host-leg view built out of bounds and (b) a
+pre-existing row-set/row-cache defect that `--experts-host 2` merely perturbs. Separating them
+needs a side-by-side build, which is the next task, not this one.
+
+**Also noted, unfixed, out of scope here:** the `run_start` telemetry record does not echo
+`experts_host`, so a trace cannot prove from `run_start` alone that the host leg was requested;
+`experts_total` appears only on `layer_compute` records, which this run never reached.
+
+## 2026-10-05 (host-only, no GPU hold): T-GPLR-82 step 2 -- the host expert sub-op exists, is guarded, and is flagged off by default
+
+**Task.** T-GPLR-82 **step 2 only** (the host sub-op), owner-directed 2026-10-05. Contract
+`docs/plans/expert-compute-staging-decoupling.md`, S2. Build a CPU-backend expert sub-op that
+computes routed rows against the weights where they already lie, add `--experts-host N`
+(default 0 = off), and prove no weight source is rewired. **No GPU arm, no semantic QA, no
+commit** was authorised for this pass, so this entry reports build and host-test evidence only.
+
+**What was built.** One weight derivation over the FULL top-k, sliced into a device head leg
+(`dev_rows = n_expert_used - N`) and a host leg (`N`), summed through the existing add chain
+(`qwen35moe.cpp:435-486`). The host leg binds the MODEL LOADER's tensors
+`model.layers[il].ffn_{gate,up,down}_exps` -- never `layer(il)`, which under
+`LLAMA_LAYER_STREAMING` returns `ls->slot_layer(il)` and therefore the slot's compact CUDA
+copies (`qwen35moe.cpp:892-949`, `build_moe_host_leg`). Host-leg ids are a separate INPUT
+(`rowset_selected_experts_host`, `qwen35moe.cpp:472-476`), not a view of `sel_in`, and the
+executor fills them from the last `N` top-k positions
+(`llama-layer-streaming.cpp:4960-4996`). `build_moe_ffn` gained a null-defaulted
+`moe_weights_in` (`llama-graph.h:1119`, `:1158`; `llama-graph.cpp:1924`, `:1977`) because
+neither leg can normalise over its own subset without the pair summing to 2.0.
+
+**The guard is on the real path.** `llama_ls_policy::ls_check_no_rewire`
+(`llama-expert-split-policy.h:281`) is called from `build_moe_host_leg`
+(`qwen35moe.cpp:934-942`), not only from tests, and a non-ok verdict `GGML_ABORT`s with the
+refusal reason, the layer, and the counts. It now carries the two facts S2 names: the weight's
+declared placement, and `GGML_BACKEND_BUFFER_USAGE_COMPUTE` on its buffer, which is what
+separates a weight at its declared host placement from one the scheduler's `compute_splits`
+path has staged -- placement alone cannot tell those apart. `min_batch_override_live` is passed
+explicitly `false` because that route is not in this tree (reverted 2026-09-22); it exists so
+re-introducing it has to touch this call site.
+
+**Validated (measured, host-only).** `cmake --build build/llama-cuda --config Release --target
+llama-layer-streaming` and `... --target test-layer-streaming-expert-split`: exit 0, zero
+errors, final source fully built (both binaries up to date on a repeat build). ctest
+`test-layer-streaming-expert-split` at 11:18:21 on a binary built 11:18:13 -- mtime checked
+before believing it -- **PASS**, `AC1 PASS (0 failures)`, with five rewire-guard fixtures
+(all-placed, one rewired, device leg ignored, compute-staging buffer, live MIN_BATCH). CLI
+surface checked through the shipped binary: `--help` prints the flag, `--experts-host 99`
+exits 2 with `expects 0..64 routed rows`. `load_row_set` verified **byte-identical**
+(36,204 B before and after) against the pre-edit backup, so step 2 touched nothing in the
+staging path. Scratch removed: no `g82*` file remains anywhere in the tree.
+
+**Plan/code mismatches hit.** (1) The SDD's "zero router weight for the tail" pad is not
+expressible in `build_moe_ffn`: SOFTMAX normalises, SOFTMAX_WEIGHT re-normalises, and
+SIGMOID/SQRT_SOFTPLUS are strictly positive, so no gating path can exclude a padded row. S2
+sidesteps it because the two positional widths sum to exactly `top_k` (no pad needed);
+S3, where membership is per-row, will need an explicit mask this function does not have yet.
+(2) S2 requires "weights bound to the in-flight source rows on the host", but the graph builder
+runs once per graph set while residency changes per token; membership therefore had to move to
+an executor input (`ff_input_hsel`), which is what makes S3's residency-aware rule possible
+without a rebuild. (3) The policy header's namespace was `llama_layer_streaming`, which
+collides with the class of the same name as soon as one translation unit includes both headers;
+renamed to `llama_ls_policy` (function names unchanged). (4) The init-time input-buffer budget
+for row-set companion inputs is computed from `row_set_requested`, which the runner assigns
+AFTER `ls.init`, so those inputs already take the spill path today; left untouched, and the
+third host-leg input behaves the same way rather than diverging.
+
+**Not validated, and it matters.** No GPU arm ran, so nothing here proves the host sub-op
+executes correctly: the scheduler's backend assignment for CPU-resident `MUL_MAT_ID` weights,
+the cross-backend ACTIVATION round-trip the SDD names as permitted-but-unproven, and any
+numerics drift from CPU accumulation are all unmeasured. `experts_host > 0` in a trace is
+still the falsifier AC7 asks for, and it is unmeasured. Step 3 (removing the device wait) is
+deliberately absent, so this pass buys no speedup by construction.
+
+**Recommendation.** Keep experimenting. Treat step 2 as a compiled, guarded skeleton: the
+placement argument is now checked at run time instead of asserted in a comment, but the
+execution question is unanswered until an owner-authorised GPU arm reports a non-zero
+`experts_host / experts_total` with balanced device+host accounting.
+
+## 2026-10-03 (host-only, no GPU hold): T-GPLR-82 step 1 -- the decoupling is now observable; experts_* ledger, TG readiness, per-token window
+
+**Task.** T-GPLR-82 **step 1 only** (instrumentation), owner-directed 2026-10-03. Make the
+decoupled-compute mechanism *observable* before any behaviour changes, so a working host
+sub-op can later be told apart from an inert one. Scope: `src/llama-layer-streaming.cpp` and
+its header. **No host execution path, no `--experts-host` flag, prefill untouched.**
+
+**What was added, and where.** All default-inert; every field is emitted from a site that
+already existed.
+
+| field | event | anchor | note |
+|---|---|---|---|
+| `experts_total`, `experts_host`, `experts_device`, `host_us` | `layer_compute` | `main.cpp:7023-7041` | inside the row-set-only `parts` block |
+| `t_begin_us`, `round_wall_us` | `rowset_round` | `main.cpp:10857-10863` | pairs with the existing `t_us` |
+| `ready_at_consumption` | `rowset_fetch` | `main.cpp:10836-10842` | TG had no readiness field at all |
+| `rowset_round_t0_us` (member) | -- | header `:1711` | round-start stamp |
+| `t_layer_compute` signature | -- | header `:1038` | +4 defaulted params |
+
+**Inertness rests on the existing gate, not on new plumbing.** The optional `parts` block is
+written only when `attn_compute_us >= 0.0`, and **only the row-set TG caller
+(`main.cpp:4948`) passes that**. Both prefill callers pass `-1.0` and therefore keep the
+byte-identical short form. The buffer grew `160 -> 320` bytes, which cannot affect a record
+that never uses it. `ffn_dev` is emitted **unchanged**.
+
+**Two plan/code mismatches, found and handled.**
+
+1. **The plan's "per-token `t_us` on `rowset_round`" was already satisfied** -- `tel_rowset_round`
+   has emitted `t_us` since before this task. The real gap is different: there was no round
+   *start*, so the gap between consecutive stamps was unattributable and the 2,662.864 ms
+   `tg82` outlier could not be placed (round stamps spanned 7.249 s of a 10.680 s wall).
+   Implemented the start stamp instead, and added `round_wall_us` so each token's window is
+   measurable end to end.
+2. **`ready_at_consumption` on TG is a LATENCY PROXY, not an observed wait.** The row-set path
+   has no consumption-time wait site to observe, so the field reuses the existing `<100.0 us`
+   convention that `main.cpp:4961` already feeds to `add_layer_stats`, making the trace and the
+   in-memory statistic agree by construction. This is recorded in a code comment precisely so
+   it is not later read as the measured readiness gate it was meant to close.
+
+**`host_us` is a real measurement but currently measures the wrong thing.** It times this
+layer's host-side row-set consume (union build + `load_row_set`), which today is the only host
+work on the path. It does **not** yet measure host expert arithmetic -- there is none until
+step 2. From S2 the same timer covers that too. Anyone reading `host_us` before S2 must not
+treat it as the 36.5 / 59.4 us/expert figure.
+
+**Validation.** Host-only, no GPU, no mutex. `cmake --build ... --target
+llama-layer-streaming` **exit 0**, 0 errors; `llama.dll` and `llama-layer-streaming.exe`
+relinked, `llama.dll` sha256 now **`1c52865caf0befa126c1ec5955e858d8c0d00e54e1fca753383d5e855710e221`**
+(previously `715ca377...`). `ctest -R test-layer-streaming-expert-split` **Passed**, exit 0.
+Format specifiers were checked against their argument types by hand at all three emit sites,
+since a mismatch compiles but corrupts the trace. The four `C4477` warnings in the build log are
+`[ls-exec]` debug `fprintf`s at `main.cpp:5159/5176/5270/5276` -- outside every S1 hunk and
+present in the pre-patch file, so pre-existing.
+
+**Method note, because it nearly caused a wrong edit.** This pass first "verified" the vendored
+files were CRLF using `grep -c $'\r'`, which in Git Bash matches **every line** and therefore
+returned the line count for both files -- indistinguishable from a true "all CRLF" result. Both
+files are **LF**. The patcher now detects newline style from the raw bytes and re-asserts it
+after writing, instead of assuming it. This is the same failure shape as the earlier
+`ready_at_consumption` `None is False` defect: a check that looks like it passed and did not.
+
+**Not done, by instruction.** No `--experts-host`, no host sub-op, no prefill change, no GPU
+arm, no semantic QA. Nothing committed.
+
+## 2026-10-03 (no GPU hold, read-only analysis of the tg82 trace): where every demanded expert ran during token generation -- all of them on the GPU, 49.2% cache-resident, and no layer ever waited
+
+**Task.** Owner, after the `tg82` run: "how was the impress [TG] happening?
+When was an expert being executed on the CPU and when on the GPU? What happens
+with experts that are waiting to be transferred? ... in flight? ... when the
+router demands an expert that is not gonna be mapped?" Answered from the `tg82`
+trace alone, no new hardware run.
+
+**The headline is that this run has no CPU/GPU split at all.** Across all
+**5,120** token-generation `layer_compute` records: `ffn_dev` = `{1: 5120}`,
+`attn_dev` = `{1: 5120}`, and **`cpu_us > 0` in 0 of 5,120**. Not one demanded
+expert row was executed on the host. So the three sub-questions resolve as
+follows, and none of them has a host leg in this configuration.
+
+**1. Where each expert ran.** `top_k` = 8 on every layer, `route_union`
+median 8.0 -- at batch 1 the eight experts a layer demands are eight distinct
+experts, so **40,960 rows** were demanded over the phase (40 layers x 128
+tokens x 8). **Every one executed on the GPU.**
+
+**2. What was already there.** The resident row cache
+(`--residency-tg-retain 2`) served **20,132 of 40,960 = 49.2%**. The other
+**20,828** came across PCIe. `fetched + reused = 40,960` exactly, so every
+demanded row is accounted for with no unexplained residue. `n_rows_retired`
+sums to 20,188, i.e. the cache is evicting continuously, not accumulating.
+The first token is cold -- **320 fetched, 0 reused**; rounds 2-128 settle at a
+**49.5%** reuse rate.
+
+**3. In flight / waiting. TG readiness-at-consumption is UNMEASURED, and an
+earlier draft of this entry claimed otherwise -- that claim is withdrawn.**
+`ready_at_consumption` is **not a field on `rowset_fetch` at all**; it lives
+only on `layer_ready_wait`, which this trace emits **1,960 times, all of them
+phase 0**. There are **zero** TG-phase `layer_ready_wait` records. So "no layer
+ever blocked on an unfinished transfer" has **no evidence behind it** and must
+not be quoted. What TG *does* record per layer: median `host_submit_us`
+**0.072 ms** (issuing), `transfer_us` **0.733 ms**, `ready_latency_us`
+**0.662 ms**, `bytes_staged` median **6.750 MiB** (max 15.562). Roughly
+40 x 6.75 MiB = **~276 MiB staged per token**, matching the per-round median
+of 276.211 MiB.
+
+**PP, for contrast, is measured and blocks constantly:** of the 1,960
+`layer_ready_wait` records, **1,421 (72.5%) were NOT ready at consumption**,
+median `wait_us` **31.472**, p90 31.715, max 123.590. The scheduler's
+readiness signal is real and does fire -- it is simply not instrumented for
+token generation. The indirect TG argument (median `ready_latency_us`
+0.662 ms against a per-layer share of 51.784/40 = 1.29 ms) *suggests* the
+copy wins the race every time, but that is an inference from two medians,
+**not a measurement**, and it is exactly the class of claim this project's
+gates exist to catch.
+
+**4. Router demands an expert that is not mapped.** It is **staged from the
+host mmap over PCIe and then executed on the GPU.** There is no host-execution
+fallback in this configuration -- that is exactly the gap
+[T-GPLR-61 step B](docs/plans/generic-prefill-layer-residency-plan.md) exists
+to fill. Note this is the *opposite* of the cost-gate premise: the gate was
+measured on host expert arithmetic at ~36.5 us/expert against ~171 us/expert
+over the link, i.e. computing on the host is 3.4-6.7x cheaper than fetching,
+so a not-mapped expert being fetched is the expensive branch by that model.
+
+**Correcting a number that reads well and means little.** TG per-token *layer
+compute* median is 16.395 ms = **60.992 tok/s**, but that **excludes the
+staging**. The end-to-end steady-state figure is the round-to-round gap:
+median **51.784 ms = 19.31 tok/s** (mean 57.082 ms = 17.52 tok/s). Against the
+stock anchor's **40.96 tok/s** (24.41 ms/token) this configuration is
+**0.47x, i.e. roughly 2.1x slower** -- not "quite good". The 60.99 figure must
+never be quoted as a decode rate.
+
+**An inconsistency I could not resolve, recorded rather than smoothed.** The
+worst token is `ubatch` 50 at **2,662.864 ms** of summed layer compute (second
+worst 247.927 ms), yet the `rowset_round` gap from round 49 to round 50 is only
+**410.424 ms**, and the rounds span 7.249 s of a 10.680 s TG wall, leaving
+**3.431 s outside the round loop**. The 2.66 s cannot be placed inside the
+410 ms gap, so either `rowset_round.t_us` marks round submission rather than
+completion, or the rebuild is attributed into `layer_compute` while it is paid
+outside the loop. **Not established.** Resolving it needs a `t_us`-per-token
+event, which is what the trimmed-median telemetry proposal would add anyway.
+
+**New tool `tools/tg-expert-routing.py`** (5,749 B): prints the execution-side
+census (`ffn_dev`/`attn_dev`/`cpu_us`), the demand-versus-residency ledger
+(`route_union`, `n_rows_fetched/resident/retained/retired`), the in-flight
+timings, and the per-token reuse rate. Two defects found and fixed while
+writing it, both in the tool rather than the trace: the missing-trace path
+raised a traceback instead of a clean message (the same defect
+`tools/pad-delta.py` was tightened for), and `n_rows_reused` was read off
+`rowset_fetch`, where the field does not exist -- it is a per-`rowset_round`
+field, and reading it per-layer is what made the reuse ledger look empty.
+Negative path verified exit 1 with a clean message; real trace exit 0.
+
+**A third tool defect, found on the final verification pass, of the same family
+as the second.** Section 3 asked `e.get("ready_at_consumption") is False` over
+`rowset_fetch` records. That field does not exist there, so `.get()` returned
+`None`, the predicate was False for all 5,120, and the tool printed a clean,
+plausible **`0 of 5120`** -- which reads as "every layer was ready". A missing
+field and a false field are different facts, and `None is False` silently
+converts the first into the second. The tool now counts field *presence*
+separately and prints an explicit `UNMEASURED` warning when it is absent.
+**This is the third time in this task that reading a field off an event that
+does not carry it produced a confident wrong answer** (`n_rows_reused`, then
+`ready_at_consumption`). The rule worth adopting: a trace-analysis tool must
+fail loudly on an absent key rather than default it.
+
+## 2026-10-03 (GPU hold tg82, current binary): the 50k / 128-token shape re-run -- PP inside the band, and one 2,662.864 ms outlier token that poisons the mean
+
+**Task.** Owner: "run some benchmark ... 50000 tokens and 128 generating
+tokens." The shape already existed (`tg81-pad50k`, four arms), but **every one
+of those arms ran on the previous `llama.dll`**: the current dll is
+`715ca3779a072789861659fa0d129b709905c24a5180d95f5828df0ca7d5e59b`, mtime
+2026-10-03 10:06, and the `tg81` arms ran 06:48-07:05. A fresh arm was
+therefore the only way to get a **current-binary** point at this shape. No code
+change, no rebuild.
+
+**Design.** One arm, `j1-pad256-50k`, flag-identical to `i1`/`i4`
+(`--residency moe-expert-bank --pp-schedule batch-major --residency-tg
+--residency-tg-retain 2 --layer-slots 2 --kv-graph-pad 256 --kv-cache q8
+--ctx-size 262144 --tg-tokens 128 --ubatch 1024 --copy-source mmap-registered
+--route-telemetry 1`, `anchor-50000.txt`). Launched through
+`tools/with-gpu-lock.ps1 -VerdictTag tg82-50k128 -AllowUnprovenanced`; mutex
+acquired and released, `gpu_pre`/`gpu_post` both clean, verdict **PASS**,
+command exit **0**, 160.9 s. Evidence
+`build/llama-cuda/logs/tg82-50k128-current/`. The provenance gate **REFUSED**
+the arm (`binary_state=not-supplied`) and the run passed only under the waiver;
+the dll hash above is the binary identity, recorded here by hand.
+
+**Prefill is unchanged and inside the `tg81` band.** 50,000 tokens, wall
+**137.138 s**, mean **364.597 tok/s**; transfer 151.213 s, wait 45.620 s,
+compute 56.821 s, overlap **1.850x**, 1,958 evictions, feed **5.939 GB/s**.
+The four `tg81` arms read 348.8-379.9 tok/s, so this sits inside them. The
+transfer+wait+compute overlap (measured, 1.78-1.90x across all five arms) is
+**DMA against SM** -- it is not host arithmetic, and it must not be quoted as
+evidence of CPU/GPU compute concurrency.
+
+**Token generation: the mean is meaningless here, the median is not.** The
+phase summary reads **mean 11.985 tok/s / 10.680 s wall** -- worse than `i1`'s
+18.600 -- but that is the mean-contamination pathology this project already
+knows. Per-token cost (sum over the 40 `layer_compute` records of
+`compute_us + setup_us`, grouped by `ubatch`):
+
+| arm | binary | median/token | median tok/s | mean/token | max token |
+| --- | --- | --- | --- | --- | --- |
+| `j1` | **current** | **16.395 ms** | **60.992** | 39.247 ms | **2662.864 ms** |
+| `i1` | previous | 16.633 ms | 60.121 | 18.223 ms | 151.139 ms |
+| `i4` | previous | 16.433 ms | 60.853 | 18.702 ms | 199.201 ms |
+
+**The three medians agree within 1.4%**, so the binary change is not a TG
+regression -- `j1`'s median is in fact the best of the three. The entire mean
+gap is **one token**: `j1`'s single 2,662.864 ms outlier, the `view_rebuilds_total=1`
+KV view rebuild at `required=50176`. It contributes (2662.9 - 16.4)/128 =
+**20.7 ms/token** to the mean, which is the whole 18.600 -> 11.985 difference.
+This is the **largest single-token outlier recorded at this shape**, ~17x `i1`'s
+151 ms, and it is the strongest instance yet of the standing rule that
+`phase_summary.tokens_per_s` must never be quoted as a TG result.
+
+**Re-confirms T-GPLR-79 on the rebuilt dll.** Across all 5,120 TG layer records
+`ffn_dev` is `{1: 5120}` and **0 of 5,120 ran host arithmetic** (`cpu_us > 0`).
+The CPU+GPU *concurrent* case still does not exist on this binary; this run
+re-measures the zero-host-compute result rather than the overlap model.
+
+**New tool `tools/trace-summary.py`** (3,791 B): phase summaries with the
+overlap ratio and achieved feed, plus per-token median/mean/min/max built from
+`layer_compute` grouped by `ubatch`, plus the host-arithmetic and `ffn_dev`
+census. It exists because the first per-token implementation in this session
+filtered on `phase == "tg"` and let `phase_summary` through, reporting the
+phase wall as a "median" of n=1; the corrected filter keys on
+`event == "layer_compute"` and `phase == 1`.
+
+**Not established.** No A/B against the `tg81` arms is available for PP/TG
+*means*, because that binary boundary is unresolved in both directions: the
+medians match, but n=1 arm per binary cannot separate a real small regression
+from session drift. Nothing here tests answer stability, and the charter's
+262,144/50k identity arms remain impossible without handoff.
+
+## 2026-10-03 (host-only, no GPU hold): T-GPLR-61 step A -- the `moe-row-split` policy and shape are written and AC1 PASSES. The identity gate is untouched. Soft gate -- advisory evidence only.
+
+**Task.** Owner, after asking what hybrid-inference results exist at K=2: *"create an experiment ... what you have on the GPU, you run on the GPU, what's in flight, you wait for it, what is not in flight, we will CPU in the there."* That is verbatim the recorded owner direction for **T-GPLR-61**, which the plan already carries as `ready`. Scope agreed with the owner before any code: **step A only** (host-only policy and shape), with the AC2 identity probe deferred and the 512-token anchor chosen when it is run. No GPU hold, no model load, no change to any default path.
+
+**What the record already said, so nothing was re-derived.** Stock llama.cpp hybrid exists and is strong: all 120 expert-bank tensors on `CUDA_Host`, 16 whole layers on CPU, **39.204 tok/s TG at 10.193 GiB** (owner doc1, 2026-10-01 head-to-head). Our layer-residency path at the same context is **25.074 tok/s = 0.640x stock**, while winning prefill **1.94x**. So the hybrid the owner describes has never run *here*: `experts_host`, `rows_gate_cpu` and `split_expert_ffn` return **zero hits** across `third_party/llama.cpp/src` and `/tools`.
+
+**What step A now contains.** A new standalone header
+`third_party/llama.cpp/src/llama-expert-split-policy.h` (9,590 B) holding pure
+decision functions in `namespace llama_layer_streaming`: `ls_classify_row`
+(READY / PENDING / ABSENT), `ls_evaluate_gate` (named policy, refuses rather
+than defaulting), `ls_plan_split` (partition + two constant-width descriptors +
+the SDD's telemetry counters). It is deliberately its own header and adds **no
+members to any class**, so it cannot change the layout of anything already
+linked. Test `tests/test-layer-streaming-expert-split.cpp` (17,659 B), registered
+in `tests/CMakeLists.txt` inside the `LLAMA_LAYER_STREAMING` block, and added to
+the host suite's explicit CTest allowlist in `tools/run-tests.ps1`.
+
+**AC1 PASSES -- all seven fixtures, plus the gate arithmetic.** Focused CTest
+`test-layer-streaming-expert-split` passes; host suite `SUCCESS`, **78/78 CTest
+tests and 0 FAIL**, exit 0. **The suite did not run this test at first.**
+`run-tests.ps1 -Suite host` selects by an explicit allowlist, not by "all
+registered": the new name was absent, so the suite passed 77/77 without ever
+executing AC1 -- a green suite that silently omitted the one test added that
+week. Fixed by adding `expert-split` to that allowlist, after which the count
+went 77 -> 78 and the log contains the test's own `AC1 PASS` line. The gate reproduces the SDD's measured comparison rather than
+a convenient one: `wait_us` lands at 170.96 us for a 1,769,472 B row at
+10.35 GB/s against `host_us` 36.5, a **4.68x** margin, inside the recorded
+3.4-6.7x band.
+
+1. all-READY **never splits** -- `experts_host == 0`, `staged_bytes_avoided == 0`.
+2. all-PENDING with the gate open sends every row to the host, 8 x 1,769,472 B avoided.
+3. a **closed gate is not a refusal**: PENDING rows return to the ordinary wait
+   path, and the device sub-op is asserted **slot-identical** to the no-split
+   plan. This is the property that makes the flag safe to add.
+4. a mixed set splits per row (4/4), and the router's executed id set is
+   preserved in order on **both** sub-ops -- nothing dropped, substituted or reordered.
+5. an **absent** demanded row refuses and emits no sub-op at all.
+6. an **unevaluable** policy refuses: unknown policy, zero feed rate, and a
+   *negative* feed rate (which must not sneak through as free transfer).
+7. padding is inert (`is_pad`, no id, no backend) and both sub-ops are exactly
+   `top_k` wide for **every k from 1 to 8** and **every residency mix**, with
+   `experts_device + experts_host == experts_total` throughout.
+
+**Two defects the fixtures caught, both fixed in the policy rather than in the test.**
+(i) `rows_gate_gpu` counted only PENDING rows that stayed on the device, so the
+gate's two counters did not sum to the demand in a mixed set. READY rows are
+dispositions too, so it now counts every device-assigned row and the pair sums.
+(ii) A slot not host-bound was emitted with `expert_id = -1`, which made the two
+sub-ops **differently shaped** instead of **differently weighted**. The SDD's
+padded shape requires both partials to be full-width terms carrying their own
+id, selected out by a zero router weight; without that the add-chain reduction
+would not sum correctly. Both sub-ops now carry the expert id for every demanded
+position, and only tail padding uses -1.
+
+**A build-hygiene cost worth recording.** Adding any file under
+`third_party/llama.cpp` makes the provenance attestation fail with *"the binary
+PREDATES its sources"*, because the checker compares the newest source against
+the newest engine artifact. An ordinary incremental rebuild does **not** clear
+it: MSBuild correctly declines to relink an engine whose inputs did not change,
+so the artifact stays at its old mtime. The host suite failed **6 arm-verdict
+cases** on this. The fix is a real rebuild, and `--clean-first` is what does it
+-- it costs a full CUDA template rebuild (~15 min, 106 artifacts); only the known
+pre-existing `test-unicode` `unicode_regex_split` link failure remains. **The
+engine binary `llama.dll` hash changed** (715CA3779A072789) from the one behind
+the 2026-10-03 pad arms, so **any A/B against those arms is now cross-binary**.
+
+**NOT proven, and deliberately so.** Step A proves the partition and the refusal
+contract **only**. Nothing here has executed on hardware, no runner reaches this
+code, and no host sub-op exists yet. AC2 -- greedy token ids byte-identical to
+the all-GPU arm at the 512 anchor -- is untouched and remains the blocking gate;
+per AC5 a run in which the mechanism never fires is a recorded outcome, never a
+pass with an implied benefit. **No performance claim of any kind is made.** The
+SDD's named residual hazard is also untouched: activations crossing the backend
+boundary are permitted by letter and evidence but **not proven safe**, and that
+is where the per-layer sync cost lands.
+
+**Tooling warning that affects every future doc search in this repo.**
+`code_search` and `read_files` resolve to the Freebuff **worktree**, which is a
+much older copy: `docs/tg-expert-path-reconciliation.md` is 131,204 B there
+against **366,496 B** in the repo, and `docs/plans/qwen36-staging-contention-arm.md`
+exists only in the worktree. Every finding in this entry came from `grep`/`sed`
+in the terminal against the real tree. Searches run through the agent tools on
+these documents are reading stale content.
+
+**Evidence.** `third_party/llama.cpp/src/llama-expert-split-policy.h`,
+`tests/test-layer-streaming-expert-split.cpp`, `tests/CMakeLists.txt`;
+suite record `build/llama-cuda/suite-runs/20261003T081238Z-host/revision.json`
+(digest `175CB7FDE0CFED8E`, nested head `9b90025c4f9d`, 12 tracked / 3 untracked
+changed, `llama.dll` 715CA3779A072789). Commit: unassigned -- no commit
+authorised; outer HEAD `98773fe` and nested `9b90025c4f9d` both unmoved.
+
+## 2026-10-03 (2 GPU holds, 4 matched arms at the 50k shape): the KV graph pad is worth **+19.5% TG** at 50k, and the previous session's headline for that arm was an artifact. Soft gate -- advisory evidence only.
+
+**Task.** Owner: "Measure the KV graph pad benefit at the 50k shape by running a
+same-session no-pad control" -- `h3-pad256-50k` (12.568 tok/s / 79.57 ms per
+token) had no matched comparison, so it was not a delta. Scope: the 50k shape
+only. No code change, no rebuild; the binary is byte-identical to the one that
+produced h3 (`llama-layer-streaming.exe` mtime 2026-10-02 23:55:01, unchanged).
+
+**Design.** Four arms, two pad and two no-pad, at the charter 50k shape,
+identical in every flag except `--kv-graph-pad 256`, split across **two separate
+GPU mutex holds** with the order **reversed** in the second hold
+(`i1-pad, i2-nopad` then `i3-nopad, i4-pad`) so a monotone session drift cannot
+masquerade as the pad effect. All four exit 0, 128/128 tokens, 149-166 s,
+gpu_pre/gpu_post clean. Evidence `build/llama-cuda/logs/tg81-pad50k/`,
+verdicts `tg81-pad50k` / `tg81b-pad50k` (both PASS; both waved through the
+provenance gate with `-AllowUnprovenanced`, so neither carries binary identity).
+**Provenance gap, recorded rather than papered over:** `run_start` does not emit
+`kv_graph_pad` at all, so the telemetry alone cannot say which of the four arms
+carried the pad. Arm identity rests on `arms.txt` plus the launch script, and
+the corroboration is indirect -- the two pad arms each show exactly 1
+`tg_view_rebuild` at `required=50176` and each no-pad arm shows 0 and stays at
+`kv_view_live=262144`, which is only reachable with the flag set. Adding
+`kv_graph_pad` and its `_source` to the `run_start` event would make this
+self-proving and is a one-line change for whoever picks it up.
+
+**Result -- TG, measured on the median per-token latency, not the mean.**
+
+| arm | pad | median ms | trim ms | tok/s (median) | graph builds |
+|---|---|---|---|---|---|
+| i1 | yes | 51.32 | 50.21 | 19.49 | 1 |
+| i4 | yes | 50.80 | 49.40 | 19.68 | 1 |
+| i2 | no | 59.19 | 58.09 | 16.90 | 0 |
+| i3 | no | 62.87 | 61.39 | 15.91 | 0 |
+
+Pad median-of-medians 51.06 ms vs no-pad 61.03 ms: **no-pad is 19.5% slower per
+token** (tok/s 19.58 vs 16.39). The two arms' medians do not overlap -- gap
+7.87 ms. Pooled over all 254+254 per-token samples, 254/254 pad samples are
+faster than 253/254 no-pad samples (Mann-Whitney z = -13.85, p = 1.3e-43). All
+four 2x2 pairings land between +15.3% and +23.8%. The pad arm also replicates
+tightly (51.32 vs 50.80, 1.0% apart); the control is the noisier of the two
+(59.19 vs 62.87, 6.2% apart), so the headline delta carries roughly that much
+spread.
+
+**Measured costs, same arms.** PP is untouched, as it must be -- the pad is a TG
+mechanism: pad PP 374.2 tok/s vs no-pad 364.4 tok/s against a 348.8-379.9
+spread across all four arms, i.e. inside run-to-run noise. Peak VRAM is
+**bit-identical at 10,074,259,456 B in all four arms**: the pad costs nothing in
+memory. Each pad arm still shows exactly 1 rebuild
+(`built=262144 -> required=50176`, `mechanism=t-gplr-47-fresh-context-rebuild`);
+each no-pad arm shows 0, staying pinned at 262,144-wide for all 128 tokens.
+
+**Why the median and not `phase_summary.tokens_per_s`.** `h3-pad256-50k` and
+`i1-pad256-50k` are the **same configuration, same binary, same prompt**, run
+17 hours apart, and they disagree by 48% on the headline: 12.568 vs 18.600
+tok/s. Their medians agree within 4% (53.56 vs 51.32 ms). The cause is a single
+token: h3's first TG token took **419.39 ms** against a ~53 ms median, and it
+carries the graph rebuild. One such token moves a 128-token mean by ~30%, and
+it moved h3's reported `total_compute_us` (3382 ms) *above* the no-pad control
+(3173 ms) -- which is why the attention-width model fitted against h3 returns a
+**negative** implied attention cost of -258 ms, a physical impossibility that
+would have read as a falsified mechanism had it not been checked. `i3` has the
+same pathology in the control arm (max 1189.12 ms, mean 74.46 vs median 62.87).
+`tools/pad-delta.py` now reports mean, median, 10%-trimmed mean and max side by
+side so this is visible rather than buried in a single field.
+
+**Mechanism cross-check.** If the only thing the pad changes is the live
+attention view width, then TG compute = A*(live/262144) + R with A and R shared
+by both arms. Solving each clean pair separately gives A = 1362 ms (i1 vs i2)
+and A = 1241 ms (i4 vs i2); the previously recorded 512-shape pair gives
+A = 1459 ms. The mechanism's falsifiable prediction is that three different live
+widths (768, 50176, 262144) imply the SAME full-width attention constant, and
+they do agree to within **14.9%** (1459 -> 1241 ms) -- but that figure should be
+read honestly: the two 50k fits differ from *each other* by 8.9% despite
+identical flags, so ~9% of the spread is arm-to-arm session noise, not model
+error. The prediction is supported at the level the noise permits, not
+confirmed, and it is the weakest of the claims in this entry. This is why the pad helps at all: with the whole
+262,144-wide cache live during decode, attention reads 262,144 columns when only
+~50,000 are real.
+
+**Token output: identical.** All four new arms and h3 emit **the same 128 token
+ids**, pad and no-pad alike, first divergence `None`. This is new information
+about the open T-GPLR-80 question: the pad does **not** perturb output at the 50k
+shape. The recorded 512-shape divergence at index 42 (pad 248045 vs no-pad 846)
+is **not** reproduced at 50k over 128 tokens. That weakens hypothesis (b) -- "the
+whole-cache view is genuinely wrong" -- because a systematic mask defect at
+262,144-wide should show at both shapes, and it now shows at neither reliably.
+It stays consistent with hypothesis (a), a near-tie resolved differently because
+a 50,176-wide and a 262,144-wide softmax reduce in a different order. **This is
+not settled**: 128 tokens is a short window, the 512-shape divergence is still
+unexplained, and `--tg-logit-margin` -- the instrument that measures the margin
+at the divergence point -- is still OFF on every 512-shape arm recorded so far.
+
+**Charter-scale caveat, measured not assumed.** The pad's benefit is largest
+exactly where the charter does *not* operate. It scales as 1 - live/262144, so
+at `--ctx-size 262144` the projected compute saving is ~41% at a 500-token
+prompt, 33% at 50k, 25% at 100k, 9.7% at 200k, and **0.0% at a 262,144-token
+prompt by construction** -- the whole cache is genuinely live, so there is
+nothing to narrow. The projection also assumes TG wall keeps its measured
+~42%-transfer / ~22%-compute split, so it understates nothing and overstates the
+wall-clock share if transfer dominates harder at longer contexts. The honest
+reading is: `--kv-graph-pad 256` is a **short-prompt, long-ctx** optimisation.
+It is worth having and it is free, but at the charter's own 262k context it buys
+nothing, and this measurement does not support it as a lever for the 8 GB target.
+
+**Not concluded.** Gates are soft: this entry reports what four arms measured,
+not that the pad is correct or approved. Still open after this work: the 512-shape
+token-42 divergence; whether the pad is safe at contexts where `live` crosses a
+pad block during generation; the unattributed RAM commit hold; ctx ~= 125,700 on
+K=2 (8 GiB route) never run.
+
+## Index of archived entries (2026-08-18 .. 2026-10-02)
 
 Format: `<date> -- <shard>:<line> -- <entry>`, newest first. The rows
 are derived from the shard files; do not edit them by hand.
 
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:9` -- ## 2026-10-02 (3 GPU holds, host suite): `--kv-graph-pad 256` token generation is FIXED in the row-set executor. The...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:107` -- ## 2026-10-02 (1 GPU hold + host analysis, owner-directed): attention in the K-cache TG path is ALREADY 100% on the G...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:192` -- ## 2026-10-02 (host-only, no GPU hold): T-GPLR-78 -- the T-GPLR-75/76 classifier is CORRECTED at the source. No-kerne...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:242` -- ## 2026-10-02 (1 GPU hold, 2 arms, owner-directed "maybe do not use mmap?"): the answer is NO -- `--no-mmap` ADDS ~th...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:326` -- ## 2026-10-02 (host-only, no GPU): T-GPLR-77 -- `docs/currentstate.md` re-split under the size guard (480,985 -> 351,...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:376` -- ## 2026-10-02 (1 GPU hold + host build): T-GPLR-76 answers "which nodes" — the ONLY host-side op in the attention gra...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:447` -- ## 2026-10-02 (3 GPU holds, 10 arms, bisect): the ~58 GiB commit hold is NOT ours and NOT context-driven — ctx is eli...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:539` -- ## 2026-10-02 (1 GPU hold + host build): T-GPLR-75 answers the owner's CPU-inference question BY MEASUREMENT — the K...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:625` -- ## 2026-10-02 (4 GPU holds, owner-directed TG focus): the K cache is MEASURED at last — TG 13.3-16.2 tok/s, peak VRAM...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:822` -- ## 2026-10-02 (host-only, code inspection, no GPU hold): the K-cache was NEVER tested at our shape and is not wired i...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:944` -- ## 2026-10-02 (ONE GPU hold, 4 arms, owner-authorised): the CPU thread lever is REFUTED on hardware — 1/4/12/16 threa...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1025` -- ## 2026-10-02 (host-only, NO GPU): NUMA is ELIMINATED (1 socket, 0 NUMA nodes) and first-touch is RULED OUT BY MAGNIT...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1116` -- ## 2026-10-02 (host-only analysis + one host build, NO GPU): the overlap question is ANSWERED from existing traces —...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1188` -- ## 2026-10-02 (HOST-ONLY microbenchmark, NO GPU, NO mutex): the 36.5us/expert figure REPRODUCES at 35.07 (12 threads)...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1274` -- ## 2026-10-02 (host-only, NO GPU): the 42.6%-vs-4.0% blocker is CLOSED and the policy question it gated is answered —...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1350` -- ## 2026-10-02 (host-only + one host build, NO GPU): pool hit-rate observability FIXED — the published rate's denomina...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1426` -- ## 2026-10-02 (host-only, NO GPU): per-layer K is CORRECT and maximally valuable at small K (+1.96 pp at K=1) — but K...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1500` -- ## 2026-10-02 (host-only, NO GPU): the owner's simpler rule ("in-flight wait, queued don't") is ALREADY implemented i...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1574` -- ## 2026-10-02 (host-only, NO GPU): the proposed byte-accurate PCIe ledger is WITHDRAWN as unnecessary — byte accounti...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1657` -- ## 2026-10-02 (host-only, NO GPU): the 42.6% vs 4.0% conflict was a CATEGORY ERROR — they are disjoint terms, both tr...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1741` -- ## 2026-10-02 (expert row-cache K, host-only, NO GPU): per-layer K is worth at most +2 pp over flat K, the 8 GB targe...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1836` -- ## 2026-10-02 (T-GPLR-71 dip REPLICATION, one mutex hold, 12 interleaved arms): the ctx-131,072 dip DOES NOT REPRODUC...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1892` -- ## 2026-10-02 (T-GPLR-71 dip investigation, host-only, NO GPU): the 6.5% ctx-131,072 dip is EXONERATED of the mechani...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:1957` -- ## 2026-10-02 (T-GPLR-71 CONSOLIDATED OWNER SUMMARY — this entry SUPERSEDES the ab20/ab21 owner summary below): the v...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2063` -- ## 2026-10-02 (T-GPLR-71 audit close-out, host-only, NO GPU): the test's own justification is now measured, `set_view...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2133` -- ## 2026-10-02 (T-GPLR-71 guard proof, host test + ONE hardware arm): steps 3-4 are EXERCISED, not dead code — and dri...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2228` -- ## 2026-10-02 (T-GPLR-71 ab20/ab21, TWO mutex holds, FIRST hardware execution of `--kv-graph-pad`): token generation...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2295` -- ## 2026-10-02 (T-GPLR-71 step 5, host-only, observability only): AC1, AC3 and AC6 are now scorable from a DEFAULT tra...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2320` -- ## 2026-10-02 (T-GPLR-71 audit follow-up, host-only): the view-coverage fail-safe pointed the wrong way — an unrecord...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2347` -- ## 2026-10-02 (T-GPLR-71 steps 3-4, host-only, NO GPU window): the TG set is rebuilt when its built view cannot cover...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2374` -- ## 2026-10-02 (T-GPLR-71 steps 1-2, host-only, NO GPU window): the control is preserved, `--kv-graph-pad` exists and...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2402` -- ## 2026-10-02 (host-only, source reading): YES the view can be sized at graph-build time — the handoff executor is in...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2437` -- ## 2026-10-02 (host-only): the CPU is NOT an extra additive cost inside the 43 ms — but host layer execution is 42.6%...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2469` -- ## 2026-10-02 (prof3, host-only analysis): stock's decode scan length is ESTABLISHED — our engine scans the whole all...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2508` -- ## 2026-10-02 (host-only): the decode attention kernel is already at ~97% of its block-wave occupancy, and the MMA sp...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2536` -- ## 2026-10-02: T-GPLR-70 FALSIFIED AND REVERTED -- narrowing the TG KV window made token generation 18.9% SLOWER, and...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2572` -- ## 2026-10-02 (host-only): the ten full-attention layers cost ~2,075 us because TG's decode attention scans the WHOLE...
+- 2026-10-02 -- `docs/currentstate/2026-10-02.md:2641` -- ## 2026-10-02 (host-only): T-GPLR-68 ATTRIBUTED — the unaccounted VRAM is llama.cpp's own compute-buffer reserve, and...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:9` -- ## 2026-10-01 (host-only): the activation slab's second half IS resident, telemetry reports the sum exactly, and the...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:24` -- ## 2026-10-01 (ab18b, host-only): the per-layer token-generation decomposition — and a RETRACTION of the "788 us/laye...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:42` -- ## 2026-10-01 (ab18): the MATCHED 8 GB comparison — prefill **3.72x** stock, token generation **0.62x**, at the same...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:65` -- ## 2026-10-01 (ab17): the TG leg finally has numbers — the hybrid does BOTH legs inside 8 GB, prefill is 2.11x stock...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:92` -- ## 2026-10-01 (ab16): T-GPLR-66 CLOSED — the `alloc_spill` crash is fixed, the depth-2 ubatch curve is complete, and...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:122` -- ## 2026-10-01 (ab15): the depth-2 PP curve on the real card — ubatch 1024 AND 2048 CRASH, and the act-slab law retire...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:147` -- ## 2026-10-01 (ab14): the 8 GB TARGET CONDITION, budget-emulated — it ACCEPTS, it is VRAM-neutral, and it admits a co...
+- 2026-10-01 -- `docs/currentstate/2026-10-01.md:191` -- ## 2026-10-01: THE OWNER'S TWO REAL CONFIGURATIONS, RUN HEAD TO HEAD — layer-major is a PP-ONLY win (1.94x / 1.83x at...
+- 2026-09-25 -- `docs/currentstate/2026-09-25.md:9` -- ## 2026-09-25: T-GPLR-59 D1 adversarial closure; parser and teardown gaps fixed
+- 2026-09-25 -- `docs/currentstate/2026-09-25.md:19` -- ## 2026-09-25: T-GPLR-59 D1 same-session MTP frontier completes; proposal precision positive, runtime D-gate FAIL
+- 2026-09-25 -- `docs/currentstate/2026-09-25.md:37` -- ## 2026-09-25: T-GPLR-59 D1 authorized MTP handoff arm/null run; pairing gate PASS, D-gate not yet established
+- 2026-09-25 -- `docs/currentstate/2026-09-25.md:51` -- ## 2026-09-25: T-GPLR-59 D1 adversarial replay/lifecycle fixes
+- 2026-09-25 -- `docs/currentstate/2026-09-25.md:61` -- ## 2026-09-25: T-GPLR-59 D1 runtime wiring reaches host validation; real MTP run still pending
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:9` -- ## 2026-09-24: T-GPLR-59 D1 implementation slice starts (decision recorded 2026-09-25)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:21` -- ## 2026-09-24: Owner closes T-GPLR-53, T-GPLR-56, T-GPLR-58, and T-GPLR-60; T-GPLR-59 remains pending owner calls (de...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:31` -- ## 2026-09-24: T-GPLR-59/60 architecture pass separates engine pool policy, telemetry state, and host replay; behavio...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:45` -- ## 2026-09-24: T-GPLR-59/60 validator adversarial pass fixed duplicate-start, pre-init state, and malformed-number ac...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:57` -- ## 2026-09-24: T-GPLR-60 G0/G1 host learning-curve experiment is COMPLETE; G1 FAILS the equal-row gate and the family...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:73` -- ## 2026-09-24: T-GPLR-59 FOLLOW-UP: the host-only counterfactual 12-row pool replay is IMPLEMENTED and SCORED over re...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:85` -- ## 2026-09-24: T-GPLR-59 prediction pool is IMPLEMENTED and HOST-VALIDATED (policy + instrumentation green; no GPU/mo...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:97` -- ## 2026-09-24: THE ARM-ZERO-ADMISSION QUESTION IS RESOLVED (host-only diagnosis) - a history-only predictor cannot be...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:111` -- ## 2026-09-24: T-GPLR-58 A4 COMPLETED (owner-authorized, one mutex hold, seven legs) - both K=2 arms were capacity-bo...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:123` -- ## 2026-09-24: T-GPLR-58 FRESH K=8 COACT ADMISSION TRACE (owner-authorized, uncommitted)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:131` -- ## 2026-09-24: T-GPLR-58 CACHE-AWARE CANDIDATE COUNTERFACTUAL (host-only, uncommitted)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:139` -- ## 2026-09-24: T-GPLR-58 MODE-2 ADMISSION TELEMETRY (host-only, uncommitted)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:147` -- ## 2026-09-24: T-GPLR-07 CHECKER CLI SELF-TEST HARDENED (host-only)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:153` -- ## 2026-09-24: T-GPLR-07 `--tg-text` CHECKER MODE BEHAVIOR VERIFIED (host-only)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:159` -- ## 2026-09-24: T-GPLR-58 A2 FILL-ID REPLAY IS REPAIRED - a fresh null K=8 leg passes check-telemetry with ZERO violat...
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:171` -- ## 2026-09-24: T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS (50/512)
+- 2026-09-24 -- `docs/currentstate/2026-09-24.md:185` -- ## 2026-09-24 — Nested engine rebuild and host-suite provenance recheck
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:9` -- ## 2026-09-23: T-GPLR-58 K-SCALING PROBE (owner-directed) - retention scales cleanly to K=12, the null PLACED ~200 fi...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:25` -- ## 2026-09-23: T-GPLR-58 A3 RAN (one mutex hold, five legs, GPU-clean) - the arm PROPOSED on 10,178 of 10,240 layer-s...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:39` -- ## 2026-09-23: T-GPLR-58 MODE 2 LANDED - the engine CONSUMES the A1 proposer, and the fill-room bound says an arm's c...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:86` -- ## 2026-09-23: THE T-GPLR-58 WORK IS COMMITTED AS A TASK-SPLIT SERIES (four outer + two nested commits, no GPU time s...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:98` -- ## 2026-09-23: T-GPLR-58 A1 IMPLEMENTED - the predictor POLICY (four families, the bar and vote operators, the count-...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:112` -- ## 2026-09-23: M7 RESTATED (Planner call, T-GPLR-58) - the vacuous "lead median > 0" band becomes an invariant on the...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:126` -- ## 2026-09-23: T-GPLR-58 A2 IMPLEMENTED - the TG predictor VERDICT SURFACE is in the tree (host-validated, refuses wh...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:140` -- ## 2026-09-23: T-GPLR-58 A0 IMPLEMENTED - the speculative TG expert-row placement MECHANISM is in the tree, default-o...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:158` -- ## 2026-09-23: T-GPLR-58 A0/A1 SETTLED - MECHANISM IS A0 AND LIVES IN THE STREAMING MODULE, POLICY IS A1 AS PURE FUNC...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:172` -- ## 2026-09-23: T-GPLR-58 BOUNDING PASS - the incumbent row cache's uncovered margin is MEASURED at eight recorded sha...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:197` -- ## 2026-09-23: THE TWO PREDICTOR SOURCE CLASSES T-GPLR-58 EXCLUDES ARE NOW DRAFTED AS T-GPLR-59 - an MTP draft-previe...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:213` -- ## 2026-09-23: THE TG EXPERT-PREDICTION WIRE-IN IS DRAFTED AS T-GPLR-58 AND MARKED READY THE SAME DAY - three pre-reg...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:229` -- ## 2026-09-23: THE T-53 SETTLEMENT AND THE T-56 A3 WORK ARE COMMITTED AS A TASK-SPLIT SERIES (five outer + one nested...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:248` -- ## 2026-09-23: T-GPLR-56 A3 IS IMPLEMENTED AND HOST-VALIDATED (`p1-pace` behind three DEFAULT-OFF flags, its own refu...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:264` -- ## 2026-09-23: THE UNCOMMITTED T-GPLR-53/54/56 WORK IS COMMITTED AS A TASK-SPLIT SERIES (seven outer + five nested co...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:280` -- ## 2026-09-23: T-GPLR-53 BAND-QUANTITY ESCALATION SETTLED (owner directive, OPTION A) AND THE REPORTING FIX LANDED -...
+- 2026-09-23 -- `docs/currentstate/2026-09-23.md:312` -- ## 2026-09-23: PREDICTOR SCREENING PORTED FROM THE COLIBRI FUNNEL - coact/markov-1 beat the history baseline at every...
 - 2026-09-22 -- `docs/currentstate/2026-09-22.md:9` -- ## 2026-09-22: THE A1-LADDER SESSIONS RAN AFTER ALL (both rungs PASS, both CERTIFY, both MEASURED) - the card was hel...
 - 2026-09-22 -- `docs/currentstate/2026-09-22.md:34` -- ## 2026-09-22: THE PER-PART TG TIMINGS WERE ALREADY LANDED (F3/H8, 2026-09-14) - WHAT WAS MISSING IS THAT A TIMING NE...
 - 2026-09-22 -- `docs/currentstate/2026-09-22.md:46` -- ## 2026-09-22: PROVENANCE IS NOW BINDING AT THE LAUNCHERS, AND ONE REAL ARM IS CERTIFIED (scope corrected the same da...
@@ -778,8 +1755,36 @@ are derived from the shard files; do not edit them by hand.
 Shard entry text is frozen. New entries go in the live Recent entries
 block; the next resplit moves old entries and regenerates this index.
 
+## 2026-10-10 (optimizaionV1 D7 PP sweep, 27 arms, one mutex hold, all arms uncertified by provenance): the FA causal-GQA opt-in gives +13% to +17% steady prefill at 50k with identical VRAM; job-sized ctx 51,456 saves 2.9 to 4.0 GB with no PP cost. Best measured 8 GB with headroom: ubatch 4096 + FA at job ctx (3,693 tok/s, 5,724 MiB peak). Best 8 GB keeping ctx 262k: ubatch 1024 + FA (3,310 tok/s, 7,750 MiB). Best 16 GB: ubatch 4096 + 3 slots + f16 KV + FA (3,820 tok/s, 12,460 MiB). The plan's expected 16 GB figure of about 4,800 tok/s is not reproduced. 22 pinned arms carry a gate FAIL whose only reason is the driver rule that accepts mmap-registered only (run-lm-ubatch-sweep.ps1 line 246). Replicate spreads 0.02% to 0.80%. Anchor arm on the ab16 binary runs 4.1% under ab16 (cross-session drift). FA answer path not tested: the qa-smoke suite is batch-major. Details and corrected expectations: docs/plans/optimizaionV1-pp-sweep-results.md. Nothing committed.
+
 ## Known gaps / risks (current)
 
+- **The stock/LM ratio decays with prompt length and the mechanism is UNPROVEN.**
+  1.943x -> 1.651x -> 1.533x at 50k / 144,001 / 200,000 prompt tokens. The
+  explanation (stock copies only routed experts, improving as the route union
+  saturates) has **no route telemetry at 144k/200k**. Do not quote 1.943x as a
+  general multiplier; it is the 50k figure.
+- **LM token generation is unusable at the two owner contexts** (short 1.93 GiB
+  at ctx 262,144, 5.34 GiB at ctx 512,000) and 0.640-0.741x stock where a
+  partial handoff does fit. Any LM throughput claim must state that TG was not
+  measured, or state that it lost.
+- **Partial-handoff TG token-level fidelity is UNPROVEN**: identical-flag arms
+  `lmh20` and `lmh20b` produced divergent sequences at 128 generated tokens
+  despite a bit-identical token 0. The LM driver emits no detokenized text, so
+  no coherence check is possible.
+- **An unexplained context-scaled VRAM term remains.** LM's *unaccounted* VRAM
+  grows 3.115 -> 5.507 GiB from ctx 262,144 to 512,000 (~9.8 KiB per context
+  token) and ~8 KiB per *prompt* token (7.95 / 8.09 KiB/token measured). The KV
+  account is NOT the cause (it is byte-identical to stock's). Cause UNPROVEN.
+- **`--handoff-partial N` is inert on its own** (`main.cpp:3454`, the
+  `handoff_mode_str = "on";` sits inside a `//` comment). Always pass
+  `--handoff` explicitly. Recorded, deliberately unfixed; T-GPLR-67.
+- **`alloc_spill` crashes LM at ubatch 2048 / high context**: `finish_build:
+  input buffer exhausted and spill allocation failed`, exit `0xC0000409`, with
+  a 64 MiB host input buffer. Suspected 32 B alignment in `alloc_spill`
+  (`src/llama-layer-streaming.cpp:1173-1202`). NOT re-exercised this session —
+  every LM arm ran ubatch 4096. Do not read a ubatch-2048 LM number as a
+  measurement without checking this first. T-GPLR-66.
 - Foreign `deepseek_v4.exe` shared the GPU during earlier validation
   (~12.4 GiB VRAM held, high util), so those timing results are subject to
   shared-GPU noise. The completed 20K run started with the GPU idle; every
@@ -806,34 +1811,3 @@ block; the next resplit moves old entries and regenerates this index.
   slot_layer() routes recurrent layers to CPU-resident host_layers;
   load_layer() skips H2D copies for them.
 - T-Q38HG-05 (GTX 1080 validation) is gated on owner hardware access.
-
-## 2026-09-24 — Nested engine rebuild and host-suite provenance recheck
-
-- **Goal / outcome:** Rebuild the vendored `third_party/llama.cpp` engine and rerun the complete outer host suite after the T-GPLR-07 checker hardening exposed an unrelated provenance failure. The rebuild cleared the provenance/source-newer-than-binary condition; no source changes or commits were made.
-- **Build evidence:** `cmake --build build/llama-cuda --config Release --target test-layer-streaming-layout test-layer-streaming-tg-spec --parallel 16` completed successfully and rebuilt both linked host executables. The initial layout executable printed all assertions and then terminated with the known stale-layout teardown signature (`0xc0000409`); rebuilding the test targets was required because CTest does not build them automatically.
-- **Focused validation:** `ctest --test-dir build/llama-cuda -C Release -R "test-layer-streaming-(layout|tg-spec)$" --output-on-failure` passed **2/2**.
-- **Complete host validation:** `powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tests.ps1 -Suite host` exited **0**; CTest passed **44/44** (including layout and tg-spec), and the semantic-QA checker self-test passed. Suite record: `build/llama-cuda/suite-runs/20260924T090949Z-host/revision.json`.
-- **Provenance:** revision digest `63280E460286C26F`; nested head `e3627d5f39fc`; nested state `4 tracked / 0 untracked changed`; `llama.dll` SHA-256 prefix `AAF1E97736CED8DF`.
-- **Scope and limits:** host-only validation; no CUDA/model workload was run. The wrapper self-test emitted a busy-process refusal/timed-out mutex line from its stubbed/parallel coverage, but it did not fail the suite; timing and runtime residency behavior remain unmeasured here. All repository gates are advisory, not release authorization.
-
-### Owner decision summary
-
-- **Original goal:** Remove the unrelated nested-engine provenance blocker and establish a trustworthy host baseline.
-- **How it works:** The engine DLLs and each host test executable are rebuilt from the current nested source. CTest then runs the host-only checks and the outer suite records the engine revision and DLL identity alongside the verdict.
-- **Glossary:** *nested engine* means the vendored `third_party/llama.cpp` build; *host suite* means CPU-only unit, fixture, refusal, and checker tests; *DLL* means Windows dynamic-link library; *provenance digest* means the recorded source revision identity; *CTest* is the CMake test driver.
-- **Pros / cons:** **Measured:** the provenance mismatch and stale-layout crash were cleared, and the host suite is green. **Measured limitation:** the suite is not a CUDA, model-loading, semantic-QA GPU, performance, or concurrency validation. **Residual risk:** future header changes can again leave linked test executables stale unless the test targets are rebuilt explicitly.
-- **Recommendation:** **Adopt this rebuilt host baseline for subsequent host work.** Keep the owner’s normal final acceptance separate; run the required GPU/model validations under the shared-GPU mutex before making residency or performance claims.
-
-## 2026-09-24: T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS (50/512)
-
-**Original goal and contract.** Run the required T-GPLR-07 smoke tier after the engine rebuild: the 50-token N1 rung and the 512-token five-item anchor, each through calibrated prompt generation, the real CUDA runner, strict dedicated-JSONL telemetry checking, programmatic answer grading, and the must-fail negative control. This is a semantic answer-stability gate, not a token-identity or performance gate.
-
-**Recorded command and environment.** `powershell -NoProfile -ExecutionPolicy Bypass -Command "& 'C:/Development/AI/qwen38GZI/tools/run-tests.ps1' -Suite qa-smoke -SmokeLengths 50,512 -ModelPath 'C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf'"` ran on the recorded NVIDIA GeForce RTX 5090 Laptop GPU (24,463 MiB physical VRAM; driver 610.74; CUDA UMD 13.3). Model artifact: `C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf`, 21,388,319,008 bytes, `qwen35moe`, 40 trunk layers plus the recorded MTP block. Each runner leg used the canonical shape: calibrated `--prompt-file`, `--ubatch 50/512`, `--tg-tokens 96`, `--pp-no-logits`, `--pp-schedule batch-major`, `--residency moe-expert-bank`, `--kv-cache q8`, `--no-handoff`, `--allow-full-residency`, dedicated `--telemetry`, and `--tg-text`.
-
-**Graded result.** The suite exited **0**; both rungs passed. The 50-token positive verdict was `aggregate=PASS`, exit 0, with N1=`QX-7741`; its negative control returned exit 1 and `aggregate=FAIL` as required. The 512-token positive verdict was `aggregate=PASS`, exit 0, with N1=`QX-7741`, N2=`TR-2918`, N3=`MK-5501`, N4=`LD-8834`, K1=`Paris`; its negative control returned exit 1 and `aggregate=FAIL` for all five items as required. Independent checker verdict files: `build/llama-cuda/gplr07-qa-50-positive.verdict.json`, `gplr07-qa-50-negative.verdict.json`, `gplr07-qa-512-positive.verdict.json`, and `gplr07-qa-512-negative.verdict.json`.
-
-**Telemetry and lifecycle result.** Both dedicated traces report `check-telemetry: OK (30547 events, 3 slots)`, 40 layers, zero graph builds, `run_end.exit_status=0`, `failed=false`, and peak VRAM 3,424,190,464 bytes (3,265.56 MiB). The resolved run shape was batch-major PP, mmap-registered copy source, q8 KV, no handoff, 3 residency slots, and 96 generated TG tokens. 50-token timing split: PP wall 3,159.9 ms (transfer 8,615.4 ms, wait 551.0 ms, compute 750.8 ms); TG wall 123,232.8 ms (transfer 302,893.2 ms, wait 58,119.5 ms, compute 55,724.3 ms), 0.779 tok/s. 512-token timing split: PP wall 3,182.0 ms (transfer 8,598.3 ms, wait 535.2 ms, compute 830.6 ms); TG wall 123,241.4 ms (transfer 302,901.4 ms, wait 58,118.8 ms, compute 55,737.0 ms), 0.779 tok/s. These are smoke-run observations, not a benchmark or speedup claim.
-
-**Mutex and provenance evidence.** The wrapper acquired `Global\\AI-GPU-EXCLUSIVE-v1` for each leg; `gpu_pre_run=clean` and `gpu_post_run=clean`, with `gpu_probe_source=nvidia-smi`. The final 512-leg verdict is `build/llama-cuda/verdicts/llama-layer-streaming.verdict.json` (PASS, exit 0); the suite record is `build/llama-cuda/suite-runs/20260924T091342Z-qa-smoke/revision.json`. Engine digest `63280E460286C26F`, nested HEAD `e3627d5f39fc`, `llama-layer-streaming.exe` `D2BD131C866EDFFC`, `llama.dll` `AAF1E97736CED8DF`; `sources_newer_than_binary=false`, with 4 pre-existing tracked nested changes and 0 untracked changes. The run did not modify source or binary state.
-
-**Scope, risks, and recommendation.** **Measured:** the 50/512 semantic-QA smoke tier, strict telemetry, answer grading, negative controls, mutex, and provenance all pass. **Unproven:** 4k/24k/50k/100k/200k ladder rungs, long-context behavior, throughput improvement, quality equivalence beyond the programmed answer checks, and multi-project GPU contention under load. The physical GPU is shared, although this run's pre/post probes were clean. **Recommendation:** adopt this smoke-tier result as the current post-rebuild CUDA correctness baseline; keep final acceptance and performance/quality claims with the owner.

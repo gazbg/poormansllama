@@ -1,0 +1,899 @@
+{
+  "entries": [
+    {
+      "body_chars_lf": 4008,
+      "body_sha256_lf": "65065b8659eaf5b4dfd188b72361a4fc1b0d7e4486206addefc2578b283edb16",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 103,
+      "orig_line_start": 32,
+      "title": "## 2026-10-02 (1 GPU hold + host build): T-GPLR-76 answers \"which nodes\" \u2014 the ONLY host-side op in the attention graph is VIEW, and VIEW executes no kernel. The 75% \"mixed\" was a telemetry artifact, not CPU inference. CORRECTS the T-GPLR-75 reading"
+    },
+    {
+      "body_chars_lf": 5172,
+      "body_sha256_lf": "0bada761fdcdfdecca7a04c82882ff332fbae1640c92b15f35d39ee6157a31af",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 196,
+      "orig_line_start": 104,
+      "title": "## 2026-10-02 (3 GPU holds, 10 arms, bisect): the ~58 GiB commit hold is NOT ours and NOT context-driven \u2014 ctx is eliminated, the stock llama.cpp path holds MORE (70.6 GiB) than the streaming K=2 path (59.4 GiB) on the identical workload"
+    },
+    {
+      "body_chars_lf": 4750,
+      "body_sha256_lf": "73331c6808c8e2ee9d6cd6030540d326a2f0d59fdf6db2d33d40356ef8148841",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 283,
+      "orig_line_start": 197,
+      "title": "## 2026-10-02 (1 GPU hold + host build): T-GPLR-75 answers the owner's CPU-inference question BY MEASUREMENT \u2014 the K cache is GPU-side, handoff-partial is CPU-side; and the RAM commit spike is localised in TIME (a flat 58 GiB step held for the whole run)"
+    },
+    {
+      "body_chars_lf": 10890,
+      "body_sha256_lf": "fb499325302b97fde17e40b0a167ef6a898242b3aeff5fafd57237e672359d9f",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 481,
+      "orig_line_start": 284,
+      "title": "## 2026-10-02 (4 GPU holds, owner-directed TG focus): the K cache is MEASURED at last \u2014 TG 13.3-16.2 tok/s, peak VRAM 9,607.9 MiB so it does NOT fit 8 GiB; TG is 97.1% host-bound; `--kv-graph-pad 256` breaks TG on the row-set path; and a ~71 GB transient COMMIT spike whose first explanation was falsified"
+    },
+    {
+      "body_chars_lf": 7060,
+      "body_sha256_lf": "ff12f55ba32ce0ed7cd8ff84071e4f05c35376b302bef23870873be9b7968c08",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 604,
+      "orig_line_start": 482,
+      "title": "## 2026-10-02 (host-only, code inspection, no GPU hold): the K-cache was NEVER tested at our shape and is not wired into the layer-major PP executor \u2014 and the act slab is architecturally minimal, so \"size it per chunk\" is not available. The real 8 GB lever is q4 KV"
+    },
+    {
+      "body_chars_lf": 5057,
+      "body_sha256_lf": "78346b78a40a4da10a4cf97039c384a418f670d2b527ccf6bb6c82b087fcdd16",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 685,
+      "orig_line_start": 605,
+      "title": "## 2026-10-02 (ONE GPU hold, 4 arms, owner-authorised): the CPU thread lever is REFUTED on hardware \u2014 1/4/12/16 threads give 30.116/29.577/29.979/29.990 tok/s, a 1.8% spread, where the microbenchmark predicts 66%. Host layer cost is thread-invariant at ~682 us"
+    },
+    {
+      "body_chars_lf": 4873,
+      "body_sha256_lf": "87173abcd650d088a2f4f6d7104455eea0ae655af5b0837ea2febdaf6281c674",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 776,
+      "orig_line_start": 686,
+      "title": "## 2026-10-02 (host-only, NO GPU): NUMA is ELIMINATED (1 socket, 0 NUMA nodes) and first-touch is RULED OUT BY MAGNITUDE (13x penalty vs the observed 1.68x) \u2014 what is left is thread UNDER-UTILISATION: 16 threads are configured, ~4 logical cores are busy"
+    },
+    {
+      "body_chars_lf": 4391,
+      "body_sha256_lf": "4c1225c2921786cf2c83c637e5901d1bbb905857f38d6ab6b71eacbb79402c73",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 848,
+      "orig_line_start": 777,
+      "title": "## 2026-10-02 (host-only analysis + one host build, NO GPU): the overlap question is ANSWERED from existing traces \u2014 ZERO host/device overlap in 4,992 layer transitions \u2014 and per-span `cpu_us`/`dev` telemetry is built to confirm it per layer (compiled, 77/77, not yet run on hardware)"
+    },
+    {
+      "body_chars_lf": 5077,
+      "body_sha256_lf": "005a2942e9a540a9442b6d5ebc9d4959e7bf1c894f2839876de49995d9de0ceb",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 934,
+      "orig_line_start": 849,
+      "title": "## 2026-10-02 (HOST-ONLY microbenchmark, NO GPU, NO mutex): the 36.5us/expert figure REPRODUCES at 35.07 (12 threads) \u2014 and the in-situ 58.0us/expert is the 1-THREAD cell almost exactly, so the host is running expert FFN single-threaded on a machine that saturates at 12"
+    },
+    {
+      "body_chars_lf": 4580,
+      "body_sha256_lf": "0ea7db1ca04036cd81bef59e97c4f8c68de5950c0c00e5db980969ec58ba707e",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1010,
+      "orig_line_start": 935,
+      "title": "## 2026-10-02 (host-only, NO GPU): the 42.6%-vs-4.0% blocker is CLOSED and the policy question it gated is answered \u2014 experts already run on the CPU, it is VRAM-forced, and the host is running at 30.5 of a possible 48.5 GB/s, so the gap is parallelisation, not bandwidth"
+    },
+    {
+      "body_chars_lf": 4795,
+      "body_sha256_lf": "8e682b34f8869259061ffed281a541f3374ef2f32284f00ac071d9cb5be26228",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1086,
+      "orig_line_start": 1011,
+      "title": "## 2026-10-02 (host-only + one host build, NO GPU): pool hit-rate observability FIXED \u2014 the published rate's denominator excluded every capacity failure, so `lru4`'s 0% was unreadable; reason codes, capacity and working set now ride on every event"
+    },
+    {
+      "body_chars_lf": 4235,
+      "body_sha256_lf": "5b3711bff93e51be84cf60c68e5ec1b9de80fff199895aa7f100b68ffe8f713b",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1160,
+      "orig_line_start": 1087,
+      "title": "## 2026-10-02 (host-only, NO GPU): per-layer K is CORRECT and maximally valuable at small K (+1.96 pp at K=1) \u2014 but K=2 does not fit at 8 GB/262k at all, and the row cache's real currency is PROMPT LENGTH: a K=1 cache costs 69% of the maximum prompt"
+    },
+    {
+      "body_chars_lf": 5248,
+      "body_sha256_lf": "bb39f68ce9cb1e97ea3f94bb7f13558edf5c410e197c404067a4fac8853a204a",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1234,
+      "orig_line_start": 1161,
+      "title": "## 2026-10-02 (host-only, NO GPU): the owner's simpler rule (\"in-flight wait, queued don't\") is ALREADY implemented in the row-set path \u2014 and the real PP loss is a flag-off registration stall of~1.8-2.0 s, which also CORRECTS the disk-paging attribution above"
+    },
+    {
+      "body_chars_lf": 5637,
+      "body_sha256_lf": "0f856500a70a9962e505c9833e5f7cbcdbbde1f99373a8c934698fd8989e3f99",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1317,
+      "orig_line_start": 1235,
+      "title": "## 2026-10-02 (host-only, NO GPU): the proposed byte-accurate PCIe ledger is WITHDRAWN as unnecessary \u2014 byte accounting already exists, is free, and is exact; and the owner's mmap disk-paging worry is REAL, already measured, and costs 10.7-11.1% of the first PP pass"
+    },
+    {
+      "body_chars_lf": 5268,
+      "body_sha256_lf": "834a42b1c94c5effe68b7a5e8cf12e1bd1dbf6ecdfe1f25d36a7fb35316cb439",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1401,
+      "orig_line_start": 1318,
+      "title": "## 2026-10-02 (host-only, NO GPU): the 42.6% vs 4.0% conflict was a CATEGORY ERROR \u2014 they are disjoint terms, both true, and in the CURRENT run host execution is 52.2%, not 42.6%"
+    },
+    {
+      "body_chars_lf": 6218,
+      "body_sha256_lf": "fed9f0e1e1217dd451987e94ddd047f06110860b2c8676657988fdf8d5522b23",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1496,
+      "orig_line_start": 1402,
+      "title": "## 2026-10-02 (expert row-cache K, host-only, NO GPU): per-layer K is worth at most +2 pp over flat K, the 8 GB target has NEGATIVE headroom for any cache, and a 215 us fixed cost per fetch is why 115x fewer bytes took 16x MORE time"
+    },
+    {
+      "body_chars_lf": 6365,
+      "body_sha256_lf": "f996c5aa608550d14437ad753622699539531d80b69dcdee4b0c443d94b48eb9",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1553,
+      "orig_line_start": 1497,
+      "title": "## 2026-10-02 (T-GPLR-71 dip REPLICATION, one mutex hold, 12 interleaved arms): the ctx-131,072 dip DOES NOT REPRODUCE \u2014 it was a single-arm transient, and in ab21 the control's outlier was a DIFFERENT context"
+    },
+    {
+      "body_chars_lf": 6743,
+      "body_sha256_lf": "c2e2d85f2c719b556f8c6e5a3087e561a023c7bf9e3e33720456bf2c74703d51",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1619,
+      "orig_line_start": 1554,
+      "title": "## 2026-10-02 (T-GPLR-71 dip investigation, host-only, NO GPU): the 6.5% ctx-131,072 dip is EXONERATED of the mechanism \u2014 the control pays the same step, and the cell is slow for both engines in prefill too"
+    },
+    {
+      "body_chars_lf": 20892,
+      "body_sha256_lf": "d29b0b607fba48ef3da35c65446648049724ee010c32d2e014b70ee5a9f7936d",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1726,
+      "orig_line_start": 1620,
+      "title": "## 2026-10-02 (T-GPLR-71 CONSOLIDATED OWNER SUMMARY \u2014 this entry SUPERSEDES the ab20/ab21 owner summary below): the view-coverage guard is live, not dead; the TG win re-derived from artefacts; three prior figures corrected"
+    },
+    {
+      "body_chars_lf": 12900,
+      "body_sha256_lf": "e23819bf7d00e8cd30c2e46d0e49f4b4609a6108a52b71d24a8795001446f37d",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1796,
+      "orig_line_start": 1727,
+      "title": "## 2026-10-02 (T-GPLR-71 audit close-out, host-only, NO GPU): the test's own justification is now measured, `set_view_pad` stays virtual, and two structural follow-ups are named rather than acted on"
+    },
+    {
+      "body_chars_lf": 12764,
+      "body_sha256_lf": "7bd94c9b81e230763c979eb23de954932b1539f3b9d60f9f0c0ae118bc4c4cce",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1891,
+      "orig_line_start": 1797,
+      "title": "## 2026-10-02 (T-GPLR-71 guard proof, host test + ONE hardware arm): steps 3-4 are EXERCISED, not dead code \u2014 and driving them for the first time surfaced a real latent crash"
+    },
+    {
+      "body_chars_lf": 14338,
+      "body_sha256_lf": "6bb72f34a6271574b73da5c82fe7d0cdcd50411906d455dcc094ad85af0532fa",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1958,
+      "orig_line_start": 1892,
+      "title": "## 2026-10-02 (T-GPLR-71 ab20/ab21, TWO mutex holds, FIRST hardware execution of `--kv-graph-pad`): token generation is +26.5% faster at the 8 GB operating point with prefill, VRAM and answers unchanged \u2014 but the mechanism that won is NOT the one that was designed"
+    },
+    {
+      "body_chars_lf": 4421,
+      "body_sha256_lf": "028e50ebbafce2aaa5ff9023bb5e1fe2ac4f83378918979e2ded7be6851e7aec",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 1983,
+      "orig_line_start": 1959,
+      "title": "## 2026-10-02 (T-GPLR-71 step 5, host-only, observability only): AC1, AC3 and AC6 are now scorable from a DEFAULT trace \u2014 three new `phase_summary` fields, no pw-probe gate"
+    },
+    {
+      "body_chars_lf": 5809,
+      "body_sha256_lf": "48f9bf9da7b1fc7165b000d9535c111dc1b94a3166a2eabb1eec4cd94366ee9e",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2010,
+      "orig_line_start": 1984,
+      "title": "## 2026-10-02 (T-GPLR-71 audit follow-up, host-only): the view-coverage fail-safe pointed the wrong way \u2014 an unrecorded width could opt a live set out of the check that prevents under-reading"
+    },
+    {
+      "body_chars_lf": 7699,
+      "body_sha256_lf": "1b441deb59c26e16d9d4353d36811f72fb4251004958ab4bf733c47ba61b848e",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2037,
+      "orig_line_start": 2011,
+      "title": "## 2026-10-02 (T-GPLR-71 steps 3-4, host-only, NO GPU window): the TG set is rebuilt when its built view cannot cover the live one, and the `--kv-graph-pad` refusal is lifted"
+    },
+    {
+      "body_chars_lf": 5032,
+      "body_sha256_lf": "b476a606e1c279615efb3be15adac3477ddce146742ae0b8b769a38436145493",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2065,
+      "orig_line_start": 2038,
+      "title": "## 2026-10-02 (T-GPLR-71 steps 1-2, host-only, NO GPU window): the control is preserved, `--kv-graph-pad` exists and REFUSES to run, and the host suite is 76/76"
+    },
+    {
+      "body_chars_lf": 8199,
+      "body_sha256_lf": "52107613c7489bf06ff6100a42d65a342bd2666f5892bb4d5d0a32c26d1f1abd",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2100,
+      "orig_line_start": 2066,
+      "title": "## 2026-10-02 (host-only, source reading): YES the view can be sized at graph-build time \u2014 the handoff executor is innocent; the cause is ONE constant, and simply flipping it would break TG"
+    },
+    {
+      "body_chars_lf": 6233,
+      "body_sha256_lf": "1e7f4c113dbf617ecdcbe2ee055afe96e8bb6e3dec4a72df5de2c02fa69e937d",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2132,
+      "orig_line_start": 2101,
+      "title": "## 2026-10-02 (host-only): the CPU is NOT an extra additive cost inside the 43 ms \u2014 but host layer execution is 42.6% of the token wall, and one layer of weights no longer fits in the headroom"
+    },
+    {
+      "body_chars_lf": 8559,
+      "body_sha256_lf": "506d3644c7ce6f8d23b66ad227dc0faa993bdf9759e5c4ef8f64a05c49c9d0f8",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2171,
+      "orig_line_start": 2133,
+      "title": "## 2026-10-02 (prof3, host-only analysis): stock's decode scan length is ESTABLISHED \u2014 our engine scans the whole allocated cache and stock does not, and the old \"42x\" gap was a warmup-profile artifact"
+    },
+    {
+      "body_chars_lf": 5538,
+      "body_sha256_lf": "23d61be9fac2586be6854be10d78bd124238c437b8982531d64c43f9041bfbfd",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2199,
+      "orig_line_start": 2172,
+      "title": "## 2026-10-02 (host-only): the decode attention kernel is already at ~97% of its block-wave occupancy, and the MMA specialization is UNREACHABLE at decode"
+    },
+    {
+      "body_chars_lf": 7901,
+      "body_sha256_lf": "7cb6eb4d5b5f0c5bd0fdffdd83754fc31d38ccde630b4da0d53e9a267cbcfab9",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2235,
+      "orig_line_start": 2200,
+      "title": "## 2026-10-02: T-GPLR-70 FALSIFIED AND REVERTED -- narrowing the TG KV window made token generation 18.9% SLOWER, and locally built llama.dll is not reproducible"
+    },
+    {
+      "body_chars_lf": 9573,
+      "body_sha256_lf": "6cd4d1304ec39d57f1e38f1640014bb0d82a4b650e94f9f65c1c6e9757e48c1e",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2304,
+      "orig_line_start": 2236,
+      "title": "## 2026-10-02 (host-only): the ten full-attention layers cost ~2,075 us because TG's decode attention scans the WHOLE 262,144-slot KV cache, not the ~50,128 live tokens"
+    },
+    {
+      "body_chars_lf": 8224,
+      "body_sha256_lf": "9c40b31189f4c9ee4cc365681eab3dfe20fe6b64a599af1bc2742b8fb08a67ba",
+      "date": "2026-10-02",
+      "dest": "live",
+      "orig_line_end": 2344,
+      "orig_line_start": 2305,
+      "title": "## 2026-10-02 (host-only): T-GPLR-68 ATTRIBUTED \u2014 the unaccounted VRAM is llama.cpp's own compute-buffer reserve, and `peak_vram_bytes` was never a measurement"
+    },
+    {
+      "body_chars_lf": 2739,
+      "body_sha256_lf": "2170d97113c8a0f7ac4f96f11e35f199797791c36a2fb9b42a0a2bad1c74d425",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2359,
+      "orig_line_start": 2345,
+      "title": "## 2026-10-01 (host-only): the activation slab's second half IS resident, telemetry reports the sum exactly, and the under-reporting suspicion is WITHDRAWN"
+    },
+    {
+      "body_chars_lf": 3826,
+      "body_sha256_lf": "3b964eb28771277524df76624c8933b1e3de0b1a617a83dc60c16a9d42a26a5c",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2377,
+      "orig_line_start": 2360,
+      "title": "## 2026-10-01 (ab18b, host-only): the per-layer token-generation decomposition \u2014 and a RETRACTION of the \"788 us/layer of overhead\" hypothesis"
+    },
+    {
+      "body_chars_lf": 3873,
+      "body_sha256_lf": "165b7daccab6a698c787e5262c8b5fa2caef2881571a8fdf9c68a242e1ce1ad6",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2400,
+      "orig_line_start": 2378,
+      "title": "## 2026-10-01 (ab18): the MATCHED 8 GB comparison \u2014 prefill **3.72x** stock, token generation **0.62x**, at the same VRAM; and the TG gap is per-layer OVERHEAD, not arithmetic"
+    },
+    {
+      "body_chars_lf": 4754,
+      "body_sha256_lf": "ad042096bf92d7de1b17311051c37db8edb1724f166691e9b533c15f209a1bc4",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2427,
+      "orig_line_start": 2401,
+      "title": "## 2026-10-01 (ab17): the TG leg finally has numbers \u2014 the hybrid does BOTH legs inside 8 GB, prefill is 2.11x stock at 47% of its VRAM, and token generation is 0.56x and is **compute-bound, not transfer-bound**"
+    },
+    {
+      "body_chars_lf": 5165,
+      "body_sha256_lf": "274433a377f0adc4b1113a602f1569a68dac1e96b9d02a06960640b282473006",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2457,
+      "orig_line_start": 2428,
+      "title": "## 2026-10-01 (ab16): T-GPLR-66 CLOSED \u2014 the `alloc_spill` crash is fixed, the depth-2 ubatch curve is complete, and **ubatch 1024 is the fastest configuration that actually fits 8 GB**"
+    },
+    {
+      "body_chars_lf": 4971,
+      "body_sha256_lf": "4ae849f3ed9d6ee83ecd53ec2cd0095b0ae1ece39df25da22e50f198329f8e67",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2482,
+      "orig_line_start": 2458,
+      "title": "## 2026-10-01 (ab15): the depth-2 PP curve on the real card \u2014 ubatch 1024 AND 2048 CRASH, and the act-slab law retires the \"fits at 262k\" claim"
+    },
+    {
+      "body_chars_lf": 6731,
+      "body_sha256_lf": "6b17c1a6bb9f2c44ee34d98443a818194e81e07eaff94d049fe4dd8670745d26",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2526,
+      "orig_line_start": 2483,
+      "title": "## 2026-10-01 (ab14): the 8 GB TARGET CONDITION, budget-emulated \u2014 it ACCEPTS, it is VRAM-neutral, and it admits a configuration a real 8 GB card would have REFUSED"
+    },
+    {
+      "body_chars_lf": 10088,
+      "body_sha256_lf": "b49e1e0061204cf83a38ec67c7e12395bef9847502d0b1100c1b6c6cb9ba18d4",
+      "date": "2026-10-01",
+      "dest": "live",
+      "orig_line_end": 2571,
+      "orig_line_start": 2527,
+      "title": "## 2026-10-01: THE OWNER'S TWO REAL CONFIGURATIONS, RUN HEAD TO HEAD \u2014 layer-major is a PP-ONLY win (1.94x / 1.83x at ISO-VRAM), token generation loses or does not exist, and the largest free win is a STOCK flag"
+    },
+    {
+      "body_chars_lf": 2426,
+      "body_sha256_lf": "02a9a09578f15329ddc45ec04808a2f7b287b3e534011bfefd62f43cd1769504",
+      "date": "2026-09-25",
+      "dest": "live",
+      "orig_line_end": 2581,
+      "orig_line_start": 2572,
+      "title": "## 2026-09-25: T-GPLR-59 D1 adversarial closure; parser and teardown gaps fixed"
+    },
+    {
+      "body_chars_lf": 4764,
+      "body_sha256_lf": "6e15b0a856fb5e1729c7a78766ac6f5c9ec383b45fce90e2b03b254227f48992",
+      "date": "2026-09-25",
+      "dest": "live",
+      "orig_line_end": 2599,
+      "orig_line_start": 2582,
+      "title": "## 2026-09-25: T-GPLR-59 D1 same-session MTP frontier completes; proposal precision positive, runtime D-gate FAIL"
+    },
+    {
+      "body_chars_lf": 5183,
+      "body_sha256_lf": "4609b5ed3843a4f3f0b9a7c511e98c106baf0fb7644c1af056b7dc327e193ccc",
+      "date": "2026-09-25",
+      "dest": "live",
+      "orig_line_end": 2614,
+      "orig_line_start": 2600,
+      "title": "## 2026-09-25: T-GPLR-59 D1 authorized MTP handoff arm/null run; pairing gate PASS, D-gate not yet established"
+    },
+    {
+      "body_chars_lf": 1827,
+      "body_sha256_lf": "33c6cf879765a83c801b7ab4475b8fb564e976cbac431d83093cd189ba5c33f4",
+      "date": "2026-09-25",
+      "dest": "live",
+      "orig_line_end": 2624,
+      "orig_line_start": 2615,
+      "title": "## 2026-09-25: T-GPLR-59 D1 adversarial replay/lifecycle fixes"
+    },
+    {
+      "body_chars_lf": 2999,
+      "body_sha256_lf": "0ac69362303cc6962f9e3b21923ad3af3fe863139914679855e684b8e307a602",
+      "date": "2026-09-25",
+      "dest": "live",
+      "orig_line_end": 2636,
+      "orig_line_start": 2625,
+      "title": "## 2026-09-25: T-GPLR-59 D1 runtime wiring reaches host validation; real MTP run still pending"
+    },
+    {
+      "body_chars_lf": 1633,
+      "body_sha256_lf": "9ddee5f12d3473bbfa67e54809f058121ac28ac11cd0865159c449a55ed5ed2a",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2648,
+      "orig_line_start": 2637,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 9,
+      "title": "## 2026-09-24: T-GPLR-59 D1 implementation slice starts (decision recorded 2026-09-25)"
+    },
+    {
+      "body_chars_lf": 2251,
+      "body_sha256_lf": "ba512b774c56b68b2f2bea273b67686102ba385776df834de8fc172de3f4bf0f",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2658,
+      "orig_line_start": 2649,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 21,
+      "title": "## 2026-09-24: Owner closes T-GPLR-53, T-GPLR-56, T-GPLR-58, and T-GPLR-60; T-GPLR-59 remains pending owner calls (decision recorded 2026-09-25)"
+    },
+    {
+      "body_chars_lf": 4783,
+      "body_sha256_lf": "436f6f1f8dcb9d3cbf374b8b9287fe294d74f5016107a06a71d88fa09e87ed26",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2672,
+      "orig_line_start": 2659,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 31,
+      "title": "## 2026-09-24: T-GPLR-59/60 architecture pass separates engine pool policy, telemetry state, and host replay; behavior and STOP are unchanged"
+    },
+    {
+      "body_chars_lf": 4153,
+      "body_sha256_lf": "c8d3d8e5a002842f441ec0cc9c99ed4ce70b3281f6e05cfa60d74dc1d7a68acf",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2684,
+      "orig_line_start": 2673,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 45,
+      "title": "## 2026-09-24: T-GPLR-59/60 validator adversarial pass fixed duplicate-start, pre-init state, and malformed-number acceptance; the STOP result is unchanged (no GPU/model run)"
+    },
+    {
+      "body_chars_lf": 5229,
+      "body_sha256_lf": "6de1dbbf68b880298501b4afad7241e7c8441ead6524415518b53e30ef2e0c7c",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2700,
+      "orig_line_start": 2685,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 57,
+      "title": "## 2026-09-24: T-GPLR-60 G0/G1 host learning-curve experiment is COMPLETE; G1 FAILS the equal-row gate and the family is STOPPED (no GPU/model run)"
+    },
+    {
+      "body_chars_lf": 4592,
+      "body_sha256_lf": "6d618f0fb32dae3b63543519d35fac0e93fdde1bc85ff35c5e9a4b13e8ff8c3f",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2712,
+      "orig_line_start": 2701,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 73,
+      "title": "## 2026-09-24: T-GPLR-59 FOLLOW-UP: the host-only counterfactual 12-row pool replay is IMPLEMENTED and SCORED over recorded traces (host-only; no GPU/model run) (uncommitted)"
+    },
+    {
+      "body_chars_lf": 3622,
+      "body_sha256_lf": "3ede81c8cbdb472f16331667cce126696da1df93185568003fdb6cc79f09c2da",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2724,
+      "orig_line_start": 2713,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 85,
+      "title": "## 2026-09-24: T-GPLR-59 prediction pool is IMPLEMENTED and HOST-VALIDATED (policy + instrumentation green; no GPU/model run) (uncommitted)"
+    },
+    {
+      "body_chars_lf": 4460,
+      "body_sha256_lf": "de9dbde641adf2b61e8f653474fbc30e61ba36896e75ea0170b9315a5c641215",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2738,
+      "orig_line_start": 2725,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 97,
+      "title": "## 2026-09-24: THE ARM-ZERO-ADMISSION QUESTION IS RESOLVED (host-only diagnosis) - a history-only predictor cannot be admitted BY CONSTRUCTION, and the null escapes only by leaving the routed history (uncommitted)"
+    },
+    {
+      "body_chars_lf": 4231,
+      "body_sha256_lf": "78f079e907a7adaabaf665049eea8d3397d49d46dc13d346f5c9dd8b03d2d13f",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2750,
+      "orig_line_start": 2739,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 111,
+      "title": "## 2026-09-24: T-GPLR-58 A4 COMPLETED (owner-authorized, one mutex hold, seven legs) - both K=2 arms were capacity-bound at zero placements, not predictor-quality results"
+    },
+    {
+      "body_chars_lf": 2803,
+      "body_sha256_lf": "390491ab99d689ad84bfcf255841fb680dc7c088599a6d05b645f0c1fadca8de",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2758,
+      "orig_line_start": 2751,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 123,
+      "title": "## 2026-09-24: T-GPLR-58 FRESH K=8 COACT ADMISSION TRACE (owner-authorized, uncommitted)"
+    },
+    {
+      "body_chars_lf": 2729,
+      "body_sha256_lf": "f32fb0f4ca41ad342a96580174f8924ae2964c788694de13c53ffab50453fbb7",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2766,
+      "orig_line_start": 2759,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 131,
+      "title": "## 2026-09-24: T-GPLR-58 CACHE-AWARE CANDIDATE COUNTERFACTUAL (host-only, uncommitted)"
+    },
+    {
+      "body_chars_lf": 1972,
+      "body_sha256_lf": "2b0da51beb9a177ebe599825b648bacde1bac2d696411a6f4167d6d5cfe8ffbf",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2774,
+      "orig_line_start": 2767,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 139,
+      "title": "## 2026-09-24: T-GPLR-58 MODE-2 ADMISSION TELEMETRY (host-only, uncommitted)"
+    },
+    {
+      "body_chars_lf": 1107,
+      "body_sha256_lf": "e6adef3460bf1ed99bc2bc52c099c06576419e9b8881a3d5f2ca78fd0b7d309e",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2780,
+      "orig_line_start": 2775,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 147,
+      "title": "## 2026-09-24: T-GPLR-07 CHECKER CLI SELF-TEST HARDENED (host-only)"
+    },
+    {
+      "body_chars_lf": 1276,
+      "body_sha256_lf": "5dc10a037bfef1b0a96f312e09405b4a6a856510e940cac739bf54141c4c75cc",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2786,
+      "orig_line_start": 2781,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 153,
+      "title": "## 2026-09-24: T-GPLR-07 `--tg-text` CHECKER MODE BEHAVIOR VERIFIED (host-only)"
+    },
+    {
+      "body_chars_lf": 4224,
+      "body_sha256_lf": "02c452746090caacf468e5cecfc48fdfd1b117d47f2bbd7019a2170df386d69e",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 2798,
+      "orig_line_start": 2787,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 159,
+      "title": "## 2026-09-24: T-GPLR-58 A2 FILL-ID REPLAY IS REPAIRED - a fresh null K=8 leg passes check-telemetry with ZERO violations, and the instrumentation exposed and fixed a real cache-occupancy bug (uncommitted)"
+    },
+    {
+      "body_chars_lf": 3719,
+      "body_sha256_lf": "54b9c150ed04c6267d3b36ddad4be1ecde95ca8d87989b212007a30973c026f2",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2814,
+      "orig_line_start": 2799,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 9,
+      "title": "## 2026-09-23: T-GPLR-58 K-SCALING PROBE (owner-directed) - retention scales cleanly to K=12, the null PLACED ~200 fills that converted to nothing, and the ARM placed ZERO everywhere - a submit-counter defect (submitted is cumulative, increments up to 306 vs budget 8) and an unexplained arm-specific admission refusal now own the question (uncommitted)"
+    },
+    {
+      "body_chars_lf": 5431,
+      "body_sha256_lf": "31bd947ef4ea79389735a05924ed41d99b36173204dd8e0365dc335bde05f5b9",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2828,
+      "orig_line_start": 2815,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 25,
+      "title": "## 2026-09-23: T-GPLR-58 A3 RAN (one mutex hold, five legs, GPU-clean) - the arm PROPOSED on 10,178 of 10,240 layer-stages and the planner PLACED ZERO; the ceiling at K=2 is 0.00%, so M1/M3 fail on CAPACITY, and the first real run exposed (and fixed) a bring-up defect that had made every speculative mode inert (uncommitted)"
+    },
+    {
+      "body_chars_lf": 3947,
+      "body_sha256_lf": "dc3412779081cc817a91985cd1bd82463426eebab113b14bfb67b361bcf5d44f",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2875,
+      "orig_line_start": 2829,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 39,
+      "title": "## 2026-09-23: T-GPLR-58 MODE 2 LANDED - the engine CONSUMES the A1 proposer, and the fill-room bound says an arm's ceiling is CAPACITY, not precision (host-only, no GPU, no mutex, no arm run, no model loaded)"
+    },
+    {
+      "body_chars_lf": 3460,
+      "body_sha256_lf": "445f793d09362b566cf60ea844e3353afba7433e7d8a4f808067866f311548f7",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2887,
+      "orig_line_start": 2876,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 86,
+      "title": "## 2026-09-23: THE T-GPLR-58 WORK IS COMMITTED AS A TASK-SPLIT SERIES (four outer + two nested commits, no GPU time spent)"
+    },
+    {
+      "body_chars_lf": 4738,
+      "body_sha256_lf": "81b56237b497ebcf4b555791cd32758b299d2b4a3389fccd954c9cd7f65c54cd",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2901,
+      "orig_line_start": 2888,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 98,
+      "title": "## 2026-09-23: T-GPLR-58 A1 IMPLEMENTED - the predictor POLICY (four families, the bar and vote operators, the count-matched null, the planner) is in the tree and PROVEN EQUAL to the offline screen row by row: 483,840 comparisons on the eight recorded legs, zero mismatches (host-only, no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)"
+    },
+    {
+      "body_chars_lf": 4374,
+      "body_sha256_lf": "9d5a60a23db4d9ce343e10310054aee6196d0f87400560b87c14a325d1103f6c",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2915,
+      "orig_line_start": 2902,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 112,
+      "title": "## 2026-09-23: M7 RESTATED (Planner call, T-GPLR-58) - the vacuous \"lead median > 0\" band becomes an invariant on the reap floor PLUS a late-fill-rate arm band, both host-proven (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)"
+    },
+    {
+      "body_chars_lf": 5186,
+      "body_sha256_lf": "a8db9e17a1baed62eba2188c726e121ae077615ba65537b86548af772babae64",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2929,
+      "orig_line_start": 2916,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 126,
+      "title": "## 2026-09-23: T-GPLR-58 A2 IMPLEMENTED - the TG predictor VERDICT SURFACE is in the tree (host-validated, refuses what it cannot justify), plus the two engine additions its bands needed (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)"
+    },
+    {
+      "body_chars_lf": 5915,
+      "body_sha256_lf": "43d9c453466b35a49b291fc3fcc93c4f67da4a3fe561efa734c69c4d0d223331",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2947,
+      "orig_line_start": 2930,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 140,
+      "title": "## 2026-09-23: T-GPLR-58 A0 IMPLEMENTED - the speculative TG expert-row placement MECHANISM is in the tree, default-off, with its rules proven host-only and a mode-0 differential against the pre-A0 retention algorithm (no GPU, no mutex, no arm run; committed as the T-GPLR-58 series)"
+    },
+    {
+      "body_chars_lf": 4069,
+      "body_sha256_lf": "c471eec2b2521cca21f9fab8936bc1c2f92f20ca6e6198657dbeb2d1a1c5a260",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2961,
+      "orig_line_start": 2948,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 158,
+      "title": "## 2026-09-23: T-GPLR-58 A0/A1 SETTLED - MECHANISM IS A0 AND LIVES IN THE STREAMING MODULE, POLICY IS A1 AS PURE FUNCTIONS, AND THERE IS NO RUNNER-SIDE PROPOSER (contract text only; no code changed, no GPU, no arm run)"
+    },
+    {
+      "body_chars_lf": 5490,
+      "body_sha256_lf": "e91b1a88fb2dd5b6f6a60a23f5c2a219b8139e15dc6ff4c8eecfdde9dcbe3451",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 2986,
+      "orig_line_start": 2962,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 172,
+      "title": "## 2026-09-23: T-GPLR-58 BOUNDING PASS - the incumbent row cache's uncovered margin is MEASURED at eight recorded shapes, and the predictor ceiling is 99.7% of demands with only 0.5-3.4% of the margin unreachable (host-only, no GPU, no mutex, no source change)"
+    },
+    {
+      "body_chars_lf": 5987,
+      "body_sha256_lf": "3b3c6d8545d7a9c82ae9db89f3692977bd573fe0f882995bf0de487b4799bbed",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3002,
+      "orig_line_start": 2987,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 197,
+      "title": "## 2026-09-23: THE TWO PREDICTOR SOURCE CLASSES T-GPLR-58 EXCLUDES ARE NOW DRAFTED AS T-GPLR-59 - an MTP draft-preview source (proposed futures) and a hidden-state probe head, each with its own pre-registered gate (host-only, no source change, no GPU, no arm run)"
+    },
+    {
+      "body_chars_lf": 8095,
+      "body_sha256_lf": "3294eb5ccb604a047a03270626ac4f60f33953c9575e7d373520817691aa08b1",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3018,
+      "orig_line_start": 3003,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 213,
+      "title": "## 2026-09-23: THE TG EXPERT-PREDICTION WIRE-IN IS DRAFTED AS T-GPLR-58 AND MARKED READY THE SAME DAY - three pre-registerable arms (bar-0.9 safety, unbarred coact, fusion), the exact-demand-priority invariant, and NULL-CORRECTED acceptance quantities (host-only, no source change, no GPU, no arm run)"
+    },
+    {
+      "body_chars_lf": 3344,
+      "body_sha256_lf": "ef397628ca18b5342563260a9ad8f2e2f8116f3231d57b5ac1f9dc031cd9be01",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3037,
+      "orig_line_start": 3019,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 229,
+      "title": "## 2026-09-23: THE T-53 SETTLEMENT AND THE T-56 A3 WORK ARE COMMITTED AS A TASK-SPLIT SERIES (five outer + one nested commit; the record 9e2f3ed dropped is restored in the process)"
+    },
+    {
+      "body_chars_lf": 7023,
+      "body_sha256_lf": "27fe945312c16be7fa7b5b2cd17cee5d4782b43ba1fcb92bd4d9d0aa59321b9a",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3053,
+      "orig_line_start": 3038,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 248,
+      "title": "## 2026-09-23: T-GPLR-56 A3 IS IMPLEMENTED AND HOST-VALIDATED (`p1-pace` behind three DEFAULT-OFF flags, its own refusing analyzer, one-command session); the 4k HOLD IS BLOCKED ON THE SHARED CARD and nothing was started"
+    },
+    {
+      "body_chars_lf": 3880,
+      "body_sha256_lf": "aa921824311cfe0368bdc3f110ade368449757bedffa342a88b1d480f3bc4b5e",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3069,
+      "orig_line_start": 3054,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 264,
+      "title": "## 2026-09-23: THE UNCOMMITTED T-GPLR-53/54/56 WORK IS COMMITTED AS A TASK-SPLIT SERIES (seven outer + five nested commits, no GPU time spent)"
+    },
+    {
+      "body_chars_lf": 3160,
+      "body_sha256_lf": "fb967e490f0ca9046fbbf07a462c2f426ac2fab8a0eebb76a1773cb7ea601021",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3101,
+      "orig_line_start": 3070,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 280,
+      "title": "## 2026-09-23: T-GPLR-53 BAND-QUANTITY ESCALATION SETTLED (owner directive, OPTION A) AND THE REPORTING FIX LANDED - host-only, no GPU, no mutex, no arm re-run"
+    },
+    {
+      "body_chars_lf": 4083,
+      "body_sha256_lf": "67d306c1f918a4d6455d5ca4972c956e67449b5eea6ff8622bb52998a2343caf",
+      "date": "2026-09-23",
+      "dest": "shard",
+      "orig_line_end": 3103,
+      "orig_line_start": 3102,
+      "shard": "docs/currentstate/2026-09-23.md",
+      "shard_line": 312,
+      "title": "## 2026-09-23: PREDICTOR SCREENING PORTED FROM THE COLIBRI FUNNEL - coact/markov-1 beat the history baseline at every budget on every substantive stream, and coupling-copula leads unique coverage and high-budget recall (host-only, no GPU, no engine change; feasibility result, NOT a wire-in verdict). The T-GPLR-15 close left the predictive hypothesis explicitly open (ceiling 0.9385 vs retention 0.3088 at K=1); the colibri/deepseek-v4-baseline predictor-funnel (docs/findings/predictor-funnel-findings.md, DeepSeek-V4) supplied the candidate families and the replay methodology, now ported to our rowset_fetch schema as `tools/predictor-screen-gplr.py` (selftest for online faithfulness included, PASS; a predictor for (t,L) sees only tokens <t and layers <L, matching what the live engine could know). Corpus: 74 traces collapse to 7 distinct demand streams; screened one per stream (the two 256-token vehicles echo/honest, 50k-context, QA-depth; the two gplr57 rungs carry 3 TG tokens each and are reported but unconcludable). **Anchors:** history@B=8 reproduces the recorded (b) K=1 to ~1e-3 on BOTH vehicles (echo 0.3076 vs 0.3088; honest 0.2458 vs 0.2468) - the port is validated against the repo's own recordings; other shapes print anchor N/A (no recorded K=1; the first run mis-flagged 50k and the anchor was scoped to the 10240-row vehicle). **Results (recall@B / precision-per-byte / extra-hits-vs-history):** echo stream coact 42.6/43.0/16573 at B=8 vs history 30.8/30.9/0, markov-1 39.5, coupling-copula 31.9 but highest unique coverage and 77.2 recall at B=32; honest stream coact 28.1/28.4 at B=8 vs history 24.6 (same-precision +3.5pp), coupling 59.0 at B=32; 50k and QA streams repeat the ranking (coact/markov above history at every B, coupling wins B=32). **Reading:** colibri's H1 (same-layer transition structure beats history) and H2 (cross-layer coupling adds coverage, favors long context) both reproduce on Qwen3.6-35B-A3B; projection (labeled arithmetic, NOT measurement): a predictor feeding a K=2-sized window plausibly reaches what K=4-6 retention delivers - the charter's VRAM objective has a candidate lever. **Limits:** n=1 prompt per stream, no fresh capture; the (b)-projection is not a measurement; colibri's own T-pf-06 end-to-end A/B shrank fusion gains to noise on larger samples and its slot-thrash incident (UPDATE101) showed predicted fills must yield to exact demand - any wire-in needs that invariant plus a pre-registered acceptance quantity. Evidence: `docs/findings/predictor-screen-gplr.md` (method, full tables, reproduce commands); tool `tools/predictor-screen-gplr.py`; deterministic re-run verified. **Same-day extension (confidence-bar frontier + fusion, all offline):** colibri's barsweep/fusion operators ported (`--mode bar`, `--mode fusion`; selftest extended and PASS). Bar sweep: a conservative bar (0.9) strictly DOMINATES history on both axes on both streams (markov-1@0.9 = 25.1/29.0 vs history 24.6/24.7 honest; 36.1/41.7 vs 30.8/30.9 echo), but loosening to bar 0.7 collapses recall ~2.7x for a precision jump (41-57pp) - colibri's H3-disconfirm reproduces, so the bar is risk control, not frontier-pushing. Fusion (tune/held 80/20 split, grid at B=8): fusion dominates every single candidate on BOTH axes on both streams (best held: 29.6/29.6 honest vote-fusion vs history 22.7/22.7; 48.8/48.8 tuned weighted vs 27.9/27.9 echo); the colibri portable weight vector lands within 0.1pp (honest) / 2.4pp (echo) of per-stream tuning, so no per-cell tuning is needed; and the NULL-SOURCE CONTROL exposes the pool-growth share - a history-clone alone lifts held history 22.7 -> 28.0, so the structure-attributable gain is +1.6pp (honest) / +6.3pp (echo), and any wire-in case must argue against the null row, not the history row. Three measured operating points now exist for a wire-in decision: unbarred coact (+3.5pp honest, equal ppb), bar-0.9 (+0.5/+4.3, risk-free), fusion (+6.9/+6.9 honest with the null caveat). The T-pf-06 lesson stands: an offline win is a hypothesis; the engine A/B remains the verdict instrument."
+    },
+    {
+      "body_chars_lf": 4078,
+      "body_sha256_lf": "577d1141bc9c8ba75e5ec09a2244c20113b9661d4b86e061c96021216732ee5f",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 3117,
+      "orig_line_start": 3104,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 171,
+      "title": "## 2026-09-24: T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS (50/512)"
+    },
+    {
+      "body_chars_lf": 4078,
+      "body_sha256_lf": "577d1141bc9c8ba75e5ec09a2244c20113b9661d4b86e061c96021216732ee5f",
+      "date": "2026-09-24",
+      "dest": "shard",
+      "orig_line_end": 3409,
+      "orig_line_start": 3397,
+      "shard": "docs/currentstate/2026-09-24.md",
+      "shard_line": 171,
+      "title": "## 2026-09-24: T-GPLR-07 CUDA SEMANTIC-QA SMOKE TIER PASS (50/512)"
+    }
+  ],
+  "live": {
+    "apply_time_bytes_lf": 351314,
+    "apply_time_entry_count": 46,
+    "recent_heading": "## Recent entries (2026-09-25 .. 2026-10-02)",
+    "tail_marker": "## Known gaps / risks (current)"
+  },
+  "live_cutoff": "2026-09-25",
+  "new_shards": [
+    {
+      "body_bytes_lf": 81918,
+      "body_sha256_lf": "b5a4f1803793f83699473c729ea420399730f709a6cd2d212cdc4a6752edb0d0",
+      "bytes_lf": 82282,
+      "covers": "2026-09-23",
+      "entries": 17,
+      "eof_newline_stripped": true,
+      "file": "docs/currentstate/2026-09-23.md"
+    },
+    {
+      "body_bytes_lf": 57238,
+      "body_sha256_lf": "a1c75581a874d93d0265c21843e60107a95fecbfc84eec6a224a59b59127c1af",
+      "bytes_lf": 57602,
+      "covers": "2026-09-24",
+      "entries": 17,
+      "eof_newline_stripped": true,
+      "file": "docs/currentstate/2026-09-24.md"
+    }
+  ],
+  "policy": "dated entry text is copied verbatim; only trailing blank separators are normalized; the generated organization/index block is replaced; the non-entry risk tail stays live",
+  "preexisting_shards": [
+    {
+      "bytes_lf": 26258,
+      "file": "docs/currentstate/2026-08-18-and-earlier.md",
+      "sha256_lf": "fa055c9e2993d33973976009aa763c3b47a71efbb0ba19939e6f14b84761f54c"
+    },
+    {
+      "bytes_lf": 144548,
+      "file": "docs/currentstate/2026-08-20..2026-09-11.md",
+      "sha256_lf": "8da42a740e125c9f371aca79e98fefa7efc27d2f668ed061fd59f3fe380dd621"
+    },
+    {
+      "bytes_lf": 107435,
+      "file": "docs/currentstate/2026-09-12..2026-09-13.md",
+      "sha256_lf": "6d1f0e3d3eb9e31cec814edae39b86bd60059da221da5a8c9c6d437e6df320e1"
+    },
+    {
+      "bytes_lf": 97265,
+      "file": "docs/currentstate/2026-09-14.md",
+      "sha256_lf": "c25fd2390563982e5d3815780177ea5165c14755048b5da8e4cf8efe978af08d"
+    },
+    {
+      "bytes_lf": 94387,
+      "file": "docs/currentstate/2026-09-15..2026-09-16.md",
+      "sha256_lf": "26ec022a201082f22eba31b871328050725321a734bdb9828a3773e4ab060909"
+    },
+    {
+      "bytes_lf": 33613,
+      "file": "docs/currentstate/2026-09-17.md",
+      "sha256_lf": "dd9c6545ff5a2b5540f40cd0fb98f7f9f10893520b7640e0b2c033707c815f04"
+    },
+    {
+      "bytes_lf": 52063,
+      "file": "docs/currentstate/2026-09-18.md",
+      "sha256_lf": "8e483000e12a21d734bb5d13a07ca9b2c65895594c77d5ed8b62a0e21faebd34"
+    },
+    {
+      "bytes_lf": 28860,
+      "file": "docs/currentstate/2026-09-19.md",
+      "sha256_lf": "b48efd7147f885b32eb69dcb7e264cced5c8fdf7096de42cc717b5c2bde5a337"
+    },
+    {
+      "bytes_lf": 11258,
+      "file": "docs/currentstate/2026-09-20.md",
+      "sha256_lf": "2acbca673bfbfaa4220bcc9292897c386c9f80c2c2b56deb25581941d940524b"
+    },
+    {
+      "bytes_lf": 53498,
+      "file": "docs/currentstate/2026-09-21.md",
+      "sha256_lf": "59ea3c9c18c9f477c584460fd9ff6202cbe95eeb4144e6518514b34155214cc8"
+    },
+    {
+      "bytes_lf": 97071,
+      "file": "docs/currentstate/2026-09-22.md",
+      "sha256_lf": "92cb85628d46ba18f175d8a4d543a1ac43972d220f1e67a8d690df0c2af51783"
+    }
+  ],
+  "replaced_generated_region": {
+    "disposition": "replaced by the derived live organization, recent-entry and archive-index blocks",
+    "end_line": 3324,
+    "start_line": 3
+  },
+  "resplit_date": "2026-10-02",
+  "source": "docs/currentstate.md",
+  "source_bytes_lf": 480985,
+  "source_lines": 3409,
+  "source_sha256_lf": "80100fd64e6cdcd3aa3789866d0f2ba54cfb05ccb9a5843a5504b9bcff45f3b7",
+  "tool": "tools/resplit-currentstate.py",
+  "verification": {
+    "checks": [
+      "apply-time source hash recorded",
+      "preexisting shard files byte-exact in LF",
+      "new shard bodies and entry bodies byte-exact in LF",
+      "apply-time live entry bodies present and ordered",
+      "live archive index exactly derived from all shard files",
+      "live organization, recent block and risk tail present"
+    ],
+    "command": "python tools/resplit-currentstate.py --verify"
+  }
+}
