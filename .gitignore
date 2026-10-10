@@ -76,3 +76,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Freebuff session worktrees (tool-managed; each carries its own repo state)
+/.freebuff/worktrees/
