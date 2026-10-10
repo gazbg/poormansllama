@@ -602,6 +602,7 @@ if (-not $spec.Gpu) {
 # the emitter/key cross-check reads the engine's own tel_spec(), so a key the checker
 # requires but the engine does not emit fails HERE, with no GPU.
 if (-not $spec.Gpu) {
+
     $predictTool = Join-Path $PSScriptRoot 'check-tg-predict.py'
     if (Test-Path -LiteralPath $predictTool) {
         Write-Host "[tg-predict] predictor verdict-surface selftest (host-only fixtures)..."
@@ -612,6 +613,28 @@ if (-not $spec.Gpu) {
         }
     } else {
         Write-Host "[tg-predict] FAILED: $predictTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
+        exit 1
+    }
+}
+# --- T-GPLR-82 attribution: the per-op row-count probe's classifier (host-only) ----------
+# The probe (tools/layer-streaming/op-rows-probe.cpp, target op-rows-probe) is a CUDA/CPU
+# measurement: it asks whether a MUL_MAT_ID output row changes with the number of routed
+# positions in the batch, which is the only way a batched expert matmul could carry the
+# split's 1.3e-3 step-0 shift. tools/check-op-rows-probe.py classifies its JSON. Only the
+# CLASSIFIER runs here -- its bands, its refusal of a failed shape, and its refusal of an
+# unreadable file -- so the host suite pins the verdict surface with no GPU and no model.
+# The measurement itself is a mutex-held run, recorded in docs/currentstate.md.
+if (-not $spec.Gpu) {
+    $opRowsTool = Join-Path $PSScriptRoot 'check-op-rows-probe.py'
+    if (Test-Path -LiteralPath $opRowsTool) {
+        Write-Host "[op-rows] row-count band classifier selftest (host-only fixtures)..."
+        & python $opRowsTool --selftest
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "FAILED: check-op-rows-probe.py --selftest exited with code $LASTEXITCODE (see above)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "[op-rows] FAILED: $opRowsTool not found - this guard is REQUIRED. A missing checker is a FAILED check, not a skipped one; this suite is green only if every guard RAN." -ForegroundColor Red
         exit 1
     }
 }
