@@ -4160,4 +4160,1060 @@ G1 result: miss-only pool hits are repeatable and far above the count-matched nu
 
 Adversarial follow-up (2026-09-24): focused CLI probes found and fixed four task-owned boundary defects: missing/malformed trace and the fixed calculator-prompt input now refuse with exit 2 instead of leaking an exception; the free-form prompt override was removed so an unrelated prompt cannot be recorded as provenance; the command's `--trace` is included in the required equal-demand provenance set instead of silently checking only the default; and H2D accounting now uses each stage/layer's recorded `row_bytes` (the source has 1,769,472 B rows except layers 34/38/39 at 2,039,808 B). The analyzer selftest is now 15 checks, including fixed prompt identity/mismatch refusal, empty/out-of-order rejection, layer-byte mapping, transfer closure, prefix isolation, per-stage budget, and lead-2. The corrected H32/K4 coact values are 3.50 GiB useful and 0.85 GiB wasted H2D; the hit-share decision is unchanged. No async path exists in this host-only analyzer, and no imaginary phase/async hardening was added; the existing ideal-next-reap lifecycle and GPLR-59 generation tests remain the relevant state-synchronization coverage. Final decision remains **STOP**.
 
+---
+
+## Layer-major vs stock at the owner's real configurations (2026-10-01) - three DRAFT tasks
+
+These three blocks were drafted on 2026-10-01 from the head-to-head sessions recorded in
+`docs/tg-expert-path-reconciliation.md` §12.6 and summarised in `docs/currentstate.md`. **All
+three are `draft`: none is authorized, none has a Planner contract, and no GPU time is
+committed by any of them.** IDs continue after T-GPLR-62 (the highest used in this plan);
+T-GPLR-63 and -64 are taken on another branch, so numbering starts at 65. Task numbering is
+the Planner's to confirm at contract time.
+
+Shared context for all three. Model `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf` (qwen35moe, 40 layers,
+256 experts top-8, 19.91 GiB), RTX 5090 Laptop 24 GB, stock = anchor `llama-server` build 10892
+at `C:\Development\AI\llamacppCUDA`, LM = this tree's `tools/layer-streaming` with
+`--residency moe-expert-bank --pp-schedule layer-major`. Measured baseline this work must not
+regress: LM PP **4,079.2 tok/s @ 10.056 GiB** against stock **2,099.6 @ 10.193 GiB** at ctx
+262,144 (1.943x, 0.137 GiB apart), and LM TG **0.640-0.741x** stock. Every ratio is same-session
+- cross-session LM variance reaches 16% - and VRAM is always the WDDM per-process peak from the
+arm's own `*.mem.csv`, never the wrapper's `peak VRAM:` stderr line.
+
+### T-GPLR-61 (ready): `moe-split-expert-ffn` — per-expert host/device split at token generation, shaped for the 8 GB target
+
+**Status: READY (owner-directed 2026-10-01).** Promoted from the draft at
+`docs/plans/qwen36-cpu-expert-placement-draft.md`, which is retained as the
+full derivation, the withdrawn-and-corrected cost measurements, and the
+provenance of the shape. The two blockers that held it at DRAFT are both
+discharged:
+
+- **The SDD amendment is written.** `docs/layer-residency-sdd.md` section 4 now
+  carries the **`moe-row-split` class** — a *placement* class, not a storage
+  class — with membership, structural exactness, trigger, cost gate, padded
+  shape, the execution-shape constraint and its reasoning, the capacity
+  treatment, the failure contract and the telemetry set.
+- **The execution-shape question is resolved (2026-09-30, recorded in the SDD).**
+  The class sits **OUTSIDE** section 4's row-set prohibition. That prohibition's
+  subject is `MUL_MAT_ID` *in a row-set graph* consuming CUDA-resident weights,
+  and what it forbids is the scheduler's expert row-copy plus any op-offload path
+  that **rewires a weight source**. A CPU-backend sub-op reading tensors at their
+  declared host placement is none of those. The T-GPLR-16 deadlock is specific to
+  CUDA `MUL_MAT_ID` consuming scheduler-staged *host-bank weights*. The residual
+  hazard — activation cross-backend staging — is **named in the SDD, permitted by
+  both letter and evidence, and not proven safe**; it is where the per-layer sync
+  cost lands, so step D's guard must assert specifically that no *weight* source
+  is ever rewired, and step E must *measure* the activation round-trip.
+
+**Owner direction (2026-10-01), which is this task's reason for existing:** on a
+card with only 8 GB of VRAM, the full context must be used without sacrificing
+prefill or token generation, and the answer is not stock-parameter tuning but a
+reactive hybrid policy — *when an expert is in flight, wait; when it is merely
+queued and not in flight, compute it on the CPU instead of waiting for the
+transfer.*
+
+**The shape is the 8 GB card, and ab14 (2026-10-01) is what makes it concrete.**
+The one measured session at the target condition
+(`build/llama-cuda/logs/ab14-lm8g-a1-u4096.jsonl`) gives, at 3 slots / ubatch
+4096 / ctx 262,144 / KV q8: `static` 913.2, `per_layer` 1,523.5, `slot_window`
+1,494.0, `kv` 2,720.0, `state` 62.8 MiB — **`bounded_window` 6,713.5 MiB, which
+already contains KV and state** (`main.cpp:585`; see reconciliation §10.2 for why
+adding them again is the double count that once produced a bogus "8,500 > 8,192"
+refusal) — plus `act_slab` 1,125.0 MiB (ubatch-sized, **not** the 390.6 MiB a
+ubatch-512 estimate suggests) and `reserve` 512.0 MiB.
+
+At the 8,192 MiB budget the engine's own admission test is
+`bounded <= budget` (`main.cpp:4730`), which **passes with 1,478.5 MiB to spare**.
+But the test that decides whether a *physical* 8 GB card can run it is
+`bounded + act_slab + reserve <= free_start` (`main.cpp:4741`), and
+**6,713.5 + 1,125.0 + 512.0 = 8,350.5 MiB > 8,192 — this configuration would
+have been REFUSED.** ab14 ran anyway because the budget flag never feeds that
+third check. **That is the measured form of the owner's standing warning that
+budget emulation over-reports what a real card can hold, and it is why this task
+must be planned against a configuration that was never emulated.**
+
+What actually fits at 8 GB, derived from the same `byte_account` with the act
+slab scaled linearly to ubatch 512 (**derived, not measured at ubatch 512**):
+
+| slots | bounded | + act slab (ub512) | + reserve | vs 8,192 | cache headroom (`budget - bounded`) | deepest K that fits |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 5,717.7 | 140.6 | 512.0 | **6,370.3 fits** | 2,474.3 | **K=4** (2,185.4) |
+| 2 | 6,215.3 | 140.6 | 512.0 | **6,867.9 fits** | 1,976.7 | K=2 (1,093.0) |
+| 3 | 6,713.5 | 140.6 | 512.0 | **7,366.1 fits** | 1,478.5 | K=2 |
+| 3 | 6,713.5 | 1,125.0 (ub4096) | 512.0 | **8,350.5 REFUSES** | — | — |
+
+**So the 8 GB target condition is 1-2 slots at ubatch 512, and at those depths at
+most 32 of a layer's 256 expert rows can be device-resident (K=4 x W=1 x top_k=8)
+— 12.5% of a bank.** At least 87.5% of demanded experts have no device residency
+available at any budget. **That is why this task is a feasibility mechanism at 8
+GB and not a TG tuning knob.** On a 24 GB card the same block is worth an
+estimated ~1.14x serial / ~1.33x overlapped (draft §8); on an 8 GB card the
+alternative to a host-computed expert is a link fetch the measurement says is
+3.4-6.7x more expensive than computing the row where it already lies.
+
+**Cost gate: measured, and not to be re-derived** (owner directive 2026-10-01).
+`tools/expert-cpu-bench`, iteration-disjoint (`--pool 256 --id-stride 8`), real
+Q4_K bytes, TG shape `n_tokens=1`, 300 iterations, medians: marginal host cost
+**~36.5 us/expert** against **~171 us/expert** for the link at the best measured
+end-to-end feed of 10.35 GB/s (row bytes 1,769,472). Margin **3.4-6.7x, constant
+in k**. A first measurement (2026-09-29, ~8.7-9.8 us/expert) was **withdrawn**: it
+used a hard-coded expert-id stride of 1, so 7 of every 8 slabs were still
+cache-warm and the marginal cost measured was a cache cost, not a DRAM cost —
+visible in the run's own `gbps` column rising 41.9 -> 128.6 GB/s as k went 1 -> 8.
+The corrected figure **raised** CPU cost ~3.9x and **lowered** the transfer
+break-even hit rate from ~88.8% to 83.2%, so it moved *against* the GPU path.
+**The rule is unchanged and is not a tunable threshold: a demanded row that is not
+device-resident computes on the host.** The estimator stays explicit and host-side
+so it can be re-derived when the host or the model changes, and a named gate
+policy that cannot be evaluated **refuses the run** rather than defaulting.
+
+Goal. Let a token-generation layer begin its expert FFN before every demanded
+expert row has landed, by computing the still-**PENDING** rows on the CPU and the
+already-resident rows on the GPU, summing both into the layer output. The layer
+never waits on a row copy that has not completed. The split is decided at demand
+time from actual residency, per layer and per token; nothing about it is fixed at
+run start. The predictor's role is to raise the resident share, not to choose the
+split.
+
+Scope. Opt-in, CUDA+CPU, **default off**, single process, **TG only**. A
+residency-driven split of the expert FFN into a device sub-op and a host sub-op;
+a trigger and cost gate; a fixed-width padded execution shape so the persistent
+graph set stays static; a non-finite guard; telemetry separating device experts,
+host experts, and rows the split skipped. The identity probe is the blocking gate.
+The reference project's `V4_CUDA_TG_CPU_DIRECT` is a **read-only source of the
+mechanism**, not a dependency.
+
+Non-goals.
+
+- **No placement-fixed CPU banks.** A per-layer static CPU/GPU split is a
+  different mechanism.
+- **No change to the demand set.** The router's executed IDs are authoritative
+  and untouched; the split never drops, substitutes, delays or reorders an expert.
+- **No change to the predictor.** This consumes whatever is resident; it adds,
+  retunes and re-gates nothing. T-GPLR-58/59/60 stand.
+- **No `GGML_OP_OFFLOAD_MIN_BATCH` override and no scheduler expert-rowcopy** for
+  the affected layers.
+- No prefill change. In layer-major PP the bank arrives whole; this is a TG class
+  by construction.
+- No change to routing, router arithmetic, top-k, quantization bytes, KV or
+  recurrent state, logits pattern, sampling, the add-chain reduction, the shared
+  expert, or any default path.
+- **No performance claim.** The first deliverable is feasibility/correctness.
+- **Not a substitute for an 8 GB capacity configuration.** This task changes where
+  a demanded expert computes; it does not make ab14's ubatch-4096 3-slot
+  configuration fit an 8,192 MiB card.
+
+Design and failure contract. As written into `docs/layer-residency-sdd.md`
+section 4 (`moe-row-split`); the full reasoning, the bounded bounds of the
+microbenchmark and the reference project's three mandatory test cases are in the
+retained draft.
+
+Implementation steps.
+
+- **A. Policy and shape (host-only).** Pure functions: residency classification
+  at demand time (READY / PENDING / absent), the cost gate, the fixed-width
+  padding plan, and the host/device sub-op descriptor. No CUDA handles. CTest
+  fixtures: all-READY (must not fire), all-PENDING with the gate open, gate
+  closed by estimate, a mixed set, an absent row (refuse), padding contributing
+  zero, an unevaluable policy (refuse).
+- **B. Engine.** Extend the row-set path to build the two sub-ops against the
+  existing add-chain reduction, with the host sub-op's weights bound to the
+  in-flight source rows on the host. Slot, generation, copy-event and
+  consumer-done lifecycles are unchanged; in-flight copies keep running and
+  retire normally — the split must not cancel or consume a copy the mechanism
+  still owns.
+- **C. Guards.** Extend the host-only T-GPLR-16 guard to assert the MIN_BATCH
+  override and the scheduler rowcopy are unreachable, and **specifically that no
+  weight source on this path is ever rewired**; add the non-finite abort and the
+  absent / never-executed aborts.
+- **D. Focused host validation, then the identity probe.** No performance arm.
+
+Falsifiable acceptance criteria.
+
+- **AC1 (policy and shape, host-only, blocking).** All-READY never splits; a
+  PENDING row goes to the host only when the gate opens; a closed gate returns it
+  to the ordinary wait path unchanged; padding contributes exactly zero; an absent
+  demanded row refuses; an unevaluable policy refuses; the emitted sub-op
+  descriptors are constant-width for every input.
+- **AC2 (IDENTITY, blocking, the real gate).** On the 512-token anchor with the
+  split enabled and the gate forced open: greedy token IDs **byte-identical** to
+  the recorded all-GPU streaming arm for the same shape, `check-telemetry` OK,
+  aggregate PASS 5/5, negative control FAILing as designed. **If AC2 fails the
+  task stops there** and records the falsification — no placement tuning, no gate
+  tuning, no rescue. Per AC1's structure the failure can only be fp-order or
+  kernel-domain divergence, and that distinction must be stated.
+- **AC3 (no hang).** The arm completes inside the recorded wall band with no TDR
+  and no `cudaErrorLaunchTimeout`. A hang is a hard fail even if AC2 passed.
+- **AC4 (instrumentation, not performance).** `experts_device + experts_host ==
+  experts_total` at every (layer, token); in-flight copies complete and retire
+  normally; `staged_bytes_avoided` is consistent with `experts_host` and the
+  measured row bytes.
+- **AC5 (inertness is a reportable result, not a failure).** `experts_host == 0`
+  for the whole run is a valid recorded outcome — the mechanism did not fire —
+  and must be reported as such, never as a pass with an implied benefit.
+- **AC6 (no default change).** Flag absent: trace byte-identical to the recorded
+  control, host suite green, dense regression unchanged.
+- **AC7 (the falsifier the owner should read first).** The recorded
+  `experts_host / experts_total` share at the 512 anchor. The T-GPLR-59 frontier
+  run measured a demand-hit share of 0.4518, so the prior is that the host
+  carries a large minority-to-majority of expert work. **At the 8 GB shape the
+  prior is far stronger**: K=4 caps device residency at 12.5% of a bank, so most
+  demanded rows are host-eligible by construction. A large host share is not a
+  defect to tune down — it is the input to the performance arithmetic, and until
+  an arm is authorized no speed claim of any kind may be made.
+- **AC8 (the 8 GB shape, when an arm is authorized).** Any arm run at the 8 GB
+  target must be at a configuration whose `bounded + act_slab + reserve` is
+  **measured** to be under 8,192 MiB. ab14 is the cautionary case: it was
+  admitted by a budget that does not feed the check that would have refused it.
+
+Focused validation commands.
+
+```powershell
+# 0. host-only, no GPU
+cmake --build build/llama-cuda --config Release --target test-layer-streaming-layout test-layer-streaming-tg-spec --parallel 16
+ctest --test-dir build/llama-cuda -C Release -R "^(test-layer-streaming-layout|test-layer-streaming-tg-spec)$" --output-on-failure
+python tools/check-tg-predict.py --selftest
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tests.ps1 -Suite host
+
+# 1. the blocking identity probe (GPU, mutex, owner-invoked)
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/with-gpu-lock.ps1 -TimeoutSeconds 1800 -Command "<recorded arm: canonical 512 anchor, split enabled, gate forced open, --check-telemetry strict, --tg-text, --route-telemetry 1>"
+#    expected: exit 0, checker OK, ids identical to the recorded control,
+#    aggregate=PASS 5/5, negative control exit 1, and a NON-ZERO experts_host.
+#    a refusal (exit 2) is a valid recorded result and discharges AC1 only.
+
+# 2. only after AC2 passes, and only with fresh owner authorization:
+python tools/check-route-parity.py <trace>     # decode-free pass-2 integrity
+python tools/decode-tg-ids.py <trace>          # answer-shape check
+```
+
+Expected results: every host step green; step 1 either the identity result with
+a non-zero host share, or a loud refusal — never a silent degradation; step 2 only
+after step 1 passes.
+
+Required state and document updates.
+
+- A dated `docs/currentstate.md` entry separating **feasibility** (does it run, is
+  the output identical), **instrumentation** (are the counters and the in-flight
+  lifecycle true) and **performance** (not measured here — say so).
+- The owner summary: goal, plain-language mechanism, glossary, pros/cons with
+  every claim labeled measured / expected / unproven, and a recommendation.
+- No build, trace, verdict or telemetry artifact into version control.
+- If the block later changes, `docs/plans/qwen36-cpu-expert-placement-draft.md`
+  keeps the derivation and the withdrawn measurements; this block is the contract.
+
+Escalate to the owner before proceeding if: any measurement shows the scheduler
+rewiring a **weight** source on this path (immediate stop — this is the named
+residual hazard); AC2 fails; any hang or TDR appears; the mechanism turns out to
+need the MIN_BATCH override, the scheduler rowcopy, or a variable-width graph; a
+demanded row cannot be classified as READY, PENDING or absent; a new dependency is
+needed; a flag would change an accepted trace's meaning; or a performance arm is
+proposed before AC2 passes.
+
+### T-GPLR-65 (draft): adopt the V1 causal-flash-attention dispatch fix into the vendored engine
+
+Status: DRAFT (2026-10-01). Not authorized. The fix exists and is measured **only** in the side
+copy `C:\Development\fafix\src\ggml\src\ggml-cuda\fattn.cu` behind an env toggle
+(`FAFIX_CAUSAL_GQA=1`); the vendored tree is untouched.
+Dependencies: none inside this plan; requires a Planner task contract before any vendored edit,
+because `third_party/llama.cpp` is a gitlink carrying another workstream's uncommitted
+`src/models/qwen35moe.cpp` edit. Blocked on that coordination, not on evidence.
+Commit: (none - not started)
+
+Goal. Move the measured V1 dispatch fix from the side copy into the vendored
+`ggml/src/ggml-cuda/fattn.cu`, and prove it is a pure kernel-selection change: same
+quantization, same routing, same expert IDs, same answers, less time.
+
+Scope. The one gate that failed and the kernels it gates. A causal `flash_attn_ext` op with
+`mask == nullptr` fails `use_gqa_opt` / `gqa_opt_applies` (`ggml-cuda/fattn.cu:58` and `:386`),
+so it dispatches `<256,256,64,1>`: no cp.async pipeline, ~8x K/V re-reads, and the KV_max skip
+at `fattn-common.cuh:~1094` is lost. The K/V `ne[1] % 256` gate misses because `prepare_chunk`
+shrinks that dimension (`src/llama-layer-streaming.cpp:5579-5587`). Note the mechanism has two
+independent gate failures, and only the first is the V1 edit.
+Non-goals. No change to attention math, mask handling, KV quantization, or any non-causal path;
+no new dependency; no default-on behavior change without the semantic-QA ladder; **not** a fix
+for the pre-existing Ada+ q8_0 KV hazard where `n_q == 2` selects VEC and ignores the causal
+window - that is a separate defect and is explicitly out of scope here.
+
+Evidence already on disk (measured, 2026-10-01). VRAM-neutral: ON and OFF both peak at
+**10.056 GiB** at ctx 262,144 (and likewise at ctx 128,000/f16 and 512,000/q8). Contribution at a
+50k prompt is **1.186x / 1.182x / 1.182x** across those three contexts - a 0.4% spread over a 4x
+context range - and it **grows** with prompt length: **1.342x** at 144,001 and **1.377x** at
+200,000 tokens. Sources: `build/llama-cuda/verdicts/ab9.verdict.json`, traces
+`build/llama-cuda/logs/ab9-{on,off}*.jsonl`; the length points are ab6/ab7. Side-copy fidelity on
+record: logits within a 0.1-1.3 noise floor, answer-QA PASS, ktest2 332 cases, bench 1.37-2.09x
+at long `nkv`.
+
+Acceptance criteria (falsifiable). (1) With the vendored fix and the side copy carrying identical
+source, a same-session ON/OFF pair at ctx 262,144 / 50k reproduces **>= 1.15x** PP with WDDM peaks
+equal to within 0.01 GiB. (2) PP at 200,000 prompt tokens improves by **>= 1.30x** versus the same
+binary with the gate restored, confirming the length dependence. (3) `tools/check-answer.py`
+reports `aggregate=PASS` on the 512-token anchor under the **default-off** path, and the must-fail
+negative control still fails. (4) The full host suite passes with no new failures. Failing (1)
+means the gate diagnosis is wrong and the task stops.
+
+Validation commands. Build the vendored engine under the project CMake, then run the 50k/512
+semantic-QA smoke tier through `tools/with-gpu-lock.ps1` (mutex
+`Global\AI-GPU-EXCLUSIVE-v1`, one workload per hold, `-WaitCpuQuiet`), then one owner-invoked
+50k PP arm at ctx 262,144 with the gate on and off. **No compile may run inside a timing arm.**
+Side-copy the exe and every DLL before rebuilding if an A/B control across the vendored change is
+wanted - the streaming code lives in `llama.dll`, so copying the exe alone silently loads the new
+library.
+
+Required state/document updates. A `docs/currentstate.md` entry recording the vendored commit and
+the reproduced ON/OFF pair; an `AGENTS.md` gotcha if the gate behaves differently in the vendored
+build than in the side copy (in particular if the `% 256` dimension differs after
+`prepare_chunk`).
+
+Escalate before proceeding if the vendored edit would collide with the other workstream's
+`qwen35moe.cpp` change, if the fix cannot be made default-off, or if reproducing >= 1.15x requires
+touching anything outside `fattn.cu`. A PP win that needs a mask-upload or padding change is a
+different task.
+
+### T-GPLR-66 (draft): fix the `alloc_spill` alignment failure that crashes LM at ubatch 2048 and high context
+
+Status: **DONE (owner-directed 2026-10-01).** Fixed, built, host-tested and validated on GPU. Commit: (none - owner has authorized no commit).
+
+**ROOT CAUSE (found and fixed).** `alloc_spill` sized its spill buffer as a **flat
+sum** of the pending tensors' alloc sizes, rounded up once to 32 B. But
+`alloc_tensors` **realigns every tensor to the buffer alignment as it walks**, so a
+pending set containing odd-sized tensors needs per-tensor padding the flat sum
+omits. The buffer therefore came up short by exactly the padding, and because the
+overflow always lands on the **last** tensor of the set, the only thing the runner
+ever printed was the generic `finish_build: input buffer exhausted and spill
+allocation failed`.
+
+**Measured proof, from the ab15 failing arm's own log:** `layer-streaming: tensor
+'leaf_3' exceeds backing buffer (offset=802848 size=4 buffer=802848 align=32)`.
+`buffer=802848` **is the spill buffer**: it was allocated at precisely the cursor
+the walk had already reached, for a 4-byte tensor. The `exceeds backing buffer`
+line the run DID emit was misread as evidence against this cause - it also appears
+in **working** arms (5x at ubatch 4096), because hitting the *primary* buffer's
+limit is normal and is exactly what the spill exists to handle. (Reading these
+logs needs `tr -d '\000'`; they are UTF-16 **with BOM** and `iconv -f UTF-16LE`
+mis-parses them and silently finds nothing.)
+
+**The fix** sizes the spill by walking it the way `alloc_tensors` will, using
+`ggml_backend_buft_get_alignment` rather than a hardcoded 32. `alloc_spill`'s three
+silent-false paths now each set a distinguishing `error_msg`.
+
+**Why it looked non-monotonic in ubatch** (512 and 4096 clean, 1024 and 2048
+crashing): at ubatch 4096 the pending set is dominated by 32 MiB-aligned `inp_embd`
+slices where the padding is zero and a flat sum happens to be correct; at 1024 and
+2048 the set carries small tensors (`leaf_*`, 4 B) whose padding is not.
+
+**Validation (ab16, one mutex hold, 5 arms, `gpu_pre`/`gpu_post` clean, mutex
+released).** ubatch **1024 and 2048 now complete at exit 0** where ab15 aborted
+with 0xC0000409 on the identical configuration. The control is internal and
+same-binary: ubatch 512 and 4096 in the same session on the same binary. Host
+suite green first: `test-layer-streaming-layout` and `test-layer-streaming-tg-spec`
+both PASS. Side-copied binary `build/llama-cuda/bin/gplr66-fixed/` (exe
+`70e35f47acf27e17`, llama.dll `bcd5ddac455ca2b6`).
+
+**What the fix is NOT.** It does not change prefill speed on the widths that already
+worked - it only sizes a host allocation that happens after the primary input
+buffer overflows. Its effect is **crash -> completion**, and the recovered points
+are worth +18.3% (ubatch 1024) and +27.0% (ubatch 2048) over ubatch 512 in tok/s
+simply because those widths now run at all.
+
+**REPRODUCED TWICE, AND IT IS IN OUR TREE (ab15, 2026-10-01).** The "never
+re-exercised" honesty note below is now **superseded**: an ab15 sweep at slots 2 /
+ctx 262,144 / KV q8 / 50,000 tokens crashed at **ubatch 1024 AND ubatch 2048**,
+both with exit `-1073740791` (0xC0000409), while **ubatch 512 and 4096 both
+completed**. Both failures abort at the same message, and the string lives in
+**our** vendored tree, not only in the fafix vehicle: `src/llama-layer-streaming.cpp:3867`
+sets `error_msg = "finish_build: input buffer exhausted and spill allocation failed"`
+and `src/models/qwen35moe.cpp:495` turns it into `GGML_ABORT`. The signature is
+**non-monotonic in ubatch and strikes in pass 2/3, never pass 1** (u1024 got
+3,460.6 tok/s through pass 2 before dying; u2048 completed pass 1), which points
+at an alignment/allocation edge case rather than a resource limit - consistent
+with this task's hypothesis. Traces `build/llama-cuda/logs/ab15-s2u{1024,2048}-a1-u*.log`.
+
+**What this changes for the task.** The title says "ubatch 2048"; the defect is
+**at least a two-point set {1024, 2048} with 512 and 4096 clean**, so the
+alignment hypothesis must explain a non-monotonic pattern, not a single shape.
+ACs that assume ubatch 2048 is the only failing width are wrong as written.
+Dependencies: none; self-contained inside `src/llama-layer-streaming.cpp`.
+Commit: (none - not started)
+
+Goal. Make `alloc_spill` allocate at an alignment its consumers actually require, so a layer-major
+prefill at ubatch 2048 with a large context completes instead of aborting with
+`finish_build: input buffer exhausted and spill allocation failed` and exit `0xC0000409`.
+
+Scope. `alloc_spill` at `src/llama-layer-streaming.cpp:1173-1202` and the 64 MiB host input
+buffer it draws from. The suspected cause is a 32-byte alignment assumption that does not hold
+for the spill buffer's consumers.
+Non-goals. No change to the residency window size, the slot budget, KV placement, or the
+preflight; no raising of VRAM limits to make the shape fit; no change to any ubatch that currently
+works (4096 is clean).
+
+Honesty note, which is part of the task's evidence. The crash was observed once, at LM ubatch
+2048 / ctx 262,144 with `--pp-repeat >= 2`. **It was never re-exercised**: every LM arm in the
+2026-10-01 head-to-head sessions ran ubatch 4096. So the alignment theory is a hypothesis, not a
+diagnosis, and the first acceptance step is to reproduce rather than to fix. Do not let this block
+be read as "known root cause".
+
+Acceptance criteria (falsifiable). (1) The failing shape (LM, ubatch 2048, ctx 262,144,
+`--pp-repeat 2`) completes with exit 0 and a `check-telemetry: OK` trace - reproduced FIRST, on the
+unmodified tree, to confirm the shape still fails. (2) After the fix, that same arm passes and its
+`phase_summary` PP is within 10% of the same run at ubatch 4096 (a larger ubatch is not free, so
+this is a sanity band, not an equality). (3) The alignment actually required is *demonstrated* -
+a host-only test that asserts the spill pointer satisfies the consumer's alignment - so the fix is
+justified by evidence rather than by a crash disappearing. (4) The host suite passes unchanged.
+If (1) does not reproduce, the task is re-scoped or closed as not-reproducible; that outcome is a
+legitimate result and must be recorded rather than papered over.
+
+Validation commands. Reproduce with one mutex-held arm at ubatch 2048 / ctx 262,144 /
+`--pp-repeat 2` through `tools/with-gpu-lock.ps1`. Then the focused host CTest target, then the
+50/512 semantic-QA smoke tier.
+
+Required state/document updates. A `docs/currentstate.md` entry stating whether the shape
+reproduced, the confirmed alignment, and the commit; remove or keep the risk bullet in
+`docs/currentstate.md` accordingly.
+
+Escalate before proceeding if reproduction requires a larger context than 262,144, if the fix
+would change the residency window size, or if the spill buffer turns out to be sized rather than
+aligned incorrectly. Report a NOT-REPRODUCED result upward rather than iterating on a fix for a
+crash that no longer occurs.
+
+### T-GPLR-67 (draft): `--handoff-partial N` is inert because its handoff-on assignment sits inside a comment
+
+Status: DRAFT (2026-10-01). Recorded, deliberately **NOT fixed** - the vendored tree is another
+workstream's and this needs a Planner contract. One-token change.
+Dependencies: coordination with the workstream holding `third_party/llama.cpp` (it carries an
+uncommitted `src/models/qwen35moe.cpp` edit).
+Commit: (none - not started)
+
+Goal. Make `--handoff-partial N` do what its own comment says, so passing it alone activates a
+handoff instead of leaving `handoff_mode_str` at `auto`.
+
+The defect, verbatim. `tools/layer-streaming/main.cpp:3454` reads:
+
+        // stay host-resident (CPU) for mixed-placement TG. Implies an
+        // explicit handoff-on request.            handoff_mode_str = "on";
+
+The assignment is **inside the `//` comment**. `--handoff-partial N` parses `N` and sets
+`handoff_partial_n`, but `handoff_mode_str` stays `"auto"`. Because `auto` resolves OFF whenever
+full model+KV+state does not fit, the flag alone can never activate a handoff at a large context,
+and every `--tg-tokens > 3` run then refuses at `main.cpp:4871`. Note the `--help` text
+(`main.cpp:67-68`) describes only which banks migrate and never claims a handoff - so `--help` and
+the code agree, and what the comment swallowed is the **documented intent**. A reader of `--help`
+has no way to learn the flag is inert alone.
+
+Measured impact (2026-10-01). All four partial-handoff arms of session **ab11** (`lmh20`, `lmh14`,
+`lmh28`, `lmh20b`) failed this way - `ARM EXIT 2 (4.7s)` each, with
+`handoff: auto -> OFF` then the cap. Evidence: `build/stock-levers/ab11.wrapper.log` and
+`ab11-lmh20.tail.txt:2234-2236`. Workaround used for all reported numbers: pass `--handoff`
+explicitly alongside `--handoff-partial N`.
+
+Scope. One line in the vendored `tools/layer-streaming/main.cpp`, plus the `--help` text if the
+Planner wants the implication stated there.
+Non-goals. No change to the partial-handoff policy itself (which banks migrate for a given N), to
+the preflight, or to the tg-token cap; no default change to `--handoff-partial`'s current
+effective behavior without an owner call, since making the flag work may change what existing
+recorded commands do.
+
+Acceptance criteria (falsifiable). (1) `--handoff-partial 20` alone, at a shape where `auto` would
+resolve OFF, activates the handoff - i.e. the run proceeds past the `main.cpp:4871` cap instead of
+exiting 2. (2) `--handoff-partial 20 --handoff` behaves **identically** to today's recorded
+workaround arm (same banks migrated, same `phase_summary` shape). (3) The refusal still fires for
+`--no-handoff --tg-tokens > 3`, so the cap is not accidentally removed. (4) Host suite passes.
+Criterion (2) is the important one: the fix must make the flag behave as its comment always
+claimed, not introduce a new policy.
+
+Validation commands. Host-only first: extend the existing flag-surface fixture to assert the
+assignment is reachable. Then one mutex-held partial-handoff arm via `tools/with-gpu-lock.ps1` at
+ctx 262,144, `--handoff-partial 20`, and the mirrored `--handoff-partial 20 --handoff` arm.
+**Fidelity caveat that must be resolved by this task:** in ab12, `lmh20` and `lmh20b` - identical
+flags - produced DIVERGENT sequences at 128 generated tokens despite a bit-identical token 0
+(early margins 0.0093/0.1617/0.1099/0.0595 against 1.6988/2.0027/1.1112/3.2644). Any token-level
+claim about the partial-handoff path is UNPROVEN until that divergence is explained; this task
+should report PP/TG aggregate behavior and explicitly decline to certify token identity.
+
+Required state/document updates. Remove the `AGENTS.md` gotcha about passing `--handoff`
+explicitly once the flag works alone; record the outcome in `docs/currentstate.md`; update the
+`docs/tg-expert-path-reconciliation.md` §12.6.8 defect note from "recorded, not fixed" to the
+resolution.
+
+Escalate before proceeding if making the flag effective would change an existing recorded
+command's behavior in a way the owner has not called, or if the vendored coordination is
+unavailable. This is a one-token fix, and the temptation to land it outside a contract is exactly
+what the vendored-tree rule exists to prevent.
+
 Architecture pass (2026-09-24, shape only; STOP unchanged). The T-GPLR-59/60 code now has three explicit boundaries. (1) `src/llama-layer-streaming-pool.{h,cpp}` owns the pure prediction-row state enum, exact expert-slab arithmetic, admission plan, generation transition, lookup, retirement, and completion policy. It has no CUDA or runner state. `llama_layer_streaming` remains the single runtime owner of pool buffers, completion events, package sources, and counters, and the large streaming implementation only orchestrates those resources through the policy API. (2) `tools/layer-streaming/telemetry-pool.{h,cpp}` owns all stateful `spec_pool*` validation; `main.cpp` only creates one validator per telemetry pass and forwards events. The minimal JSONL readers used by both validators live once in `telemetry-json.{h,cpp}`. (3) `tools/tg_pool_core.py` owns trace parsing, shared real-cache replay, pool lifecycle, fate closure, and report-data construction. `analyze-gplr59-pool.py` is now the CLI/rendering/selftest adapter, while T-GPLR-60 imports the shared real-cache fact builder, `PoolLayer`, and `replay_pool_stages`; its former duplicate replay lifecycle is deleted. The shared core emits its complete fate ledger; no policy, event schema, capacity, scientific result, or experimental decision changed in this pass. Data flow is runner flags -> engine policy/CUDA adapter -> JSONL -> state-owning validator, and recorded trace -> shared replay core -> CLI-specific scoring/presentation. Adversarial entry-point validation also added negative fixtures for duplicate `run_start`, `spec_pool` before `rowset_init`, and quoted/malformed numeric fields; these exercise the real `--check-telemetry` and `--validate-telemetry` paths. The shared reader preserves valid decimal serialization used by phase summaries while rejecting quoted, partial, non-finite, overflow, and malformed-array tokens. Runtime teardown remains event-synchronized before pool buffers/state are released; no extra async/cleanup path was added. This is validator robustness evidence only: no pool-enabled CUDA run was authorized, and the T-GPLR-60 decision remains **STOP**.
+
+### T-GPLR-70 (FALSIFIED 2026-10-02 by ab19): narrowing the TG KV window makes TG 18.9% SLOWER
+
+Status: **IMPLEMENTED, MEASURED, REJECTED, REVERTED.** The change built clean and passed the
+host suite (76/76), ran correctly, and **regressed token generation by 18.9%**. The patch was
+reverted and the reverted source is proven digest-identical to the validated pre-T-GPLR-70 tree
+(`source_digest 28382EF598129F94`, the same value the ab16 verdict recorded). **Do not re-apply
+this patch.** The rejected binary set is retained at `build/llama-cuda/bin/gplr70-changed/` for
+reproducibility only, carries a `DO-NOT-RUN.txt`, and must not be reported as a candidate.
+Dependencies: none. Evidence: `build/stock-levers/ab19.plan`, `ab19.manifest.jsonl`,
+`build/llama-cuda/logs/ab19-{ctl38x,g70x}-a1-u1024.*`, `build/llama-cuda/verdicts/ab19.verdict.json`.
+Commit: (none - reverted; nothing to commit)
+
+**What was built.** In `llama_context::layer_streaming_compute`, before each token-generation launch,
+assign every `GGML_OP_FLASH_ATTN_EXT` node's K and V view `ne[1]` to `max(ubatch.pos)+1`, mirroring
+the PP patch (`T-Q38FA-01` in `prepare_chunk`). Gated to `ls->phase != 0`, so PP was untouched by
+construction. Causal was re-stated only where the node was already causal.
+
+**A bug in the patch itself, found and fixed before the arm ran.** The first version shrank the view
+only when it was longer than the live window ("never grow"). Because the graph set is built once
+(`graph_builds == 1`) and reused for every token while the live window grows one token per step,
+that guard **froze the view at token 1's window** and would have silently stopped reading the newest
+tokens from token 2 onward. The PP patch has no such guard; it assigns unconditionally. This is the
+single most dangerous shape of bug in this mechanism and it was caught by reading the code, not by
+a test.
+
+**Measured result (ab19: one mutex hold, both arms re-run in session, side-copied binaries,
+llama.dll the only differing artifact, `route=1` on both).**
+
+| arm | PP tok/s | peak VRAM | TG tok/s | TG compute/token |
+| --- | --- | --- | --- | --- |
+| `ctl38x` (bin=fixed, pre-fix) | 3,089.6 | 7.600 GiB (re-derived) | **23.096** | 39,996.6 us |
+| `g70x` (bin=g70, narrowed) | 3,089.2 | 7.600 GiB (re-derived) | **18.733** | 50,000.2 us |
+
+PP and VRAM are unchanged, as designed. **TG regressed 18.9%.** The patch demonstrably fired:
+`T-GPLR-70: TG attention KV view set 262144 -> 50001 (q_pos_base 50000, layer 3); 1 fa node(s)
+per layer graph`.
+
+**AC1 FAILED (the primary criterion): the narrowing did not reduce the decode attention cost.**
+**AC2 FAILED in the worst direction: TG fell instead of rising 15%.**
+**AC3 FIRED - this is the falsifier, and it fired.** The claim "the TG decode attention waste is the
+KV view length" is **not supported by the measurement that was supposed to confirm it.**
+
+**The regression is not where the hypothesis said it would be, and that is the real finding.**
+
+| group | control | narrowed | delta |
+| --- | --- | --- | --- |
+| host-resident banks (il < 38) | 38,222.5 us | 47,195.5 us | **+23.5%** |
+| device-migrated banks (il >= 38) | 1,774.1 us | 2,804.7 us | **+58%** |
+
+The 30 gated-DeltaNet layers own **no `FLASH_ATTN_EXT` node** and therefore **could not have been
+narrowed at all** - yet they regressed too. So the damage is a **side effect of mutating the
+persistent graph set's KV view tensors**, not of narrowing them. The TG graph set is built once and
+reused for all 128 tokens; its K/V views are shared across the layer graphs in the set, so changing
+`ne[1]` on them perturbs the whole set's shape-dependent state - the scheduler's allocation plan and
+the recurrent layers' view of the shared cache - for every subsequent token. **Mirroring the PP
+patch's tensor mutation is therefore NOT safe on the TG path, because PP rebuilds per-chunk sets
+that each own their views while TG reuses one set.**
+
+**Corrected understanding of the ctx -> cost law (the host-only evidence that motivated this).**
+The law is real - same engine, same 50,000-token prompt, ctx 50,176 -> 128,000 is 2.551x and the
+decode FA kernel goes 228.3 -> 557.6 us (2.442x, 4.2% off). But **it is not evidence that the kernel
+scans beyond `n_kv_valid`**, because narrowing the scan length made things worse, not better. The
+consistent reading is that cost tracks `ctx` through the kernel's **launch geometry**
+(`fattn-common.cuh:1085-1190`: `ntiles_KV`, `parallel_blocks`, `stream_k` all derive from
+`K->ne[1]`), not through the amount of KV actually read. That points the next experiment at
+**parallelism and occupancy**, not at scan length: the decode kernel is the non-tensor-core
+`flash_attn_ext_vec<256,1,Q8_0,Q8_0>` launched at **grid (1,10,16) = 160 CTAs x 128 threads,
+regs=255** - about 5.9% of a 5090's resident thread slots.
+
+**AC5 NOT EVALUABLE as run, and the reason is a harness mistake, not a result.** `check-route-parity.py`
+reported 40 diverging layers per chunk in **both** arms, including the untouched pre-fix control. The
+parity contract is defined for a clean `--pp-repeat 2` trace; `ab19.plan` omitted `rep=`, so the
+harness defaulted to **3 passes**, and a 3-pass trace cannot satisfy the exactly-twice contract. The
+divergence is an artifact of the plan, and it is identical in both arms, so it says nothing about the
+patch either way. **Any future T-GPLR-70 arm must set `rep=2` explicitly.**
+
+**A second, independent finding, because it undercuts how this project records build identity.**
+**Locally built `llama.dll` is NOT reproducible.** Two consecutive no-op rebuilds of byte-identical
+source produced `0d98d81c0189634d` and `e131f822f999d9b0`. So a DLL SHA-256 identifies *a
+particular file that was side-copied*, and nothing more. Statements like "changed arm is
+llama.dll bd4718f45b186fd7" remain accurate as descriptions of preserved artifacts - the side-copy
+rule is what makes the A/B valid - but a hash must never be presented as a reproducible build
+identity. **The reproducible identity is the SOURCE digest.** That is what actually proved the
+revert: `revision digest 28382EF598129F94` equals the `source_digest` the ab16 verdict recorded for
+the pre-T-GPLR-70 tree.
+
+**What survives from the original investigation.** The measured facts stand and are unaffected by
+this falsification: KV is on CUDA0 for exactly the 10 attention layers and `flash_attn` is enabled,
+so host/PCIe KV reads and non-FA paths are eliminated; `n_embd_k_gqa = 512` over `n_head_kv = 2`
+gives head_dim 256; the attention-layer penalty is 1,435 us host vs 1,375 us device (+4%) and so is
+independent of expert placement; and the decode kernel runs at ~5.9% occupancy.
+**CORRECTION (prof3, 2026-10-02): the sentence that followed here - "Only the interpretation 'the
+kernel reads 262,144 slots instead of 50,128' is withdrawn" - was itself wrong and is now reversed.**
+The scan waste is real and independently measured; only the **patch mechanism** was falsified.
+
+### T-GPLR-71 (MEASURED, owner-directed 2026-10-02): size the TG attention view from live n_kv at graph-build time, via `n_pad` + a post-prefill TG set rebuild
+
+**Status: MEASURED** (promoted by owner 2026-10-02; steps 1-5 + ab20-ab22 executed 2026-10-02; host gates + ab23 cross-session replication revalidated 2026-10-08). Owner acceptance pending.
+
+**Dependencies.**
+- **T-GPLR-47** — the fresh-context swap-in-slot rebuild, i.e. the `needs_rebuild` / `rebuild_replacement` / `begin_set` replacement branch this task REUSES rather than reimplements.
+- **T-GPLR-62 S2** — `mark_row_set_sets_stale()` and the flagged-set routing in `layer_streaming_compute` (`:4330-4350`).
+- **T-GPLR-70 + its prof3 addendum** — the analysis being fixed (decode FA 5.116x across a 5.22x ctx sweep; **+9,000.4 us/token PREDICTED** = 20.8% of the TG wall; not re-derived this pass) and the falsified mechanism this task must not repeat.
+- **T-GPLR-68 / T-GPLR-69** — VRAM attribution, and the `peak_vram_bytes` defect that makes AC4 nvidia-smi-only.
+- **ab19 `ctl38x`** — the baseline binary set and the 23.096 tok/s / 3,089.6 tok/s PP reference numbers.
+
+**Commit:** _(unfilled — no commit is authorised; leave blank until the owner asks, and record the hash here only if one is made)_
+
+**Goal.** Remove the **9,000.4 us/token PREDICTED** dead-KV scan of the T-GPLR-70 addendum above (measured recovery: **9,026.2 us/token** of compute), **without mutating a reused graph**, and without regressing PP (charter priority 1).
+
+**Root cause (code facts, read from source).** The attention view length is chosen at graph-build time by `llama_kv_cache::get_n_kv()` (`src/llama-kv-cache.cpp:1233`):
+`n_pad_cur = max(n_pad, 256)`, `n_kv = min(cells.size(), max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur)))`.
+`cells.used_max_p1()` is the live position, so **upstream already sizes from live**. Our runner pins the override at `tools/layer-streaming/main.cpp:4470`: `cparams.n_pad = (uint32_t) n_ctx_total;` which forces `n_kv = 262144` for every graph. Stock uses the default `n_pad = 0` (`src/llama-context.cpp:3936`) and therefore gets live-sized views.
+**The handoff executor is not involved and needs no change.** Any fix aimed at it is aimed at the wrong layer.
+
+**Scope.**
+- (a) Replace the `n_pad = n_ctx_total` pin with a granularity that keeps graphs reusable (must satisfy `GGML_ASSERT(kv_size % n_pad == 0)`, `llama-kv-cache.cpp:98`; `kv_size = 262144`, so 256 is legal).
+- (b) Build/rebuild the **phase-1** set **after prefill**, when `get_n_kv()` is truthful, and key the TG set on `n_kv` so later growth forces a rebuild rather than silent staleness. Reuse the existing `needs_rebuild` / `rebuild_replacement` / `mark_row_set_sets_stale()` path (T-GPLR-62 S2, T-GPLR-47).
+
+**Non-goals.** No change to the handoff executor. No tensor mutation of a prebuilt graph (T-GPLR-70's mechanism, falsified). No change to routing, expert IDs, arithmetic or checkpoint metadata. No change to `--pp-schedule`, the act slab, or slot policy.
+
+**Design / failure contract.**
+- A set whose built view can no longer cover the live position MUST be rebuilt, never silently reused. An under-reading view is a correctness failure (wrong tokens attended), so this fails loudly or not at all.
+- Recurrent state is NOT re-initialised by the rebuild: the prebuild must not be simply re-run after prefill, because it advances recurrent session state (`llama-context.cpp:1748-1750`). A post-prefill rebuild must reuse the T-GPLR-47 replacement semantics.
+- KV cache and recurrent state stay owned by logical layer; nothing here may move them into a weight slot.
+
+**Why (a) alone is forbidden.** TG sets are built at bring-up (`llama_context::layer_streaming_prebuild`, TG branch `:1746`), before any cells are applied, so `get_n_kv()` would return the 256 floor and generation would read only the last 256 positions. **(a) without (b) is a regression, not a fix.**
+
+**Known PP risk that must be gated.** PP already narrows its own view per chunk (`T-Q38FA-01`, `llama-layer-streaming.cpp:5602-5610`), and in phase 0 `use_implicit_causal_mask()` is true (`llama-graph.cpp:1490`) so **no `kq_mask` tensor is allocated** (`llama-graph.cpp:2798`) — `n_pad` therefore does not change PP VRAM. The open risk is layout: the per-chunk sets assume constant shapes for "non-aliasing act-slab slices" (`llama-context.cpp:1537-1548`) and PP currently reports `graph_builds: 0`. Any extra timed build is a direct PP loss.
+
+**Implementation steps (B1 — reuse the T-GPLR-47 replacement path).** Ordered; each step is independently checkable.
+1. **Side-copy the control BEFORE rebuilding.** Copy the exe **and all DLLs** from `build/llama-cuda/bin/gplr66-fixed` to `build/llama-cuda/bin/t-gplr71-control`. Rebuilding destroys the control, and the streaming code lives in `llama.dll`.
+2. **`n_pad` granularity.** At `tools/layer-streaming/main.cpp:4470`, replace `cparams.n_pad = (uint32_t) n_ctx_total;` with a granularity constant (default **256**, which divides `kv_size = 262144` and satisfies `GGML_ASSERT(kv_size % n_pad == 0)`, `src/llama-kv-cache.cpp:98`). Expose it as `--kv-graph-pad` so a later arm can sweep it **without a rebuild**.
+3. **Rebuild the phase-1 set after prefill.** At handoff, mark the phase-1 (TG) sets stale so `layer_streaming_compute` rebuilds them on the first TG token through the existing replacement branch (`needs_rebuild` + `rebuild_replacement` + `begin_set`). **Do not add new lifecycle code and do not re-run `layer_streaming_prebuild`** — re-running it would advance recurrent session state (`src/llama-context.cpp:1748-1750`). This step is what makes `mctx->get_n_kv()` truthful: at bring-up it returns the 256 floor.
+4. **Key the set on `n_kv`.** Add the `n_kv` observed at build time to the graph-set key beside `chunk_key` (`src/llama-layer-streaming.cpp:4330`), so a set whose built view can no longer cover the live position is **rebuilt, never silently reused**. With granularity 256 and `tg=128` this must fire **at most once**; assert it in telemetry.
+5. **Make the built view observable.** The `tel_kv_view` / `tel_mctx_lifecycle` emitters are pw-probe-gated, so a defaulted trace cannot answer AC1. Emit the per-phase built view length in `phase_summary` (one field) so AC1 is checkable from the trace alone.
+6. **Host validation** (steps 2-5), then **one** GPU A/B. Do not spend more than one mutex hold.
+
+**Falsifiable acceptance criteria.**
+1. `phase_summary phase=tg` shows decode FA cost flat in ctx across a sweep (today it is 5.116x over a 5.22x ctx change) — target <=1.05x.
+2. TG tok/s improves by >=15% at the 8 GB operating point vs `ctl38x` (23.096 tok/s), with PP unchanged within run-to-run noise.
+3. **PP does not regress**: `graph_builds` stays **0** in `phase_summary phase=pp`, and PP tok/s >= 3,089.6 x 0.98. (State the observed session-to-session spread alongside the result; a bare "within noise" is not evidence.)
+4. VRAM peak does not increase (`gpu-mem-poll` nvidia-smi only; `run_end.peak_vram_bytes` is not a measurement, see T-GPLR-69).
+5. Semantic-QA smoke tier passes (T-GPLR-07 ladder), since generation output must be unchanged.
+6. **The TG rebuild fires at most once** for `tg=128` (step 4), and **zero** times in PP.
+
+**Exact validation commands and expected results.**
+
+Host only (no mutex needed; CPU-only compile and checks are exempt from the GPU mutex).
+```
+# 1. Build. CUDA_PATH is REQUIRED to build and not to run (AGENT_ENVIRONMENT.md addendum F).
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2
+cmake --build C:/Development/AI/qwen38GZI/build/llama-cuda --config Release
+```
+Expected: exit 0, no new warning in `llama-kv-cache.cpp` / `llama-layer-streaming.cpp`.
+```
+# 2. Host suite. Emits the SOURCE DIGEST - the reproducible build identity.
+tools/run-tests.ps1 -Suite host
+```
+Expected: exit 0. Record the printed `revision digest`; it must be recorded in this block.
+```
+# 3. Focused CTest (host-capable targets only). -C Release is mandatory: this tree is
+#    multi-config and without it every test reports "Not Run" (exit 1) - a usage error,
+#    not a failure.
+ctest --test-dir C:/Development/AI/qwen38GZI/build/llama-cuda -C Release -R "test-layer-streaming-(route-topk|host-mem)$"
+```
+Expected: exit 0, **2/2**.
+**Do NOT widen this regex.** `-R "layer-streaming|route-topk|host-mem"` selects **111** tests, of which **25 are model-backed `-run` targets** that fail with `missing or empty model environment variable: Q38LS_MODEL_PATH`. They initialise CUDA, so they belong to the GPU rung with the env var set inside the mutex hold, not to host validation. Measured 2026-10-02: the wide regex gives 86/111 with all 25 failures environmental, which reads like a regression and is not one.
+
+GPU (exactly one mutex hold; `run-ab-session.ps1` does NOT take the mutex itself).
+```
+# 4. Write build/stock-levers/ab20.plan first:
+#      ctl38x  lm ub=1024 ctx=262144 kv=q8 slots=2 pp=50000 bin=fixed route=1 tg=128 ho=1 hpart=38
+#      g71x    lm ub=1024 ctx=262144 kv=q8 slots=2 pp=50000 bin=g71  route=1 tg=128 ho=1 hpart=38
+#    and add g71 -> build/llama-cuda/bin/t-gplr71-changed to $lmBinDir in run-ab-session.ps1.
+tools/with-gpu-lock.ps1 -Command "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Development\AI\qwen38GZI\build\stock-levers\run-ab-session.ps1 -Session ab20 -PlanFile C:\Development\AI\qwen38GZI\build\stock-levers\ab20.plan"
+```
+Expected: verdict PASS, `gpu_pre`/`gpu_post` clean, both arms exit 0. **No compiles inside this hold.**
+```
+# 5. AC1 ctx sweep, reusing the prof3 machinery (arms lm@50176, lm@128000, lm@262144),
+#    then re-derive with the tool instead of by hand:
+python build/stock-levers/tg-decode-scan-length.py
+```
+Expected: the "ours" row reads <=1.05x across the 5.22x ctx sweep (today: 5.116x).
+```
+# 6. Semantic-QA smoke tier (T-GPLR-07): 512-token default, aggregate checker PASS
+#    including the negative control failing as designed.
+```
+If route parity is evaluated, the plan must set `rep=2` explicitly - `run-ab-session.ps1` defaults to 3, which **cannot** pass and made ab19's AC5 unevaluable.
+
+**Required state/doc updates.** `docs/currentstate.md`, this block, and the AGENTS.md gotcha for `n_pad`.
+
+**Execution record -- steps 1-2, 2026-10-02 (host-only; NO GPU window).** Control side-copied to `build/llama-cuda/bin/t-gplr71-control/` (16 files, hashed, re-verified after every later rebuild; identity `llama.dll bcd5ddac455ca2b6` / exe `70e35f47acf27e17` = ab19 `ctl38x`). `--kv-graph-pad N` added to `main.cpp` as **opt-in**, not defaulted: with 256 as the default and steps 3-4 absent, generation would attend to a few hundred positions. A positive `N` therefore refused with exit 2. Host suite 76/76, digest `E1AA5A5DDB92ECB7`. **Both of those are superseded by the steps 3-4 record below: the refusal is lifted and the digest has moved.**
+
+**Execution record -- steps 3-4, 2026-10-02 (host-only; NO GPU window; nothing measured).**
+
+*Hypothesis, stated before the first edit.* If each phase-1 set records the `n_kv` it was built against and the executor arms the T-GPLR-47 replacement branch whenever that view can no longer cover the live `get_n_kv()`, the bring-up TG set is rebuilt once on the first TG token, and the legacy `n_pad = n_ctx_total` pin makes both sides the same constant so nothing fires.
+
+*Cheapest disproof, run first, passed* (three numbers from `llama-kv-cache.cpp:1233`). Layer-major implies `pw_probe` (`main.cpp:3201`), so the prebuild builds WIDTH CLASSES -- chunk 0 at [0,1024), chunk 1 at [1024,2048), tail(848) at [2048,2896) -- then the phase-1 widths at `pos_c = applied = 2896`.
+
+| config | bring-up set | required, 1st TG | required, tg=128 | arms? | refires? |
+| --- | --- | --- | --- | --- | --- |
+| legacy `n_pad = n_ctx` | 262,144 | 262,144 | 262,144 | no | no |
+| opt-in pad 256 | **3,072** | **50,176** | 50,176 | **once** | no |
+
+*CORRECTION: "Why (a) alone is forbidden" was right for the wrong reason.* It claimed `used_max_p1()` is 0 at bring-up, giving a 256 floor. False: `build_variant` calls `vmctx->apply()` BEFORE `model.build_graph()`, and layer-major's width classes apply real positions, so cells exist. The floor is **3,072**, not 256. Conclusion unchanged; mechanism corrected.
+
+*Step 3 done:* `arm_tg_view_rebuild()` sets exactly T-GPLR-62 S2's two flags, so `begin_set` takes the identical T-GPLR-47 fresh-context branch. No new lifecycle code; the prebuild is not re-run. Recurrent safety is structural, not argued: the replacement re-derives graphs and applies nothing, whereas the prebuild calls `vmctx->apply()`.
+
+*Step 4 done, deliberately NOT via `find_set`'s key.* A narrower view must REPLACE its set; putting width in the variant identity would allocate a second set beside the stale one. `graph_set::n_kv` is recorded in `finish_build()` and compared by `view_covers_live()`.
+
+*Deviation from the plan, deliberate:* the granularity is **not** `cparams.n_pad`. That pin also sizes the phase-0 sets, which T-Q38FA-01 only ever SHRINKS; under the pw width classes the continuing class is built at ~2,048 columns while chunk 48 drives it with a 50,000 window, so a context-wide 256 pad would force an EXPAND. The pin is unchanged and the granularity is a phase-scoped override (`llama_memory_i::set_view_pad` -> `llama_kv_cache::n_pad_view`, 0 = off) armed at the prefill -> generation boundary. `--kv-graph-pad 0` never calls it.
+
+*Refusal lifted* because its own named prerequisite now exists, wired to a branch already proven in situ, and shown by the table to fire only when the built view cannot cover the live one. This establishes nothing about hardware behaviour.
+
+**Execution record -- four-dimension audit follow-up, 2026-10-02 (host-only).**
+
+The audit found the fail-safe ordering self-defeating and it is fixed. `view_covers_live()` read an unrecorded width as "safe to reuse", so a set that could not prove coverage opted out of the check that prevents under-reading. Now: `required <= 0` -> nothing to check, reuse; `built <= 0` -> **coverage UNPROVEN, rebuild**; else `built >= required`. Second, `cur_build_n_kv` was never reset, so an un-instrumented build inherited the PREVIOUS build's width and stamped a plausible but unverified number; `finish_build()` now records unconditionally and then clears to -1. Unknown costs at most one extra rebuild, because the rebuild goes through `layer_streaming_compute`, which records the real width.
+
+*All five `model.build_graph` sites, read individually:*
+1. `llama-context.cpp:1526`, `layer_streaming_prebuild`'s `build_variant` -- **records** (set after `vmctx->apply()`, from the same context the builder reads).
+2. `llama-layer-streaming.cpp:4386`, `layer_streaming_compute`'s build-on-miss -- **records**.
+3. `llama-context.cpp:1392`, `process_ubatch` -- **does not record, and CAN reach a live set.** The streaming branch returns at `:1363` only for `LLM_GRAPH_TYPE_DEFAULT`, so a non-default type (the MTP draft head on `ctx_dft`, which shares the same `llama_layer_streaming`) falls through here with `p.layer_streaming` set, because `graph_params()` attaches it unconditionally at `:2881`.
+4. `llama-context.cpp:2836`, `graph_reserve` -- reaches `begin_build` only if `layer_streaming != nullptr`, but it runs at context init before the runner attaches it, so in practice it cannot touch a live set. Uninstrumented regardless.
+5. `llama-context.cpp:3845`, `opt_epoch_iter` -- **does not record and can reach a live set** when speculative graph optimisation is enabled.
+
+Sites 3-5 are therefore covered by the fail-safe, not by instrumentation, which is the reason for that choice: instrumenting them would mean casting a hybrid memory context inside three generic llama.cpp paths, and a site that records the WRONG width is worse than one that records none.
+
+*Storm bound.* In the ab20 operating point (`--no-mtp`, no speculative opt) sites 3 and 5 are unreachable, so the unknown-width branch cannot fire there at all and the count is the predicted single rebuild. With `--mtp` it is unmeasured: if the MTP path rebuilt a phase-1 set on every token, each such build would stamp -1 and each TG token would rebuild. `arm_tg_view_rebuild` emits `built_n_kv`/`required_n_kv` per firing, so a storm is directly countable from a trace rather than inferred. **That event is kept deliberately:** plan step 4 states the rebuild "must fire at most once; assert it in telemetry", so it is the contract's own requirement for AC6 and the only storm detector -- not an added reporting surface. Step 5's `phase_summary` field remains unwritten and gets its own pass.
+
+*Audit's other findings, not fixed here:* the avoidable `llama_memory_i` virtual (three forwards for one integer; its vtable hazard already cost one test failure), duplicated prose, and that no PP/TG behaviour has been measured.
+
+*Validation after the fail-safe fix:* build exit 0 (no new warning); `tools/run-tests.ps1 -Suite host` 76/76; focused ctest 2/2; `resplit-currentstate.py --verify` PASS; `git diff --check` clean. Source digest **`381E65E7B85DE7E7`** (11 tracked changed; `llama.dll 2FFB3AEA3A1BCFCA`; record `build/llama-cuda/suite-runs/20261002T123710Z-host/revision.json`). It supersedes `F4C398FB032C2646`, which was the steps 3-4 pre-audit-fix digest. **The two pre-existing uncommitted mods** (`src/llama-layer-streaming.cpp` lines ~1185-1219 and `src/models/qwen35moe.cpp`) were left untouched apart from this task's own hunks.
+
+*INCIDENT, task-owned: this plan file crossed the doc-size FAIL band (480,000 B) during these records and failed the host suite's doc-size guard.* These two execution records were compressed in response (they had duplicated source comments and `currentstate.md`), which is also the audit's QUALITY finding. **The file remains close to the cap and needs a Planner-level split before the next task adds to it** -- moving closed task blocks into `docs/plans/generic-prefill-layer-residency-archive.md` is the documented mechanism. That is a structural decision, not one this pass should take unilaterally.
+
+*AC1-AC5 measured by ab20/ab21 below; AC6 by ab22. `--kv-graph-pad` HAS now been executed on hardware.*
+
+**Step 5 (2026-10-02, host-only).** `phase_summary` now carries `kv_view_built`, `kv_view_live` and `view_rebuilds_total` unconditionally (pw-probe gating left on the per-kernel emitters); counters are cumulative because PP passes share ONE `graph_builds` baseline. Score AC1 on the **absolute** `kv_view_built` -- the legacy pin makes both sides 262,144, so a ratio test would pass the control it fails in substance. Observability only. Scored in ab20/ab22 below.
+
+**AB20/AB21 EXECUTION RECORD, 2026-10-02 (first hardware execution of `--kv-graph-pad`, 2 mutex holds).** Control `build/llama-cuda/bin/t-gplr71-control` (ab19 `ctl38x`, re-verified 16/16); candidate `build/llama-cuda/bin/t-gplr71-changed` (`llama.dll 14f4e04d98f9bd6e`). `pp_prebuild_per_pass` read as RESOLVED from `run_start`: **1, source `default`** (rep=2 + KV q8). Score AC1 on absolute `kv_view_built`. Telemetry `build/llama-cuda/logs/ab2{0,1}-*.jsonl` (+`.mem.csv`), `gplr07-qa-512{,-kvpad256}.*`.
+
+| AC | Result |
+|---|---|
+| AC1 | **PASS.** `kv_view_built` = **50,176** at ctx 262144 / 131072 / 65536 vs the control's 262,144. TG across a 4.00x ctx sweep: control **0.827x**, candidate **1.000x** (target <=1.05). Kernel-level (nsys) flatness NOT re-measured. |
+| AC2 | **PASS.** TG 23.407 -> **29.609 tok/s = +26.5%** same-hold (+28.2% vs the 23.096 baseline), target >=15%. Compute 39,281.8 -> 30,255.6 us/token: **9,026 recovered** vs the 9,000.4 predicted (0.3%). |
+| AC3 | **PASS.** `graph_builds` **0** on every PP line, both engines, all ctx. PP 3,089.0 -> 3,096.7 (+0.25%); n=1 per cell. |
+| AC4 | **PASS, figures corrected 2026-10-02 on re-derivation.** At ctx 262144 both arms peak at **8,160,768,000 B = 7,782.71 MiB = 7.600 GiB** (poller only) and are **byte-identical**; ctx 65536 at 5,039.94 MiB; the n=2 interleaved replication reads **byte-identical at all three contexts, 6/6 arms** (the ab21 +270,336 B at ctx 131072 was a transient). The 7,778.4 MiB / 7.596 GiB this row previously carried appears in no artefact and is withdrawn. |
+| AC5 | **PASS on both paths.** qa-smoke 512: 5/5 needles, negative control FAIL exit 1, check-telemetry OK (30,547 events); repeated by hand **with** `--kv-graph-pad 256`, same PASS, `kv_view_built`=`kv_view_live`=768. |
+| AC5b | Route parity **clean on all 6 arms** (480 events / 240 distinct / every tuple x2 / 0 singletons), exit 0. Required `rep=2` + `--route-telemetry 1`; the wrapper default `rep=3` cannot pass. |
+| AC6 | **Superseded by ab22 below.** At `tg=128` the guard correctly had nothing to do; it fires at `tg>=177`. |
+
+**CORRECTED (was: "the rule was never reached").** ab20 read `view_rebuilds_total: 0` because `tg=128` stops 49 tokens short of the first pad boundary, NOT because the decode set is a build-on-miss. The set IS found and built (`rs_z -1`) and the guard is evaluated on every TG token; it has nothing to do until live outgrows the built width at token 177 (see ab22). ab20's speedup still came from the step-2 `n_pad_view` override sizing that build. **Do not read `view_rebuilds_total: 0` at `tg<=176` as unreachability.**
+
+**Withdrawn.** The plan's predicted ~16x-too-narrow bring-up set (3,072 vs 50,176) is not what runs. AC1's flatness is scored from end-to-end TG tok/s, NOT the nsys FA-kernel scan, so prof3's ratios are **not** re-measured.
+
+**Confounds.** TG ids differ between arms, but the same control config also differs across sessions (pre-existing nondeterminism, not this change); cache uncontrolled; n=1 per cell; candidate dips 6.5% at ctx 131072 (unexplained); **provenance never supplied, not refused** (no `REFUSED` token exists in any verdict; `ab20` carries `binary_state=not-supplied` and there is no session-level `ab21` verdict), identity resting on hashing both binary directories before and after. Detail in `docs/currentstate.md`.
+
+**GUARD PROOF, 2026-10-02 (host test + ONE hardware arm).** Steps 3-4 are no longer reviewed-but-unexecuted.
+
+*Host.* New `tests/test-layer-streaming-tg-view.cpp`, 39 checks, in `-Suite host` (now **77/77**, was 76). It drives the **production** symbols, so two were extracted to be reachable: `should_arm_view_rebuild` (the shipped guard `if`) and `record_built_view` (the stamp+reset inside `finish_build`, whose sanity returns hid the reset). Covers all three directions, the reset, the flag pair, the storm arithmetic, and the legacy pin staying inert.
+
+*It found a real latent defect.* Driving `arm_tg_view_rebuild` for the first time **ever** killed the process with `0xC0000094` -- the divide-by-zero already measured and fixed at `llama_ls_tel_mark` (`:1312`): `ggml_time_us()` divides by the static `timer_freq` that `ggml_time_init()` sets, and `arm_tg_view_rebuild` called it without that guard. Harmless on the runner, invisible to review **because the function had never run**. Fixed with the repo's own one-liner.
+
+*Configuration derived, not guessed.* Case (f) models the runner's real initial condition (decode set built on-miss at `GGML_PAD(50001,256)`=50,176) and predicts the guard's **only** firing at generated **token 177**, live 50,432.
+
+*ab22, one hold, one arm, `tg=256`: prediction exact.* One `tg_view_rebuild` event, `built_n_kv 50176`/`required_n_kv 50432`; `view_rebuilds_total` **0/0/1**; `kv_view_built`=`kv_view_live`=**50,432**; `graph_builds` 0/0/2; VRAM **7.600 GiB** = 8,160,768,000 B (re-derived; unchanged); route parity clean; TG **29.513** vs 29.609 tok/s at `tg=128`, so the mid-generation rebuild costs nothing measurable. **Steps 3-4 are exercised, not dead code.** Provenance was never supplied, not refused (`binary_state=not-supplied`); the hash attests a directory, not the running process. Detail in `docs/currentstate.md`.
+
+**Escalation condition.** If any extra PP graph build cannot be avoided, or if the act-slab layout cannot be made chunk-shape-independent without new VRAM, **stop and escalate to the owner**: the charter ranks PP above TG, and a TG gain bought with PP graph builds or added VRAM is not a win.
+
+### T-GPLR-70 ADDENDUM (prof3, 2026-10-02, host-only): stock's scan length is ESTABLISHED, and the "42x" gap was a warmup artifact
+
+Tool `build/stock-levers/tg-decode-scan-length.py`; evidence `prof3-{anchsm,anch,anchbig,lm,lmbig}.sqlite`.
+Method: identical decode kernel `flash_attn_ext_vec<256,1,Q8_0,Q8_0,0>` on `grid (1,10,16)` /
+`block (32,4,1)` in **both** engines, one decode pass per trace (10 attention layers = one token),
+`--ctx-size` swept 50,176 / 128,000 / 262,144 = **5.22x**.
+
+| engine | 50,176 | 128,000 | 262,144 | ratio over the 5.22x ctx sweep |
+| --- | --- | --- | --- | --- |
+| stock | 2,695.6 us | 2,661.4 us | 2,677.8 us | **0.993x - flat** |
+| ours | 2,282.7 us | 5,966.3 us | 11,678.2 us | **5.116x - proportional** |
+
+- **Stock scans live tokens only; ours scans the whole allocated cache.** Stock's scan length is
+  pinned by elimination: reading 262,144 slots would require 1,065 GB/s, while the same kernel at
+  ctx 50,176 over the same 546 MB achieves 202 GB/s. The only self-consistent value is ~50,128.
+- **Both engines run in the same efficiency band (stock 203-205 GB/s, ours 233-244 GB/s)**, so the
+  gap is *bytes scanned*, not kernel efficiency. That also closes the "~230 GB/s is suspicious"
+  worry: stock is equally far from the card's ~1,792 GB/s.
+- **The defect below is CONFIRMED; +9,000.4 us/token at ctx 262,144 is the PREDICTED size, not a**
+  **measurement** (the measured recovery is 9,026.2 us/token of compute, 8,949.4 of wall), 20.8% of the
+  43,297 us/token TG WALL measured by ab19 `ctl38x` (23.096 tok/s) at the validated 8 GB operating
+  point.** (Its layer-compute sum, 39,996.6 us/token, is a different quantity and must not be
+  substituted for the wall.)
+- **WITHDRAWN: "stock's decode FA is 13.2 us" and the "42x" gap.** That row used
+  `flash_attn_ext_vec<256,**2**,..>` on `grid (1,1,16)` = llama.cpp's **2-query warmup at
+  `n_past ~ 0`**, not decode. Stock's real decode cost is 2,661 us. Correct ratios, which must
+  **always carry their ctx**: **0.847x / 2.242x / 4.361x** at 50,176 / 128,000 / 262,144. At ctx
+  50,176, where allocated ~= live, **we are faster than stock**.
+- **CORRECTED byte width:** Q8_0 packs 34 B per 32 values, so KV is **1,088 B/token/layer**, not the
+  1,024 B an f16 assumption gives. **Q8_0 KV is 1.0625x LARGER than f16 KV**, not smaller - relevant
+  to any future f16-vs-q8 size argument. The "51.33 MB of real work" figure is withdrawn.
+- **The ~29.8 tok/s / 0.79x projection stays withdrawn** - the premise is confirmed but no working
+  fix exists. **Next probe:** whether the handoff executor can size the TG FA view from the live
+  position at *graph-build* time, or whether a per-token graph rebuild is required (which would cost
+  the `graph_builds == 0` property the handoff path relies on). **Do not retry the tensor mutation** -
+  that mechanism is falsified independently of the premise.
+
+**The defect.** `llama-layer-streaming.cpp:5602-5610` (tag `T-Q38FA-01`) narrows the attention KV
+view to the valid window on the **layer-major PP** path:
+`n_kv_valid = chunks[c].token_start + chunks[c].n_tokens`, applied as
+`t->src[1]->ne[1] = n_kv_valid; t->src[2]->ne[1] = n_kv_valid;` plus
+`ggml_flash_attn_ext_set_causal(t, q_pos_base, n_kv_valid)`. **There is no equivalent on the TG
+path**, whose graphs come from the handoff executor and are sized by `mctx->get_n_kv()` - the
+allocated, padded cache. At ctx 262,144 with a 50,000-token prompt, **every generated token scans
+262,144 KV slots instead of ~50,128: a 5.23x waste**, concentrated in the 10 full-attention layers,
+which cost ~2,075 us each against ~640 us for the 30 gated-DeltaNet layers.
+**Confirmed by the prof3 addendum above** (5.116x cost across a 5.22x ctx sweep, against stock's
+flat 0.993x on the identical kernel).
+
+**Measured evidence (host-only, existing nsys exports, no GPU, no rebuild).**
+- `lm50` at ctx 50,176 -> decode FA 228.3 us; `lm` at ctx 128,000 -> **557.6 us**. Same engine, same
+  50,000-token prompt (`run-prof.ps1` `$PpTokens = 50000`), same KV type, same launch geometry
+  `flash_attn_ext_vec<256,1,Q8_0,Q8_0,0>` grid (1,10,16) = 160 CTAs x 128 threads. **2.551x ctx ->
+  2.442x cost**, 4.2% off; cost per KV slot 4.551 vs 4.356 ns, constant to 4.5%.
+- `prof2-v1on` at ctx 128,000 -> 595.5 us, reproducing `lm`.
+- Extrapolation to ctx 262,144 -> **~1,166 us**, 81% of the measured 1,435 us attention penalty.
+
+**Scope.** Narrow the TG decode attention's KV view to the live window, mirroring the PP patch, and
+prove it. **Non-goals.** No change to the PP path (it is already correct); no change to the upstream
+FA kernels or the `ncols1=1` vec specialization, whose 160-CTA geometry is a separate, upstream
+occupancy limit; no VRAM trade; no default-path change.
+
+**Falsifiable acceptance criteria.**
+- **AC1.** With a decode profile at ctx 262,144 and a 50,000-token prompt, the decode FA kernel's
+  average drops from the predicted ~1,166 us to **< 350 us**. Anything in between is a partial fix
+  and must be reported as one.
+- **AC2.** The same arm's TG `tokens_per_s` rises from 23.26 tok/s by **at least 15%**, and the
+  measured peak VRAM does not increase by more than the compute-buffer drift (T-GPLR-68: ~78 MiB per
+  ubatch doubling).
+- **AC3 (falsifier).** If the decode FA kernel time does **not** track `n_ctx` when re-profiled after
+  the patch, the waste is not in the KV view length and the whole hypothesis is wrong. The existing
+  2-point ctx law makes this the sharpest available falsifier.
+- **AC4 (stock parity check, mandatory before any ratio is quoted).** Establish stock's actual scan
+  length at the same ctx and prompt. Stock's recorded decode FA is 13.2 us at ctx 128,000, which for
+  51.33 MB would be ~3.9 TB/s and is therefore physically impossible - so stock's `n_kv` is
+  **unverified** and the "42x" gap must not be quoted until it is.
+- **AC5.** Route parity stays clean on the patched arm (`--route-telemetry 1`), proving the patch
+  changes no arithmetic.
+
+**Validation.** One GPU arm under `tools/with-gpu-lock.ps1`, decode-profiled, plus a host-side
+trace check. No compiles during timing arms. Semantic-QA smoke tier if the change touches output.
+
+**Escalate** if narrowing the TG KV view changes generated tokens - that would mean the PP patch and
+the TG path disagree about what the causal window is, which is a correctness finding far more
+important than the speedup.
+
+### T-GPLR-68 (RESOLVED 2026-10-02, host-only): the unaccounted VRAM term is llama.cpp's own compute-buffer reserve
+
+Status: **MEASURED (2026-10-02, host-only, no GPU, no rebuild)**. AC1 met, AC2 met, AC3 met by an
+independent tool rather than by a falsifying arm, AC4 met **out of sample** for the residual and
+**NOT met** for the compute-buffer law (stated below, not papered over). The fix - adding the term
+to the capacity predicate - is **not started and not authorized**; see "What is left" at the end.
+Dependencies: none. Re-derivation tool: `build/stock-levers/vram-gap-attrib.py`.
+Commit: (none - measurement only, no source change)
+
+**Why it matters, and why it is not a footnote.** The capacity predicate
+(`llama-layer-streaming.cpp:6563`) accounts for `bounded_window + row_cache + prediction_pool +
+act_slab + reserve`. Measured on ab16 (slots 2, ctx 262,144, KV q8, 50,000 tokens, our tree), that
+`accounted` total is **6.451 GiB at ubatch 512, 1024, 2048 AND 4096 - constant** - while the
+**measured per-process peak runs 7.293 / 7.596 / 8.214 / 9.568 GiB**. Everything the ubatch lever
+buys or costs lives outside the predicate:
+
+| ubatch | accounted GiB | measured peak GiB | unaccounted GiB |
+| --- | --- | --- | --- |
+| 512 | 6.451 | 7.293 | +0.842 |
+| 1024 | 6.451 | 7.596 | +1.145 |
+| 2048 | 6.451 | 8.214 | +1.763 |
+| 4096 | 6.451 | 9.568 | +3.117 |
+
+The unaccounted term is **4.6x larger than the whole accounted term's spread**, and it grows roughly
+linearly in graph-set width. ab12 shows the same structure at slots 3 / ubatch 4096 with partial
+handoff: accounted 6.938 GiB, measured 13.434-19.341 GiB, unaccounted +6.497 to +12.403 GiB.
+
+**Consequences that are already established and should not be re-derived.**
+- **The 8 GB question can never be answered by `--residency-budget-mib` or by the capacity
+  predicate.** Both reason over `accounted`; the binding term is outside it. This is a second,
+  independent reason (the first is that the flag never sees the act slab or the reserve) and it is
+  why ab14 accepted a configuration that a real 8 GB card refuses.
+- **The only trustworthy statement of fit is a MEASURED per-process peak**, which is why ab16's
+  8 GB claim is stated against 7,778.3 MiB measured rather than against any predicted total.
+- **Any capacity model that omits it will be wrong in the direction that matters** - it will admit
+  configurations that do not fit.
+
+**Scope.** Account for the unaccounted term. Candidates to separate, none yet proven: graph-set
+compute buffers whose width scales with ubatch; the CUDA context (largely fixed); allocator slack;
+the per-width graph-set retention under `--pp-prebuild-per-pass`. Only the first is expected to be
+ubatch-dependent, and that expectation is currently unverified.
+
+**RESOLUTION 2026-10-02 (host-only: `byte_account` + runner `.log` + `mem.csv`, no GPU, no
+rebuild).** The unaccounted term is **llama.cpp's own scheduler compute-buffer reserve** — the
+`sched_reserve: CUDA0 compute buffer size` line the engine already prints at load time and that
+`byte_account` never counts. The name of the `graph_footprint` fields pointed at the right file
+but neither field is the term:
+
+| `graph_footprint` field | what the code actually computes | is it the term? |
+| --- | --- | --- |
+| `io_ctx_reserved_bytes` | `sum ggml_get_mem_size(io ctx)` (`main.cpp:5380`) — **host** tensor-descriptor metadata. 384.0 MiB, identical in all four arms. | **No.** Host RAM, and constant in ubatch. |
+| `io_ctx_used_bytes` | `sum ggml_nbytes(t)` over **every tensor of every graph** (`main.cpp:5381-5383`) — a LOGICAL sum. 104,561 / 183,688 / 289,191 / 500,196 MiB at ubatch 512/1024/2048/4096. | **No.** ~50x the physical footprint; the gallocr reuses across graphs. |
+| `slot_vram_bytes` | the slot window | **No** — already inside `byte_account.slot_window` (996.0 MiB, an 8,192 B alignment difference). |
+
+**The attribution (ab16, MiB; every "actual" term is a number a tool printed, nothing modelled):**
+
+| ubatch | measured peak | `byte_account` plan | GAP | weights | kv | state | **COMPUTE** | slab | slot | sum of actuals | residual |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 512 | 7,472.2 | 6,606.1 | 866.1 | 1,921.3 | 2,720.0 | 62.8 | **937.0** | 390.6 | 996.0 | 7,027.8 | 444.4 |
+| 1024 | 7,782.7 | 6,606.1 | 1,176.6 | 1,921.3 | 2,720.0 | 62.8 | **1,218.0** | 390.6 | 996.0 | 7,308.8 | 473.9 |
+| 2048 | 8,415.8 | 6,606.1 | 1,809.7 | 1,921.3 | 2,720.0 | 62.8 | **1,780.0** | 390.6 | 996.0 | 7,870.8 | 545.0 |
+| 4096 | 9,801.8 | 6,606.1 | 3,195.8 | 1,921.3 | 2,720.0 | 62.8 | **3,032.0** | 390.6 | 996.0 | 9,122.8 | 679.1 |
+
+- **AC1 (decomposition) MET.** The compute buffer carries **90.5% / 89.3% / 89.9%** of the growth
+  from ubatch 512. What survives is a bounded, characterized residual — not a mystery.
+- **AC2 (law) MET for the residual.** `residual = 411 + 0.0655 x ubatch` MiB; per-arm errors
+  +0.0 / −4.0 / −0.0 / +0.0 MiB. Over the whole ab16 shape, `measured peak ~= 7,139 + 0.650 x
+  ubatch` MiB — exact at both ends, −22 to −55 MiB in the middle (a sub-linear term, not noise).
+- **AC3 (falsifier) MET by an independent witness, not by a toggling arm.** The claim was
+  "compute buffers scale with graph-set width". llama.cpp sized that buffer itself and printed
+  the answer; the per-width deltas are monotonic in ubatch (+281 / +562 / +1,252 MiB per
+  doubling). **The `--pp-prebuild-per-pass` leg of AC3 is NOT exercised** — every ab16 arm ran
+  with it at its default of 1, so there is no contrast arm. That sub-test remains open.
+- **AC4 (predictive) MET OUT OF SAMPLE for the residual, NOT MET for the compute buffer.** The
+  ab5 arms (`ctx 512,000`, slots 3, KV 5,312.5 MiB — a different session and a different shape)
+  predict a residual of `411 + 0.0655 x 4096 = 679.3` MiB and measure **686.4 / 686.4 / 682.4**
+  MiB across three repeats: **+7.3 MiB, 1.1%**. The compute buffer, however, is **not** a function
+  of ubatch alone: at the *same* ubatch 4096 it is 3,032.0 MiB in ab16 and **5,472.0 MiB** in ab5.
+  The whole of that difference is ctx/slots/KV. So the four-point ab16 law is a law **for a fixed
+  ctx and slot count**, and a predictive compute-buffer law needs the ctx axis measured.
+
+**The VRAM shape, which rules out two candidates outright.** From `mem.csv`, every arm is a single
+**step at setup** that reaches its plateau by t≈10.9 s and then holds **flat** for the entire run
+(20-29 of 24-32 samples at plateau): u1024 24/30, u2048 23/27, u4096 23/27. Nothing accumulates
+per chunk, per layer or per pass. Therefore:
+- **allocator slack / fragmentation from repeated PP passes: ELIMINATED as the growth term** (no
+  growth exists to explain);
+- **`--pp-prebuild-per-pass` retention: ELIMINATED as the growth term** (same reason);
+- the CUDA context is inside the constant part of the residual, not the ubatch-dependent part.
+
+**What the residual is, honestly.** ~411 MiB constant plus a slow 0.0655 MiB/token drift. A
+constant of that order is the right size for the CUDA context plus driver and poller overhead on
+Windows; the drift is **not separately attributed**. Stated as unattributed rather than guessed.
+
+**Two corrections this produced, one of them a withdrawal-grade one.**
+
+1. **`byte_account` also OVER-counts weights by +515.3 MiB.** It plans `static + per_layer =
+   2,436.7 MiB`; llama.cpp allocated `CUDA0 model buffer = 1,921.3 MiB`. So the predicate is wrong
+   in **both** directions at once, and the over-count happens to mask part of the under-count. `kv`
+   and `state` agree exactly with `llama_kv_cache` / `llama_memory_recurrent` (2,720.0 / 62.8 MiB).
+2. **`run_end.peak_vram_bytes` is not a measurement and has never been one on the default path.**
+   It is `vram.total - vram.free_min` (`main.cpp:6424`), and `free_min` is updated **only** by
+   `ls_vram_budget_refresh`, whose three post-start call sites are all inside
+   `if (ls.row_set_retain)` (`:4956`, `:5036`) or `if (residency_tg)` (`:5742`). With the row cache
+   and `--residency-tg` off — the ab16 shape — it is **never called again after
+   `ls_vram_budget_measure_start`**, so `free_min == free_start` forever and the field is the
+   free-VRAM-at-startup number echoed back: **3,424,190,464 B = 3,265.6 MiB, byte-identical in all
+   five ab16 arms**, understating the true peak by 4,206.6-6,536.3 MiB. The console prints the same
+   fiction (`peak VRAM: 3265.56 MiB`) and `q38ls-layer-streaming-profile` carries it into its
+   report. Every peak quoted in this project has therefore come from the nvidia-smi poller, which
+   is the right source. Filed as **T-GPLR-69**; not fixed here.
+
+**Re-derived number, recorded because the charter requires it.** ab16 ubatch 1024's measured peak
+re-derives to **7,782.7 MiB** (the plateau is exactly 8,160,768,000 B in 24 of 30 samples), not the
+7,778.3 MiB carried in the PP-curve table — a 4.4 MiB (0.06%) discrepancy whose provenance is not
+recoverable from the stored artifacts. Every downstream statement ("fits in 8 GB", the 413.7 MiB
+headroom, the 3.72x / 0.62x comparison) is unchanged at that magnitude, but **the table figure
+should be corrected to 7,782.7 MiB** and the 8 GB headroom is **409.3 MiB, not 413.7**.
+
+**Act-slab suspect: still eliminated, and the general lesson stands.** The 2026-10-01 check stands
+(`build/stock-levers/act-slab-residency.py`, `RATIO resident/reported: 1.000`, both halves bound,
+`n_embd_io = n_embd_inp() = 2048` not 4096). It was never the term. **Lesson, now twice earned:
+an accounting suspect is not a finding until the source's own unit is checked** — here 4096 vs
+2048 manufactured an apparent 2x under-report that the data never contained, and **an accounting
+suspect must be checked against the allocator that actually made the allocation, not against
+another field of the same estimate.** `byte_account` was never the allocation log; `sched_reserve`
+was.
+**Non-goals.** No change to the predicate's *semantics* until the term is understood; no attempt to
+make the number smaller in this task; no new dependency; no default-path change. Reporting an
+unknown term as unknown is this task's deliverable, not hiding it.
+
+**Falsifiable acceptance criteria.**
+- **AC1 (decomposition).** At a fixed shape, the measured peak minus `accounted` is attributed to
+  named components with per-component measurements, and the residual is either zero or bounded.
+- **AC2 (law).** The ubatch dependence is characterized across at least the four widths already
+  measured, with a stated form and its residuals. A claim of "roughly linear" is not accepted
+  without the residuals.
+- **AC3 (falsifier).** The claim "graph/compute buffers scale with graph-set width" is FALSIFIED if
+  the per-width delta does not follow ubatch monotonically, or is FALSIFIED if it does not change
+  when `--pp-prebuild-per-pass` is toggled while width is held fixed. Either outcome is a result.
+- **AC4 (predictive value).** The characterization predicts a measured peak for a shape not in the
+  training set, within a stated tolerance. A model that cannot predict an unseen shape has not
+  solved AC2, however well it fits the four points it was built from.
+
+**Validation.** Host-only first (byte accounting arithmetic over recorded `mem.csv` + `byte_account`
+pairs); then at most one GPU arm per claim, through the mutex, no compiles during timing arms. All
+existing traces (`ab16-*`, `ab12-*`) are legitimate inputs and are re-readable now that the UTF-16
+log-reading trap is recorded in `AGENTS.md`.
+
+**Escalate** if the unaccounted term turns out to be dominated by something the predicate is
+*supposed* to own (which would mean the predicate is wrong, not merely incomplete), or if any part
+of it is a per-run leak rather than a steady-state cost.
+
+**Escalation condition: FIRED, and the answer is the first branch.** The term is dominated by
+something the predicate is *supposed* to own — it is the model's own compute buffers, the same
+family as the `static`/`per_layer`/`slot_window` terms already in `bounded`. So the predicate is
+**wrong, not merely incomplete**, and additionally over-counts weights by 515.3 MiB. The VRAM is a
+setup-time step, not a per-run leak, so the second branch did not fire.
+
+**What is left (not done here, not authorized).**
+1. Add the compute-buffer term to the capacity predicate — but it is **not known at preflight
+   time**, because the predicate runs before the context exists and `sched_reserve` prints after
+   it. This needs a *prediction* of `compute(ctx, slots, ubatch)`, which the current evidence
+   does not yet support (see AC4). Predicting it by sweeping ubatch, as ab16 did, is the discovery
+   method; predicting it from `ctx`/`slots` is the deliverable.
+2. Fix the +515.3 MiB weight over-count, which is a pure accounting bug and needs no measurement.
+3. The `T-GPLR-69` `peak_vram_bytes` defect.
+4. The `--pp-prebuild-per-pass` leg of AC3 (one A/B arm; cheap, and it also pins the last open
+   candidate from the original list).
+
+### T-GPLR-69 (draft, found 2026-10-02 by T-GPLR-68): `run_end.peak_vram_bytes` reports free-VRAM-at-startup, not a peak
+
+Status: DRAFT. Found during T-GPLR-68 attribution. **Not started, not authorized.** This is a
+report-only defect in the experimental path; it is not a capacity bug, but every future capacity
+claim that trusts the field would be wrong by 4-6 GiB.
+Dependencies: none.
+Commit: (none)
+
+**The defect.** `tel_run_end(exit_status, vram.total - vram.free_min, ...)` (`main.cpp:6424`)
+reports the device low-water mark. `free_min` is advanced **only** inside
+`ls_vram_budget_refresh` (`main.cpp:692-698`), which is called from exactly four places:
+`ls_vram_budget_measure_start` (`:4478`, before anything is allocated), and three later sites
+guarded by `if (ls.row_set_retain)` (`:4956`, `:5036`) or `if (residency_tg)` (`:5742`). On the
+default path — no row cache, no `--residency-tg` — **none of the three later sites runs**, so
+`free_min` never moves below `free_start` and the field is `total - free_start`.
+
+**Evidence.** All five ab16 arms emit `peak_vram_bytes = 3,424,190,464` byte-for-byte identical
+across ubatch 512/1024/2048/4096 and the V1 reference arm, while their measured peaks span
+7,472.2-9,801.8 MiB. `total - free_start = 25,650,855,936 - 22,226,665,472 = 3,424,190,464`,
+which is exactly `byte_account.free_vram` subtracted from `byte_account.total_vram`. The T-GPLR-24
+"low-water mark" fix is therefore correct **only** for row-cache / `--residency-tg` runs — which
+are exactly the runs the fix was written for — and silently inert everywhere else. The console
+line `peak VRAM: 3265.56 MiB` and the `q38ls-layer-streaming-profile` report field inherit it.
+
+**Falsifiable acceptance criteria.**
+- **AC1.** With row cache and `--residency-tg` both off, `run_end.peak_vram_bytes` tracks a real
+  change in device usage across two arms with different ubatch (today it cannot: they are equal).
+- **AC2.** The fix samples the device at least once after the compute buffer is allocated, so the
+  field is never below the sum llama.cpp reports it allocated.
+- **AC3 (falsifier).** If adding the post-prebuild refresh moves `peak_vram_bytes` to within
+  ~2% of the nvidia-smi plateau on ab16's four arms, the field becomes a usable cross-check on
+  the poller. If it does not, the discrepancy is the driver's own accounting and the field stays
+  advisory.
+- **AC4.** Every existing fixture that pins a `peak_vram_bytes` value keeps passing unchanged —
+  the fixtures are synthetic and must not be rewritten to match.
+
+**Escalate** if sampling the device inside the timed region costs measurable PP throughput; the
+correct response would then be a post-run out-of-band sample, not a loop of in-loop reads.
+
+---
+
+## Appendix: re-derived ledger for T-GPLR-68 (2026-10-02)
+
+`build/stock-levers/vram-gap-attrib.py` reads three independent sources per arm and prints the
+ledger above. It is the re-derivation path for every number in this block. One trap it encodes:
+`mem.csv` `dedicated_bytes` is in **bytes** while `byte_account` is compared in **MiB**, and a
+first cut of this script compared them directly and reported every arm as "peak reached at
+t=0.00s". The unit bug produced a *correct-looking* conclusion for the wrong reason — the same
+class of error as the 4096-vs-2048 act-slab trap, and the reason the shape line in the tool now
+carries an explicit warning comment.

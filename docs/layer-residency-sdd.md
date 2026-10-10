@@ -429,6 +429,120 @@ arrives.
   The class never alters routing, expert IDs, quantization bytes, or
   checkpoint metadata, and never owns KV, recurrent state, or session state.
 
+### moe-row-split class (per-expert host/device execution of one row set; added 2026-10-01, owner-directed)
+
+A **placement** class, not a storage class. It exists because on a card too
+small to hold the routed-expert rows, "wait for the row to arrive" is not a
+slow path but the whole cost: at an 8,192 MiB residency budget and 262,144
+context, bounded residency is 5,717.7 MiB and the row cache's whole allowance is
+2,474.3 MiB (section 10.2 of
+`docs/tg-expert-path-reconciliation.md`; `main.cpp:655-662`), so at most
+`K*W*top_k = 32` of a layer's 256 expert rows — 12.5% of a bank — can be
+device-resident at all. The majority of demanded experts must therefore be
+obtained some other way, and the only two ways are the link and the host.
+
+The link is not competitive, and this is measured rather than assumed
+(`tools/expert-cpu-bench`, iteration-disjoint, Q4_K bytes, TG shape
+`n_tokens=1`, 300 iterations, 2026-09-30, arm C `--pool 256 --id-stride 8`):
+the marginal host cost of one additional expert is **~36.5 us** against
+**~171 us** to fetch the same 1,769,472 B row at the best measured end-to-end
+feed of 10.35 GB/s. The host is **3.4-6.7x** cheaper at every k, and the margin
+is constant in k, so there is no break-even point at which fetching wins. The
+rule this class encodes is therefore not a tunable threshold: **a demanded row
+that is not device-resident computes on the host.**
+
+- **Membership.** Per logical MoE layer and per token, the router's exact
+  executed ID set is partitioned once, at demand time, into `S_gpu` (rows that
+  are device-resident at that instant) and `S_cpu` (every other demanded row).
+  The partition is **not fixed at run start**, is not per-layer-static, and is
+  not a placement budget: it is re-derived from actual residency for each
+  (layer, token). The shared expert, the router, attention, embeddings, the
+  output head, KV and recurrent state are untouched by the partition.
+- **Structural exactness.** The MoE output is a plain additive reduction over
+  experts (`src/llama-graph.cpp`: `experts = ggml_mul(build_lora_mm_id(down_exps, ...), weights)`
+  then one `view_2d` per expert and a `ggml_add` chain). Summing a `S_gpu`
+  partial and a `S_cpu` partial computes the same sum. The only permitted
+  divergence sources are floating-point summation order and the CPU-vs-CUDA
+  quantized kernel; corruption is not an available failure mode. Neither
+  permitted source is claimed to be zero — see the identity gate in T-GPLR-61.
+- **Trigger.** The split fires for a demanded row that is **not resident**. A
+  row that has not been *issued* is not a candidate and is a staging defect; a
+  row that is READY always runs on the device, because then there is no transfer
+  to save.
+- **Cost gate (explicit, host-side, re-derivable).** A named gate policy
+  evaluates per row from measured constants — host expert cost, row bytes,
+  measured link feed rate — and decides host-vs-wait. Its inputs and outputs are
+  telemetry (`rows_gate_cpu`, `rows_gate_gpu`, `gate_estimated_host_us`,
+  `gate_estimated_wait_us`). A named policy is never silently widened, and a
+  policy that **cannot be evaluated refuses the run** rather than defaulting.
+- **Fixed-width padded shape (required by the persistent graph set).** Each
+  sub-op is emitted at constant width `top_k`, with absent experts padded by a
+  zero router weight, so every (token, layer) yields identical graph shapes and
+  the graph set never rebuilds because of a subset. A variable-width sub-op is
+  out of scope and must be escalated, not improvised.
+- **Execution-shape constraint — READ TOGETHER WITH THE ROW-SET CONSTRAINT
+  ABOVE. This class sits OUTSIDE that prohibition, and the reasoning is
+  recorded here so it is not re-litigated.** The row-set constraint's subject
+  is explicit: "`MUL_MAT_ID` **in a row-set graph** must always consume
+  CUDA-resident weights owned by the matching slot generation", and what it
+  forbids is the scheduler's expert row-copy and any op-offload path that
+  **rewires a weight source**. The host sub-op is neither: it is a CPU-backend
+  op reading tensors at their own declared host placement, so no CUDA op
+  consumes host weights, no weight source is rewired, and nothing is staged
+  into a compute-usage staging buffer. The T-GPLR-16 deadlock evidence is
+  specific to the forbidden shape (CUDA `MUL_MAT_ID` consuming
+  scheduler-staged **host-bank weights**); deliberate host placement consumed
+  by a host op is ordinary `-ngl` partial offload.
+  **Residual hazard, named rather than assumed.** Activations must cross the
+  backend boundary: the input is device-resident, the host sub-op needs it, and
+  the partial must return for the add chain. That IS scheduler cross-backend
+  staging inside graph execution — of **activations**, not weights. The
+  constraint does not reach it and the deadlock evidence does not cover it, so
+  it is permitted by both letter and evidence; it is permitted, not proven safe.
+  It is where the per-layer sync cost lands and it is the nearest neighbour of a
+  known device deadlock. Therefore the guard for this class must assert
+  **specifically** that no *weight* source on this path is ever rewired by the
+  scheduler, and the activation round-trip must be **measured**, never assumed
+  free. A measurement showing the scheduler rewiring a weight source here is an
+  immediate stop and an escalation.
+- **Invariants are NOT relaxed.** The device sub-op still waits for its rows'
+  copy events and still consumes only slot-resident weights of the matching
+  generation; the host sub-op consumes **no slot at all**, because host-placed
+  weights are not slot contents. Package membership, atomic readiness and
+  retirement, generation identity and consumer-done accounting are unchanged, and
+  an in-flight copy the mechanism still owns is never cancelled or consumed by
+  this class.
+- **Capacity treatment.** Host-executed rows consume **zero device bytes**. This
+  is the property that matters at the 8 GB target: the class raises the device
+  share's floor without raising VRAM, and it is the only mechanism on the board
+  that can serve a demanded expert when the budget cannot hold it. The capacity
+  predicate in section 7 is unchanged — this class adds no device term — and a
+  host row is never counted against `--residency-budget-mib` or the row cache.
+- **Failure contract.** Refuse **before model load** (exit 2, `run_refused`
+  with the byte/placement arithmetic) on: an unknown or unevaluable gate policy;
+  a shape that cannot support the split (handoff active, a non-MoE residency
+  policy, a non-CUDA backend, an MTP draft loop that cannot be made draft-safe).
+  At run time: a non-finite value from any host expert is a **loud abort** naming
+  layer and expert ID; a demanded row that is neither READY nor PENDING/absent is
+  a loud abort; a row that is gate-approved for the host and then not executed is
+  a loud abort.
+- **Telemetry.** Per (layer, token): `experts_total`, `experts_device`,
+  `experts_host`, `rows_gate_cpu`/`rows_gate_gpu`, gate estimates, host execution
+  wall, `staged_bytes_avoided`, and the non-finite scan result. These counters are
+  the mechanism's own falsifier instruments and are emitted **even when the split
+  never fires** — a run with `experts_host == 0` is a recorded outcome of "did
+  not fire", never a pass with an implied benefit.
+- **Scope.** Opt-in, CUDA+CPU, **default off**, single process, TG only. In
+  layer-major PP the bank arrives whole, so there is nothing to split; this is a
+  TG class by construction. It never alters routing, expert IDs, top-k,
+  quantization bytes, the add-chain reduction, KV or recurrent state, logits
+  pattern, sampling, or any default path, and it makes no performance claim
+  until its identity gate passes.
+
+**Why this class exists at all, in one line:** on a card that cannot hold the
+banks, the alternative to a host-computed expert is a ~171 us link fetch of a row
+that costs ~36.5 us to compute where it already lies.
+
 ## 5. Layer-Major Prefill
 
 ```text
