@@ -2341,7 +2341,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // PARAMETER, and S2 gives each leg its own narrower row count (dev_rows =
     // top_k - host_rows for the device leg, host_rows for the host leg), so
     // indexing by hparams.n_expert_used walks off the end of the tensor:
-    
+
     //   GGML_ASSERT(view_src == NULL || data_size == 0 ||
     //              data_size + view_offs <= ggml_nbytes(view_src)) failed
     //
