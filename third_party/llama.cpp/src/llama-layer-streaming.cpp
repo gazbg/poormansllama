@@ -10457,6 +10457,17 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
     // budget at its default of 0, s3_cap stays 0 and both branches below take
     // exactly today's path: every staged row waits, one blocking sync.
     const bool s3 = experts_host_n > 0 && per_token != nullptr &&
+                    // T-GPLR-82 FALSIFIER: the decoupling exists to let a MISSED row
+                    // compute on the HOST leg while its copy runs. With the tail leg on the
+                    // DEVICE there is no host leg to absorb a skipped wait, so a skipped
+                    // wait means the device leg reads a row that was never staged --
+                    // MEASURED 2026-10-10 (session gplr82-a2dev, exe a9ddf169, arm A2dev with
+                    // an unbounded budget): 512 of 512 logit readouts non-finite while
+                    // ffn_dev read 1 (all device) and the ledger reported 0 host rows. The
+                    // conjunct is therefore part of the mode, not a tuning flag: this
+                    // predicate and the graph builder must agree on whether a host leg
+                    // exists or the run computes on unstaged bytes.
+                    !experts_host_leg_device &&
                     experts_host_budget_us > 0.0 && !row_set_recon &&
                     !row_set_spec_on && row_set_spec_mode == 0 &&
                     row_set_spec_arm < 0 && row_set_spec_pool == 0;

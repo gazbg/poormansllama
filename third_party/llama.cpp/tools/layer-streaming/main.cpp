@@ -3629,8 +3629,7 @@ int main(int argc, char ** argv) {
             } else if (raw_leg == "device") {
                 experts_host_leg_device = true;
             } else {
-                fprintf(stderr, "error: --experts-host-leg expects 'cpu' or 'device' (got '%s')
-",
+                fprintf(stderr, "error: --experts-host-leg expects 'cpu' or 'device' (got '%s')\n",
                         raw_leg.c_str());
                 return 2;
             }
@@ -5175,8 +5174,7 @@ int main(int argc, char ** argv) {
             "--experts-host-leg device re-places the --experts-host split's tail leg; without "
             "--experts-host no split is built, so the flag would change nothing while reading as "
             "if the falsifier had run";
-        fprintf(stderr, "error: %s. Pass --experts-host N as well, or drop --experts-host-leg.
-",
+        fprintf(stderr, "error: %s. Pass --experts-host N as well, or drop --experts-host-leg.\n",
                 detail);
         ls.tel_run_refused("experts_host_leg_without_host", detail, 1, 0, 0, "none");
         return 1;

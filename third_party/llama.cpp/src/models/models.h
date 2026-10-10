@@ -2306,6 +2306,22 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * host_ids,     // [n_host, n_tokens] I32
                     ggml_tensor * host_weights, // [1, n_host, n_tokens] F32 final
                             int   n_host) const;
+
+        // T-GPLR-82 FALSIFIER (2026-10-10, diagnostic). The SAME constant-width
+        // tail leg as build_moe_host_leg above, built against the SLOT layer's
+        // staged (device) expert tensors instead of the loader's host-placed banks,
+        // so the tail executes on the backend that owns those weights. Reached only
+        // under --experts-host-leg device (qwen35moe.cpp branches on it); the host
+        // leg above is what every normal run builds. It binds no weight the rewire
+        // guard has to inspect -- there is no host leg in this mode -- and it does
+        // NOT add the shared expert, which the device head leg already carries.
+        ggml_tensor * build_moe_tail_leg_device(
+                    ggml_tensor * cur,          // post-norm activation
+                            int   il,
+                    ggml_tensor * tail_ids,     // [n_tail, n_tokens] I32
+                    ggml_tensor * tail_pos,     // [n_tail, n_tokens] I32 window positions, or null
+                    ggml_tensor * tail_weights, // [1, n_tail, n_tokens] F32 final
+                            int   n_tail) const;
 #endif
 
         ggml_tensor * build_norm_gated(

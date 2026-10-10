@@ -532,12 +532,29 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                 }
                 cb(w_full, "ffn_moe_weights_split", il);
 
-                // device head leg: the FIRST dev_rows positions
-                ggml_tensor * sel_head = ggml_view_2d(ctx0, sel_in, dev_rows, n_tokens, sel_in->nb[1], 0);
+                // T-GPLR-82 FALSIFIER: WHICH SIDE OF THE ROW EACH LEG TAKES. The shipped
+                // split is head-at-0 plus a host tail in the SUFFIX. A suffix view cannot be
+                // expressed here: ggml bounds-checks a view as data_size + view_offs <=
+                // nbytes(src), and a [host_rows, n_tokens] I32 view with the parent row
+                // stride needs (T-1)*nb1 + host_rows*4 bytes PLUS an offset of dev_rows*nb1,
+                // which overruns (measured: GGML_ASSERT at ggml.c:1787 while building the
+                // persistent layer graphs). The device-tail mode therefore keeps the same
+                // 6/2 widths and the same ONE w_full derivation, but puts the TAIL at offset
+                // 0 and the HEAD at host_rows*len: the wider head view then ends exactly at
+                // the parent last byte, and the two legs cover disjoint complete positions.
+                // Which side holds which rows is not a fixed property of the shipped
+                // mechanism either -- its membership is plan-chosen per token. The shipped
+                // path is untouched: both offsets stay 0, head first.
+                const size_t id_off  = tail_device ? (size_t) host_rows * sel_in->nb[0]     : 0;
+                const size_t pos_off = tail_device ? (size_t) host_rows * sel_pos_in->nb[0] : 0;
+                const size_t w_off   = tail_device ? (size_t) host_rows * w_full->nb[1]     : 0;
+                // device head leg: dev_rows positions -- the FIRST ones in the shipped split,
+                // the LAST ones in the device-tail diagnostic (which holds the tail at 0)
+                ggml_tensor * sel_head = ggml_view_2d(ctx0, sel_in, dev_rows, n_tokens, sel_in->nb[1], id_off);
                 ggml_tensor * w_dev = ggml_view_3d(ctx0, w_full, 1, dev_rows, n_tokens,
-                                                    w_full->nb[1], w_full->nb[2], 0);
+                                                    w_full->nb[1], w_full->nb[2], w_off);
                 ggml_tensor * pos_head = window_live
-                    ? ggml_view_2d(ctx0, sel_pos_in, dev_rows, n_tokens, sel_pos_in->nb[1], 0)
+                    ? ggml_view_2d(ctx0, sel_pos_in, dev_rows, n_tokens, sel_pos_in->nb[1], pos_off)
                     : nullptr;
 
                 ggml_tensor * dev_out = build_layer_ffn(cur, il, sel_head, pos_head, w_dev, dev_rows);
@@ -548,15 +565,14 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                     // the slot's staged weights. Suffix VIEWS of the device leg's own
                     // inputs, so no new INPUT and no executor-side fill exists: every
                     // demanded row is staged and awaited exactly as in the unsplit path.
-                    ggml_tensor * sel_tail = ggml_view_2d(ctx0, sel_in, host_rows, n_tokens,
-                                                          sel_in->nb[1], (size_t) dev_rows * sel_in->nb[1]);
+                    // Offset 0 with the PARENT strides: the tail holds the first host_rows
+                    // positions in this mode, so there is no suffix arithmetic to bound.
+                    ggml_tensor * sel_tail = ggml_view_2d(ctx0, sel_in, host_rows, n_tokens, sel_in->nb[1], 0);
                     ggml_tensor * pos_tail = window_live
-                        ? ggml_view_2d(ctx0, sel_pos_in, host_rows, n_tokens,
-                                       sel_pos_in->nb[1], (size_t) dev_rows * sel_pos_in->nb[1])
+                        ? ggml_view_2d(ctx0, sel_pos_in, host_rows, n_tokens, sel_pos_in->nb[1], 0)
                         : nullptr;
                     ggml_tensor * w_tail = ggml_view_3d(ctx0, w_full, 1, host_rows, n_tokens,
-                                                        w_full->nb[1], w_full->nb[2],
-                                                        (size_t) dev_rows * w_full->nb[1]);
+                                                        w_full->nb[1], w_full->nb[2], 0);
                     host_out = build_moe_tail_leg_device(cur, il, sel_tail, pos_tail, w_tail, host_rows);
                 } else {
                     // host leg ids: a separate INPUT, not a view of sel_in. The host
@@ -1086,7 +1102,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_moe_host_leg(
 ggml_tensor * llama_model_qwen35moe::graph::build_moe_tail_leg_device(
         ggml_tensor * cur, const int il,
         ggml_tensor * tail_ids, ggml_tensor * tail_pos, ggml_tensor * tail_weights,
-        const int n_tail) {
+        const int n_tail) const {
     GGML_ASSERT(ls != nullptr && "build_moe_tail_leg_device is only reachable on the row-set path");
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
@@ -1106,7 +1122,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_moe_tail_leg_device(
             tail_ids,
             tail_pos,
             tail_weights);
-    cb(moe_out, "ffn_moe_tail_out", il);
     return moe_out;
 }
 #endif // LLAMA_LAYER_STREAMING
