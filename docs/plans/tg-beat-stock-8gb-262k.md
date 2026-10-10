@@ -111,6 +111,33 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - D8 Next lever is host-leg cost and overlap, not correctness: fused executor-owned host expert job (no ggml sched), concurrent with
   the device head leg; then K=4 / admission policy from the cache simulation.
 
+- **E8 (session e8-hostrows, S3 off, 32 tokens)**: ffn_compute_us vs host rows 1/2/4/6 = 579/613/574/643 us (all-device FFN 121 us): linear fit
+  574 + 8.8 x rows => the CPU leg through the ggml scheduler is a FIXED ~450-500 us per layer; expert math is ~10 us/row. (Guard readbacks
+  `ls_first_nonfinite` add ~170 us/layer of wall outside ffn_compute: env `LLAMA_LS_NO_SPLIT_SCAN=1` skips them for timing arms.)
+- **E9 (session e9-thr)**: applying `--cpu-threads` to the scheduler CPU backend did NOT shrink the fixed cost; more threads made it worse
+  (ffn_compute us: old 4-thread per-call pool 441, 2t 502, 4t 461, 8t 500, 16t 563). Thread propagation is therefore opt-in only
+  (`LLAMA_LS_TEST_NO_CPU_THREADS` currently inverts nothing: see code; default to be flipped to opt-in).
+
+## Agent findings (all labelled by the agents; D = derived, M = measured)
+- cache-sim (D, 23 streams, 4 natural docs): LRU hit 0.40-0.44/0.56-0.62/0.78 at 16/32/64 rows per layer; offline optimum 0.61/0.77/0.89. Layer-adaptive
+  capacity and static hot sets do not pay. Second-touch admission cuts PCIe fills ~3x (142 -> 25 rows/token) at equal hit on natural text. A one-layer-lead
+  co-activation prewarm adds +5pp. Fixed cost F dominates: 100 us F = 3.7 ms/token, +1pp hit = 0.19 ms.
+- research-cpu (D): fixed overhead is GPU<->CPU crossings in the scheduler (sync of the whole stream, pageable D2H/H2D) 120-180 us, CPU-split dispatch
+  30-70 us, 4 threads default (`--cpu-threads` never reaches the scheduler CPU backend; confirmed in code). Fused executor-owned host job would reach
+  ~34 tok/s only with a slimmed executor floor.
+- mtp-spec (D/M): self-speculation is a ~1.35x multiplier (range 1.1-1.6x) on a working base engine; the drafter loop exists in `main.cpp` but is
+  incompatible with layer-major PP and the host leg today. Upstream PR 22673 reports 22.9 -> 29.4 tok/s at d=2 on a 6 GB laptop.
+- branch-mining (ledger): **the earlier 'handoff-partial 38' arm ran ~30 tok/s at 7.6 GiB (ab20/tg72) but with incoherent output from TG token 2 -> a
+  run-1-ok/run-2-corrupt signature of the same allocation bug**; AER hybrid executor (GPU slot cache + pinned mailbox + CPU miss pool + EMA admission,
+  `LLAMA_MOE_HYBRID`) measured **97/118/134 tok/s at C32/64/96 vs 48/54/61 stock at matched VRAM, ctx 1k** (docs/currentstate.md of the AER worktree, 2026-10-01).
+
+## Decisions (continued 2)
+- D9 STRATEGY: the owner's idea (GPU slot cache of the last-K experts, CPU computes misses, background admission, no predictor) already exists as the AER hybrid
+  engine and was measured ~2x stock. Port it into the LM nested tree and use it as the TG engine after LM PP: `--tg-hybrid` makes decode graphs bypass the
+  streaming executor (`ls->tg_stock`, ls==nullptr in the graph builder) so `llama_moe_hybrid_build_ffn` applies. Core commit `aa6f00805` applied to the
+  LM tree (13/14 files clean; `qwen35moe.cpp` hook ported by hand; registration tolerates ranges the runner already pinned). PP stays LM (charter priority 1).
+- D10 Measure first: E10 reproduces the AER hybrid vs stock at the goal shape (`-c 262000`, q8 KV, C=16/24/32 slots, interleaved, VRAM polled).
+
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
