@@ -57,6 +57,13 @@ static void usage(const char * prog) {
         "  --no-mmap              load the model into ordinary host memory\n"
         "  --model-env NAME       read the model path from environment variable NAME\n"
         "  --kv-cache S           f16 (default), q8, or q4 for both K and V\n"
+        "  --kv-graph-pad N       KV graph-length granularity passed to llama_context_params.n_pad\n"
+        "                         (default 0 = legacy: n_pad = n_ctx, which pins every attention view\n"
+        "                         to the whole allocated cache). N>0 makes llama_kv_cache::get_n_kv()\n"
+        "                         return GGML_PAD(live_positions, N) instead. T-GPLR-71: N>0 is only\n"
+        "                         correct together with a post-prefill phase-1 graph-set rebuild, because\n"
+        "                         the TG set is otherwise built at bring-up when no KV cells exist yet\n"
+        "                         and would read only the last N positions. Must divide --ctx-size.\n"
         "  --telemetry PATH       JSONL telemetry output (default: none)\n"
         "  --telemetry-chunk-stride N  emit layer-major PP chunk timings every N chunks (default: 10; always includes first and final)\n"
         "  --graph-budget-mib N   fail after the prebuild, before the timed PP, if the summed reserved\n"
@@ -164,6 +171,18 @@ static void usage(const char * prog) {
         "  --residency-tg-window W  T-GPLR-62 S2: narrow the row-set slot window to W experts\n"
         "                       (0 = full bank, default). W must cover the worst-case\n"
         "                       union; a wider union refuses with 'window_overflow'.\n"
+        "  --graph-preflight-only  T-GPLR-82: build the persistent row-set graphs, print the\n"
+        "                       graph footprint, then EXIT before PP/TG execution. A\n"
+        "                       graph-build assert surfaces here instead of after a full\n"
+        "                       pass. The model IS still loaded: the prebuild needs a real\n"
+        "                       llama_context, so only EXECUTION is skipped, not the load.\n"
+        "  --experts-host N     T-GPLR-82 S2: compute the LAST N positions of every routed top-k\n"
+        "                       on the CPU backend, against the model loader's host-placed\n"
+        "                       expert banks, instead of on the device. Default 0 = off,\n"
+        "                       which builds no host leg at all. N must be less than the\n"
+        "                       model's top_k (the graph builder refuses otherwise, with\n"
+        "                       the real number). Requires --residency-tg: the host sub-op\n"
+        "                       only exists on the row-set executor path.\n"
         "  --residency-tg-recon   T-GPLR-62 S2 A9: byte-compare every staged slot slab against\n"
         "                       the checkpoint bytes for that position. Slow; a mismatch\n"
         "                       refuses the run with 'recon_mismatch'.\n"
@@ -323,6 +342,15 @@ static const char * const kRunRefusalReasons[] = {
     "init_failed",          // ls.init returned false (streaming bring-up failed)
     "prebuild_failed",      // the PP persistent-graph prebuild failed
     "graph_budget",         // reserved io bytes exceeded --graph-budget-mib
+    // T-GPLR-61 step-C evidence (measured 2026-10-08, gplr61-mtp-refusal): the
+    // four bring-up guard refusals below were emitted without being registered
+    // here, so check-telemetry REJECTED their own refusal trace ("reason is
+    // missing or not one of the recognized refusal reasons"). The enum's whole
+    // point is that an emitted reason is checkable; these four now are.
+    "row_set_layer_major",        // T-GPLR-73: row-set flags under --pp-schedule layer-major
+    "experts_host_without_rowset",// T-GPLR-82 S2: --experts-host without --residency-tg
+    "experts_host_budget_without_host", // T-GPLR-61 S4: --experts-host-budget without --experts-host
+    "experts_host_with_mtp",      // T-GPLR-61 step C: --mtp with --experts-host
 };
 
 static bool ls_run_refusal_reason_ok(const std::string & reason) {
@@ -1294,6 +1322,20 @@ struct ls_phase_build_allowance {
     // rebuild. That build is inside the timed region by construction and is
     // expected, not a violation.
     bool s2_narrow_seen = false;
+    // T-GPLR-80: an armed --kv-graph-pad made a phase-1 set's built attention
+    // view stop matching the live one, so the executor flagged it for the same
+    // T-GPLR-47 fresh-context rebuild. That rebuild is inside the timed region
+    // BY CONSTRUCTION -- the whole point of the pad is that the view stops
+    // spanning the whole cache, so the set cannot be prebuilt once and reused
+    // for the whole session -- and it is expected, not a violation. It happens
+    // once per pad block crossed (measured 2026-10-02, tg80-padfix: exactly 1
+    // rebuild over 128 tokens at pad 256, with kv_view_built == kv_view_live ==
+    // 50176 afterwards; the unarmed control reports 0 builds and 262144/262144).
+    //
+    // This does NOT weaken the check. The allowance is driven by an EVENT the
+    // guard emits when it decides a rebuild is required, so a build with no
+    // matching tg_view_rebuild is still a violation, exactly as before.
+    bool view_pad_rebuild_seen = false;
     // T-GPLR-12: handoff events anywhere in the run. Never reset.
     bool handoff_ever = false;
 
@@ -1305,17 +1347,26 @@ struct ls_phase_build_allowance {
             handoff_ever = true;
         } else if (event == "rowset_narrow") {
             s2_narrow_seen = true;
+        } else if (event == "tg_view_rebuild") {
+            view_pad_rebuild_seen = true;
         }
     }
 
     // The single rule. The build is still counted and reported either way; this
     // only decides whether it counts as a violation.
-    bool allows_builds_in_phase() const { return handoff_seen || s2_narrow_seen; }
+    bool allows_builds_in_phase() const { return handoff_seen || s2_narrow_seen || view_pad_rebuild_seen; }
 
     // T-GPLR-10 asks whether this phase followed a handoff, then the phase ends.
     // Both flags are per-phase facts, so both are cleared here. The S2 flag is
     // emitted once, immediately after the PP phase_summary and before any TG
     // phase_summary, so clearing it at a phase boundary cannot change a verdict.
+    //
+    // T-GPLR-80: view_pad_rebuild_seen is deliberately NOT cleared here. Unlike
+    // the other two it can fire on ANY generation token, not only at a phase
+    // edge -- the pad block boundary lands wherever the live position crosses
+    // it (measured: token 1, then token 177 at pad 256) -- so a phase-boundary
+    // reset would silently un-account a mid-phase rebuild and report it as a
+    // violation. TG is the last phase, so holding it costs nothing.
     bool end_phase() {
         const bool after_handoff = handoff_seen;
         handoff_seen   = false;
@@ -1422,6 +1473,18 @@ static int check_telemetry(const std::string & path) {
         }
 
         const std::string event = json::value(line, "event");
+
+        // T-GPLR-80: route EVERY event through the allowance's single mapping,
+        // before the per-event dispatch below. It used to be called only from
+        // the `handoff` and `rowset_narrow` branches, so the struct's own
+        // promise -- "a new topology-change event cannot be honoured at one
+        // call site and forgotten at the other" -- was false for any event
+        // without a branch of its own, which is how `tg_view_rebuild` was
+        // silently dropped and a legitimate --kv-graph-pad rebuild kept being
+        // reported as "graph construction in timed region". Idempotent: the
+        // mapping only sets flags.
+        build_allowance.note_event(event);
+
         if (event == "run_start") {
             if (have_run_start) {
                 err("duplicate run_start");
@@ -2463,6 +2526,10 @@ static int validate_telemetry(const std::string & path) {
 
         const std::string event = json::value(line, "event");
 
+        // T-GPLR-80: see the sibling checker above -- the mapping must see every
+        // event, not only the ones that happen to have a branch of their own.
+        build_allowance.note_event(event);
+
         if (event == "run_start") {
             if (have_run_start) {
                 err("duplicate run_start");
@@ -3175,8 +3242,19 @@ int main(int argc, char ** argv) {
     int pp_prewarm = 0;              // T-GPLR-53 A4: pre-timed modality pre-warm (0=off default; bitfield 1/2/4/8)
     int pp_prewarm_delay_ms = 1700;  // T-GPLR-53 A4: mode-4 no-touch delay duration (default = compiled control)
     int pp_span_pace = 0;            // T-GPLR-56 A3: paced registration of the mapped spans (0=off default, 1=paced)
+    // T-GPLR-71: 0 = legacy behaviour (n_pad = n_ctx, i.e. every attention view spans the
+    // whole allocated cache). A positive value is a granularity that must divide the
+    // rounded session length; it is REJECTED unless the post-prefill phase-1 rebuild of
+    // step 3 is in place, because on its own it would build the TG view before any KV
+    // cell exists and silently under-read. See the usage text and the plan block.
+    long long kv_graph_pad = 0;
     int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
     int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
+    // T-GPLR-72: host-backend thread count. Default 16 = the value that was
+    // previously hardcoded, so a default run is the same configuration it
+    // always was. The A/B arm varies ONLY this, to size how much host
+    // throughput the configured thread count actually buys.
+    int cpu_threads = 16;
     int device = 0;
     std::string tel_path;
     std::string check_path;
@@ -3224,6 +3302,23 @@ int main(int argc, char ** argv) {
     bool residency_tg = false;       // T-GPLR-13: --residency-tg moe-row-set TG policy (reactive expert row windows)
     int  residency_tg_retain = 0;    // T-GPLR-19: --residency-tg-retain [N] per-layer row cache (0 = off, default; bare flag = kRowSetRetainDefault)
     int  residency_tg_window = 0;    // T-GPLR-62 S2: --residency-tg-window W compact row-set slot width in experts (0 = full bank, default)
+    int  experts_host = 0;          // T-GPLR-82 S2: --experts-host N routed rows per token computed on the CPU backend (0 = off, default)
+    // T-GPLR-82 FALSIFIER (2026-10-10): --experts-host-leg device. false (default) =
+    // the shipped host leg, i.e. the tail rows run on the CPU from the loader's
+    // host-placed banks. true = the same constant-width tail leg built against the
+    // slot's staged tensors, so it runs on the device. Diagnostic only, refused
+    // without --experts-host N, and it builds no host sub-op and no hsel input.
+    bool experts_host_leg_device = false;
+    // T-GPLR-61 S4: --experts-host-budget B, microseconds of host expert work per
+    // token that the copy-wait decoupling may spend (each admitted row costs the
+    // measured 36.5 us/expert). 0 -- the default -- is today's behaviour: every
+    // staged row is awaited. "inf" admits every missed row the fixed host leg
+    // can hold (host-first).
+    double experts_host_budget = 0.0;
+    // T-GPLR-82: build the persistent row-set graphs, print the footprint, then exit
+    // BEFORE any PP or TG execution. A graph-CONSTRUCTION defect (a ggml view that
+    // overruns its source, say) otherwise only shows up after a whole timed pass.
+    bool graph_preflight_only = false;
     bool residency_tg_recon  = false; // T-GPLR-62 S2 A9: --residency-tg-recon byte-level staged-window recon (off by default)
     int         residency_tg_spec = 0;        // T-GPLR-58 A0: --residency-tg-spec <0|1|2> speculative placement (0 off, 1 scripted, 2 reserved for the A1 proposer)
     int         residency_tg_spec_budget = 0; // T-GPLR-58 A0: --residency-tg-spec-budget <N> pending fills per layer (0 = auto = top_k)
@@ -3310,6 +3405,8 @@ int main(int argc, char ** argv) {
             // T-GPLR-04: --ctx-size is honored in run mode as the explicit
             // context/KV capacity, independent of the PP token count.
             run_ctx_size = ctx_size;
+        } else if (arg == "--kv-graph-pad") {
+            kv_graph_pad = atoll(arg_value(argc, argv, i, "--kv-graph-pad").c_str());
         } else if (arg == "--residency-budget-mib") {
             residency_budget_mib = atoll(arg_value(argc, argv, i, "--residency-budget-mib").c_str());
         } else if (arg == "--reserve-mib") {
@@ -3364,6 +3461,12 @@ int main(int argc, char ** argv) {
             pp_prewarm_delay_ms = atoi(arg_value(argc, argv, i, "--pp-prewarm-delay-ms").c_str());
             if (pp_prewarm_delay_ms < 0 || pp_prewarm_delay_ms > 60000) {
                 fprintf(stderr, "error: --pp-prewarm-delay-ms expects 0..60000; got %d\n", pp_prewarm_delay_ms);
+                return 2;
+            }
+        } else if (arg == "--cpu-threads") {
+            cpu_threads = atoi(arg_value(argc, argv, i, "--cpu-threads").c_str());
+            if (cpu_threads < 1 || cpu_threads > 256) {
+                fprintf(stderr, "error: --cpu-threads expects 1..256; got %d\n", cpu_threads);
                 return 2;
             }
         } else if (arg == "--pp-span-pace") {
@@ -3490,6 +3593,60 @@ int main(int argc, char ** argv) {
             if (residency_tg_window < 0 || residency_tg_window > 4096) {
                 fprintf(stderr, "error: --residency-tg-window expects 0..4096 experts (got %d)\n",
                         residency_tg_window);
+                return 2;
+            }
+        } else if (arg == "--graph-preflight-only") {
+            graph_preflight_only = true;
+        } else if (arg == "--experts-host") {
+            // T-GPLR-82 S2: how many of every routed top-k are COMPUTED on the
+            // CPU backend instead of the device. 0 is the default and builds no
+            // host leg at all, so an un-flagged command line is untouched. The
+            // membership rule is positional (the LAST N top-k positions), which
+            // is what keeps the graph a fixed shape; the ids themselves are an
+            // executor input, so S3 can choose membership per token with no
+            // rebuild. The authoritative bound is the model's top_k, which the
+            // graph builder checks against the real number.
+            experts_host = atoi(arg_value(argc, argv, i, "--experts-host").c_str());
+            if (experts_host < 0 || experts_host > 64) {
+                fprintf(stderr, "error: --experts-host expects 0..64 routed rows (got %d)\n",
+                        experts_host);
+                return 2;
+            }
+        } else if (arg == "--experts-host-leg") {
+            // T-GPLR-82 FALSIFIER (2026-10-10): where the SPLIT's tail leg executes.
+            // "cpu" is the shipped mechanism: build_moe_host_leg binds the model
+            // LOADER's host-placed expert banks, so those rows run on the CPU backend
+            // and the split is not numerically equivalent to the unsplit FFN. "device"
+            // builds the same constant-width tail leg against the SLOT's staged tensors
+            // instead, so the tail runs on the same backend as the head -- a DIAGNOSTIC
+            // partition that exists only to separate a backend effect from a partition
+            // effect. It is not a placement policy: it gives away the mechanism's point
+            // (those rows are not staged by then in the shipped mode) and it is never a
+            // default. Absent = cpu = every existing command line unchanged.
+            const std::string raw_leg = arg_value(argc, argv, i, "--experts-host-leg");
+            if (raw_leg == "cpu") {
+                experts_host_leg_device = false;
+            } else if (raw_leg == "device") {
+                experts_host_leg_device = true;
+            } else {
+                fprintf(stderr, "error: --experts-host-leg expects 'cpu' or 'device' (got '%s')
+",
+                        raw_leg.c_str());
+                return 2;
+            }
+        } else if (arg == "--experts-host-budget") {
+            // T-GPLR-61 S4: the budget that gates S3's copy-wait decoupling.
+            // B in microseconds of host expert work per token. 0 keeps every
+            // blocking wait exactly as it was; "inf" is host-first.
+            const std::string raw = arg_value(argc, argv, i, "--experts-host-budget");
+            if (raw == "inf") {
+                experts_host_budget = HUGE_VAL;
+            } else {
+                experts_host_budget = atof(raw.c_str());
+            }
+            if (!(experts_host_budget >= 0.0)) {  // rejects negative AND NaN
+                fprintf(stderr, "error: --experts-host-budget expects a non-negative '%s' value or 'inf' (got '%s')",
+                        raw.c_str());
                 return 2;
             }
         } else if (arg == "--residency-tg-recon") {
@@ -4450,8 +4607,9 @@ int main(int argc, char ** argv) {
     cparams.n_outputs_max = pp_no_logits
         ? (mtp ? (uint32_t) (1 + mtp_draft) : 1)
         : (uint32_t) pp_tokens;
-    cparams.n_threads       = 16;
-    cparams.n_threads_batch = 16;
+    // T-GPLR-72: was hardcoded 16/16; now a flag whose default is that same 16.
+    cparams.n_threads       = (int32_t) cpu_threads;
+    cparams.n_threads_batch = (int32_t) cpu_threads;
     // T-Q38HG-06: the target may roll back a partial draft acceptance, which
     // requires recurrent-state snapshots for the Gated DeltaNet layers (the
     // hybrid memory clamps to 0 when the arch lacks rollback support).
@@ -4463,10 +4621,67 @@ int main(int argc, char ** argv) {
         cparams.type_k = GGML_TYPE_Q4_0;
         cparams.type_v = GGML_TYPE_Q4_0;
     }
-    // KV cache graph padding = n_ctx (the rounded total): keeps padded n_kv
-    // (and thus every graph shape) constant for the whole session so the
-    // persistent graphs built by the prebuild are reused by every ubatch with
-    // no timed graph construction. Must divide kv_size (= n_ctx_seq).
+    // T-GPLR-71: KV cache graph padding.
+    //
+    // LEGACY (kv_graph_pad == 0, the default, unchanged behaviour): n_pad is pinned to
+    // the rounded session length, which keeps padded n_kv -- and therefore every graph
+    // shape -- constant for the whole session, so the persistent graphs built by the
+    // prebuild are reused by every ubatch with no timed graph construction.
+    //
+    // The cost of that pin is that llama_kv_cache::get_n_kv() computes
+    //     n_kv = min(cells.size(), max(max(n_pad, 256), GGML_PAD(used_max_p1(), ...)))
+    // so with n_pad == n_ctx the max() always wins and EVERY attention view spans the
+    // whole allocated cache at every position. Measured 2026-10-02 (prof3): our decode
+    // attention costs 5.116x across a 5.22x --ctx-size sweep, i.e. it tracks the
+    // allocated cache, while stock on the identical kernel stays flat at 0.993x. At the
+    // 8 GB operating point that is 9,000.4 us/token, 20.8% of the 43,298.4 us/token TG wall.
+    //
+    // A positive kv_graph_pad makes get_n_kv() pad the LIVE position to that
+    // granularity instead, which is the mechanism stock already uses (stock runs
+    // n_pad = 0 and effectively pads to 256).
+    //
+    // WHERE THE OVERRIDE LIVES, and why it is not cparams.n_pad:
+    //   cparams.n_pad is a CONTEXT-WIDE pin. Lowering it would also narrow the
+    //   phase-0 (prefill) sets, and those are narrowed again per chunk by
+    //   T-Q38FA-01, which only ever SHRINKS a view. Under the layer-major pw
+    //   layout the prebuild builds WIDTH CLASSES (chunk 0, chunk 1, the tail),
+    //   not all 49 chunks, so the continuing class is built at position ~2048
+    //   while chunk 48 drives it with a window of 50,000. A context-wide pad of
+    //   256 would bake that class at 2,048 columns and the narrowing would then
+    //   have to EXPAND it. So the pin below stays exactly as it was, and the
+    //   granularity is armed as a phase-scoped override on the attention cache
+    //   (llama_memory_i::set_view_pad) at the prefill -> generation boundary.
+    //
+    // WHY THE BRING-UP SET MUST NOT BE TRUSTED: with pw_probe (the layer-major
+    // default) the phase-1 sets are built inside layer_streaming_prebuild at the
+    // SYNTHETIC positions that follow the width classes -- 1024+1024+848 = 2896 --
+    // so under a 256 pad they would be baked against GGML_PAD(2897,256) = 3,072
+    // columns and then reused for the whole session: generation would silently
+    // attend to only the last ~3,000 of 50,000 tokens. That is strictly worse
+    // than the waste it removes. T-GPLR-71 step 3 is what makes it safe: the
+    // executor compares each phase-1 set's recorded build width against the live
+    // width before every TG token, and flags the set for the T-GPLR-47
+    // fresh-context rebuild when the built view can no longer cover it. The
+    // refusal that used to live here is removed because that prerequisite now
+    // exists; the prebuild itself is NOT re-run (that would advance recurrent
+    // session state) -- only the one set is re-derived.
+    if (kv_graph_pad > 0) {
+        if (kv_graph_pad < 256) {
+            fprintf(stderr, "error: --kv-graph-pad %lld is below the 256 floor that "
+                    "llama_kv_cache::get_n_kv() enforces (n_pad_cur = max(n_pad, 256)); "
+                    "use 0 (legacy) or >= 256\n", kv_graph_pad);
+            return 2;
+        }
+        if ((n_ctx_total % (int) kv_graph_pad) != 0) {
+            fprintf(stderr, "error: --kv-graph-pad %lld does not divide the rounded session "
+                    "length %d; llama_kv_cache asserts kv_size %% n_pad == 0 at context "
+                    "creation, so this would fail later and less clearly\n",
+                    kv_graph_pad, n_ctx_total);
+            return 2;
+        }
+    }
+    // UNCHANGED from before T-GPLR-71, and still the prefill pin: every prefill
+    // graph is built and narrowed exactly as it was.
     cparams.n_pad = (uint32_t) n_ctx_total;
 
     // T-GPLR-04 / T-GPLR-19: the ONE VRAM budget model, seeded here with the
@@ -4892,9 +5107,104 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "layer-major preflight: streaming module initialized\n");
+    // T-GPLR-73: ANY row-set flag under --pp-schedule layer-major refuses
+    // loudly instead of being accepted quietly. The row-set executor lives in
+    // llama_context::layer_streaming_compute (the per-ubatch scheduler hook);
+    // llama_context::layer_major_pp references neither load_row_set nor
+    // ff_graphs nor row_set_active, so the combination would allocate the
+    // whole per-layer row cache (n_layer x row_set_cap rows -- 1080 MiB at
+    // K=2, additive over the full slot window) and then execute ZERO row-set
+    // fetches, inside a run whose phase_summary still looks healthy. The
+    // opt-in path must fail loudly when the requested policy is unsupported;
+    // a silent no-op that burns a gigabyte of VRAM is the worst outcome here,
+    // because it reads as "K=2 was tried and cost too much" rather than
+    // "K=2 never ran".
+    if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR &&
+        (residency_tg || residency_tg_retain > 0 || residency_tg_window > 0 ||
+         residency_tg_spec != 0 || residency_tg_spec_pool > 0 || residency_tg_recon ||
+         experts_host > 0 || experts_host_budget > 0.0)) {
+        const char * detail =
+            "row-set options are unsupported with --pp-schedule layer-major: the row-set executor is "
+            "llama_context::layer_streaming_compute, which llama_context::layer_major_pp never calls, "
+            "so the per-layer row cache would be allocated and never read";
+        fprintf(stderr, "error: %s.\n"
+                        "       Drop every --residency-tg* flag to run layer-major, or pass "
+                        "--pp-schedule batch-major (the only schedule that executes the row-set path).\n",
+                detail);
+        ls.tel_run_refused("row_set_layer_major", detail, 1, 0, 0, "none");
+        return 1;
+    }
     // T-GPLR-13: set BEFORE init/prebuild so the MoE builder creates two-part
     // TG graph sets (attn+router / FFN companion) for the row-set executor.
     ls.row_set_requested = residency_tg;
+    // T-GPLR-82 S2: 0 leaves the pre-S2 graph exactly as it was -- no host
+    // sub-op is constructed, no host-leg input exists, and the demand ledger
+    // reports every routed row as device-computed. A non-zero value is refused
+    // HERE rather than at the first graph build, because a host leg without the
+    // row-set executor would be a sub-op that nothing ever runs, and the run
+    // would look healthy in phase_summary while proving nothing.
+    if (experts_host > 0 && !residency_tg) {
+        const char * detail =
+            "--experts-host needs the row-set executor: the host expert sub-op is built by "
+            "llama_model_qwen35moe::graph::build_moe_host_leg, which only exists on the "
+            "--residency-tg two-part graph path";
+        fprintf(stderr, "error: %s.\n       Pass --residency-tg as well, or drop --experts-host.\n",
+                detail);
+        ls.tel_run_refused("experts_host_without_rowset", detail, 1, 0, 0, "none");
+        return 1;
+    }
+    // T-GPLR-61 S4: a budget without a host leg would change nothing yet read as
+    // if the decoupling had run, so it is refused at bring-up, in the same style
+    // as the experts_host guard above.
+    if (experts_host_budget > 0.0 && experts_host == 0) {
+        const char * detail =
+            "--experts-host-budget only gates the --experts-host host leg's copy wait; without "
+            "--experts-host there is no host sub-op, so a non-zero budget would be a silent no-op";
+        fprintf(stderr, "error: %s. Pass --experts-host N as well, or drop --experts-host-budget.",
+                detail);
+        ls.tel_run_refused("experts_host_budget_without_host", detail, 1, 0, 0, "none");
+        return 1;
+    }
+    // T-GPLR-82 FALSIFIER: the device-tail mode replaces the host leg rather than
+    // adding to it, so without --experts-host there is no split to place and the
+    // flag would be a silent no-op. Refused at bring-up, in the same style as the
+    // two guards above, and for the same reason: a run that looks healthy while
+    // proving nothing is the worst outcome for this experiment.
+    if (experts_host_leg_device && experts_host == 0) {
+        const char * detail =
+            "--experts-host-leg device re-places the --experts-host split's tail leg; without "
+            "--experts-host no split is built, so the flag would change nothing while reading as "
+            "if the falsifier had run";
+        fprintf(stderr, "error: %s. Pass --experts-host N as well, or drop --experts-host-leg.
+",
+                detail);
+        ls.tel_run_refused("experts_host_leg_without_host", detail, 1, 0, 0, "none");
+        return 1;
+    }
+    // T-GPLR-61 step C (SDD moe-row-split failure contract, section 4): an
+    // MTP draft loop whose draft-safety is not established refuses at
+    // bring-up. NOTE (measured 2026-10-08, gplr61-mtp-refusal): this sits
+    // AFTER llama_model_load_from_file and ls.init, so the refusal pays a
+    // full model load and touches the GPU -- it is pre-work (no run_start,
+    // no PP), not pre-load. graph_mtp builds its routed FFN with plain build_moe_ffn
+    // -- no host leg, no row-set state -- and T-GPLR-61 proves identity only
+    // for the target forward, so this combination fails loud instead of
+    // producing an unverifiable draft/verify loop. Remove the guard only
+    // with a draft-safety argument or an MTP identity run.
+    if (mtp && experts_host > 0) {
+        const char * detail =
+            "--mtp with --experts-host is unproven: the MTP draft head builds no host leg, so the per-row split is not shown draft-safe by T-GPLR-61";
+        fprintf(stderr, "error: %s\n       Drop --mtp or --experts-host.\n", detail);
+        // exit_status matches the return below (measured 2026-10-08: the event
+        // used to record 1 while the process exited 2).
+        ls.tel_run_refused("experts_host_with_mtp", detail, 2, 0, 0, "none");
+        return 2;
+    }
+    ls.experts_host_n = experts_host;
+    // T-GPLR-82 FALSIFIER (2026-10-10, diagnostic, default false): see the flag
+    // comment at its parse site. Plumbed here, before any graph is built.
+    ls.experts_host_leg_device = experts_host_leg_device;
+    ls.experts_host_budget_us = experts_host_budget;
     // T-GPLR-19 (F2-M1): per-layer row residency is requested here and its
     // private storage allocated below, both BEFORE the prebuild, so the whole
     // run works against a settled configuration and a failed allocation is
@@ -5273,8 +5583,8 @@ int main(int argc, char ** argv) {
         dparams.n_ubatch     = 1 + mtp_draft;
         dparams.n_seq_max    = 1;
         dparams.n_outputs_max = 1;
-        dparams.n_threads       = 16;
-        dparams.n_threads_batch = 16;
+        dparams.n_threads       = (int32_t) cpu_threads;
+        dparams.n_threads_batch = (int32_t) cpu_threads;
         dparams.ctx_type     = LLAMA_CONTEXT_TYPE_MTP;
         dparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
         dparams.ctx_other    = ctx;
@@ -5411,6 +5721,23 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "error: %s (aborted before the timed PP)\n", ls.error_msg.c_str());
                     exit_status = 1;
                 }
+            }
+            // T-GPLR-82: stop HERE, with the graphs built and accounted but nothing
+            // executed. Placed after the footprint/budget block (so a budget abort still
+            // reports itself) and before the mmap-registered page-locking and the timed
+            // PP (so neither runs). exit_status is honoured: a budget overrun above
+            // already set it to 1 and must stay a failure.
+            if (graph_preflight_only && exit_status == 0) {
+                fprintf(stderr,
+                        "graph preflight: persistent row-set graphs BUILT OK "
+                        "(%zu set(s), %llu build_generation, prep %.1f ms) -- "
+                        "exiting before PP execution (--graph-preflight-only)\n",
+                        ls.sets.size(), (unsigned long long) ls.build_generation,
+                        graph_prep_us / 1000.0);
+                fprintf(stderr,
+                        "graph preflight: NOTE the trace has no layer_compute records, so\n"
+                        "the demand-ledger checker is not applicable (it would exit 2).\n");
+                return 0;
             }
             // T-GPLR-37 churn-free variant: page-lock every executed layer's
             // mapped package source ONCE, here (after the prebuild, before the
@@ -5673,6 +6000,25 @@ int main(int argc, char ** argv) {
             : prompt_tokens[pp_tokens - 1]; // last PP token; first generated comes from logits
 
         ls.phase = 1;
+
+        // T-GPLR-71: arm the phase-scoped attention-view granularity. This is
+        // the prefill -> generation boundary: every prefill memory apply, and
+        // therefore every prefill graph build, has already happened above, so
+        // nothing PP depends on can be re-sized by this. From here on get_n_kv()
+        // returns GGML_PAD(live_positions, pad), which is what the first TG
+        // token's memory apply caches and what the replacement rebuild of the
+        // phase-1 set is then derived against.
+        //
+        // No-op under the default (kv_graph_pad == 0): the view pad stays 0 and
+        // get_n_kv() reads n_pad exactly as before.
+        if (kv_graph_pad > 0 && ctx != nullptr &&
+            !ctx->set_attn_view_pad((uint32_t) kv_graph_pad)) {
+            fprintf(stderr, "error: --kv-graph-pad %lld is not supported by this memory "
+                    "type; refusing rather than silently running the whole-cache "
+                    "attention view it was asked to remove\n", kv_graph_pad);
+            ls.failed = true;
+            exit_status = 1;
+        }
 
         // T-Q38HG-02/04/06: handoff — copy packages to a single device
         // buffer so the standard TG path (and the MTP draft head) sees
@@ -6449,3 +6795,4 @@ int main(int argc, char ** argv) {
 
     return exit_status;
 }
+

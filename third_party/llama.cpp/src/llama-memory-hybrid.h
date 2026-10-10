@@ -58,6 +58,12 @@ public:
 
     bool get_can_shift() const override;
 
+    // T-GPLR-71: forward the view granularity to the attention half only. The
+    // recurrent half has no n_kv -- its state is a fixed-size cell -- so there
+    // is nothing to narrow there, and forwarding keeps a hybrid model's
+    // attention view and its graph sets consistent with each other.
+    bool set_view_pad(uint32_t pad) override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

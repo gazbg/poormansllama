@@ -2283,7 +2283,30 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il,
                     ggml_tensor * selected_experts_in = nullptr,
-                    ggml_tensor * selected_experts_weight_in = nullptr);
+                    ggml_tensor * selected_experts_weight_in = nullptr,
+                    // T-GPLR-82 S2: when set, this leg's routed weights are
+                    // taken verbatim instead of being derived from the router
+                    // inside build_moe_ffn, and `routed_rows` rows are computed
+                    // instead of n_expert_used. Both default to the pre-S2
+                    // shape, so every caller outside the row-set split builds a
+                    // byte-identical graph.
+                    ggml_tensor * moe_weights_in = nullptr,
+                            int   routed_rows = 0);
+
+        // T-GPLR-82 S2: the host expert sub-op. Computes `n_host` routed rows
+        // on the CPU backend against the MODEL LOADER's host-placed expert
+        // tensors (model.layers[il].ffn_*_exps) -- never the slot layer's device
+        // copies, and never a rewired weight source (SDD section 4). Runs the
+        // existing add-chain reduction and returns its MoE contribution only;
+        // the shared-expert branch stays in the device leg.
+#ifdef LLAMA_LAYER_STREAMING
+        ggml_tensor * build_moe_host_leg(
+                    ggml_tensor * cur,        // post-norm activation
+                            int   il,
+                    ggml_tensor * host_ids,     // [n_host, n_tokens] I32
+                    ggml_tensor * host_weights, // [1, n_host, n_tokens] F32 final
+                            int   n_host) const;
+#endif
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

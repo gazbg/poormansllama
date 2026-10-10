@@ -124,6 +124,20 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // T-GPLR-71: override the granularity get_n_kv() pads the live position
+    // to. 0 restores the constructor's n_pad; the default implementation
+    // REFUSES, so a caller that asked for a narrower view learns it did not
+    // get one instead of silently running the whole-cache view it was trying
+    // to remove. Only memory types that own an attention cache override it.
+    //
+    // Declared LAST, after every pre-existing virtual, on purpose: inserting a
+    // virtual in the middle renumbers the ones below it, so any object file
+    // left over from a partial build would call the wrong override. Appending
+    // keeps every existing slot where it was. (Measured 2026-10-02: a
+    // mid-class insertion made test-layer-streaming-layout fail with
+    // 0xc0000409 until the test targets were rebuilt.)
+    virtual bool set_view_pad(uint32_t) { return false; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

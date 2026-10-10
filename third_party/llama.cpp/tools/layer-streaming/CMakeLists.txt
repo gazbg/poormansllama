@@ -55,6 +55,45 @@ if (LLAMA_LAYER_STREAMING AND GGML_CUDA)
     )
     set_tests_properties(layer-slot-lifecycle PROPERTIES TIMEOUT 900)
 
+    # T-GPLR-82: regression guard for the build_moe_ffn aggregation-loop clamp.
+    # The device leg of a split top-k builds `experts` with NE[1] = top_k -
+    # host_rows (6 for --experts-host 2 on Qwen3.6-35B-A3B), while the
+    # view/aggregation loops used to bound by hparams.n_expert_used (8), which
+    # walked one row past the tensor and aborted during graph prebuild with
+    #   GGML_ASSERT(view_src == NULL || data_size == 0 ||
+    #               data_size + view_offs <= ggml_nbytes(view_src))
+    # (ggml.c:1787, exit 0xC0000409). This test runs the exact prebuild with
+    # --experts-host 2 and stops before execution via --graph-preflight-only.
+    # Contract (empirical ctest semantics, measured 2026-10-06):
+    #   - FAIL_REGULAR_EXPRESSION wins when it matches, naming the assert;
+    #   - PASS_REGULAR_EXPRESSION is required for a pass even at exit 0, so a
+    #     vacuous run that never builds the graphs cannot pass;
+    #   - a silent non-zero exit fails both ways.
+    add_test(
+        NAME layer-streaming-host2-preflight
+        COMMAND llama-layer-streaming
+                --model-env Q38LS_MODEL_PATH
+                --residency moe-expert-bank
+                --pp-schedule batch-major
+                --residency-tg
+                --experts-host 2
+                --residency-tg-retain 2
+                --layer-slots 2
+                --kv-graph-pad 256
+                --kv-cache q8
+                --ctx-size 262144
+                --ubatch 1024
+                --tg-tokens 16
+                --copy-source mmap-registered
+                --graph-preflight-only
+                --telemetry ${CMAKE_BINARY_DIR}/gplr82-host2-preflight.jsonl
+    )
+    set_tests_properties(layer-streaming-host2-preflight PROPERTIES
+        TIMEOUT 300
+        PASS_REGULAR_EXPRESSION "persistent row-set graphs BUILT OK"
+        FAIL_REGULAR_EXPRESSION "GGML_ASSERT"
+    )
+
     # T-Q38LS-04: four-slot persistent-graph scheduler. The run test produces
     # JSONL (64 tokens, one ubatch, 4 slots); the check test validates the
     # scheduler invariants host-side (no GPU). Fixtures make the check depend

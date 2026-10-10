@@ -372,7 +372,18 @@ struct LLAMA_API llama_layer_streaming {
     //     read the pool (no torn weights, ever).
     char * pp_pool_acquire(int il, size_t & bytes, bool & contents_valid);
     void   pp_pool_release(int il, char * base, size_t staged_bytes, bool ok);
-    void   tel_pool_event(int il, bool hit, size_t bytes);
+    // T-GPLR-30 observability: `why` names the OUTCOME so a zero hit rate is
+    // self-describing. A bare hit/miss cannot distinguish a structural cliff
+    // (capacity < working set) from a broken policy, which is how the lru4
+    // 0% was misread as a policy result. Reasons:
+    //   resident      hit: the wanted bank was populated and idle
+    //   evicted       miss: an inactive entry was evicted to place the bank
+    //   out_of_range  miss: fixed policy, bank index beyond the pool (CAPACITY)
+    //   not_populated miss: fixed policy, entry exists but was never filled
+    //   entry_active  miss: fixed policy, entry is held by a live acquirer
+    //   no_free_entry miss: lru, every entry active or oversized (OCCUPANCY)
+    //   no_pool       NOT emitted: a disabled pool is not a capacity failure
+    void   tel_pool_event(int il, bool hit, size_t bytes, const char * why);
 
     // Qwen layer-major PP uses causal metadata instead of dense KQ masks.
     bool use_implicit_causal_mask = false;
@@ -479,6 +490,16 @@ struct LLAMA_API llama_layer_streaming {
         int32_t            n_outputs = -1; // out_ids width (per-ubatch logits rows)
         int                mode = -1;
         int32_t            chunk_id = -1; // >= 0: layer-major PP chunk identity
+        // T-GPLR-71: the attention view width (llama_kv_cache::get_n_kv) this
+        // set's graphs were actually built against. -1 = not recorded (a set
+        // that has not finished a build). Recorded in finish_build() from
+        // cur_build_n_kv, which the two build sites set from the live memory
+        // context. A set whose recorded view can no longer COVER the live view
+        // is rebuilt, never reused: an under-reading view is a silently wrong
+        // answer, not a slow one. Deliberately NOT part of find_set()'s variant
+        // identity -- a narrower view must REPLACE its set in place (the
+        // T-GPLR-47 fresh-context branch), not allocate a second set beside it.
+        int32_t            n_kv = -1;
         bool               built = false;
         // T-GPLR-62 S2: set when the set's baked weight pointers were invalidated
         // from under it -- build_row_set_window() replaced the slot bundle after
@@ -544,6 +565,19 @@ struct LLAMA_API llama_layer_streaming {
         // bank; while the slot is full width it is populated and audited but the
         // graph keeps consuming absolute ids, so nothing depends on it yet.
         std::vector<ggml_tensor *> ff_input_wpos;
+        // T-GPLR-82 S2: per-FFN-graph INPUT for the HOST expert leg's routed
+        // ids ([experts_host_n, n_tokens] I32). Deliberately NOT a view of
+        // ff_input: the host leg runs on the CPU backend and must not inherit a
+        // view of a device tensor, and the host membership rule is executor
+        // state that S3 will choose per token. Null (and a null back()) when the
+        // host leg is off, which is the default.
+        std::vector<ggml_tensor *> ff_input_hsel;
+        // T-GPLR-61 step C: per-FFN-graph OUTPUT carrying the host leg's
+        // PRE-AGGREGATION per-row expert outputs ([n_embd, experts_host_n,
+        // n_tokens] F32), stashed by build_moe_host_leg so the executor can
+        // scan for non-finite values after part B. Null (and a null back())
+        // when the host leg is off, which is the default.
+        std::vector<ggml_tensor *> ff_host_experts;
         // the A/B residual crossing uses the set's FREE act slot (act[(il+1)&1]
         // at part-A time; the slot pair alternates per layer exactly as the
         // single-part graphs do): part A copies the pre-FFN residual there, and
@@ -626,6 +660,29 @@ struct LLAMA_API llama_layer_streaming {
     uint64_t n_ubatches = 0;
     uint64_t build_generation = 0; // incremented on each finish_build (debug)
 
+    // T-GPLR-71: the attention view width the in-flight build is being made
+    // against, handed to finish_build() the same way cur_chunk_id hands the
+    // chunk identity to begin_build(). Set by both build sites (the prebuild's
+    // build_variant and layer_streaming_compute's build-on-miss) immediately
+    // before model.build_graph(); -1 = unknown (consumed and cleared by
+    // finish_build()).
+    int32_t cur_build_n_kv = -1;
+
+    // T-GPLR-71 step 5 (observability only; no behaviour reads these).
+    // last_live_n_kv: the live llama_kv_cache::get_n_kv() observed at the most
+    // recent execution, i.e. exactly the width the coverage rule judged
+    // against. -1 until an execution has run (the layer-major PP controller
+    // never calls layer_streaming_compute, so PP reports -1 under layer-major,
+    // which is itself informative: no phase-1 set exists during PP).
+    // view_rebuild_ctr: cumulative arm_tg_view_rebuild() firings since run
+    // start. Deliberately CUMULATIVE, not per-phase like graph_builds: every PP
+    // pass shares ONE graph_builds baseline, so a per-phase base here would let
+    // pass 2 hide pass 1's rebuilds. Cumulative cannot hide anything, and since
+    // PP's summaries are emitted before TG's, "0 on the PP lines, 1 on the TG
+    // line" attributes the firing exactly.
+    int32_t  last_live_n_kv  = -1;
+    uint64_t view_rebuild_ctr = 0;
+
         // telemetry sink (JSON Lines) and run identity
     FILE * tel_out = nullptr;
     std::string tel_path;
@@ -705,6 +762,85 @@ struct LLAMA_API llama_layer_streaming {
     // act-slab slices); -1 marks batch-major / TG sets.
     graph_set * begin_set(int mode, int64_t n_tokens, int32_t rs_z, int32_t n_outputs, int32_t chunk_id = -1);
 
+    // T-GPLR-71: true when a set built against `built` may still be reused for
+    // an execution that needs `required` columns.
+    //
+    // T-GPLR-80: this is EXACT EQUALITY, not `built >= required`. The original
+    // coverage test answered a different question from the one the executor
+    // asks, and the gap is the whole --kv-graph-pad failure:
+    //
+    //   * A graph's kq_mask is BAKED at its build width. Reuse is admitted only
+    //     by can_reuse_kq_mask(), which is `kq_mask->ne[0] == mctx->get_n_kv()`
+    //     -- exact. A set built at 262,144 columns is therefore not merely
+    //     "wide enough" when the live view is 50,176; it is UNUSABLE, and the
+    //     executor died on "graph set ... does not match current ubatch shapes".
+    //     Measured 2026-10-02 (tg73-d1-pad, --kv-graph-pad 256): the phase-1 set
+    //     is prebuilt BEFORE the pad is armed at the prefill->generation
+    //     boundary (main.cpp:5797), so it carries built = n_ctx = 262,144 while
+    //     the first TG token needs GGML_PAD(50001,256) = 50,176. `built >=
+    //     required` passed, nothing rebuilt, and the shape guard refused.
+    //   * The wider-built direction is also the dangerous one. If the exactness
+    //     were ever relaxed to a range, a 262,144-column view reused against a
+    //     50,176-column live read would silently drop the tail of the context --
+    //     exactly the failure T-GPLR-71 exists to prevent. Equality cannot: equal
+    //     widths cannot under-read.
+    //
+    // UNCHANGED from the coverage version, deliberately:
+    //   required <= 0 : nothing to check (no attention cache in play), reuse.
+    //   built    <= 0 : width UNKNOWN, so the match is UNPROVEN -> rebuild.
+    //     (Not every build site records a width: graph_params() attaches
+    //     `layer_streaming` unconditionally, so the reserve, speculative-
+    //     optimisation and non-default-graph-type builds reach
+    //     begin_build()/finish_build() too. An unrecorded width must never read
+    //     as reusable.) An unknown width costs at most one extra rebuild,
+    //     because the rebuild goes through layer_streaming_compute, which
+    //     records the real width.
+    //
+    // LEGACY EQUIVALENCE: with the view pad unarmed (--kv-graph-pad 0) both
+    // sides are the same constant (cparams.n_pad = n_ctx), so `==` and `>=`
+    // agree on every input -- covered, uncovered, unknown and the no-cache
+    // cases alike. The default run is therefore unchanged bit-for-bit; only the
+    // armed case, which previously could not run at all, gains behaviour.
+    //
+    // COST OF THE ARMED CASE, stated: the rebuild happens once per pad block,
+    // i.e. once per `pad` generated tokens (128 tokens at pad 256 is at most
+    // one). Each rebuild re-derives the whole phase-1 set inside the timed TG
+    // window. That is the price of not pinning every view to the whole cache,
+    // and it is the trade T-GPLR-71 chose; within a block every token reuses one
+    // shape, which is what makes shape-matched comparison possible at all.
+    //
+    // T-GPLR-71: the executor's guard condition as ONE named predicate, so a
+    // host test exercises the shipped decision. A test that re-spelled this
+    // `if` would prove nothing about production. Phase-gated on purpose: the
+    // phase-0 sets are driven by the layer-major controller, whose per-chunk
+    // causal narrowing is a separate mechanism that must not gain a rebuild
+    // trigger here.
+    static bool should_arm_view_rebuild(int phase, const graph_set * set, int32_t required) {
+        return phase == 1 && set != nullptr && set->built &&
+               !view_matches_live(set->n_kv, required);
+    }
+
+    static bool view_matches_live(int32_t built, int32_t required) {
+        if (required <= 0) {
+            return true;
+        }
+        if (built <= 0) {
+            return false;
+        }
+        return built == required;
+    }
+
+    // T-GPLR-71: flag one phase-1 (TG) set whose built view no longer covers
+    // the live one, and arm rebuild_replacement so the executor's next
+    // build-on-miss for it takes begin_set's T-GPLR-47 fresh-context branch --
+    // the SAME mechanism (and the same flag pair) T-GPLR-62 S2 uses after a
+    // row-set narrowing, so there is no new lifecycle path and no re-run of
+    // layer_streaming_prebuild (which would advance recurrent session state).
+    // Emits one tg_view_rebuild event naming both widths, so a trace can count
+    // rebuilds without any pw-probe gating. Cannot fail: the set is finished by
+    // the caller's precondition.
+    void arm_tg_view_rebuild(llama_layer_streaming::graph_set & set, int32_t built, int32_t required);
+
     // T-GPLR-47: construct a fresh graph_set OUTSIDE the live one (new ggml ctx
     // with the same no-alloc params, new llm_graph_result, act tensors REPLAYED
     // onto the old set's exact device regions -- never re-derived from a cursor,
@@ -743,6 +879,15 @@ struct LLAMA_API llama_layer_streaming {
     // after the graph build completes: allocate all INPUT-flagged tensors from
     // the persistent host buffer (at the set's cursor) and run sanity checks.
     bool finish_build();
+
+    // T-GPLR-71: stamp the width these graphs were built against onto the set
+    // and CLEAR the pending value. Split out of finish_build() because the
+    // reset is otherwise untestable: only two of the five build sites set
+    // cur_build_n_kv, so the clear is the only thing stopping an
+    // un-instrumented build from inheriting the PREVIOUS build's plausible-
+    // looking width -- the defect the clear exists to prevent, and invisible
+    // from finish_build()'s sanity returns.
+    void record_built_view(graph_set & set);
 
     // device tensor bundle for a logical layer (for graph building).
     // During handoff, returns the handoff-layers bundle (full resident copy of
@@ -887,9 +1032,57 @@ struct LLAMA_API llama_layer_streaming {
     // Optional F3/H8 part split: pass parts >= 0 (row-set TG only) to append the
     // part A attn+router / part B FFN timings; the default omits them, leaving
     // the record exactly as the other executors write it.
+    // T-GPLR-72 host/device split INSIDE a layer's span. cpu_us is per-thread
+    // CPU time consumed across the span (-1 = this executor does not
+    // instrument it). dev is 1 when the layer's weights live in a handoff
+    // bundle (device resident), else 0. Additive and defaulted to the
+    // unmeasured sentinel so an uninstrumented executor is visible.
+    // T-GPLR-75: attn_dev / ffn_dev carry the backend each PART of a layer ran
+    // on, classified per graph (0 = all host, 1 = all device, 2 = MIXED,
+    // -1 = not reported). They exist because the row-set executor dispatches
+    // BOTH parts through ggml_backend_sched, so one per-layer `dev` cannot
+    // describe it -- and before this the row-set call sites passed no `dev`
+    // at all, so every row-set TG event carried dev = -1 ("unreported") and
+    // the K=2 arms could not say whether they used CPU inference.
+    // T-GPLR-61 structure pass: the layer_compute record's optional tail as a
+    // record struct; defaults are the old parameter defaults (-1 / -1.0 = "not
+    // reported"). Identity fields stay positional; emitted records are
+    // byte-identical.
+    struct tel_layer_compute_params {
+        double attn_compute_us = -1.0;
+        double attn_setup_us   = -1.0;
+        double ffn_compute_us  = -1.0;
+        double ffn_setup_us    = -1.0;
+        double cpu_us          = -1.0;
+        int    dev             = -1;
+        int    attn_dev        = -1;
+        int    ffn_dev         = -1;
+        int    experts_total   = -1;
+        int    experts_host    = -1;
+        int    experts_device  = -1;
+        double host_us         = -1.0;
+        // T-GPLR-61 S4/S1: the gate's own record, emitted even
+        // when the split never fires (SDD moe-row-split telemetry).
+        int    rows_gate_cpu   = -1;
+        int    rows_gate_gpu   = -1;
+        double gate_host_us    = -1.0;
+        double gate_wait_us    = -1.0;
+        double staged_bytes_avoided = -1.0;
+        // T-GPLR-61 step C: the non-finite scan result. -1 = not scanned
+        // (no host leg), 0 = scanned clean, 1 = a non-finite value was
+        // caught (recorded, then the run aborts with a structured error
+        // naming layer, token and expert ID).
+        int    host_finite     = -1;
+    };
     void tel_layer_compute(int il, double compute_us, double setup_us, uint32_t generation, int64_t chunk,
-                           double attn_compute_us = -1.0, double attn_setup_us = -1.0,
-                           double ffn_compute_us = -1.0, double ffn_setup_us = -1.0);
+                           const tel_layer_compute_params & params = {});
+    // T-GPLR-76: WHICH nodes made a graph "mixed". attn_dev/ffn_dev say a
+    // graph straddled host and device; these say which OPS sat on the host
+    // side, because that is the actionable half. Accumulated across every
+    // layer of the first row-set round and emitted once, so a trace answers
+    // "what runs on the CPU in here" without a per-layer flood.
+    void tel_graph_backend_ops();
+    void accum_graph_ops(const struct ggml_cgraph * g, bool part_a);
     // T-GPLR-53 A2 (diagnostics only, self-gated on --pp-recon): step 1 of
     // layer-major PP stages no weights, so it produces no layer_compute record.
     // One embed_chunk per chunk carries that chunk's own span and its split.
@@ -1088,6 +1281,72 @@ struct LLAMA_API llama_layer_streaming {
     bool row_set_retain   = false;  // shape (i) retention requested (default off)
     int  row_set_retain_k = 4;      // K windows retained; 4 = the default depth
 
+    // T-GPLR-82 S2: routed expert rows per (layer, token) that the HOST leg
+    // computes instead of the device leg. 0 = off, which is the default and
+    // reproduces the pre-S2 graph exactly (no host leg is built at all). Must
+    // be strictly less than n_expert_used or no device row is left to compute;
+    // the graph builder refuses that. S2 is COUPLED: the device leg still waits
+    // for the same row-set readiness it always did, so this buys no speedup
+    // yet -- it exists so the host arithmetic is real, guarded and measured
+    // before S3 removes the wait.
+    int  experts_host_n   = 0;
+    // T-GPLR-82 S2: guard counters. host_leg_builds counts host sub-ops that
+    // were actually constructed; host_leg_weights_bound counts host-leg weights
+    // the rewire guard CHECKED and found still host-placed. A bound count of 0
+    // with a non-zero --experts-host means the guard never ran, which must not
+    // be mistaken for a pass.
+    uint32_t host_leg_builds        = 0;
+    uint32_t host_leg_weights_bound = 0;
+    // T-GPLR-61 S4: --experts-host-budget B, microseconds of host expert work
+    // per token that the S3 copy-wait decoupling may spend (one admitted row =
+    // the measured 36.5 us/expert). 0 (default) admits nothing and keeps every
+    // blocking wait byte-for-byte as it was; HUGE_VAL admits every missed row
+    // the fixed host leg can hold. Refused without experts_host_n > 0.
+    double experts_host_budget_us = 0.0;
+    // T-GPLR-82 FALSIFIER (2026-10-10, diagnostic, default false): build the
+    // split's TAIL leg on the backend that owns the slot's staged weights (the
+    // device) instead of on the CPU. It exists to break a confound, not to place
+    // work: the shipped host leg is CPU-placed because it binds the MODEL
+    // LOADER's host-placed expert banks (qwen35moe.cpp, build_moe_host_leg), so
+    // the split's measured numeric signature (step-0 logits 16.167877 against the
+    // control's 16.194481) cannot be attributed to the CPU without a partition
+    // that keeps every other property -- the fixed widths, the ONE w_full
+    // derivation, the positional suffix, the add-chain reduction -- and moves
+    // only the backend. This flag is that partition. It is NEVER a placement
+    // policy and must not be read as one: computing the tail on the device is the
+    // opposite of the mechanism's intent. It requires experts_host_n > 0 (refused
+    // at bring-up otherwise), it builds NO host sub-op and NO hsel input, and it
+    // leaves row_set_split_built at 0 for every layer so the executor's host-side
+    // paths (plan reorder, id fill, per-row scan) stay off and the ledger
+    // honestly reports 0 host rows and host_finite -1.
+    bool experts_host_leg_device = false;
+    // T-GPLR-61 S3: per slot, per expert: copies ISSUED but never observed
+    // complete on the host (a skipped wait leaves them outstanding). An
+    // outstanding row classifies PENDING -- it may compute on the host leg,
+    // never on the device leg, until a synchronization of that slot's
+    // ev_copy_ready (which covers every earlier record on the copy stream)
+    // clears the whole slot. Cleared wherever row_set_have is cleared.
+    std::vector<std::vector<uint8_t>> row_set_outstanding;
+    // T-GPLR-61 S3: per layer, per expert classification stashed by
+    // load_row_set AFTER staging for the executor's ls_plan_split and fill:
+    // the values of llama_ls_policy::ls_row_state (0=READY, 1=PENDING,
+    // 2=ABSENT). ABSENT cannot occur post-staging; the default of 2 makes a
+    // read before any load fail loudly instead of pretending READY.
+    std::vector<std::vector<uint8_t>> row_set_state;
+    // T-GPLR-61 S4: the ls_evaluate_gate verdict for the layer's last load,
+    // stashed so the executor's ls_plan_split and the layer_compute record
+    // see the SAME evaluation the wait decision used.
+    std::vector<uint8_t> row_set_gate_open;
+    std::vector<double> row_set_gate_host_us;
+    std::vector<double> row_set_gate_wait_us;
+    // T-GPLR-82 S3/S4 (2026-10-10): whether the split FFN graph was actually
+    // BUILT for this layer. The builder sets it when lp_split_in_play says the
+    // mechanism can admit a row; the executor reads it instead of experts_host_n
+    // so the two halves cannot disagree. Measured, budget at its default: with
+    // experts_host_n > 0 alone the executor demanded a host-leg id input
+    // (ff_input_hsel) that an unsplit graph never creates -- a loud abort
+    // (rc=1, "host-leg id input missing or misshaped for layer 0 (expected [2, 1])").
+    std::vector<uint8_t> row_set_split_built;
     // T-GPLR-62 S2: compact row-set WINDOW WIDTH, in experts. 0 (the default)
     // is the pre-S2 full-bank slot: ne[2] stays n_expert, the staging write
     // addresses the absolute expert id, and the graph consumes absolute ids.
@@ -1144,6 +1403,22 @@ struct LLAMA_API llama_layer_streaming {
                                     // the shallowest K whose offline (b) clears
                                     // the 0.6 gate). A caller may name any 1..64.
     int  row_set_cap      = 0;      // rows per layer = min(n_expert, K*W*top_k)
+
+    // T-GPLR-76: per-op host/device node census for the row-set TG graphs.
+    // attn_dev/ffn_dev say a graph STRADDLED host and device; these say WHICH
+    // OPS sat on the host side, which is the actionable half. Accumulated
+    // across every layer of the first row-set round and emitted once.
+    std::vector<std::pair<std::string, int> > rowset_host_ops_a;
+    std::vector<std::pair<std::string, int> > rowset_dev_ops_a;
+    std::vector<std::pair<std::string, int> > rowset_host_ops_b;
+    std::vector<std::pair<std::string, int> > rowset_dev_ops_b;
+    // T-GPLR-79: op NAMES of the host-side nodes. The op census answers "which
+    // op"; this answers "which tensor", which is what identifies a state
+    // tensor or a staging buffer. Host-only, so it stays small even if a graph
+    // is mostly device.
+    std::vector<std::pair<std::string, int> > rowset_host_names_a;
+    std::vector<std::pair<std::string, int> > rowset_host_names_b;
+    bool rowset_ops_emitted = false;
 
     // per layer: private bank storage, one cache tensor per package member
     // (shaped [ne0, ne1, cap] so a position is addressable at pos*slab), and
@@ -1487,7 +1762,8 @@ struct LLAMA_API llama_layer_streaming {
     // generation). Emits one rowset_fetch event; returns false with a
     // structured error on any inconsistency (never silently runs foreign
     // rows).
-    bool load_row_set(int il, const std::vector<int32_t> & ids);
+    bool load_row_set(int il, const std::vector<int32_t> & ids,
+                      const std::vector<std::vector<int32_t>> * per_token = nullptr);
 
     // T-GPLR-62 S2: union position lookup table written by the LAST successful
     // load_row_set. Sized n_expert, ALL entries set to -1, then
@@ -1537,6 +1813,12 @@ struct LLAMA_API llama_layer_streaming {
     // the checker validates coverage conservation against them (gate 10).
     uint64_t rowset_round_rows_retained = 0;
     uint64_t rowset_round_rows_retired  = 0;
+    // T-GPLR-82 S1: round START stamp. rowset_round's own t_us is the END
+    // stamp; with no start stamp the gap between consecutive stamps cannot
+    // be attributed, which is why the 2,662.864 ms tg82 outlier could not be
+    // placed (round stamps spanned 7.249 s of a 10.680 s wall). Telemetry
+    // only: nothing in the execution path reads this member.
+    int64_t  rowset_round_t0_us = 0;
     void rowset_round_end();
 
     // --- T-GPLR-08: one-layer-ahead PrefetchVirtualMemory probe (host feed) ---

@@ -21,6 +21,7 @@
 #ifdef LLAMA_LAYER_STREAMING
 
 #include "llama-layer-streaming.h"
+#include "llama-expert-split-policy.h"
 
 #include <chrono>
 #include <thread>
@@ -1170,6 +1171,30 @@ static bool alloc_tensors(ggml_backend_buffer_t buf, ggml_backend_buffer_type_t 
 // finish_build used to abort the whole run. Host memory, no VRAM, no placement
 // change; the tensor objects and their addresses are exactly what they would
 // have been inside buf_inputs.
+// T-GPLR-72: per-thread CPU time in microseconds, or -1 if unavailable.
+// Wall time cannot answer "was the host working?", because a CUDA region's
+// host block also waits on the device. GetThreadTimes reports this thread's
+// kernel + user CPU time at 100 ns resolution, which is what separates host
+// execution from a blocked span.
+static int64_t ls_thread_cpu_us() {
+#ifdef _WIN32
+    FILETIME ct, et, kt, ut;
+    if (GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut) == 0) {
+        return -1;
+    }
+    ULARGE_INTEGER k, u;
+    k.LowPart = kt.dwLowDateTime; k.HighPart = kt.dwHighDateTime;
+    u.LowPart = ut.dwLowDateTime; u.HighPart = ut.dwHighDateTime;
+    return (int64_t) ((k.QuadPart + u.QuadPart) / 10);   // 100 ns -> us
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return -1;
+    }
+    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
+}
+
 bool llama_layer_streaming::alloc_spill(const std::vector<ggml_tensor *> & tensors) {
     // the failed alloc_tensors pass may have allocated a prefix into
     // buf_inputs before hitting the tensor that did not fit; ggml_backend_
@@ -1182,19 +1207,42 @@ bool llama_layer_streaming::alloc_spill(const std::vector<ggml_tensor *> & tenso
         }
     }
     if (pending.empty()) {
+        error_msg = "alloc_spill: nothing left to allocate (the primary buffer exhausted but every tensor is already bound)";
         return false;
     }
+    // T-GPLR-66 (measured 2026-10-01, ab15): the size must be the size the
+    // ALLOCATOR WILL WALK, not a flat sum of the tensor sizes rounded once.
+    // alloc_tensors() realigns every tensor to the buffer alignment before it
+    // places it, so a pending set containing odd-sized tensors needs per-tensor
+    // padding that a flat sum omits. The flat sum made the buffer short by
+    // exactly the padding and the overflow always landed on the LAST tensor of
+    // the set -- measured: "tensor 'leaf_3' exceeds backing buffer
+    // (offset=802848 size=4 buffer=802848 align=32)", i.e. the spill buffer was
+    // allocated at precisely the cursor the walk had already reached.
+    //
+    // This is why the failure was non-monotonic in --ubatch and looked like a
+    // resource problem: at ubatch 4096 the pending set is dominated by 32 MiB
+    // aligned inp_embd slices, where the padding is zero and the flat sum is
+    // correct; at 1024/2048 the set carries small tensors ('leaf_*', 4 B) whose
+    // padding is not. ubatch 512 and 4096 completed, 1024 and 2048 aborted with
+    // exit 0xC0000409 on both slots=2 and (earlier) slots=3.
+    const ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+    const size_t spill_align = ggml_backend_buft_get_alignment(buft_cpu);
     size_t bytes = 0;
     for (const ggml_tensor * t : pending) {
-        bytes += ggml_backend_buft_get_alloc_size(ggml_backend_cpu_buffer_type(), t);
+        bytes = (bytes + spill_align - 1) / spill_align * spill_align;
+        bytes += ggml_backend_buft_get_alloc_size(buft_cpu, t);
     }
-    bytes = (bytes + 31) / 32 * 32;
     ggml_backend_buffer_ptr spill(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), bytes));
     if (!spill) {
+        error_msg = "alloc_spill: host allocation of " + std::to_string(bytes) + " B failed for " +
+                    std::to_string(pending.size()) + " tensor(s)";
         return false;
     }
     size_t off = 0;
     if (!alloc_tensors(spill.get(), ggml_backend_cpu_buffer_type(), pending, off)) {
+        error_msg = "alloc_spill: " + std::to_string(pending.size()) + " tensor(s) did not fit the " +
+                    std::to_string(bytes) + " B spill buffer (walk reached " + std::to_string(off) + " B)";
         return false;
     }
     buf_inputs_spill.push_back(std::move(spill));
@@ -2625,10 +2673,15 @@ char * llama_layer_streaming::pp_pool_acquire(int il, size_t & bytes, bool & con
     if (pp_pool_policy == 0) {
         // fixed: banks 0..N-1 pooled permanently, populated at configure
         if (il < 0 || il >= (int) pp_pool.size()) {
+            // CAPACITY, not policy: the pool is smaller than the bank index.
+            pool_n_miss++;
+            tel_pool_event(il, false, 0, "out_of_range");
             return nullptr;
         }
         pp_pool_entry & e = pp_pool[il];
         if (!e.populated || e.active) {
+            pool_n_miss++;
+            tel_pool_event(il, false, 0, e.active ? "entry_active" : "not_populated");
             return nullptr;
         }
         e.active = true;
@@ -2636,7 +2689,7 @@ char * llama_layer_streaming::pp_pool_acquire(int il, size_t & bytes, bool & con
         pool_bytes_saved += e.bytes;
         bytes = e.bytes;
         contents_valid = true;
-        tel_pool_event(il, true, e.bytes);
+        tel_pool_event(il, true, e.bytes, "resident");
         return (char *) ggml_backend_buffer_get_base(e.buf.get());
     }
     // lru: hit = populated entry mirroring il (reads only, so a pending DMA
@@ -2655,7 +2708,7 @@ char * llama_layer_streaming::pp_pool_acquire(int il, size_t & bytes, bool & con
             pool_bytes_saved += back.bytes;
             bytes = back.bytes;
             contents_valid = true;
-            tel_pool_event(il, true, back.bytes);
+            tel_pool_event(il, true, back.bytes, "resident");
             return (char *) ggml_backend_buffer_get_base(back.buf.get());
         }
     }
@@ -2687,10 +2740,14 @@ char * llama_layer_streaming::pp_pool_acquire(int il, size_t & bytes, bool & con
             pp_pool.push_back(std::move(moved));
         }
         pool_n_miss++;
-        tel_pool_event(il, false, nbytes);
+        tel_pool_event(il, false, nbytes, "evicted");
         bytes = nbytes;
         return (char *) ggml_backend_buffer_get_base(pp_pool.back().buf.get());
     }
+    // OCCUPANCY/CAPACITY: nothing was evictable. Counted, because leaving it
+    // silent is what made the published rate's denominator incomplete.
+    pool_n_miss++;
+    tel_pool_event(il, false, 0, "no_free_entry");
     return nullptr; // every entry busy or oversized: serve from mmap
 }
 
@@ -2717,9 +2774,13 @@ void llama_layer_streaming::pp_pool_release(int il, char * base, size_t staged_b
     }
 }
 
-void llama_layer_streaming::tel_pool_event(int il, bool hit, size_t bytes) {
-    tel_write(tel_out, "{\"event\":\"pool_event\",\"run_id\":%llu,\"layer\":%d,\"hit\":%s,\"bytes\":%zu,\"phase\":%d,\"t_us\":%lld}",
-        (unsigned long long) run_id, il, hit ? "true" : "false", bytes, phase, (long long) ggml_time_us());
+void llama_layer_streaming::tel_pool_event(int il, bool hit, size_t bytes, const char * why) {
+    // cap/policy ride on every event so no join is needed to read the rate:
+    // a 0% over cap=4 is a capacity statement, not a policy statement.
+    tel_write(tel_out, "{\"event\":\"pool_event\",\"run_id\":%llu,\"layer\":%d,\"hit\":%s,\"why\":\"%s\",\"bytes\":%zu,\"cap\":%d,\"policy\":%d,\"phase\":%d,\"t_us\":%lld}",
+        (unsigned long long) run_id, il, hit ? "true" : "false",
+        why ? why : "unspecified", bytes,
+        (int) pp_pool.size(), pp_pool_policy, phase, (long long) ggml_time_us());
 }
 
 void llama_layer_streaming::pool_stats(uint64_t & n_hit, uint64_t & n_miss, uint64_t & bytes_saved) {
@@ -2826,8 +2887,11 @@ bool llama_layer_streaming::set_pp_pool(int n_banks, const char * policy) {
             populated_bytes += e.bytes;
         }
     }
-    tel_write(tel_out, "{\"event\":\"pool_init\",\"run_id\":%llu,\"n\":%d,\"policy\":\"%s\",\"bytes\":%zu,\"populated_bytes\":%zu,\"populate_us\":%.1f,\"t_us\":%lld}",
-        (unsigned long long) run_id, pp_pool_n, pol.c_str(), total_bytes, populated_bytes,
+    // working_set is published because capacity/working_set IS the whole
+    // explanation for a zero hit rate; without it a reader cannot tell a
+    // structural cliff from a broken policy.
+    tel_write(tel_out, "{\"event\":\"pool_init\",\"run_id\":%llu,\"n\":%d,\"working_set\":%d,\"policy\":\"%s\",\"bytes\":%zu,\"populated_bytes\":%zu,\"populate_us\":%.1f,\"t_us\":%lld}",
+        (unsigned long long) run_id, pp_pool_n, n_layer, pol.c_str(), total_bytes, populated_bytes,
         (double) (t_pool1 - t_pool0), (long long) ggml_time_us());
     return true;
 }
@@ -3105,6 +3169,16 @@ bool llama_layer_streaming::init(const llama_model & model, int n_slots_, int de
 
     const llama_hparams & hparams = model.hparams;
     n_layer = (int) hparams.n_layer();
+    // T-GPLR-82 S3/S4 (2026-10-10): per-layer "the split FFN graph was BUILT".
+    // The model builder sets it when ls_split_in_play says the mechanism can
+    // admit a row, and the executor reads it instead of experts_host_n, so the
+    // two halves cannot disagree. Sized HERE -- init() is the bring-up that
+    // precedes every graph build. Sizing it in begin_row_set() instead was an
+    // out-of-bounds write (access violation 0xC0000005 during "building
+    // persistent graphs", measured 2026-10-10), because begin_row_set() runs
+    // AFTER the persistent graphs are built. Nothing clears it afterwards: the
+    // graphs persist for the run.
+    row_set_split_built.assign(n_layer, 0);
     n_embd_io = hparams.n_embd_inp();
 
     recr.resize(n_layer);
@@ -3782,6 +3856,8 @@ llama_layer_streaming::graph_set * llama_layer_streaming::begin_set(int mode, in
     set->ff_layer.clear();
     set->ff_input.clear();
     set->ff_input_wpos.clear(); // T-GPLR-62 S2: keep the two vectors the same length
+    set->ff_input_hsel.clear(); // T-GPLR-82 S2: same, one entry per FFN graph
+    set->ff_host_experts.clear(); // T-GPLR-61 step C: host-leg row outputs
     set->built = false;
 
     // T-GPLR-44 (measured, now fixed at the root by T-GPLR-47): the warning
@@ -3840,6 +3916,14 @@ ggml_cgraph * llama_layer_streaming::new_graph(int layer) {
     return g;
 }
 
+// T-GPLR-71: see the header. Recorded unconditionally, then cleared, so an
+// un-instrumented build records "unknown" (-1) instead of inheriting the
+// previous build's width. view_matches_live reads -1 as unproven -> rebuild.
+void llama_layer_streaming::record_built_view(graph_set & set) {
+    set.n_kv = cur_build_n_kv;
+    cur_build_n_kv = -1;
+}
+
 bool llama_layer_streaming::finish_build() {
     if (cur == nullptr || cur->ctx == nullptr) {
         error_msg = "finish_build: begin_build not called";
@@ -3881,6 +3965,19 @@ bool llama_layer_streaming::finish_build() {
         return false;
     }
 
+    // T-GPLR-71: record the attention view width these graphs were built
+    // against, BEFORE clearing needs_rebuild -- it is the fact the executor's
+    // coverage test compares the next live width against. A failed build never
+    // reaches here, so the flag and the width are cleared together.
+    //
+    // Recorded UNCONDITIONALLY, then the pending value is cleared. Clearing is
+    // load-bearing: only two build sites set cur_build_n_kv, so without the
+    // reset an un-instrumented build (reserve / speculative opt / non-default
+    // graph type) would inherit the PREVIOUS build's width and stamp a
+    // plausible-looking but unverified number onto a live set -- strictly worse
+    // than recording "unknown". With the reset such a site records -1, which
+    // view_matches_live now reads as unproven -> rebuild.
+    record_built_view(set);
     set.built = true;
     // T-GPLR-62 S2: the graphs now bind the CURRENT bundle (the compact one
     // when a narrowing happened), so the rebuild-pending flag is satisfied.
@@ -4225,6 +4322,193 @@ static bool backend_is_cuda(ggml_backend_t backend) {
     return ggml_backend_is_cuda(backend);
 }
 
+// T-GPLR-75: which backend actually executed a graph's nodes. The row-set
+// executor dispatches EVERY graph through ggml_backend_sched like the normal
+// path, so a single per-layer `dev` cannot describe a two-part layer: part A
+// (attention + residual + router) and part B (FFN + shared experts on the
+// staged rows) can land on different devices. Classify each graph on its own:
+//   0 = every node on a HOST buffer, 1 = every node on a device buffer,
+//   2 = MIXED (the honest answer when a graph straddles), -1 = not classifiable.
+// This is the measurement the K=2 arms lacked: they reported dev = -1 for all
+// 5,120 row-set TG events, so "does --residency-tg use CPU inference" had no
+// answer from the trace.
+// T-GPLR-78: ops that allocate a new tensor descriptor but run NO kernel.
+// Verified in this tree, ggml-cpu/ggml-cpu.c ggml_compute_forward(): RESHAPE,
+// PERMUTE, VIEW and TRANSPOSE are each an explicit `// nop` case. They still
+// appear in g->nodes with a real buffer, so before this filter a graph whose
+// only host-side node was a VIEW classified as 2 (MIXED) -- which is how
+// T-GPLR-75 reported 75% of attention "mixed" when ~100% of it was on the
+// GPU (T-GPLR-76 census: the ONLY host-side op was VIEW, 60 of 2,420).
+//
+// GGML_OP_CONT is deliberately NOT here: it dispatches ggml_compute_forward_cont
+// with n_tasks = n_threads, i.e. it is a real copy, and a host-side CONT means
+// an actual device->host transfer. Dropping it would hide real host work.
+static bool ls_op_is_metadata_only(ggml_op op) {
+    switch (op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_NONE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int ls_classify_graph_backend(const ggml_cgraph * g) {
+    if (g == nullptr || g->n_nodes == 0) {
+        return -1;
+    }
+    int n_host = 0;
+    int n_dev  = 0;
+    for (int k = 0; k < g->n_nodes; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (t == nullptr || t->buffer == nullptr) {
+            continue;
+        }
+        if (ls_op_is_metadata_only(t->op)) {
+            continue;
+        }
+        if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
+            ++n_host;
+        } else {
+            ++n_dev;
+        }
+    }
+    if (n_host == 0 && n_dev == 0) {
+        return -1;
+    }
+    if (n_host == 0) {
+        return 1;
+    }
+    if (n_dev == 0) {
+        return 0;
+    }
+    return 2;
+}
+
+// T-GPLR-76: WHICH ops sat on which side. The classifier above answers "did
+// this graph straddle"; this answers "which ops", which is the part an owner
+// can act on ("attention is on the CPU because MUL/SOFT_MAX have no CUDA
+// kernel in this build" is a different conversation from "it is mixed").
+// Tensors with no buffer are SKIPPED, exactly as in the classifier, so an
+// unallocated node is never silently reported as device-side.
+//
+// T-GPLR-78: this census is deliberately NOT filtered by ls_op_is_metadata_only.
+// The classifier answers "where did the work run"; the census answers "which
+// ops are in the graph and where does each node's buffer live", and that
+// question is only useful if the no-kernel VIEW nodes stay visible -- they are
+// exactly what exposed the T-GPLR-75 misreading. A graph filtered here would
+// have hidden the evidence that motivated the fix.
+static void ls_ops_census(const ggml_cgraph * g,
+                          std::vector<std::pair<std::string, int> > & host,
+                          std::vector<std::pair<std::string, int> > & dev,
+                          std::vector<std::pair<std::string, int> > & host_names) {
+    if (g == nullptr) {
+        return;
+    }
+    for (int k = 0; k < g->n_nodes; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (t == nullptr || t->buffer == nullptr) {
+            continue;
+        }
+        const bool is_host = ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer));
+        // T-GPLR-79: name the host-side nodes. Done BEFORE the op lookup so a
+        // host node is always attributable even if ggml_op_name is null, and
+        // names are truncated so a long CB name cannot bloat the event.
+        if (is_host) {
+            // T-GPLR-79b: ggml names a view "%s (view)" from its source, so a
+            // view of an unnamed source prints as "(view)" and the op census
+            // cannot say WHICH memory it touches. Walk view_src to the memory
+            // root and key on that instead: op, shape, type and hop count are
+            // what actually identify a state tensor or a KV view.
+            const ggml_tensor * root = t;
+            int hops = 0;
+            while (root->view_src != nullptr && hops < 16) {
+                root = root->view_src;
+                ++hops;
+            }
+            const char * rnm = ggml_get_name(root);
+            std::ostringstream ks;
+            ks << ggml_op_name(root->op) << " ne=[";
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                ks << (i ? "," : "") << root->ne[i];
+            }
+            ks << "] type=" << ggml_type_name(root->type)
+               << " hops=" << hops
+               << " rootbuf=" << (root->buffer == nullptr ? "none" :
+                     (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(root->buffer)) ? "host" : "dev"))
+               << " rname='" << (rnm ? rnm : "") << "'"
+               << " dst_off=" << ggml_nbytes(t);
+            std::string tn = ks.str();
+            if (tn.size() > 120) {
+                tn = tn.substr(0, 120);
+            }
+            bool hf = false;
+            for (size_t i = 0; i < host_names.size(); ++i) {
+                if (host_names[i].first == tn) {
+                    ++host_names[i].second;
+                    hf = true;
+                    break;
+                }
+            }
+            if (!hf) {
+                host_names.push_back(std::make_pair(tn, 1));
+            }
+        }
+        std::vector<std::pair<std::string, int> > & into = is_host ? host : dev;
+        const char * nm = ggml_op_name(t->op);
+        const std::string name = nm ? nm : "?";
+        bool found = false;
+        for (size_t i = 0; i < into.size(); ++i) {
+            if (into[i].first == name) {
+                ++into[i].second;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            into.push_back(std::make_pair(name, 1));
+        }
+    }
+}
+
+void llama_layer_streaming::accum_graph_ops(const ggml_cgraph * g, bool part_a) {
+    if (rowset_ops_emitted) {
+        return;   // the first round is representative; do not re-census
+    }
+    ls_ops_census(g, part_a ? rowset_host_ops_a : rowset_host_ops_b,
+                      part_a ? rowset_dev_ops_a  : rowset_dev_ops_b,
+                      part_a ? rowset_host_names_a : rowset_host_names_b);
+}
+
+static std::string ls_ops_json(const std::vector<std::pair<std::string, int> > & v) {
+    std::string s = "{";
+    for (size_t i = 0; i < v.size(); ++i) {
+        s += (i ? "," : "");
+        s += "\"" + v[i].first + "\":" + std::to_string(v[i].second);
+    }
+    return s + "}";
+}
+
+void llama_layer_streaming::tel_graph_backend_ops() {
+    if (rowset_ops_emitted) {
+        return;
+    }
+    rowset_ops_emitted = true;
+    tel_write(tel_out,
+        "{\"event\":\"graph_backend_ops\",\"run_id\":%llu,"
+        "\"part_a_host\":%s,\"part_a_device\":%s,\"part_b_host\":%s,\"part_b_device\":%s,"
+        "\"part_a_host_names\":%s,\"part_b_host_names\":%s,"
+        "\"t_us\":%lld}",
+        (unsigned long long) run_id,
+        ls_ops_json(rowset_host_ops_a).c_str(), ls_ops_json(rowset_dev_ops_a).c_str(),
+        ls_ops_json(rowset_host_ops_b).c_str(), ls_ops_json(rowset_dev_ops_b).c_str(),
+        ls_ops_json(rowset_host_names_a).c_str(), ls_ops_json(rowset_host_names_b).c_str(),
+        (long long) ggml_time_us());
+}
+
 bool llama_layer_streaming_prebuild(llama_context * ctx, const llama_batch & batch, int64_t tg_tokens, ggml_status & ret) {
     return ctx->layer_streaming_prebuild(batch, tg_tokens, ret);
 }
@@ -4267,6 +4551,95 @@ int64_t llama_context::layer_major_pp_first_token() {
     return best;
 }
 
+// One owner for the structured failure shape (error_msg -> failed -> error
+// event -> GGML_STATUS_FAILED); byte-identical to the inline copies it
+// replaces -- traces and checkers parse these exact strings.
+static ggml_status ls_shape_failure(llama_layer_streaming * ls, std::string msg) {
+    ls->error_msg = std::move(msg);
+    ls->failed = true;
+    ls->tel_error(ls->error_msg.c_str());
+    return GGML_STATUS_FAILED;
+}
+
+// T-GPLR-61 step C: the host-leg non-finite check, extracted from
+// layer_streaming_compute unchanged. The host leg's PRE-AGGREGATION
+// per-row outputs were stashed at graph-build time (ff_host_experts); the
+// aggregate cannot attribute a bad value to a row, so the scan is per row
+// and the expert ID is read back from the hsel input that selected it.
+// Flag absent -> no stash, no read, no sync: AC6 inertness.
+static ggml_status scan_host_expert_outputs(llama_layer_streaming * ls, llama_layer_streaming::graph_set * set,
+                                            int il, int64_t n_tok, int & host_finite) {
+    ggml_tensor * hex = nullptr;
+    if ((size_t) il < set->ff_host_experts.size()) {
+        hex = set->ff_host_experts[(size_t) il];
+    }
+    if (hex == nullptr || hex->data == nullptr || hex->buffer == nullptr ||
+        !ggml_is_contiguous(hex)) {
+        return ls_shape_failure(ls, "layer_streaming_compute: host-leg per-row outputs were not stashed for layer " +
+                                    std::to_string(il) + " (build_moe_host_leg did not capture experts_out)");
+    }
+    if (hex->ne[1] != ls->experts_host_n || hex->ne[2] != n_tok) {
+        return ls_shape_failure(ls, "layer_streaming_compute: host-leg per-row outputs have shape [" +
+                                    std::to_string(hex->ne[0]) + ", " + std::to_string(hex->ne[1]) + ", " +
+                                    std::to_string(hex->ne[2]) + "] for layer " + std::to_string(il) +
+                                    ", expected [*, " + std::to_string(ls->experts_host_n) + ", " +
+                                    std::to_string(n_tok) + "]");
+    }
+    ggml_tensor * hsel = set->ff_input_hsel[(size_t) il];
+    if (hsel == nullptr || hsel->data == nullptr) {
+        return ls_shape_failure(ls, "layer_streaming_compute: host-leg id input missing at scan for layer " +
+                                    std::to_string(il));
+    }
+    const int64_t ne0 = hex->ne[0], ne1 = hex->ne[1];
+    std::vector<float> rowbuf;
+    const float * rows = nullptr;
+    if (ggml_backend_buffer_is_host(hex->buffer)) {
+        rows = (const float *) hex->data;
+    } else {
+        rowbuf.resize((size_t) (ne0 * ne1 * hex->ne[2]));
+        ggml_backend_tensor_get(hex, rowbuf.data(), 0, rowbuf.size() * sizeof(float));
+        rows = rowbuf.data();
+    }
+    std::string bad;
+    // T-GPLR-61 step-C evidence (fault injection, test-only): when
+    // LLAMA_LS_TEST_NONFINITE is set, the FIRST scanned element is
+    // forced to read as non-finite, so this abort path runs for real
+    // end-to-end (scan loop, expert readback from hsel, message with
+    // layer/token/expert, host_finite=1 record, FAILED return --
+    // measured 2026-10-08, gplr61-nonfinite). Unset (the default)
+    // the branch is never taken: zero behavior change. Nothing
+    // downstream ever consumes the poisoned value because the run
+    // aborts below on the same pass.
+    static const bool test_nonfinite = getenv("LLAMA_LS_TEST_NONFINITE") != nullptr;
+    bool injected = false;
+    for (int64_t tt = 0; tt < hex->ne[2] && bad.empty(); ++tt) {
+        for (int64_t r = 0; r < ne1 && bad.empty(); ++r) {
+            const float * rp = rows + (tt * ne1 + r) * ne0;
+            for (int64_t cc = 0; cc < ne0; ++cc) {
+                float v = rp[cc];
+                if (test_nonfinite && !injected) {
+                    v = std::nanf("");
+                    injected = true;
+                }
+                if (!std::isfinite(v)) {
+                    const int32_t expert =
+                        ((const int32_t *) hsel->data)[tt * hsel->ne[0] + r];
+                    bad = "layer_streaming_compute: non-finite host-expert output at layer " +
+                          std::to_string(il) + " token " + std::to_string(tt) +
+                          " expert " + std::to_string(expert) +
+                          " (row " + std::to_string(r) + ", col " + std::to_string(cc) + ")";
+                    break;
+                }
+            }
+        }
+    }
+    host_finite = bad.empty() ? 0 : 1;
+    if (!bad.empty()) {
+        ls->error_msg = bad;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const llm_graph_params & gparams) {
     llama_layer_streaming * ls = layer_streaming;
     if (ls == nullptr) {
@@ -4305,6 +4678,28 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
     // sets are selected only by the layer-major controller.
     const int32_t chunk_key = -1;
     auto * set = ls->find_set(ls->phase, ubatch.n_tokens, rs_z, n_outputs, chunk_key);
+
+    // T-GPLR-71: the width of the attention view this execution needs. This is
+    // the SAME value the graphs will be built against when a build happens
+    // below -- llama_kv_cache_context caches it at apply_ubatch() time -- so
+    // comparing it with the set's recorded build width is comparing like with
+    // like, not a prediction against a build.
+    const llama_kv_cache_context * attn_mctx = mctx_hybrid ? mctx_hybrid->get_attn() : nullptr;
+    const int32_t n_kv_req = attn_mctx ? (int32_t) attn_mctx->get_n_kv() : -1;
+    ls->last_live_n_kv = n_kv_req;   // T-GPLR-71 step 5: read by phase_summary (AC1)
+
+    // T-GPLR-71 step 3: a set built against a narrower view than is now live
+    // must be re-derived, never reused -- under-reading means silently missing
+    // context. Gated on phase 1 on purpose: the phase-0 sets are driven by the
+    // layer-major controller (which refuses this path outright above), and
+    // their per-chunk causal narrowing is a separate mechanism that must not
+    // gain a rebuild trigger here. When the view granularity is never armed
+    // (the default), the recorded and required widths are the same constant on
+    // both sides and this never fires, which is what keeps --kv-graph-pad 0
+    // bit-for-bit identical to a pre-T-GPLR-71 run.
+    if (llama_layer_streaming::should_arm_view_rebuild(ls->phase, set, n_kv_req)) {
+        ls->arm_tg_view_rebuild(*set, set->n_kv, n_kv_req);
+    }
     // T-GPLR-62 S2: a set flagged by mark_row_set_sets_stale() is `built` (its
     // ctx, result object and act regions are all still valid and get REPLAYED)
     // but its graphs were baked against the pre-narrowing bundle, so it must be
@@ -4332,6 +4727,7 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
         llm_graph_params bp = gparams;
         bp.res = set->res;
         ls->cur_chunk_id = chunk_key; // so build_graph's begin_build re-selects this set
+        ls->cur_build_n_kv = n_kv_req; // so finish_build records what this build sees
         if (model.build_graph(bp) == nullptr) {
             ls->error_msg = "layer_streaming_compute: failed to build graph set (mode " +
                             std::to_string(ls->phase) + ", n_tokens " + std::to_string(ubatch.n_tokens) +
@@ -4457,6 +4853,18 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             ls->tel_error(ls->error_msg.c_str());
             return GGML_STATUS_FAILED;
         }
+        // T-GPLR-82 S2: the host-leg id vector must track ff_input exactly,
+        // because the executor indexes it BY LAYER when it fills the host
+        // membership. A short vector there is an out-of-bounds read of a
+        // routing table, so it is checked rather than assumed.
+        if (set->ff_input_hsel.size() != set->ff_input.size()) {
+            ls->error_msg = "layer_streaming_compute: row-set set has " +
+                            std::to_string(set->ff_input_hsel.size()) +
+                            " host-leg inputs for " + std::to_string(set->ff_input.size()) + " FFN inputs";
+            ls->failed = true;
+            ls->tel_error(ls->error_msg.c_str());
+            return GGML_STATUS_FAILED;
+        }
         if (ls->row_set_spec_arm == LLAMA_LS_ARM_D1) {
             ls->d1_last_routes.assign((size_t) ubatch.n_tokens, {});
         }
@@ -4498,6 +4906,10 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             return GGML_STATUS_SUCCESS;
         };
 
+        // T-GPLR-82 S1: stamp the round start; rowset_round_end stamps the
+        // end. Telemetry only -- no execution path reads this.
+        ls->rowset_round_t0_us = ggml_time_us();
+
         // 1. embed graph (graphs[0])
         {
             double cu = 0.0, su = 0.0;
@@ -4520,6 +4932,10 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 ls->tel_error(ls->error_msg.c_str());
                 return st_a;
             }
+            // T-GPLR-75: classified AFTER the run, because alloc_graph is what
+            // assigns each node its buffer.
+            const int attn_dev = ls_classify_graph_backend(graphs[1 + il]);
+            ls->accum_graph_ops(graphs[1 + il], true);
 
             // read the router's exact top-k IDs from part A's probabilities
             std::vector<std::vector<int32_t>> ids_per_token;
@@ -4544,6 +4960,13 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 }
             }
 
+            // T-GPLR-82 S1: host-side span of this layer's row-set consume.
+            // A real measurement, not an estimate. Today it covers the union
+            // build plus load_row_set, because no host expert sub-op exists
+            // yet; from S2 the same timer also covers that work. This is the
+            // 36.5 vs 59.4 us/expert gap made observable rather than assumed.
+            const int64_t t_host0 = ggml_time_us();
+
             // the token-level union of routed experts (the declared MTP width
             // is the number of target rows in this ubatch);
             // ids_per_token has exactly one row here)
@@ -4555,7 +4978,7 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             }
 
             // stage missing rows for this token BEFORE part B executes
-            if (!ls->load_row_set(il, union_ids)) {
+            if (!ls->load_row_set(il, union_ids, &ids_per_token)) {
                 ls->failed = true;
                 ls->tel_error(ls->error_msg.c_str());
                 return GGML_STATUS_FAILED;
@@ -4574,6 +4997,114 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             const int64_t n_used = sel_in->ne[0];
             const int64_t n_tok  = sel_in->ne[1];
             GGML_ASSERT((int64_t) ids_per_token.size() == n_tok);
+
+            // T-GPLR-61 S3/S4: the per-token plan, the fixed-shape reorder,
+            // and the step-C guards. The graph split is fixed at build (device
+            // leg = first n_used - experts_host_n positions of sel_in with the
+            // matching w_full view; host leg = the separate hsel input paired
+            // positionally with the w_full suffix), so residency membership is
+            // expressed by REORDERING each token's row: plan-host rows take the
+            // suffix. With no host-bound row the row stays in router order --
+            // byte-identical to the S2 positional fill. ls_plan_split carries
+            // the step-C refusals: an ABSENT demanded row (staging defect) or
+            // an unevaluable gate refuses loudly instead of guessing.
+            std::vector<std::vector<int32_t>> plan_host_ids((size_t) n_tok);
+            int experts_host_plan = 0;
+            int rows_gate_cpu_sum = 0, rows_gate_gpu_sum = 0;
+            uint64_t staged_avoided_sum = 0;
+            llama_ls_policy::ls_gate_verdict gate_v;
+            gate_v.evaluable = true;
+            gate_v.open       = ls->row_set_gate_open[(size_t) il] != 0;
+            gate_v.host_us    = ls->row_set_gate_host_us[(size_t) il];
+            gate_v.wait_us    = ls->row_set_gate_wait_us[(size_t) il];
+            // T-GPLR-82 S3/S4 (2026-10-10): the split graph is built only when
+            // the mechanism can admit a row (decided in the builder). Read THAT,
+            // not the flag, so a graph with no host leg is never asked for its id
+            // input -- measured: demanding it aborts loudly ("host-leg id input
+            // missing or misshaped for layer 0 (expected [2, 1])").
+            const bool host_leg_built = ls->row_set_split_built.size() > (size_t) il &&
+                                        ls->row_set_split_built[(size_t) il] != 0;
+            if (host_leg_built) {
+                const uint64_t kRowBytes = 1769472u;
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    const std::vector<int32_t> & row = ids_per_token[(size_t) t];
+                    std::vector<llama_ls_policy::ls_row_state> dem(row.size());
+                    for (size_t k = 0; k < row.size(); ++k) {
+                        dem[k] = (llama_ls_policy::ls_row_state)
+                                 ls->row_set_state[(size_t) il][(size_t) row[k]];
+                    }
+                    const llama_ls_policy::ls_split_plan plan =
+                        llama_ls_policy::ls_plan_split(dem, gate_v, (uint32_t) row.size(), kRowBytes);
+                    if (!plan.ok) {
+                        ls->error_msg = "layer_streaming_compute: split plan refused for layer " +
+                                        std::to_string(il) + " token " + std::to_string(t) + ": " +
+                                        (plan.refuse_reason ? plan.refuse_reason : "unknown");
+                        ls->failed = true;
+                        ls->tel_error(ls->error_msg.c_str());
+                        return GGML_STATUS_FAILED;
+                    }
+                    rows_gate_cpu_sum += (int) plan.rows_gate_cpu;
+                    rows_gate_gpu_sum += (int) plan.rows_gate_gpu;
+                    staged_avoided_sum += plan.staged_bytes_avoided;
+
+                    std::vector<size_t> host_pos, dev_pos;
+                    for (uint32_t k = 0; k < plan.host.size(); ++k) {
+                        if (plan.host[k].on_host) {
+                            host_pos.push_back(k);
+                        } else {
+                            dev_pos.push_back(k);
+                        }
+                    }
+                    experts_host_plan += (int) host_pos.size();
+                    for (size_t k : host_pos) {
+                        plan_host_ids[(size_t) t].push_back(row[k]);
+                    }
+                    if (host_pos.empty()) {
+                        continue; // router order == S2 positional fill
+                    }
+                    if ((int) host_pos.size() > ls->experts_host_n) {
+                        ls->error_msg = "layer_streaming_compute: plan wants " +
+                                        std::to_string(host_pos.size()) + " host rows for layer " +
+                                        std::to_string(il) + " token " + std::to_string(t) +
+                                        " but the host leg width is " + std::to_string(ls->experts_host_n);
+                        ls->failed = true;
+                        ls->tel_error(ls->error_msg.c_str());
+                        return GGML_STATUS_FAILED;
+                    }
+                    // Fixed-width partition: suffix = host rows ++ the LAST
+                    // (host_w - n_host) device rows as fillers; the prefix
+                    // keeps exactly n_used - host_w rows. Every demanded row
+                    // appears exactly once, so the two partials still sum to
+                    // the full weighted top-k.
+                    const size_t fill_n = (size_t) ls->experts_host_n - host_pos.size();
+                    const size_t keep   = dev_pos.size() - fill_n; // == n_used - host_w
+                    // Step-C safety: the device prefix may contain ONLY READY
+                    // rows -- a non-READY row there is the one shape that
+                    // could consume an incomplete slab.
+                    for (size_t i = 0; i < keep; ++i) {
+                        if (ls->row_set_state[(size_t) il][(size_t) row[dev_pos[i]]] != 0) {
+                            ls->error_msg = "layer_streaming_compute: expert " +
+                                            std::to_string(row[dev_pos[i]]) + " of layer " +
+                                            std::to_string(il) + " is not READY but would land on the device prefix";
+                            ls->failed = true;
+                            ls->tel_error(ls->error_msg.c_str());
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                    std::vector<int32_t> reordered;
+                    reordered.reserve(row.size());
+                    for (size_t i = 0; i < keep; ++i) {
+                        reordered.push_back(row[dev_pos[i]]);
+                    }
+                    for (size_t k : host_pos) {
+                        reordered.push_back(row[k]);
+                    }
+                    for (size_t i = keep; i < dev_pos.size(); ++i) {
+                        reordered.push_back(row[dev_pos[i]]);
+                    }
+                    ids_per_token[(size_t) t] = std::move(reordered);
+                }
+            }
             for (int64_t t = 0; t < n_tok; ++t) {
                 GGML_ASSERT((int64_t) ids_per_token[(size_t) t].size() == n_used);
                 memcpy((int32_t *) sel_in->data + t * n_used,
@@ -4634,6 +5165,82 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 }
             }
 
+
+            // T-GPLR-82 S2: the HOST leg's routed ids.
+            //
+            // S2 is COUPLED and the membership rule is POSITIONAL: the last
+            // `experts_host_n` positions of the router's top_k go to the host
+            // leg and the device leg keeps the first n_expert_used -
+            // experts_host_n. The graph shape is therefore fixed and the rule
+            // costs nothing to evaluate. It is deliberately NOT cache-aware
+            // yet -- S3 is where a MISSED row goes host instead of waiting for
+            // its copy, turning this from a fixed suffix into a per-row choice.
+            //
+            // These are a COPY of the same top_k the device leg consumes, not a
+            // view of it: this INPUT lives on the CPU side of the backend split,
+            // and the DMA in flight is reading model weights, never these bytes.
+            if (host_leg_built) {
+                ggml_tensor * hsel = set->ff_input_hsel[(size_t) il];
+                if (hsel == nullptr || hsel->data == nullptr ||
+                    hsel->ne[0] != ls->experts_host_n || hsel->ne[1] != n_tok) {
+                    ls->error_msg = "layer_streaming_compute: host-leg id input missing or misshaped "
+                                    "for layer " + std::to_string(il) + " (expected [" +
+                                    std::to_string(ls->experts_host_n) + ", " + std::to_string(n_tok) + "])";
+                    ls->failed = true;
+                    ls->tel_error(ls->error_msg.c_str());
+                    return GGML_STATUS_FAILED;
+                }
+                const int64_t hn = ls->experts_host_n;
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    const auto & row = ids_per_token[(size_t) t];
+                    if ((int64_t) row.size() != n_used) {
+                        ls->error_msg = "layer_streaming_compute: routed row width " +
+                                        std::to_string(row.size()) + " != top_k " +
+                                        std::to_string(n_used) + " for layer " + std::to_string(il);
+                        ls->failed = true;
+                        ls->tel_error(ls->error_msg.c_str());
+                        return GGML_STATUS_FAILED;
+                    }
+                    memcpy((int32_t *) hsel->data + t * hn,
+                           row.data() + (n_used - hn), (size_t) hn * sizeof(int32_t));
+                }
+            }
+
+            // T-GPLR-61 step C: a row the gate approved for the host and
+            // then did not execute is a loud abort. The fill above copies the
+            // row suffix into hsel, so every plan-host id must sit in it.
+            if (host_leg_built) {
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    const std::vector<int32_t> & row = ids_per_token[(size_t) t];
+                    for (int32_t e : plan_host_ids[(size_t) t]) {
+                        bool seen = false;
+                        for (int64_t k = n_used - ls->experts_host_n; k < n_used && !seen; ++k) {
+                            seen = row[(size_t) k] == e;
+                        }
+                        if (!seen) {
+                            ls->error_msg = "layer_streaming_compute: expert " + std::to_string(e) +
+                                            " of layer " + std::to_string(il) + " token " +
+                                            std::to_string(t) +
+                                            " was approved for the host leg but is not in the executed suffix";
+                            ls->failed = true;
+                            ls->tel_error(ls->error_msg.c_str());
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                }
+            }
+ // T-GPLR-61 S4: the ledger is the PLAN's disposition -- what was
+            // INTENDED to run on the host -- not the graph's physical width;
+            // ffn_dev below stays the independent record of what actually
+            // executed (S1's intended-vs-happened pair). The clamp keeps AC4's
+            // experts_device + experts_host == experts_total exact even when
+            // the union is narrower than n_tok * top_k.
+            const int experts_total = (int) ls->row_set_ids[il].size();
+            int experts_host = experts_host_plan;
+            if (experts_host > experts_total) {
+                experts_host = experts_total;
+            }
+
             // part B: FFN + shared experts on the staged rows (ff_graphs[il])
             double ffn_compute_us = 0.0, ffn_setup_us = 0.0;
             const auto st_b = run_graph_plain(set->ff_graphs[(size_t) il], ffn_compute_us, ffn_setup_us);
@@ -4641,13 +5248,60 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                 ls->tel_error(ls->error_msg.c_str());
                 return st_b;
             }
+            const int ffn_dev = ls_classify_graph_backend(set->ff_graphs[(size_t) il]);
+            ls->accum_graph_ops(set->ff_graphs[(size_t) il], false);
 
             // slot lifecycle: part B consumed this slot generation; part A's
             // attention weights are model-resident (no slot ownership)
             ls->record_consumer_done(il, backend_cuda);
+            // T-GPLR-61 step C: buffer read, scan and error shaping live in
+            // scan_host_expert_outputs(); the abort runs here, after the
+            // layer_compute record below carries host_finite.
+            int host_finite = -1;
+            if (host_leg_built) {
+                if (scan_host_expert_outputs(ls, set, il, n_tok, host_finite) != GGML_STATUS_SUCCESS) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            // T-GPLR-82 S2: the demand ledger now SPLITS.
+            // S2 membership is POSITIONAL -- the last
+            // experts_host_n positions of every top-k go to
+            // the host leg -- so each token of this layer
+            // routes exactly experts_host_n rows host and the
+            // remainder device. Clamped to the union so a
+            // narrower union can never make the device term
+            // negative: experts_device + experts_host ==
+            // experts_total is the AC2 invariant and it has
+            // to hold on every emitted record.
+            llama_layer_streaming::tel_layer_compute_params tel_rowset;
+            tel_rowset.attn_compute_us = attn_compute_us;
+            tel_rowset.attn_setup_us   = attn_setup_us;
+            tel_rowset.ffn_compute_us  = ffn_compute_us;
+            tel_rowset.ffn_setup_us    = ffn_setup_us;
+            tel_rowset.attn_dev        = attn_dev;
+            tel_rowset.ffn_dev         = ffn_dev;
+            tel_rowset.experts_total   = experts_total;
+            tel_rowset.experts_host    = experts_host;
+            tel_rowset.experts_device  = experts_total - experts_host;
+            tel_rowset.host_us         = (double) (ggml_time_us() - t_host0);
+            // T-GPLR-61 S4/S1: the gate's own record,
+            // emitted even when the split never fires.
+            // -1 (not reported) when no host leg exists
+            // at all; a 0 host share with live estimates
+            // is a recorded did-not-fire, not a pass.
+            tel_rowset.rows_gate_cpu   = host_leg_built ? rows_gate_cpu_sum : -1;
+            tel_rowset.rows_gate_gpu   = host_leg_built ? rows_gate_gpu_sum : -1;
+            tel_rowset.gate_host_us    = host_leg_built ? gate_v.host_us : -1.0;
+            tel_rowset.gate_wait_us    = host_leg_built ? gate_v.wait_us : -1.0;
+            tel_rowset.staged_bytes_avoided =
+                host_leg_built ? (double) staged_avoided_sum : -1.0;
+            tel_rowset.host_finite     = host_finite;
             ls->tel_layer_compute(il, attn_compute_us + ffn_compute_us, attn_setup_us + ffn_setup_us,
                                   ls->slots[il % ls->n_slots].generation, (int64_t) (ls->n_ubatches - 1),
-                                  attn_compute_us, attn_setup_us, ffn_compute_us, ffn_setup_us);
+                                  tel_rowset);
+            if (host_finite == 1) {
+                return ls_shape_failure(ls, ls->error_msg);
+            }
             // T-GPLR-24 (H-A): the TG phase_summary must carry the row-set
             // terms in row-set modes. transfer = submit + ready-wait of this
             // layer's staging; wait = the ready-latency the executor blocked
@@ -4659,6 +5313,8 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
                                 attn_compute_us + ffn_compute_us + attn_setup_us + ffn_setup_us,
                                 ls->rowset_last_ready_us < 100.0);
         }
+
+        ls->tel_graph_backend_ops();
 
         // 3. output graph (graphs[1+n_layer])
         {
@@ -4848,6 +5504,9 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             return GGML_STATUS_ALLOC_FAILED;
         }
         const int64_t t_setup1 = ggml_time_us();
+        // T-GPLR-72: CPU clock starts with the compute region, so cpu_us spans
+        // exactly the region compute_us measures.
+        const int64_t c_setup1 = ls_thread_cpu_us();
         // T-GPLR-16 probe: fine-grained exec markers (remove after diagnosis).
         if (getenv("GGML_LS_GRAPH_EXEC_MARKERS") != nullptr) {
             fprintf(stderr, "[ls-exec] g=%d alloc_done\n", i);
@@ -4960,6 +5619,13 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
         }
         ggml_backend_sched_synchronize(sched.get());
         const int64_t t_compute1 = ggml_time_us();
+        const int64_t c_compute1 = ls_thread_cpu_us();
+        const double layer_cpu_us = (c_setup1 < 0 || c_compute1 < 0)
+            ? -1.0 : (double) (c_compute1 - c_setup1);
+        // dev=1 iff this layer's weights are in a handoff bundle. Under
+        // --handoff-partial N that is exactly the layers at/above the split
+        // that are in handoff_layers (0/1 for 38,39 at the 8 GB point).
+        const int layer_dev = (ls->handoff_active && ls->handoff_layers.count(layer)) ? 1 : 0;
 
         // restore the original node src pointers mutated by the split
         for (int k = 0; k < g->n_nodes; ++k) {
@@ -5051,7 +5717,11 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
             // ubatch index as the chunk identity; per-chunk identities (0..C-1)
             // are emitted only by the layer-major controller
             const int64_t chunk = (int64_t) (ls->n_ubatches - 1);
-            ls->tel_layer_compute(layer, compute_us, setup_us, ls->slots[layer % ls->n_slots].generation, chunk);
+            llama_layer_streaming::tel_layer_compute_params tel_plain;
+            tel_plain.cpu_us = layer_cpu_us;
+            tel_plain.dev    = layer_dev;
+            ls->tel_layer_compute(layer, compute_us, setup_us, ls->slots[layer % ls->n_slots].generation,
+                                  chunk, tel_plain);
 
             // lookahead: after this layer's compute is done, request the next
             // layer that maps to this slot (waits on ev_consumer_done, so the
@@ -6298,7 +6968,7 @@ bool llama_layer_streaming::build_patch_split(graph_set & gs) {
         for (ggml_tensor * t : gs.input_tensors) {
             kept_set.insert(t);
         }
-        for (const std::vector<ggml_tensor *> * lst : { &gs.ff_input, &gs.ff_input_wpos }) {
+        for (const std::vector<ggml_tensor *> * lst : { &gs.ff_input, &gs.ff_input_wpos, &gs.ff_input_hsel }) {
             for (ggml_tensor * t : *lst) {
                 if (t == nullptr) {
                     continue;
@@ -6687,21 +7357,40 @@ void llama_layer_streaming::tel_layer_ready_wait(int il, double wait_us, bool re
 // FFN) is built into a small stack buffer only when a caller asks for it, so the
 // non-row-set record stays byte-identical.
 void llama_layer_streaming::tel_layer_compute(int il, double compute_us, double setup_us, uint32_t generation,
-                                              int64_t chunk, double attn_compute_us, double attn_setup_us,
-                                              double ffn_compute_us, double ffn_setup_us) {
-    char parts[160];
+                                              int64_t chunk, const tel_layer_compute_params & params) {
+    // T-GPLR-82 S1: 160 -> 320 bytes; T-GPLR-61 S4: 320 -> 512 for the gate
+    // record. `parts` holds ONLY the row-set optional block (gated on
+    // attn_compute_us >= 0.0), so growth cannot alter any non-row-set
+    // record: the two prefill call sites pass attn_* = -1.0 and keep the
+    // byte-identical short form.
+    char parts[640]; // T-GPLR-61 step C: 512 -> 640 for the host_finite record
     parts[0] = '\0';
-    if (attn_compute_us >= 0.0) {
+    if (params.attn_compute_us >= 0.0) {
+        // experts_* is the demand ledger: what the router asked for, split
+        // by where it was computed. experts_device + experts_host must equal
+        // experts_total at every (layer, token) -- T-GPLR-82 AC2. The
+        // rows_gate_* / gate_* / staged_bytes_avoided tail is T-GPLR-61's
+        // S4 gate record: emitted even when the split never fires (-1 when
+        // no host leg exists at all).
         snprintf(parts, sizeof(parts),
-                 "\"attn_compute_us\":%.1f,\"attn_setup_us\":%.1f,\"ffn_compute_us\":%.1f,\"ffn_setup_us\":%.1f,",
-                 attn_compute_us, attn_setup_us, ffn_compute_us, ffn_setup_us);
+                 "\"attn_compute_us\":%.1f,\"attn_setup_us\":%.1f,\"ffn_compute_us\":%.1f,\"ffn_setup_us\":%.1f,"
+                 "\"attn_dev\":%d,\"ffn_dev\":%d,"
+                 "\"experts_total\":%d,\"experts_host\":%d,\"experts_device\":%d,\"host_us\":%.1f,"
+                 "\"rows_gate_cpu\":%d,\"rows_gate_gpu\":%d,"
+                 "\"gate_host_us\":%.1f,\"gate_wait_us\":%.1f,\"staged_bytes_avoided\":%.0f,"
+                 "\"host_finite\":%d,",
+                 params.attn_compute_us, params.attn_setup_us, params.ffn_compute_us, params.ffn_setup_us, params.attn_dev, params.ffn_dev,
+                 params.experts_total, params.experts_host, params.experts_device, params.host_us,
+                 params.rows_gate_cpu, params.rows_gate_gpu, params.gate_host_us, params.gate_wait_us, params.staged_bytes_avoided,
+                 params.host_finite);
     }
     tel_write(tel_out,
         "{\"event\":\"layer_compute\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,"
         "\"generation\":%u,\"chunk\":%lld,\"compute_us\":%.1f,\"setup_us\":%.1f,"
+        "\"cpu_us\":%.1f,\"dev\":%d,"
         "%s\"phase\":%d,\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, il % n_slots, generation,
-        (long long) chunk, compute_us, setup_us, parts, phase, (long long) ggml_time_us());
+        (long long) chunk, compute_us, setup_us, params.cpu_us, params.dev, parts, phase, (long long) ggml_time_us());
 }
 
 // T-GPLR-53 A2: the per-chunk embed-step timeline (see the header note).
@@ -6966,15 +7655,42 @@ void llama_layer_streaming::tel_phase_summary(const char * phase, int64_t tokens
     const double tokens_per_s = wall_us > 0 ? (double) tokens * 1e6 / (double) wall_us : 0.0;
     const uint64_t graph_builds_in_phase = build_generation - builds_at_phase_start;
     const uint64_t ubatches_in_phase = n_ubatches - stats_ubatch_base;
+
+    // T-GPLR-71 step 5: the three fields that make AC1 and AC6 scorable from a
+    // DEFAULT (non-probe) trace. They are emitted here, unconditionally, rather
+    // than in tel_kv_view / tel_mctx_lifecycle -- those are pw-probe-gated, so a
+    // default trace could not answer AC1 at all. No behaviour reads any of this.
+    //
+    //   kv_view_built : the attention view width, in KV columns, that the
+    //                   phase-1 DECODE set (mode 1, n_tokens 1, the standard
+    //                   greedy decode graph) was built against. -1 when no such
+    //                   set exists -- which is the case on every PP line under
+    //                   layer-major, and that absence is itself the evidence
+    //                   that no phase-1 set is built during PP.
+    //   kv_view_live  : the live get_n_kv() seen at the most recent execution,
+    //                   i.e. the width the coverage rule actually judged
+    //                   against. AC1 is a sweep: kv_view_built / kv_view_live
+    //                   ~= 1 means the view tracked the live token count;
+    //                   ~= ctx/live means it still tracks the allocation.
+    //   view_rebuilds_total : cumulative arm_tg_view_rebuild() firings (AC6).
+    int32_t kv_view_built = -1;
+    for (const auto & s : sets) {
+        if (s.mode == 1 && s.chunk_id == -1 && s.n_tokens == 1 && s.built) {
+            kv_view_built = s.n_kv;
+            break;
+        }
+    }
     tel_write(tel_out,
         "{\"event\":\"phase_summary\",\"run_id\":%llu,\"phase\":\"%s\",\"tokens\":%lld,"
         "\"ubatches\":%llu,\"wall_us\":%lld,\"tokens_per_s\":%.3f,\"bytes_transferred\":%llu,\"evictions\":%llu,"
         "\"total_transfer_us\":%.1f,\"total_wait_us\":%.1f,\"total_compute_us\":%.1f,\"layers_run\":%llu,"
-        "\"graph_prep_us\":%lld,\"graph_builds\":%llu}",
+        "\"graph_prep_us\":%lld,\"graph_builds\":%llu,"
+        "\"kv_view_built\":%d,\"kv_view_live\":%d,\"view_rebuilds_total\":%llu}",
         (unsigned long long) run_id, phase, (long long) tokens, (unsigned long long) ubatches_in_phase, (long long) wall_us,
         tokens_per_s, (unsigned long long) total_bytes_transferred, (unsigned long long) total_evictions,
         total_transfer, total_wait, total_compute, (unsigned long long) n_layers_run,
-        (long long) graph_prep_us, (unsigned long long) graph_builds_in_phase);
+        (long long) graph_prep_us, (unsigned long long) graph_builds_in_phase,
+        kv_view_built, last_live_n_kv, (unsigned long long) view_rebuild_ctr);
 }
 
 void llama_layer_streaming::reset_stats() {
@@ -9166,6 +9882,18 @@ bool llama_layer_streaming::begin_row_set() {
     row_set_have.assign(slots.size(), std::vector<uint8_t>(n_exp, 0));
     row_set_owner.assign(slots.size(), -1);
     row_set_ids.assign(n_layer, {});
+    // T-GPLR-61 S3/S4: same bring-up allocation as its siblings -- a failed
+    // allocation is loud here, mid-run would be worse.
+    row_set_outstanding.assign(slots.size(), std::vector<uint8_t>(n_exp, 0));
+    row_set_state.assign(n_layer, std::vector<uint8_t>((size_t) n_exp, 2)); // ABSENT until a load writes it
+    row_set_gate_open.assign(n_layer, 0);
+    row_set_gate_host_us.assign(n_layer, 0.0);
+    row_set_gate_wait_us.assign(n_layer, 0.0);
+    // T-GPLR-82 S3/S4: row_set_split_built is NOT (re)sized here. begin_row_set()
+    // runs AFTER the persistent graphs are built, so the builder's write would be
+    // out of bounds -- measured 2026-10-10 as an access violation (0xC0000005)
+    // during "building persistent graphs". init() sizes it before any build, and
+    // nothing clears it afterwards, because the graphs persist for the run.
     row_set_gen.assign(slots.size(), 0);
     for (auto & s : slots) {
         row_set_gen[&s - &slots[0]] = s.generation;
@@ -9520,6 +10248,44 @@ bool llama_layer_streaming::build_row_set_window(int width) {
 // half-flagged executor. It DOES refuse loudly if a phase-1 set exists that is
 // not a finished build, because replace_set_with_fresh_rebuild() rejects those
 // and the failure would otherwise surface as a confusing mid-TG error.
+// T-GPLR-71: the view-width arm. This is deliberately NOT a new lifecycle
+// path: it sets exactly the two flags T-GPLR-62 S2 sets (needs_rebuild and
+// rebuild_replacement), so begin_set takes the identical T-GPLR-47 fresh-context
+// replacement branch. Recurrent session state is untouched by that branch --
+// it re-derives GRAPHS against the current memory context and re-applies
+// nothing -- which is exactly why it is safe here and re-running
+// layer_streaming_prebuild is not (that one calls vmctx->apply()).
+void llama_layer_streaming::arm_tg_view_rebuild(graph_set & set, int32_t built, int32_t required) {
+    set.needs_rebuild = true;
+    rebuild_replacement = true;
+    view_rebuild_ctr++;   // T-GPLR-71 step 5: read by phase_summary (AC6)
+
+    // Same measured trap llama_ls_tel_mark() already fixes 400 lines above, and
+    // for the same reason: on Windows ggml_time_us() divides by the static
+    // timer_freq that ggml_time_init() sets, so a call before any llama init
+    // dies with 0xC0000094. It cannot fire on the runner (llama_backend_init()
+    // initialises the timer long before the first generated token), which is
+    // exactly why it survived review -- this function had never been executed by
+    // anything until the T-GPLR-71 guard test drove it, and that test is what
+    // surfaced it. A telemetry line must never be able to kill the process, and
+    // the state transition above must not depend on it. InitOnce-guarded, so this
+    // is free and llama_backend_init()'s later call is a no-op.
+    ggml_time_init();
+
+    tel_write(tel_out,
+        "{\"event\":\"tg_view_rebuild\",\"run_id\":%llu,\"set_mode\":%d,\"n_tokens\":%lld,"
+        "\"rs_z\":%d,\"n_outputs\":%d,\"built_n_kv\":%d,\"required_n_kv\":%d,"
+        "\"mechanism\":\"t-gplr-47-fresh-context-rebuild\",\"t_us\":%lld}",
+        (unsigned long long) run_id, set.mode, (long long) set.n_tokens, set.rs_z,
+        set.n_outputs, built, required, (long long) ggml_time_us());
+    fprintf(stderr,
+            "T-GPLR-71: phase-1 graph set (n_tokens %lld, rs_z %d) was built against a "
+            "%d-column attention view and %d are now live; flagging it for a "
+            "fresh-context rebuild.\n",
+            (long long) set.n_tokens, set.rs_z, built, required);
+    fflush(stderr);
+}
+
 bool llama_layer_streaming::mark_row_set_sets_stale() {
     int n_flagged = 0;
     for (auto & set : sets) {
@@ -9589,10 +10355,13 @@ ggml_cgraph * llama_layer_streaming::new_ff_graph(int layer) {
     cur->ff_layer.push_back(layer);
     cur->ff_input.push_back(nullptr); // the builder binds the INPUT right after
     cur->ff_input_wpos.push_back(nullptr); // T-GPLR-62 S2: same, for window positions
+    cur->ff_input_hsel.push_back(nullptr); // T-GPLR-82 S2: same, for the host leg's ids
+    cur->ff_host_experts.push_back(nullptr); // T-GPLR-61 step C: stashed by build_moe_host_leg
     return g;
 }
 
-bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & ids) {
+bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & ids,
+                                          const std::vector<std::vector<int32_t>> * per_token) {
     if (!row_set_active) {
         error_msg = "load_row_set: row-set staging is not active";
         return false;
@@ -9654,6 +10423,101 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         row_set_union_pos_[(size_t) uniq[i]] = (int32_t) i;
     }
     row_set_union_valid_ = true;
+
+    // -----------------------------------------------------------------------
+    // T-GPLR-61 S3/S4: the cost gate, the budget, and the copy-wait split.
+    // The gate is evaluated ONCE per load from the measured constants
+    // (tools/expert-cpu-bench, iteration-disjoint, 2026-09-30: 36.5 us per
+    // host expert; 10.35 GB/s end-to-end feed; 1,769,472 B per Q4_K routed
+    // row) and stashed per layer, so the executor's ls_plan_split and the
+    // layer_compute record see the SAME verdict the wait decision used. An
+    // unevaluable policy refuses the run (SDD moe-row-split failure contract);
+    // with these constants it always evaluates, so a flag-absent run gains no
+    // new refusal path.
+    llama_ls_policy::ls_gate_constants gate_c;
+    gate_c.host_us_per_expert = 36.5;
+    gate_c.row_bytes           = 1769472u;
+    gate_c.link_bytes_per_s    = 10.35e9;
+    gate_c.policy              = llama_ls_policy::ls_gate_policy::HOST_ALWAYS;
+    const llama_ls_policy::ls_gate_verdict gate_v = llama_ls_policy::ls_evaluate_gate(gate_c);
+    if (!gate_v.evaluable) {
+        tel_rowset_refused(il, slot_idx, slot.generation, "gate_unevaluable",
+                           gate_v.refuse_reason ? gate_v.refuse_reason : "cost gate is not evaluable");
+        error_msg = std::string("load_row_set: cost gate is not evaluable (") +
+                    (gate_v.refuse_reason ? gate_v.refuse_reason : "unknown") + ")";
+        return false;
+    }
+    row_set_gate_open[(size_t) il]    = gate_v.open ? 1 : 0;
+    row_set_gate_host_us[(size_t) il] = gate_v.host_us;
+    row_set_gate_wait_us[(size_t) il] = gate_v.wait_us;
+
+    // S3 is one package: host leg + per-token demand + a non-zero budget, and
+    // it stays OFF for the recon and predictor arms, whose own checks assume
+    // every copy was awaited before consume. With the flag absent or the
+    // budget at its default of 0, s3_cap stays 0 and both branches below take
+    // exactly today's path: every staged row waits, one blocking sync.
+    const bool s3 = experts_host_n > 0 && per_token != nullptr &&
+                    experts_host_budget_us > 0.0 && !row_set_recon &&
+                    !row_set_spec_on && row_set_spec_mode == 0 &&
+                    row_set_spec_arm < 0 && row_set_spec_pool == 0;
+    int s3_cap = 0;
+    if (s3 && gate_v.open) {
+        const double k = std::floor(experts_host_budget_us / gate_v.host_us);
+        s3_cap = k >= (double) experts_host_n ? experts_host_n : (int) k;
+        if (s3_cap < 0) {
+            s3_cap = 0;
+        }
+    }
+
+    // The per-token admission split. A row is PENDING pre-stage when it is in
+    // this load's fetch (about to be issued) or outstanding from an earlier
+    // skipped wait. Per token, the first min(pending, s3_cap) pending rows in
+    // router order are admitted to the host leg; every remaining pending row
+    // of ANY token joins the wait set. A row admitted by one token but waited
+    // by another is waited: admission only removes a wait when no token needs
+    // the row on the device. Called by both branches once fetch is known.
+    std::vector<uint8_t> s3_host_row((size_t) n_exp, 0);
+    std::vector<uint8_t> s3_wait_row((size_t) n_exp, 0);
+    bool s3_split_run = false;
+    bool s3_any_wait  = false;
+    auto s3_compute_split = [&](const std::vector<int32_t> & fetch) {
+        std::fill(s3_host_row.begin(), s3_host_row.end(), 0);
+        std::fill(s3_wait_row.begin(), s3_wait_row.end(), 0);
+        s3_split_run = false;
+        s3_any_wait  = false;
+        if (!(s3 && s3_cap > 0)) {
+            return;
+        }
+        const std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+        std::vector<uint8_t> in_fetch((size_t) n_exp, 0);
+        for (int32_t e : fetch) {
+            in_fetch[(size_t) e] = 1;
+        }
+        for (const auto & row : *per_token) {
+            std::vector<int32_t> pend;
+            pend.reserve(row.size());
+            for (int32_t e : row) {
+                if (e >= 0 && (size_t) e < (size_t) n_exp &&
+                    (outst[(size_t) e] || in_fetch[(size_t) e])) {
+                    pend.push_back(e);
+                }
+            }
+            const int admit = (int) pend.size() < s3_cap ? (int) pend.size() : s3_cap;
+            for (int i = 0; i < admit; ++i) {
+                s3_host_row[(size_t) pend[(size_t) i]] = 1;
+            }
+            for (size_t i = (size_t) admit; i < pend.size(); ++i) {
+                s3_wait_row[(size_t) pend[i]] = 1;
+            }
+        }
+        s3_split_run = true;
+        for (int32_t e : uniq) {
+            if (s3_wait_row[(size_t) e]) {
+                s3_any_wait = true;
+                break;
+            }
+        }
+    };
 
     // -----------------------------------------------------------------------
     // T-GPLR-19 (F2-M1) retention path -- SDD section 4 execution shape (i).
@@ -9912,6 +10776,30 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         }
         const size_t retained = resident;
 
+        // T-GPLR-61 S3: admission split (common block above). The retention
+        // path stages into the per-layer CACHE, so the split names fetch
+        // indices: k_wait must complete before consume; k_host rows may
+        // still be in flight at consume (the host leg reads the mmap).
+        s3_compute_split(fetch);
+        std::vector<size_t> s3_k_wait, s3_k_host;
+        if (s3_split_run) {
+            for (size_t k = 0; k < fetch.size(); ++k) {
+                const int32_t e = fetch[k];
+                if (s3_host_row[(size_t) e] && !s3_wait_row[(size_t) e]) {
+                    s3_k_host.push_back(k);
+                } else {
+                    s3_k_wait.push_back(k);
+                }
+            }
+        } else {
+            s3_k_wait.resize(fetch.size());
+            for (size_t k = 0; k < fetch.size(); ++k) {
+                s3_k_wait[k] = k;
+            }
+        }
+        const bool s3_need_wait = s3_split_run ? s3_any_wait : true;
+        int64_t s3_t_enq1 = -1, s3_t_sync_end = -1, s3_waited = 0;
+
         // scratch context for the slab views the refresh needs; re-created when
         // exhausted so one window never pays a per-view allocation
         const size_t n_views = 2 * uniq.size() * pkg.members.size() + 8;
@@ -9967,21 +10855,28 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         // 4a. H2D the complement into the cache at its assigned position. The
         //     source offset is the expert's natural slab offset, so the bytes
         //     handed to the copy are the checkpoint's own quantized rows.
-        for (size_t mi = 0; mi < pkg.members.size(); ++mi) {
-            const ggml_tensor * src_t   = pkg.members[mi].src;
-            const ggml_tensor * cache_t = mi < cache_mem.size() ? cache_mem[mi] : nullptr;
-            if (src_t == nullptr || cache_t == nullptr) {
-                continue;
+        auto s3_h2d = [&](const std::vector<size_t> & ks) {
+            if (ks.empty()) {
+                return;
             }
-            const size_t slab_bytes = ggml_row_size(src_t->type, src_t->ne[0]) * (size_t) src_t->ne[1];
-            for (size_t k = 0; k < fetch.size(); ++k) {
-                const size_t src_off = (size_t) fetch[k] * slab_bytes;
-                const size_t dst_off = (size_t) fetch_pos[k] * slab_bytes;
-                ggml_backend_tensor_set_async(backend_copy, (ggml_tensor *) cache_t,
-                                              (const char *) src_t->data + src_off, dst_off, slab_bytes);
-                bytes_staged += slab_bytes;
+            for (size_t mi = 0; mi < pkg.members.size(); ++mi) {
+                const ggml_tensor * src_t   = pkg.members[mi].src;
+                ggml_tensor         * cache_t = mi < cache_mem.size() ? cache_mem[mi] : nullptr;
+                if (src_t == nullptr || cache_t == nullptr) {
+                    continue;
+                }
+                const size_t slab_bytes = ggml_row_size(src_t->type, src_t->ne[0]) * (size_t) src_t->ne[1];
+                for (size_t k : ks) {
+                    const size_t src_off = fetch[k] * slab_bytes;
+                    const size_t dst_off = fetch_pos[k] * slab_bytes;
+                    ggml_backend_tensor_set_async(backend_copy, (ggml_tensor *) cache_t,
+                                                  (const char *) src_t->data + src_off, dst_off, slab_bytes);
+                    bytes_staged += slab_bytes;
+                }
             }
-        }
+        };
+        // 4a (batch 1): H2D the rows the device leg must see complete.
+        s3_h2d(s3_k_wait);
 
         // 4b. device-side refresh of the slot bundle from the cache for the
         //     WHOLE union, so the slot the FFN is about to read is complete.
@@ -9997,6 +10892,14 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                 continue;
             }
             for (size_t i = 0; i < uniq.size(); ++i) {
+                // T-GPLR-61 S3: a host-admitted row's cache write is in
+                // the unsynced batch, so its slot refresh is deferred to
+                // the row's next demand. The cache still lands now --
+                // warmth preserved; nothing this round reads that slab.
+                if (s3_split_run && s3_host_row[(size_t) uniq[i]] &&
+                    !s3_wait_row[(size_t) uniq[i]]) {
+                    continue;
+                }
                 const int32_t p = pos_of[i];
                 const int pp = pool_hit_pos[i];
                 ggml_tensor * src_cache = p >= 0 ? (ggml_tensor *) cache_t
@@ -10042,11 +10945,47 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         ggml_backend_event_record((ggml_backend_event_t) slot.ev_copy_end,   backend_copy);
         ls_stage_record(slot.ev_copy_ready);
         slot.t_copy_enqueue_done_us = ggml_time_us();
+        s3_t_enq1 = slot.t_copy_enqueue_done_us;
 
         // host-blocking wait: the FFN graph may only consume after the copy
         // event completes (SDD lifecycle). This covers the H2D and the D2D.
-        ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
+        // T-GPLR-61 S3: skipped only when every pending demanded row was
+        // admitted to the host leg; any waited batch keeps the sync as-is.
+        if (s3_need_wait) {
+            const int64_t w0 = ggml_time_us();
+            ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
+            s3_waited     = ggml_time_us() - w0;
+            s3_t_sync_end = ggml_time_us();
+            std::fill(row_set_outstanding[(size_t) slot_idx].begin(),
+                      row_set_outstanding[(size_t) slot_idx].end(), 0);
+        }
+
+        // T-GPLR-61 S3: batch 2 -- cache writes for host-admitted rows.
+        // Issued AFTER the wait so they never extend it; no slot refresh
+        // is queued for them (4b above skipped them).
+        if (!s3_k_host.empty()) {
+            s3_h2d(s3_k_host);
+            ggml_backend_event_record((ggml_backend_event_t) slot.ev_copy_end,   backend_copy);
+            ls_stage_record(slot.ev_copy_ready);
+            slot.t_copy_enqueue_done_us = ggml_time_us();
+            std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+            for (size_t k : s3_k_host) {
+                outst[(size_t) fetch[k]] = 1;
+            }
+        }
         const int64_t t_demand_ready = ggml_time_us();
+
+        // T-GPLR-61 S3: stash the post-staging classification for the
+        // executor (retention: every non-fetch union member is cache- or
+        // pool-resident by construction, so only outstanding is PENDING).
+        {
+            std::vector<uint8_t> & stt = row_set_state[(size_t) il];
+            std::fill(stt.begin(), stt.end(), (uint8_t) 2);
+            const std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+            for (int32_t e : uniq) {
+                stt[(size_t) e] = outst[(size_t) e] ? (uint8_t) 1 : (uint8_t) 0;
+            }
+        }
 
         // T-GPLR-62 S2 / A9: the bytes are now landed and ordered against the
         // compute stream, so this reads EXACTLY what the FFN is about to
@@ -10102,8 +11041,19 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         }
 
         const int64_t t_enq = slot.t_copy_enqueue_done_us;
-        const double host_submit_us   = (double) (t_enq - t_submit0);
-        const double ready_latency_us = (double) (t_demand_ready - t_enq);
+        double host_submit_us = 0.0;
+        double ready_latency_us = 0.0;
+        if (!s3_k_host.empty() && s3_t_enq1 >= 0) {
+            // T-GPLR-61 S3: two batches -- submit is the pure pack/enqueue
+            // wall across both; availability-wait is ONLY what the consumer
+            // actually blocked on (0 when the wait was skipped).
+            const int64_t t_split = s3_t_sync_end >= 0 ? s3_t_sync_end : s3_t_enq1;
+            host_submit_us   = (double) ((s3_t_enq1 - t_submit0) + (t_enq - t_split));
+            ready_latency_us = (double) s3_waited;
+        } else {
+            host_submit_us   = (double) (t_enq - t_submit0);
+            ready_latency_us = (double) (t_demand_ready - t_enq);
+        }
         const double transfer_us      = host_submit_us + ready_latency_us;
         slot.t_copy_submit_us       = 0;
         slot.t_copy_enqueue_done_us = 0;
@@ -10171,6 +11121,30 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
 
     const int64_t t_submit0 = ggml_time_us();
     size_t bytes_staged = 0;
+
+    // T-GPLR-61 S3: partition the fetch into a WAIT batch (the device leg
+    // must see these complete before consume) and a HOST batch (admitted
+    // rows whose copy may still be in flight at consume -- the host leg
+    // reads the mmap source, not the slot). Without admission the flow is
+    // exactly today's: one batch, one record, one blocking sync.
+    s3_compute_split(fetch);
+    std::vector<int32_t> fetch_wait = fetch;
+    std::vector<int32_t> fetch_host;
+    if (s3_split_run) {
+        fetch_wait.clear();
+        for (int32_t e : fetch) {
+            if (s3_host_row[(size_t) e] && !s3_wait_row[(size_t) e]) {
+                fetch_host.push_back(e);
+            } else {
+                fetch_wait.push_back(e);
+            }
+        }
+    }
+    const bool s3_need_wait = s3_split_run ? s3_any_wait : true;
+    int64_t   s3_t_enq1     = -1;
+    int64_t   s3_t_sync_end = -1;
+    int64_t   s3_waited     = 0;
+
     if (!fetch.empty()) {
         // T-GPLR-18: when --copy-source pinned is active the fetched slabs are
         // packed into this slot's pinned host buffer and copied from there
@@ -10195,6 +11169,13 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
                 return false;
             }
         }
+    }
+
+    auto s3_enqueue = [&](const std::vector<int32_t> & rows) {
+        if (rows.empty()) {
+            return;
+        }
+        char * staging = slot.buf_staging ? (char *) ggml_backend_buffer_get_base(slot.buf_staging.get()) : nullptr;
         ggml_backend_event_record((ggml_backend_event_t) slot.ev_copy_start, backend_copy);
         size_t staging_off = 0;
         for (const auto & m : pkg.members) {
@@ -10208,7 +11189,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
             // a single row: rows are the ne[0] inner dim. The offset is
             // expert-slab granular and byte-exact (quantization untouched).
             const size_t slab_bytes = ggml_row_size(src_t->type, src_t->ne[0]) * (size_t) src_t->ne[1];
-            for (int32_t e : fetch) {
+            for (int32_t e : rows) {
                 const size_t off = (size_t) e * slab_bytes;
                 GGML_ASSERT(off + slab_bytes <= ggml_nbytes(src_t));
                 const void * copy_src = (const char *) src_t->data + off;
@@ -10223,22 +11204,66 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         ggml_backend_event_record((ggml_backend_event_t) slot.ev_copy_end,   backend_copy);
         ls_stage_record(slot.ev_copy_ready);
         slot.t_copy_enqueue_done_us = ggml_time_us();
-        for (int32_t e : fetch) {
+        for (int32_t e : rows) {
             have[(size_t) e] = 1;
         }
+    };
+
+    if (!fetch_wait.empty()) {
+        s3_enqueue(fetch_wait);
+        s3_t_enq1 = slot.t_copy_enqueue_done_us;
     }
 
     // host-blocking wait: the FFN graph may only consume after the copy event
-    // completes (SDD lifecycle)
-    const int64_t t_wait0 = ggml_time_us();
-    ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
-    (void) t_wait0;
+    // completes (SDD lifecycle). S3 skips it only when every pending demanded
+    // row was admitted to the host leg -- the device leg then reads nothing
+    // that is in flight. Any waited batch (or no admission at all) keeps the
+    // unconditional sync exactly as before.
+    if (s3_need_wait) {
+        const int64_t w0 = ggml_time_us();
+        ggml_backend_event_synchronize((ggml_backend_event_t) slot.ev_copy_ready);
+        s3_waited     = ggml_time_us() - w0;
+        s3_t_sync_end = ggml_time_us();
+        std::fill(row_set_outstanding[(size_t) slot_idx].begin(),
+                  row_set_outstanding[(size_t) slot_idx].end(), 0);
+    }
+
+    if (!fetch_host.empty()) {
+        s3_enqueue(fetch_host);
+        std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+        for (int32_t e : fetch_host) {
+            outst[(size_t) e] = 1;
+        }
+    }
+
+    // T-GPLR-61 S3: stash the post-staging classification for the executor.
+    // outstanding (issued, never observed complete) is PENDING; a resident
+    // row is READY; a demanded row that is neither is the staging defect the
+    // SDD names, and ABSENT is what ls_plan_split refuses on.
+    {
+        std::vector<uint8_t> & stt = row_set_state[(size_t) il];
+        std::fill(stt.begin(), stt.end(), (uint8_t) 2);
+        const std::vector<uint8_t> & outst = row_set_outstanding[(size_t) slot_idx];
+        for (int32_t e : uniq) {
+            stt[(size_t) e] = outst[(size_t) e] ? 1 : (have[(size_t) e] ? 0 : 2);
+        }
+    }
 
     double host_submit_us = 0.0, ready_latency_us = 0.0;
     if (!fetch.empty()) {
         const int64_t t_enq = slot.t_copy_enqueue_done_us;
-        host_submit_us   = (double) (t_enq - t_submit0);
-        ready_latency_us = (double) (ggml_time_us() - t_enq);
+        if (s3_t_enq1 >= 0 && !fetch_host.empty()) {
+            // T-GPLR-61 S3: two batches. submit is the pure pack/enqueue
+            // wall across both; availability-wait is ONLY what the consumer
+            // actually blocked on (0 when the wait was skipped). The two
+            // stay distinct per the evidence contract.
+            const int64_t t_split = s3_t_sync_end >= 0 ? s3_t_sync_end : s3_t_enq1;
+            host_submit_us   = (double) ((s3_t_enq1 - t_submit0) + (t_enq - t_split));
+            ready_latency_us = (double) s3_waited;
+        } else {
+            host_submit_us   = (double) (t_enq - t_submit0);
+            ready_latency_us = (double) (ggml_time_us() - t_enq);
+        }
         slot.t_copy_submit_us = 0;
         slot.t_copy_enqueue_done_us = 0;
     }
@@ -10417,12 +11442,19 @@ void llama_layer_streaming::tel_rowset_fetch(int il, int slot, uint32_t generati
         "\"union_ids\":\"%s\",\"hash\":%llu,\"n_rows_fetched\":%zu,\"n_rows_resident\":%zu,"
         "\"n_rows_retained\":%zu,\"n_rows_retired\":%zu%s,"
         "\"bytes_staged\":%zu,\"bytes_full_bank\":%zu,\"host_submit_us\":%.1f,\"transfer_us\":%.1f,"
-        "\"ready_latency_us\":%.1f,\"t_us\":%lld}",
+        "\"ready_latency_us\":%.1f,\"ready_at_consumption\":%s,\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation,
         (long long) chunk, phase, top_k, union_ids.size(), ids_str.c_str(),
         (unsigned long long) hash, n_rows_fetched, n_rows_resident,
         n_rows_retained, n_rows_retired, pool_ids_json.c_str(),
         bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
+        // Same <100.0 us convention the row-set executor already feeds to
+        // add_layer_stats(..., rowset_last_ready_us < 100.0), so the trace
+        // and the in-memory statistic agree by construction. It is a LATENCY
+        // PROXY, not an observed consumption-time wait: the row-set path has
+        // no explicit wait site to observe. Reading it as a measured
+        // readiness gate would repeat the S1 defect it is meant to close.
+        ready_latency_us < 100.0 ? "true" : "false",
         (long long) ggml_time_us());
 }
 
@@ -10438,9 +11470,13 @@ void llama_layer_streaming::tel_rowset_round(int64_t round, size_t bytes_staged,
                                              uint64_t n_fetched, uint64_t n_reused) {
     tel_write(tel_out,
         "{\"event\":\"rowset_round\",\"run_id\":%llu,\"round\":%lld,\"n_tokens\":1,\"bytes_staged\":%zu,"
-        "\"bytes_full_bank\":%zu,\"n_rows_fetched\":%llu,\"n_rows_reused\":%llu,\"t_us\":%lld}",
+        "\"bytes_full_bank\":%zu,\"n_rows_fetched\":%llu,\"n_rows_reused\":%llu,"
+        "\"t_begin_us\":%lld,\"round_wall_us\":%lld,\"t_us\":%lld}",
         (unsigned long long) run_id, (long long) round, bytes_staged, bytes_full_bank,
-        (unsigned long long) n_fetched, (unsigned long long) n_reused, (long long) ggml_time_us());
+        (unsigned long long) n_fetched, (unsigned long long) n_reused,
+        (long long) rowset_round_t0_us,
+        (long long) ((rowset_round_t0_us > 0) ? (ggml_time_us() - rowset_round_t0_us) : 0),
+        (long long) ggml_time_us());
 }
 
 // ---------------------------------------------------------------------------

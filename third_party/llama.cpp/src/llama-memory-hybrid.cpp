@@ -205,6 +205,16 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
 
+// T-GPLR-71: see llama_memory_i::set_view_pad. Returns false (rather than
+// silently accepting) when there is no attention cache to narrow.
+bool llama_memory_hybrid::set_view_pad(uint32_t pad) {
+    if (!mem_attn) {
+        return false;
+    }
+    mem_attn->set_n_pad_view(pad);
+    return true;
+}
+
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }

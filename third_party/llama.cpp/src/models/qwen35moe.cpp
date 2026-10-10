@@ -4,7 +4,12 @@
 
 #ifdef LLAMA_LAYER_STREAMING
 #include "llama-layer-streaming.h"
+#include "llama-expert-split-policy.h"
 #endif
+
+// T-GPLR-82 S2: the host expert sub-op reads each MODEL LOADER tensor's declared
+// buffer placement to prove no weight source was rewired.
+#include "ggml-backend.h"
 
 const llama_layer & llama_model_qwen35moe::graph::layer(int il) const {
 #ifdef LLAMA_LAYER_STREAMING
@@ -415,8 +420,163 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
             const bool window_live = ls->row_set_window_width > 0;
 
             cur = build_norm(residual_in, layer(il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
-            cur = build_layer_ffn(cur, il, sel_in, window_live ? sel_pos_in : nullptr);
-            cb(cur, "ffn_out", il);
+
+            // T-GPLR-82 S2: the routed top-k is SPLIT into a device head leg and
+            // a host leg, each constant width, and the two are summed through the
+            // existing add chain. Both legs take their weights from ONE
+            // derivation over the FULL top_k, which is why neither leg can
+            // normalise inside build_moe_ffn: each would normalise over its own
+            // subset and the pair would sum to 2.0.
+            //
+            // The split is POSITIONAL and therefore a fixed graph shape. Which
+            // rows land on the host is executor state (ff_input_hsel), so the
+            // membership rule can change per token without a rebuild. S2 keeps
+            // the rule positional; S3 is what makes it residency-aware.
+            const int host_rows = ls->experts_host_n;
+            // T-GPLR-82 S3/S4 (2026-10-10): the split shape commits host_rows
+            // rows per (layer, token) to the CPU leg -- these widths are fixed
+            // HERE and the host leg's ids are the UNCONDITIONAL tail of the row
+            // (ff_input_hsel), so building it while the executor cannot admit a
+            // row changes the arithmetic for a run whose ledger reports zero host
+            // rows. MEASURED (session gplr82-ac1, exe 66b4eb9e, arm A2d, budget
+            // at its default 0): host share 0.000000 and
+            // sum(experts_device) == sum(experts_total) == 163,840, yet ffn_dev = 2
+            // (mixed) on all 20,480 records against 1 for the control, and
+            // divergence from the control at TG step 1 with all 512 logits FINITE.
+            // So the split is built only when ls_split_in_play -- the conjuncts
+            // the executor's own admission predicate applies -- says it can run;
+            // otherwise control falls through to the UNSPLIT FFN graph below,
+            // exactly as with the flag absent.
+            llama_ls_policy::ls_split_enable split_e;
+            split_e.host_w    = ls->experts_host_n;
+            split_e.budget_us = ls->experts_host_budget_us;
+            split_e.recon     = ls->row_set_recon;
+            split_e.spec_on   = ls->row_set_spec_on;
+            split_e.spec_mode = ls->row_set_spec_mode;
+            split_e.spec_arm  = ls->row_set_spec_arm;
+            split_e.spec_pool = ls->row_set_spec_pool;
+            const bool split_in_play = llama_ls_policy::ls_split_in_play(split_e);
+
+            // T-GPLR-82 FALSIFIER (2026-10-10, diagnostic, default off): build the
+            // SAME constant-width partition, but with the tail leg on the backend that
+            // owns the slot's staged weights instead of on the CPU. The shipped host leg
+            // is CPU-placed by CONSTRUCTION (it binds the loader's host-placed banks), so
+            // the split's measured step-0 shift cannot otherwise be separated from the
+            // partition itself. Nothing else about the shape changes: same dev_rows head,
+            // same host_rows tail, same ONE w_full derivation, same positional suffix.
+            const bool tail_device = ls->experts_host_leg_device && host_rows > 0;
+            const bool split_build  = split_in_play || tail_device;
+            if (tail_device) {
+                static bool falsifier_warned = false;
+                if (!falsifier_warned) {
+                    falsifier_warned = true;
+                    LLAMA_LOG_WARN("T-GPLR-82 FALSIFIER: --experts-host-leg device is ON -- the split's "
+                                   "tail leg (%d of %d routed rows per layer/token) is built on the DEVICE "
+                                   "backend. This is a diagnostic partition, NOT a placement policy; no host "
+                                   "leg is built and no row executes on the CPU.",
+                                   host_rows, (int) n_expert_used);
+                }
+            }
+            if (host_rows > 0 && !split_in_play && !tail_device) {
+                // Loud, not silent. A run with the flag set and the mechanism OFF
+                // must be distinguishable from a flag-absent run by the operator,
+                // not only by the ledger's zero host share.
+                static bool warned_once = false;
+                if (!warned_once) {
+                    warned_once = true;
+                    LLAMA_LOG_WARN("T-GPLR-82: --experts-host %d is NOT in play "
+                                   "(budget %.1f us/token, recon %d, spec_on %d, spec_mode %d, "
+                                   "spec_arm %d, spec_pool %d) -- building the UNSPLIT FFN graph "
+                                   "for every layer of this run, exactly as with the flag absent",
+                                   ls->experts_host_n, ls->experts_host_budget_us,
+                                   (int) ls->row_set_recon, (int) ls->row_set_spec_on,
+                                   ls->row_set_spec_mode, ls->row_set_spec_arm,
+                                   ls->row_set_spec_pool);
+                }
+            }
+            if (split_build) {
+                // Loud bounds check, not a bare write. The sizing lives in init()
+                // and must precede every build; an earlier placement made this an
+                // out-of-bounds write, which is how the access violation
+                // (0xC0000005) during "building persistent graphs" was produced.
+                if ((size_t) il >= ls->row_set_split_built.size()) {
+                    GGML_ABORT("T-GPLR-82: split flag vector holds %zu entries, no slot for layer %d",
+                               ls->row_set_split_built.size(), il);
+                }
+                // T-GPLR-82 FALSIFIER: the device-tail mode builds the split SHAPE but
+                // no host leg, so the executor must read 0 here -- that is what keeps the
+                // hsel fill, the plan reorder and the host per-row scan off, and makes the
+                // ledger report 0 host rows and host_finite -1 honestly.
+                ls->row_set_split_built[(size_t) il] = (split_in_play && !tail_device) ? 1 : 0;
+                if (host_rows >= n_expert_used) {
+                    GGML_ABORT("T-GPLR-82: --experts-host %d leaves no device rows in the top_k of %d for layer %d",
+                               host_rows, n_expert_used, il);
+                }
+                const int dev_rows = n_expert_used - host_rows;
+
+                // ONE derivation over the whole top_k, mirroring build_moe_ffn's
+                // own gather/norm/scale order exactly so the values are the ones
+                // the pre-S2 graph produced.
+                ggml_tensor * h_logits = build_lora_mm(layer(il).ffn_gate_inp, cur);
+                cb(h_logits, "ffn_moe_logits", il);
+                ggml_tensor * h_probs = ggml_soft_max(ctx0, h_logits);
+                cb(h_probs, "ffn_moe_probs", il);
+                ggml_tensor * w_full = ggml_get_rows(ctx0,
+                    ggml_reshape_3d(ctx0, h_probs, 1, n_expert, n_tokens), sel_in);
+                w_full = ggml_reshape_2d(ctx0, w_full, n_expert_used, n_tokens);
+                w_full = ggml_div(ctx0, w_full, ggml_clamp(ctx0, ggml_sum_rows(ctx0, w_full),
+                                                           6.103515625e-5, INFINITY));
+                w_full = ggml_reshape_3d(ctx0, w_full, 1, n_expert_used, n_tokens);
+                if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
+                    w_full = ggml_scale(ctx0, w_full, hparams.expert_weights_scale);
+                }
+                cb(w_full, "ffn_moe_weights_split", il);
+
+                // device head leg: the FIRST dev_rows positions
+                ggml_tensor * sel_head = ggml_view_2d(ctx0, sel_in, dev_rows, n_tokens, sel_in->nb[1], 0);
+                ggml_tensor * w_dev = ggml_view_3d(ctx0, w_full, 1, dev_rows, n_tokens,
+                                                    w_full->nb[1], w_full->nb[2], 0);
+                ggml_tensor * pos_head = window_live
+                    ? ggml_view_2d(ctx0, sel_pos_in, dev_rows, n_tokens, sel_pos_in->nb[1], 0)
+                    : nullptr;
+
+                ggml_tensor * dev_out = build_layer_ffn(cur, il, sel_head, pos_head, w_dev, dev_rows);
+                ggml_tensor * host_out;
+                if (tail_device) {
+                    // T-GPLR-82 FALSIFIER: the SAME positional suffix, weights, and
+                    // reduction as the host leg below, computed on the backend that owns
+                    // the slot's staged weights. Suffix VIEWS of the device leg's own
+                    // inputs, so no new INPUT and no executor-side fill exists: every
+                    // demanded row is staged and awaited exactly as in the unsplit path.
+                    ggml_tensor * sel_tail = ggml_view_2d(ctx0, sel_in, host_rows, n_tokens,
+                                                          sel_in->nb[1], (size_t) dev_rows * sel_in->nb[1]);
+                    ggml_tensor * pos_tail = window_live
+                        ? ggml_view_2d(ctx0, sel_pos_in, host_rows, n_tokens,
+                                       sel_pos_in->nb[1], (size_t) dev_rows * sel_pos_in->nb[1])
+                        : nullptr;
+                    ggml_tensor * w_tail = ggml_view_3d(ctx0, w_full, 1, host_rows, n_tokens,
+                                                        w_full->nb[1], w_full->nb[2],
+                                                        (size_t) dev_rows * w_full->nb[1]);
+                    host_out = build_moe_tail_leg_device(cur, il, sel_tail, pos_tail, w_tail, host_rows);
+                } else {
+                    // host leg ids: a separate INPUT, not a view of sel_in. The host
+                    // leg runs on the CPU backend and must not inherit a view of a
+                    // device tensor, and S3 needs to choose host membership freely.
+                    ggml_tensor * hsel_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, host_rows, n_tokens);
+                    ggml_set_input(hsel_in);
+                    ggml_set_name(hsel_in, "rowset_selected_experts_host");
+                    ls->cur_set()->ff_input_hsel.back() = hsel_in;
+                    host_out = build_moe_host_leg(cur, il, hsel_in,
+                        ggml_view_3d(ctx0, w_full, 1, host_rows, n_tokens,
+                                     w_full->nb[1], w_full->nb[2], (size_t) dev_rows * w_full->nb[1]),
+                        host_rows);
+                }
+                cur = ggml_add(ctx0, dev_out, host_out);
+                cb(cur, "ffn_out", il);
+            } else {
+                cur = build_layer_ffn(cur, il, sel_in, window_live ? sel_pos_in : nullptr);
+                cb(cur, "ffn_out", il);
+            }
 
             cur = ggml_add(ctx0, cur, residual_in);
             cb(cur, "post_moe", il);
@@ -446,6 +606,10 @@ void llama_model_qwen35moe::graph::build_streaming_graphs() {
                     base = base->view_src; // topk view -> argsort node
                 }
                 if (base->op == GGML_OP_ARGSORT && base->src[0] != nullptr) {
+                    // This is a dead-end diagnostic leaf in the ordinary graph.
+                    // Keep its allocation alive until the post-compute AER
+                    // readback; row-set part A marks the same tensor as output.
+                    ggml_set_output(base->src[0]);
                     ggml_build_forward_expand(gf, base->src[0]); // selection probs
                 }
             }
@@ -736,9 +900,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * selected_experts_in, ggml_tensor * selected_experts_weight_in) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * selected_experts_in, ggml_tensor * selected_experts_weight_in, ggml_tensor * moe_weights_in, const int routed_rows) {
     // Check if this is an MoE layer
     GGML_ASSERT(layer(il).ffn_gate_inp != nullptr);
+
+    // T-GPLR-82 S2: 0 means the pre-S2 shape -- the full routed top_k, weights
+    // derived inside build_moe_ffn. A non-zero value is this leg's share of a
+    // split top_k and is only ever set together with moe_weights_in.
+    const int64_t n_rows = routed_rows > 0 ? routed_rows : n_expert_used;
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
@@ -747,7 +916,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             layer(il).ffn_gate_exps,
             layer(il).ffn_down_exps,
             nullptr,
-            n_expert, n_expert_used,
+            n_expert, n_rows,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
@@ -756,7 +925,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             layer(il).ffn_gate_exps_s,
             layer(il).ffn_down_exps_s,
             selected_experts_in,
-            selected_experts_weight_in);
+            selected_experts_weight_in,
+            moe_weights_in);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -793,6 +963,153 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
     return cur;
 }
+
+// T-GPLR-82 S2: the HOST expert sub-op.
+//
+// WHY IT BINDS model.layers[il] AND NOT layer(il). In this graph
+// llama_model_qwen35moe::graph::layer() returns ls->slot_layer(il) -- the SLOT's
+// layer, whose expert tensors are the compact CUDA copies load_row_set stages.
+// The host leg must read the very bytes the DMA is reading, so it binds the
+// model LOADER's tensors: the runner forced those to a CPU buffer type at load
+// time (the exps buft override) and the slot never rewires them. That is the
+// placement the SDD permits -- the weight is host-placed and stays host-placed,
+// so nothing was rewired. The guard below checks that from the tensors'
+// declared placement instead of asserting it in a comment.
+//
+// ALL THREE routed-expert members are bound on purpose. bytes_staged in
+// load_row_set counts the gate/up/down slabs of every package member, so a host
+// leg that bound only some of them would leave the byte accounting out of step
+// with the copy loop that is still running for them.
+#ifdef LLAMA_LAYER_STREAMING
+ggml_tensor * llama_model_qwen35moe::graph::build_moe_host_leg(
+        ggml_tensor * cur, const int il,
+        ggml_tensor * host_ids, ggml_tensor * host_weights, const int n_host) const {
+    GGML_ASSERT(ls != nullptr && "build_moe_host_leg is only reachable on the row-set path");
+    const llama_layer & host_layer = model.layers[il];
+
+    const ggml_tensor * members[3] = {
+        host_layer.ffn_gate_exps, host_layer.ffn_up_exps, host_layer.ffn_down_exps,
+    };
+    if (host_layer.ffn_gate_up_exps != nullptr) {
+        // fused gate_up bank: gate and up are ONE tensor, so the bound count is 2
+        members[0] = host_layer.ffn_gate_up_exps;
+        members[1] = nullptr;
+    }
+
+    std::vector<llama_ls_policy::ls_rewire_observation> obs;
+    obs.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+        if (members[i] == nullptr) {
+            continue;
+        }
+        const bool is_host =
+            ggml_backend_buft_is_host(ggml_backend_buffer_get_type(members[i]->buffer));
+        // The staging fact is read from the buffer's USAGE, which is what
+        // separates a weight at its DECLARED placement from one the
+        // scheduler's compute_splits path has put in a compute buffer. Both
+        // usages are host-placed, so is_host alone cannot tell them apart --
+        // this is the field that makes the placement assertion sharp rather
+        // than satisfied by accident.
+        const bool in_staging =
+            ggml_backend_buffer_get_usage(members[i]->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+        // min_batch_override_live stays false: the T-GPLR-16 MIN_BATCH=1 route
+        // is not in this tree (reverted 2026-09-22), so there is no override
+        // to be live. It is passed explicitly rather than defaulted so that
+        // re-introducing that route forces a decision HERE, at the only place
+        // in the tree where a host leg is built.
+        obs.push_back({true, is_host, false, in_staging});
+    }
+    if (obs.empty()) {
+        GGML_ABORT("T-GPLR-82: layer %d has no routed-expert tensors to bind to the host leg", il);
+    }
+
+    const llama_ls_policy::ls_rewire_verdict verdict = llama_ls_policy::ls_check_no_rewire(obs);
+    if (!verdict.ok) {
+        // Loud and terminal on purpose. SDD section 4 forbids repairing this,
+        // and the graph builder has no return path the executor inspects, so
+        // continuing here would run a graph whose weights are not the ones the
+        // manifest names -- the one outcome this whole class must never have.
+        GGML_ABORT("T-GPLR-82: %s (layer %d, %u of %u host-leg weights)",
+                   verdict.refuse_reason, il, verdict.rewired, verdict.host_leg_weights);
+    }
+    ls->host_leg_builds         += 1;
+    ls->host_leg_weights_bound  += verdict.host_leg_weights;
+
+    ggml_tensor * exp_rows = nullptr;
+    ggml_tensor * moe_out = build_moe_ffn(cur,
+        host_layer.ffn_gate_inp,
+        host_layer.ffn_up_exps,
+        host_layer.ffn_gate_exps,
+        host_layer.ffn_down_exps,
+        nullptr,
+        n_expert, n_host,
+        LLM_FFN_SILU, true,
+        hparams.expert_weights_scale,
+        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+        nullptr, host_layer.ffn_gate_up_exps,
+        nullptr, nullptr, nullptr,
+        host_ids,
+        // ABSOLUTE ids: this leg's weights are the FULL bank, so there is no
+        // compact window to address and no position table to pass. Passing the
+        // device leg's window positions here would be the addressing bug the
+        // T-GPLR-62 S2 comment warns about, so this stays null deliberately.
+        nullptr,
+        host_weights,
+        &exp_rows);
+    if (exp_rows == nullptr) {
+        GGML_ABORT("T-GPLR-61: host leg for layer %d did not capture its per-row outputs", il);
+    }
+    auto * gs = ls->cur_set();
+    if (gs == nullptr || gs->ff_host_experts.empty()) {
+        GGML_ABORT("T-GPLR-61: ff_host_experts not sized before the host leg for layer %d", il);
+    }
+    // The executor scans this tensor after part B for non-finite values
+    // (SDD moe-row-split failure contract): pre-aggregation rows, so a bad
+    // value can be attributed to the exact expert that produced it.
+    gs->ff_host_experts.back() = exp_rows;
+    return moe_out;
+}
+
+// T-GPLR-82 FALSIFIER (2026-10-10, diagnostic). The SAME constant-width tail leg
+// as build_moe_host_leg, computed on the backend that owns the SLOT layer's staged
+// weights instead of on the CPU. EVERYTHING but the weight source and the resulting
+// backend is identical on purpose: same positional suffix, same n_tail width, same
+// pre-derived weights from the ONE w_full, the same build_moe_ffn reduction into the
+// same add chain. That is what makes a difference measured here attributable: a shift
+// that survives with no CPU row in the partition is not the CPU's.
+//
+// Reachable only under --experts-host-leg device (the graph builder branches on it).
+// The shared expert is deliberately not built here: the head leg already carries it,
+// and adding it twice would move the layer output far more than any numeric effect
+// this diagnostic is trying to see. The rewire guard is not consulted because this
+// mode builds no host leg at all -- there is nothing host-placed to rewire.
+ggml_tensor * llama_model_qwen35moe::graph::build_moe_tail_leg_device(
+        ggml_tensor * cur, const int il,
+        ggml_tensor * tail_ids, ggml_tensor * tail_pos, ggml_tensor * tail_weights,
+        const int n_tail) {
+    GGML_ASSERT(ls != nullptr && "build_moe_tail_leg_device is only reachable on the row-set path");
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            layer(il).ffn_gate_inp,
+            layer(il).ffn_up_exps,
+            layer(il).ffn_gate_exps,
+            layer(il).ffn_down_exps,
+            nullptr,
+            n_expert, n_tail,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, layer(il).ffn_gate_up_exps,
+            layer(il).ffn_up_exps_s,
+            layer(il).ffn_gate_exps_s,
+            layer(il).ffn_down_exps_s,
+            tail_ids,
+            tail_pos,
+            tail_weights);
+    cb(moe_out, "ffn_moe_tail_out", il);
+    return moe_out;
+}
+#endif // LLAMA_LAYER_STREAMING
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE
 llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)

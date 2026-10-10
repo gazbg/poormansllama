@@ -131,6 +131,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool set_view_pad(uint32_t pad) override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -171,6 +173,24 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+
+    // T-GPLR-71: phase-scoped attention-view granularity. 0 (the default, and
+    // the only value anything sets today) means "use n_pad exactly as before",
+    // so an untouched cache is bit-for-bit unaffected. A non-zero value makes
+    // get_n_kv() pad the LIVE position to that granularity instead of to the
+    // whole-cache floor n_pad imposes -- which is what stock does, since stock
+    // runs n_pad = 0 and therefore effectively pads to the 256 floor.
+    //
+    // This is deliberately NOT cparams.n_pad. That pin also sizes the phase-0
+    // (prefill) sets, whose graphs the T-Q38FA-01 per-chunk causal narrowing
+    // only ever SHRINKS; narrowing them requires every prefill set to be built
+    // wider than the largest window any chunk drives it with, which the
+    // per-width-class prebuild cannot guarantee (the classes are built at the
+    // first chunks' positions, not at the last chunk's). This override is
+    // armed only at the prefill -> generation boundary, so every prefill graph
+    // is built exactly as it is today.
+    void     set_n_pad_view(uint32_t pad) { n_pad_view = pad; }
+    uint32_t get_n_pad_view() const       { return n_pad_view; }
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -242,6 +262,9 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // T-GPLR-71: phase-scoped override of n_pad inside get_n_kv(); 0 = off
+    uint32_t n_pad_view = 0;
 
     // SWA
     const uint32_t n_swa = 0;

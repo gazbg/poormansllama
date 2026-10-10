@@ -790,6 +790,7 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1507,6 +1508,12 @@ bool llama_context::layer_streaming_prebuild(const llama_batch & batch_inp, int6
 
         ls->phase = mode;
         ls->cur_chunk_id = chunk_id; // so build_graph's begin_build selects the same per-chunk set
+        // T-GPLR-71: record the attention view width THIS build will see, so
+        // finish_build() can store it on the set and the executor can later ask
+        // whether that view still covers what is live. Read AFTER the apply()
+        // above, from the same context the builder will read, so the two can
+        // never disagree.
+        ls->cur_build_n_kv = vhybrid ? (int32_t) vhybrid->get_attn()->get_n_kv() : -1;
         auto * set = ls->begin_set(mode, vubatch.n_tokens, rs_z, n_outputs_new, chunk_id);
         if (set == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to begin graph set (mode %d, n %d, rs_z %d, n_outputs %d, chunk %d): %s\n",

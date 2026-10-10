@@ -1168,6 +1168,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+// T-GPLR-71: a plain KV cache IS the attention memory, so honouring the
+// phase-scoped view granularity is a direct forward. Nothing else about the
+// cache changes: the K/V storage is still allocated and filled at full size;
+// only the width of the VIEW that graphs read is narrowed, exactly as stock's
+// n_pad = 0 does.
+bool llama_kv_cache::set_view_pad(uint32_t pad) {
+    n_pad_view = pad;
+    return true;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
@@ -1235,7 +1245,11 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // T-GPLR-71: n_pad_view is the phase-scoped override. 0 reproduces the
+    // line below exactly as upstream wrote it, so every run that never arms the
+    // override gets byte-identical view widths to every run before T-GPLR-71.
+    const uint32_t n_pad_eff = n_pad_view ? n_pad_view : n_pad;
+    const uint32_t n_pad_cur = std::max(n_pad_eff, 256u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

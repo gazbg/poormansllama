@@ -404,6 +404,28 @@ if (LLAMA_LAYER_STREAMING)
     # mode the outer port comparator reads. No CUDA, no model load.
     llama_build_and_test(test-layer-streaming-tg-predict.cpp)
     target_compile_definitions(test-layer-streaming-tg-predict PRIVATE LLAMA_LAYER_STREAMING)
+
+    # T-GPLR-71: host-only proof of the TG attention-view COVERAGE GUARD --
+    # view_covers_live / should_arm_view_rebuild / record_built_view and
+    # arm_tg_view_rebuild, driven directly so the shipped decision (not a copy
+    # of it) is what is under test. Covers all three coverage directions, the
+    # width reset that stops an un-instrumented build inheriting a stale one,
+    # the storm bound over a tg sequence, and the legacy n_pad pin staying
+    # inert. No CUDA, no model load.
+    llama_build_and_test(test-layer-streaming-tg-view.cpp)
+    target_compile_definitions(test-layer-streaming-tg-view PRIVATE LLAMA_LAYER_STREAMING)
+
+    # T-GPLR-61 step A: host-only proof of the `moe-row-split` POLICY AND SHAPE
+    # (AC1) -- ls_classify_row / ls_evaluate_gate / ls_plan_split driven
+    # directly, so the shipped partition and refusal contract is what is under
+    # test. Covers all seven AC1 fixtures (all-READY inert, all-PENDING under an
+    # open gate, a closed gate returning PENDING rows to the ordinary wait path,
+    # a mixed set, an absent row refusing, an unevaluable policy refusing, and
+    # inert constant-width padding), plus the gate arithmetic against the
+    # measured constants it was derived from. No CUDA, no model load. This does
+    # NOT prove the identity gate -- that is AC2, a separate GPU task.
+    llama_build_and_test(test-layer-streaming-expert-split.cpp)
+    target_compile_definitions(test-layer-streaming-expert-split PRIVATE LLAMA_LAYER_STREAMING)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

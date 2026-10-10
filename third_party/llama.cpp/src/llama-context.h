@@ -77,6 +77,17 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    // T-GPLR-71: arm the phase-scoped attention-view granularity; see
+    // llama_memory_i::set_view_pad. Returns false when there is no memory, or
+    // when the memory type cannot narrow its view -- so the caller can refuse
+    // loudly instead of quietly running the whole-cache view it asked to remove.
+    // 0 restores the constructor's n_pad exactly. Inline because llama_context
+    // members are not exported from llama.dll (set_layer_streaming below is
+    // inline for the same reason).
+    bool set_attn_view_pad(uint32_t pad) {
+        return memory ? memory->set_view_pad(pad) : false;
+    }
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 

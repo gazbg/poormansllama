@@ -1101,7 +1101,28 @@ struct llm_graph_context {
              // passes this. NOTE: get_rows/add_id and the ffn_moe_weights gather
              // must keep using the ABSOLUTE ids -- only build_lora_mm_id on the
              // window-resident weights takes this one.
-             ggml_tensor * selected_experts_weight = nullptr) const;
+             ggml_tensor * selected_experts_weight = nullptr,
+             // T-GPLR-82 S2: pre-computed FINAL per-expert weights, shape
+             // [1, n_expert_used, n_tokens]. Non-null means the caller has
+             // already gathered and normalised the router weights and this
+             // call MUST NOT redo it: the gather, the norm_w division and the
+             // w_scale multiply are all skipped and exactly this tensor is
+             // applied. It exists because a routed top-k SPLIT ACROSS TWO LEGS
+             // (one device leg, one host leg) cannot normalise inside either
+             // leg -- each leg would normalise over its own subset and the two
+             // would sum to 2.0 -- and no gating path can express a zero-weight
+             // pad (SOFTMAX normalises, SOFTMAX_WEIGHT re-normalises,
+             // SIGMOID/SQRT_SOFTPLUS are strictly positive), so the padded
+             // tail row could never be excluded. Null (the default, and every
+             // caller outside the row-set split) keeps this function's graph
+             // byte-identical.
+             ggml_tensor * moe_weights_in = nullptr,
+             // T-GPLR-61 step C: when non-null, receives this call's
+             // PRE-AGGREGATION per-row expert outputs [n_embd, n_rows, n_tokens]
+             // so the executor can scan them for non-finite values after compute.
+             // Only the host leg passes this; the default keeps every existing
+             // caller byte-identical.
+             ggml_tensor ** experts_out = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1136,7 +1157,12 @@ struct llm_graph_context {
              // passes this. NOTE: get_rows/add_id and the ffn_moe_weights gather
              // must keep using the ABSOLUTE ids -- only build_lora_mm_id on the
              // window-resident weights takes this one.
-             ggml_tensor * selected_experts_weight = nullptr) const;
+             ggml_tensor * selected_experts_weight = nullptr,
+             // T-GPLR-82 S2: same contract as the no-bias overload above, and
+             // for the same reason: a routed top-k split across a device leg and
+             // a host leg cannot normalise inside either leg.
+             ggml_tensor * moe_weights_in = nullptr,
+             ggml_tensor ** experts_out = nullptr) const;
 
     //
     // inputs
