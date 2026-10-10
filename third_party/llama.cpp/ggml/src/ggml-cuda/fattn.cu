@@ -5,6 +5,13 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// FAFIX experiment toggle (opt-in, default off): FAFIX_CAUSAL_GQA=1 lets the mask-free causal-window FA op
+// use the GQA-optimized variants when K/V are 256-padded. Same hunk as the side copy C:\Developmentafix.
+static bool ggml_cuda_fafix_causal_gqa() {
+    static const bool on = [] { const char * e = getenv("FAFIX_CAUSAL_GQA"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -47,7 +54,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // FAFIX: the causal-window op has no mask tensor but generates its mask in-kernel, which is
+    //     mask-shape independent, so it may use the GQA-optimized variants when K/V are 256-padded.
+    bool use_gqa_opt = (mask || (ggml_cuda_fafix_causal_gqa() && ggml_get_op_params_i32(dst, 4) != 0)) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -375,7 +384,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && (mask || (ggml_cuda_fafix_causal_gqa() && ggml_get_op_params_i32(dst, 4) != 0)) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
