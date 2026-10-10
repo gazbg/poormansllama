@@ -138,6 +138,14 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
   LM tree (13/14 files clean; `qwen35moe.cpp` hook ported by hand; registration tolerates ranges the runner already pinned). PP stays LM (charter priority 1).
 - D10 Measure first: E10 reproduces the AER hybrid vs stock at the goal shape (`-c 262000`, q8 KV, C=16/24/32 slots, interleaved, VRAM polled).
 
+- **E10 (session e10-aer-pair, goal shape `-c 262000`, q8 KV, interleaved, 2 reps, side-copied AER binaries `bin/aer-v4`, 400 tokens, GPU mutex, one hold)**:
+  stock `-ncmoe 37 -t 16` 38.80 tok/s (VRAM peak +7435 MiB over idle); AER hybrid C16 70.43 (+7167 MiB), C24 79.02 (+7713), C32 86.06 (+8259).
+  => **1.8x-2.2x stock at the goal shape, measured.** Caveats: stock here is 38.8 not 30.7 (today's machine state; compare within this session only);
+  `llama-completion`, not `llama-server`; 2 reps; the hybrid's VRAM figure is WDDM whole-GPU use over idle (the cache itself is C x 40 x 3 slabs);
+  output correctness NOT yet graded (answer-stability QA is the next gate, AGENTS.md).
+- **Port status**: AER core commit `aa6f00805` applied to the LM nested tree (13 of 14 files clean); `qwen35moe.cpp` hook ported by hand (`ls == nullptr`,
+  `selected_experts_in == nullptr`, `routed_rows == 0` guard); `--tg-hybrid` runner flag + `begin_tg_stock()` (frees PP slots/slabs, sets `tg_stock`) + cap
+  exemptions; host-range registration tolerates ranges already pinned. **NOT YET COMPILED** - the build is queued behind the stock-gap series on the mutex.
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
