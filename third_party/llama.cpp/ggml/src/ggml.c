@@ -1083,6 +1083,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "MOE_HYBRID_PUBLISH",
+    "MOE_HYBRID_WAIT_ADD",
 
     "UNARY",
 
@@ -1100,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1200,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "moe_hybrid_publish(sel, w, x, map, state)",
+    "moe_hybrid_wait_add(x, pub, state)",
 
     "unary(x)",
 
@@ -1215,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6487,6 +6491,68 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_moe_hybrid_publish / ggml_moe_hybrid_wait_add
+// publish op_params (int32): [0] il, [1] n_slot, [2] n_expert, [4..5] mailbox pointer, [6..7] trace pointer
+// wait_add reads the mailbox pointer from its pub source
+
+struct ggml_tensor * ggml_moe_hybrid_publish(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * selected,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * map,
+        struct ggml_tensor  * state,
+        int32_t               il,
+        int32_t               n_expert,
+        int32_t               n_slot,
+        void                * mailbox,
+        void                * trace) {
+    GGML_ASSERT(selected->type == GGML_TYPE_I32 && selected->ne[1] == 1 && selected->ne[0] <= 8);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_nelements(weights) == selected->ne[0]);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && ggml_nelements(cur) == cur->ne[0]);
+    GGML_ASSERT(map->type == GGML_TYPE_I32 && ggml_is_contiguous(map));
+    GGML_ASSERT(n_expert > 0 && ggml_nelements(map) % n_expert == 0 && il < ggml_nelements(map) / n_expert);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(mailbox != NULL && trace != NULL && il >= 0 && n_slot > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16);
+
+    int32_t params[8] = { il, n_slot, n_expert, 0, 0, 0, 0, 0 };
+    const uint64_t mb = (uint64_t) (uintptr_t) mailbox;
+    const uint64_t tr = (uint64_t) (uintptr_t) trace;
+    memcpy(params + 4, &mb, sizeof(mb));
+    memcpy(params + 6, &tr, sizeof(tr));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_HYBRID_PUBLISH;
+    result->src[0] = selected;
+    result->src[1] = weights;
+    result->src[2] = cur;
+    result->src[3] = map;
+    result->src[4] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_hybrid_wait_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * pub,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && ggml_nelements(cur) == cur->ne[0]);
+    GGML_ASSERT(pub->op == GGML_OP_MOE_HYBRID_PUBLISH && pub->src[2]->ne[0] == cur->ne[0]);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+
+    result->op     = GGML_OP_MOE_HYBRID_WAIT_ADD;
+    result->src[0] = cur;
+    result->src[1] = pub;
+    result->src[2] = state;
 
     return result;
 }

@@ -5,6 +5,7 @@
 #ifdef LLAMA_LAYER_STREAMING
 #include "llama-layer-streaming.h"
 #include "llama-expert-split-policy.h"
+#include "llama-moe-hybrid.h"
 #endif
 
 // T-GPLR-82 S2: the host expert sub-op reads each MODEL LOADER tensor's declared
@@ -952,7 +953,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // split top_k and is only ever set together with moe_weights_in.
     const int64_t n_rows = routed_rows > 0 ? routed_rows : n_expert_used;
 
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out = nullptr;
+    ggml_tensor * moe_pub = nullptr;
+#ifdef LLAMA_LAYER_STREAMING
+    // opt-in hybrid decode (env LLAMA_MOE_HYBRID): GPU slot cache plus a host pool for the misses; nullptr means the stock path
+    if (ls == nullptr && selected_experts_in == nullptr && moe_weights_in == nullptr && routed_rows == 0) {
+        moe_out = llama_moe_hybrid_build_ffn(*this, model, il, cur, &moe_pub);
+    }
+#endif
+    if (moe_out == nullptr) {
+    moe_out =
         build_moe_ffn(cur,
             layer(il).ffn_gate_inp,
             layer(il).ffn_up_exps,
@@ -970,6 +980,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             selected_experts_in,
             selected_experts_weight_in,
             moe_weights_in);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -1003,6 +1014,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     } else {
         cur = moe_out;
     }
+
+#ifdef LLAMA_LAYER_STREAMING
+    if (moe_pub != nullptr) {
+        // add the host engine's sum over the experts that missed the VRAM cache
+        cur = llama_moe_hybrid_build_wait(*this, cur, moe_pub);
+    }
+#endif
 
     return cur;
 }

@@ -68,10 +68,58 @@ GGML_BACKEND_API bool ggml_backend_cuda_unregister_host_range(const void * ptr);
 // ggml's own backend events use cudaEventDisableTiming, so cudaEventElapsedTime
 // cannot be used on them. Nothing here orders work or sits on the critical path.
 GGML_BACKEND_API void * ggml_backend_cuda_stream_handle(ggml_backend_t backend, int stream_no);
+
+// T-Q36-AER: submit count disjoint host->device region copies (dsts[i] <-
+// srcs[i], sizes[i] bytes) as ONE batched async memcpy (cudaMemcpyBatchAsync,
+// CUDA 12.8+) on the backend's stream. Copies within the batch may execute in
+// any order, so regions must be disjoint. Returns false when the runtime
+// lacks or refuses the batch API; the caller then falls back to per-copy
+// ggml_backend_tensor_set_async (same stream, same bytes).
+GGML_BACKEND_API bool ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
+                                                         void * const * dsts, const void * const * srcs,
+                                                         const size_t * sizes, size_t count);
 GGML_BACKEND_API void * ggml_backend_cuda_timing_event_new(ggml_backend_t backend, int stream_no);
 GGML_BACKEND_API void   ggml_backend_cuda_timing_event_record(void * handle);
 GGML_BACKEND_API double ggml_backend_cuda_timing_event_elapsed_ms(void * a, void * b); // < 0 = not ready
 GGML_BACKEND_API void   ggml_backend_cuda_timing_event_free(void * handle);
+
+// T-Q36-AER experimental hybrid MoE decode (ggml_moe_hybrid_publish / _wait_add):
+// host mailbox shared by the CUDA kernels and the host miss engine. It lives in
+// pinned, device-mapped host memory; req_seq and res_seq sit on their own cache
+// lines. The device posts misses then req_seq; the host writes y then res_seq.
+#define GGML_MOE_HYBRID_MAX_EMBD  4096
+#define GGML_MOE_HYBRID_MAX_USED  8
+#define GGML_MOE_HYBRID_MAX_LAYER 128
+struct ggml_moe_hybrid_mailbox {
+    volatile int32_t req_seq;
+    int32_t pad0[15];
+    int32_t layer;
+    int32_t nmiss;
+    int32_t err;
+    int32_t pad1;
+    int32_t ids[GGML_MOE_HYBRID_MAX_USED];
+    float   w[GGML_MOE_HYBRID_MAX_USED];
+    int32_t pad2[12];
+    float   x[GGML_MOE_HYBRID_MAX_EMBD];
+    volatile int32_t res_seq;
+    int32_t pad3[15];
+    float   y[GGML_MOE_HYBRID_MAX_EMBD];
+    // per-layer timeline (diagnostics only): device globaltimer ns at publish, wait start, wait end
+    // and result-add end (after the host result was loaded), then the host serve time in ns
+    // (left 0 by the host when the layer had no miss)
+    uint64_t prof[GGML_MOE_HYBRID_MAX_LAYER][5];
+};
+// device pointer of a pinned host allocation, NULL if the memory is not device-mapped
+GGML_BACKEND_API void * ggml_backend_cuda_host_device_ptr(void * host_ptr);
+// ggml_backend_cuda_copy_batch_async on the auxiliary stream (No. 1)
+GGML_BACKEND_API bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
+                                                       void * const * dsts, const void * const * srcs,
+                                                       const size_t * sizes, size_t count);
+// non-blocking completion test of a backend event (cudaEventQuery)
+GGML_BACKEND_API bool ggml_backend_cuda_event_ready(ggml_backend_event_t event);
+// hand the auxiliary stream's queued work to the GPU now (cudaStreamQuery): under WDDM the driver
+// batches submissions and would otherwise start them only at the next synchronizing call
+GGML_BACKEND_API void ggml_backend_cuda_aux_flush(ggml_backend_t backend);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 

@@ -59,6 +59,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/moe-hybrid.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2374,6 +2375,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_HYBRID_PUBLISH:
+            ggml_cuda_op_moe_hybrid_publish(ctx, dst);
+            break;
+        case GGML_OP_MOE_HYBRID_WAIT_ADD:
+            ggml_cuda_op_moe_hybrid_wait_add(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -4687,6 +4694,45 @@ void * ggml_backend_cuda_stream_handle(ggml_backend_t backend, int stream_no) {
     return (void *) cuda_ctx->stream(cuda_ctx->device, stream_no);
 }
 
+// T-Q36-AER: one batched async memcpy for count disjoint host->device region
+// copies, on the SAME stream set_tensor_async uses so the copy-event ordering
+// is unchanged. A refused or unavailable batch returns false - never aborts -
+// so the caller can fall back to per-copy set_async.
+bool ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
+                                        void * const * dsts, const void * const * srcs,
+                                        const size_t * sizes, size_t count) {
+#if CUDART_VERSION >= 12080
+    if (!ggml_backend_is_cuda(backend) || dsts == nullptr || srcs == nullptr ||
+        sizes == nullptr || count == 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // every copy must be covered by one attribute entry. The sources are
+    // host pointers allocated outside CUDA (mmap model views / pageable), so
+    // srcAccessOrder Any + explicit loc hints matches the documented shape
+    // for those pointers and lets WDDM stage them at call time. The first
+    // run used memset-0 + Stream here and crashed with an illegal memory
+    // access after PP (probe: build/probe-copy-batch/).
+    cudaMemcpyAttributes attrs[1];
+    memset(&attrs[0], 0, sizeof(attrs));
+    attrs[0].srcAccessOrder  = cudaMemcpySrcAccessOrderAny;
+    attrs[0].srcLocHint.type = cudaMemLocationTypeHost;
+    attrs[0].dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs[0].flags           = cudaMemcpyFlagDefault;
+    size_t attrs_idx[1] = { 0 };
+    cudaError_t err = cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrs_idx, 1,
+                                           cuda_ctx->stream());
+    return err == cudaSuccess;
+#else
+    (void) backend;
+    (void) dsts;
+    (void) srcs;
+    (void) sizes;
+    (void) count;
+    return false;
+#endif
+}
+
 void * ggml_backend_cuda_timing_event_new(ggml_backend_t backend, int stream_no) {
     if (!ggml_backend_is_cuda(backend)) {
         return nullptr;
@@ -4727,6 +4773,88 @@ void ggml_backend_cuda_timing_event_free(void * handle) {
     ggml_backend_cuda_timing_event * h = (ggml_backend_cuda_timing_event *) handle;
     CUDA_CHECK(cudaEventDestroy(h->ev));
     delete h;
+}
+
+// T-Q36-AER experimental hybrid MoE decode helpers (see ggml-cuda.h). Used only
+// by the opt-in hybrid path; no normal execution path calls these.
+void * ggml_backend_cuda_host_device_ptr(void * host_ptr) {
+    void * dptr = nullptr;
+    if (host_ptr == nullptr || cudaHostGetDevicePointer(&dptr, host_ptr, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return dptr;
+}
+
+bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
+                                      void * const * dsts, const void * const * srcs,
+                                      const size_t * sizes, size_t count) {
+#if CUDART_VERSION >= 12080
+    if (!ggml_backend_is_cuda(backend) || dsts == nullptr || srcs == nullptr ||
+        sizes == nullptr || count == 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, 1);
+    // 0 = one batch, 1 = batch with the overlap-with-compute hint, 2 = one cudaMemcpyAsync per copy
+    // (default: measured fastest on the decode timeline, the batch API inflates attention kernels)
+    static const int copy_mode = [] {
+        const char * v = getenv("LLAMA_MOE_HYBRID_COPY_MODE");
+        return v != nullptr ? atoi(v) : 2;
+    }();
+    if (copy_mode == 2) {
+        for (size_t i = 0; i < count; ++i) {
+            const cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream);
+            if (e != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+        return true;
+    }
+    // same attribute shape as ggml_backend_cuda_copy_batch_async; the hybrid
+    // path passes page-locked sources only, so the batch stays asynchronous
+    cudaMemcpyAttributes attrs[1];
+    memset(&attrs[0], 0, sizeof(attrs));
+    attrs[0].srcAccessOrder  = cudaMemcpySrcAccessOrderAny;
+    attrs[0].srcLocHint.type = cudaMemLocationTypeHost;
+    attrs[0].dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs[0].flags           = copy_mode == 1 ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
+    size_t attrs_idx[1] = { 0 };
+    cudaError_t err = cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrs_idx, 1, stream);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    return err == cudaSuccess;
+#else
+    (void) backend;
+    (void) dsts;
+    (void) srcs;
+    (void) sizes;
+    (void) count;
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_event_ready(ggml_backend_event_t event) {
+    const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    CUDA_CHECK(err);
+    return true;
+}
+
+void ggml_backend_cuda_aux_flush(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const cudaError_t err = cudaStreamQuery(cuda_ctx->stream(cuda_ctx->device, 1));
+    if (err == cudaErrorNotReady) {
+        (void) cudaGetLastError();
+        return;
+    }
+    CUDA_CHECK(err);
 }
 
 // T-GPLR-37 experimental: page-lock a mapped source range for direct
@@ -5427,6 +5555,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_HYBRID_PUBLISH:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_I32 &&
+                op->src[4]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                op->src[2]->ne[0] <= GGML_MOE_HYBRID_MAX_EMBD && op->src[0]->ne[0] <= GGML_MOE_HYBRID_MAX_USED;
+        case GGML_OP_MOE_HYBRID_WAIT_ADD:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] <= GGML_MOE_HYBRID_MAX_EMBD;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

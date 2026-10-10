@@ -574,6 +574,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_MOE_HYBRID_PUBLISH,
+        GGML_OP_MOE_HYBRID_WAIT_ADD,
 
         GGML_OP_UNARY,
 
@@ -2645,6 +2647,33 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // experimental MoE hybrid decode (CUDA only, single token):
+    // publish: selected [n_used, 1] I32, weights [1, n_used, 1] F32, cur [n_embd, 1] F32,
+    //          map [n_layer*n_expert] I32 (map[il*n_expert + e] = cache slot of expert e, n_slot = not cached),
+    //          state I32 device request counter
+    //          -> I32 [16]: [0..n_used) cache slot per selected expert (misses -> zero slot n_slot),
+    //             [8] miss count, [9] request sequence; misses are posted to the host mailbox and the
+    //             selected ids are written to trace[il*8 ..]; mailbox and trace must be device-visible host memory
+    // wait_add: cur [n_embd, 1] F32 -> cur + host result of the misses published in pub
+    GGML_API struct ggml_tensor * ggml_moe_hybrid_publish(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * selected,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * map,
+            struct ggml_tensor  * state,
+            int32_t               il,
+            int32_t               n_expert,
+            int32_t               n_slot,
+            void                * mailbox,
+            void                * trace);
+
+    GGML_API struct ggml_tensor * ggml_moe_hybrid_wait_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * pub,
+            struct ggml_tensor  * state);
 
     // custom operators
 

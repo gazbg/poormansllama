@@ -1320,6 +1320,10 @@ struct LLAMA_API llama_layer_streaming {
     // paths (plan reorder, id fill, per-row scan) stay off and the ledger
     // honestly reports 0 host rows and host_finite -1.
     bool experts_host_leg_device = false;
+    // after PP, run TG decode through the stock graph path (the AER hybrid engine hooks it) instead of this executor
+    bool tg_stock = false;
+    // frees the PP slot window and activation slabs, then routes decode through the stock graph path; call once after PP
+    bool begin_tg_stock();
     // T-GPLR-61 S3: per slot, per expert: copies ISSUED but never observed
     // complete on the host (a skipped wait leaves them outstanding). An
     // outstanding row classifies PENDING -- it may compute on the host leg,

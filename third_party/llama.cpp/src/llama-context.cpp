@@ -10,6 +10,7 @@
 #include "llama-memory-hybrid.h"
 #ifdef LLAMA_LAYER_STREAMING
 #include "llama-layer-streaming.h"
+#include "llama-moe-hybrid.h"
 #endif
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -491,6 +492,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+#ifdef LLAMA_LAYER_STREAMING
+    // T-Q36-AER: stop the hybrid MoE engine while its backend still exists
+    for (auto * backend : backend_ptrs) {
+        llama_moe_hybrid_release(backend);
+    }
+#endif
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1358,7 +1366,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // standard build path below: the draft context carries the streaming
     // attachment only to bind the handoff-resident blk.64 bundle through
     // slot_layer(), and executes its own graph normally (T-Q38HG-06).
-    if (layer_streaming != nullptr && gtype == LLM_GRAPH_TYPE_DEFAULT) {
+    if (layer_streaming != nullptr && gtype == LLM_GRAPH_TYPE_DEFAULT && !(layer_streaming->tg_stock && layer_streaming->phase == 1)) {
         const auto status = layer_streaming_compute(res, gparams);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: failed to compute layer-streaming graph, status: %d\n", __func__, status);
@@ -1404,7 +1412,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // (only for the streamed default graph type; non-default types such
         // as the MTP draft head allocate through the scheduler like stock,
         // T-Q38HG-06)
-        if (layer_streaming == nullptr || gtype != LLM_GRAPH_TYPE_DEFAULT)
+        if (layer_streaming == nullptr || gtype != LLM_GRAPH_TYPE_DEFAULT || (layer_streaming->tg_stock && layer_streaming->phase == 1))
 #endif
         {
             if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2878,7 +2886,7 @@ llm_graph_params llama_context::graph_params(
     };
 
 #ifdef LLAMA_LAYER_STREAMING
-    p.layer_streaming = layer_streaming;
+    p.layer_streaming = (layer_streaming != nullptr && layer_streaming->tg_stock && layer_streaming->phase == 1) ? nullptr : layer_streaming;
 #endif
 
     return p;

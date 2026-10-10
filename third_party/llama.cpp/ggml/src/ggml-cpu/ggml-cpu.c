@@ -2076,6 +2076,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_MOE_HYBRID_PUBLISH:
+        case GGML_OP_MOE_HYBRID_WAIT_ADD:
+            {
+                GGML_ABORT("%s is CUDA-only", ggml_op_name(tensor->op));
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);

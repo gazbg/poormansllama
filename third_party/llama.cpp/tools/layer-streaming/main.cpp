@@ -3248,6 +3248,7 @@ int main(int argc, char ** argv) {
     // step 3 is in place, because on its own it would build the TG view before any KV
     // cell exists and silently under-read. See the usage text and the plan block.
     long long kv_graph_pad = 0;
+    bool tg_hybrid = false; // --tg-hybrid: after PP, decode through the stock graph path (AER hybrid engine, env LLAMA_MOE_HYBRID)
     int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
     int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
     // T-GPLR-72: host-backend thread count. Default 16 = the value that was
@@ -3405,6 +3406,8 @@ int main(int argc, char ** argv) {
             // T-GPLR-04: --ctx-size is honored in run mode as the explicit
             // context/KV capacity, independent of the PP token count.
             run_ctx_size = ctx_size;
+        } else if (arg == "--tg-hybrid") {
+            tg_hybrid = true;
         } else if (arg == "--kv-graph-pad") {
             kv_graph_pad = atoll(arg_value(argc, argv, i, "--kv-graph-pad").c_str());
         } else if (arg == "--residency-budget-mib") {
@@ -4073,7 +4076,7 @@ int main(int argc, char ** argv) {
         // preflight: auto-on lifts the cap, auto-off re-enforces it loudly
         // before the timed PP), and explicit --handoff lifts it as in
         // T-GPLR-10.
-        if (tg_tokens > 3 && handoff_mode_str == "off") {
+        if (tg_tokens > 3 && handoff_mode_str == "off" && !tg_hybrid) {
             fprintf(stderr, "error: --pp-schedule layer-major supports at most 3 --tg-tokens in this experiment\n");
             return 2;
         }
@@ -5082,7 +5085,7 @@ int main(int argc, char ** argv) {
         // actually turn on (auto-off included): streaming layer-major TG
         // beyond 3 tokens is exactly the transfer-bound shape the cap exists
         // for. Refusing here is loud and pre-work (before the timed PP).
-        if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && !handoff && tg_tokens > 3) {
+        if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && !handoff && !tg_hybrid && tg_tokens > 3) {
             fprintf(stderr, "error: --pp-schedule layer-major supports at most 3 --tg-tokens without an active handoff (handoff auto did not activate; free VRAM or pass --handoff explicitly on a fitting shape)\n");
             return 2;
         }
@@ -5997,6 +6000,11 @@ int main(int argc, char ** argv) {
             ? (llama_token) (pp_tokens - 1)
             : prompt_tokens[pp_tokens - 1]; // last PP token; first generated comes from logits
 
+        if (tg_hybrid && !ls.begin_tg_stock()) {
+            fprintf(stderr, "error: --tg-hybrid release failed: %s\n", ls.error_msg.c_str());
+            ls.failed = true;
+            exit_status = 1;
+        }
         ls.phase = 1;
 
         // T-GPLR-71: arm the phase-scoped attention-view granularity. This is

@@ -77,5 +77,7 @@ if (LLAMA_LAYER_STREAMING)
     # needs <windows.h> (min/max/small macros) and llama-layer-streaming.cpp
     # uses std::min/std::max and locals named `small`.
     target_sources(llama PRIVATE llama-layer-streaming-host-mem.cpp)
+    # T-Q36-AER: opt-in hybrid MoE decode (VRAM expert cache + host miss engine)
+    target_sources(llama PRIVATE llama-moe-hybrid.cpp)
     target_compile_definitions(llama PRIVATE LLAMA_LAYER_STREAMING)
 endif()

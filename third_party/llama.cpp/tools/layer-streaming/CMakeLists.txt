@@ -19,6 +19,32 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(llama-layer-streaming PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# T-GPLR-82 attribution: per-op probe for row-count dependence of the MoE expert
+# matmul. The split computes the same routed experts in a 6-wide head and a 2-wide
+# tail where the shipped path computes one 8-wide op, so this measures whether an
+# output row changes with the batch row count. No model, no llama context.
+if (LLAMA_LAYER_STREAMING)
+    add_executable(op-rows-probe op-rows-probe.cpp)
+    target_compile_definitions(op-rows-probe PRIVATE LLAMA_LAYER_STREAMING)
+    target_compile_features   (op-rows-probe PRIVATE cxx_std_17)
+    target_link_libraries(op-rows-probe PRIVATE ggml)
+    if (BUILD_SHARED_LIBS)
+        set_target_properties(op-rows-probe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    # Host control: the CPU backend has its own quantized kernels, so its row-count
+    # answer is independent evidence and needs no GPU and no mutex.
+    add_test(
+        NAME layer-streaming-op-rows-cpu
+        COMMAND op-rows-probe --device CPU --json ${CMAKE_BINARY_DIR}/op-rows-cpu.json
+    )
+    set_tests_properties(layer-streaming-op-rows-cpu PROPERTIES
+        TIMEOUT 300
+        PASS_REGULAR_EXPRESSION "op-rows-probe RESULT: OK"
+        FAIL_REGULAR_EXPRESSION "FAILED"
+    )
+endif()
+
 # focused boundary test: one recurrent layer and one full-attention layer
 # through the one-layer execution boundary (T-Q38LS-02)
 if (LLAMA_LAYER_STREAMING AND GGML_CUDA)

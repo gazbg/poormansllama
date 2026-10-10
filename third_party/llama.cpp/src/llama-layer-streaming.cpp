@@ -4691,7 +4691,12 @@ static ggml_status scan_host_expert_outputs(llama_layer_streaming * ls, llama_la
     }
     // the CPU quantized matmul turns a NaN activation block into zeros, so the output rows alone cannot see a bad input
     static const char * const kGuardedTensors[2] = { "split_ffn_in", "split_dev_out" };
+    // timing arms may skip the two blocking readbacks (about 170 us per layer); the default keeps them
+    static const bool skip_split_scan = getenv("LLAMA_LS_NO_SPLIT_SCAN") != nullptr;
     for (const char * nm : kGuardedTensors) {
+        if (skip_split_scan) {
+            break;
+        }
         const std::string where = ls_first_nonfinite(set->ff_graphs[(size_t) il], nm);
         if (!where.empty()) {
             ls->error_msg = "layer_streaming_compute: non-finite split FFN tensor " + where + " at layer " + std::to_string(il);
@@ -4754,6 +4759,20 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
     llama_layer_streaming * ls = layer_streaming;
     if (ls == nullptr) {
         return GGML_STATUS_FAILED;
+    }
+    // opt-in: this path returns before graph_compute(), so the CPU backend keeps its 4 default threads and builds a pool per call (measured: more threads were slower here)
+    static const bool apply_cpu_threads = getenv("LLAMA_LS_APPLY_CPU_THREADS") != nullptr;
+    if (apply_cpu_threads) {
+        if (backend_cpu != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (set_threadpool_fn) {
+                set_threadpool_fn(backend_cpu, threadpool);
+            }
+        }
+        for (const auto & set_n_threads_fn : set_n_threads_fns) {
+            set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads);
+        }
     }
     if (ls->failed) {
         return GGML_STATUS_FAILED;
@@ -5744,6 +5763,11 @@ ggml_status llama_context::layer_streaming_compute(llm_graph_result * res, const
         }
 
         const int64_t t_setup0 = ggml_time_us();
+        // host-routed layers run CPU splits inside a persistent graph: see ls_reset_graph_allocs()
+        static const bool no_alloc_reset = getenv("LLAMA_LS_TEST_NO_ALLOC_RESET") != nullptr;
+        if (is_layer && !no_alloc_reset && ls->handoff_active && ls->handoff_partial && layer < ls->handoff_partial_from) {
+            ls_reset_graph_allocs(g);
+        }
         // T-GPLR-16 probe: unbuffered per-graph execution markers (remove after diagnosis).
         if (getenv("GGML_LS_GRAPH_EXEC_MARKERS") != nullptr) {
             fprintf(stderr, "[ls-exec] g=%d enter\n", i);
@@ -7979,6 +8003,26 @@ void llama_layer_streaming::reset_stats() {
 // their FFN on CPU (the T-Q38HG-04 mixed-execution precedent, inside one
 // layer). During PP the slot window banks every layer unchanged — the CPU
 // routing is phase-gated in slot_layer()/load_layer(), never a PP behavior.
+bool llama_layer_streaming::begin_tg_stock() {
+    size_t slot_bytes = 0;
+    size_t slab_bytes = 0;
+    for (auto & slot : slots) {
+        if (slot.buf) {
+            slot_bytes += ggml_backend_buffer_get_size(slot.buf.get());
+            slot.buf.reset();
+        }
+        slot.buf_staging.reset();
+        ls_unregister_slot_source(slot);
+    }
+    if (buf_slab) {
+        slab_bytes = ggml_backend_buffer_get_size(buf_slab.get());
+        buf_slab.reset();
+    }
+    tg_stock = true;
+    LLAMA_LOG_INFO("%s: released %zu slot bytes and %zu slab bytes; decode runs on the stock graph path\n", __func__, slot_bytes, slab_bytes);
+    return true;
+}
+
 bool llama_layer_streaming::begin_handoff_partial(int partial_from_) {
     if (handoff_active) {
         error_msg = "begin_handoff_partial: handoff already active";
