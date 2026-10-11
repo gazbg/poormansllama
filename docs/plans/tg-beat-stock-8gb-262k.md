@@ -146,6 +146,12 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - **Port status**: AER core commit `aa6f00805` applied to the LM nested tree (13 of 14 files clean); `qwen35moe.cpp` hook ported by hand (`ls == nullptr`,
   `selected_experts_in == nullptr`, `routed_rows == 0` guard); `--tg-hybrid` runner flag + `begin_tg_stock()` (frees PP slots/slabs, sets `tg_stock`) + cap
   exemptions; host-range registration tolerates ranges already pinned. **NOT YET COMPILED** - the build is queued behind the stock-gap series on the mutex.
+- **E12 (smoke, session e12-smoke): the ported hybrid runs end to end inside LM.** Build OK after three fixes: (1) `cudaHostRegister`
+  'already mapped' collision - the hybrid engine (init at PP, from its first single-token graph) pins the whole expert bank (17.5 GiB,
+  reg 9.7 ms) before LM's register-once pass; LM now accepts already-pinned spans WITHOUT claiming ownership (no unpin of the hybrid's
+  pages); (2) hybrid tolerance matches the real CUDA text 'already mapped'. Result: rc 0, 47 TG tokens, coherent answer containing all
+  anchor needles (QX-7741 TR-2918 MK-5501 LD-8834 Paris), hybrid timeline present (span 26.5 ms over 47 tokens, stall 10.5 ms, host serve 11.6 ms).
+  Not yet graded by the QA checker, not yet measured for speed.
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
