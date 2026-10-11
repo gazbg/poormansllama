@@ -181,6 +181,46 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - **E18 (8 GB shape, LM-hosted hybrid C16 + kv pad, 3 reps, QA each, deterministic)**: 65.58 / 65.49 / 64.96 tok/s; QA PASS 3/3;
   identical output across reps (dlogit 0.0000). VRAM peak not polled in this run (run-tg-arms had no poller at the time).
 - **E19 (stock and AER reference, same shape, 3 reps each)**: in progress at time of writing; see verdict under build/llama-cuda/e19-stock-8gb.
+## RESULT TABLE (goal shape, anchor-512 prompt, 128 TG tokens, decode tok/s, whole-GPU VRAM peak, idle 0 MiB)
+| arm | harness | n | tok/s mean (range) | VRAM peak | fits 8192 MiB | QA (needles) |
+|---|---|---|---|---|---|---|
+| stock `-ncmoe 37` (E19) | llama-completion | 3 | 35.10 (34.68-35.77) | 7443 MiB | yes | not run |
+| AER engine C16 (E19) | llama-completion | 3 | 72.06 (71.82-72.25) | 7177 MiB | yes | not run |
+| LM hybrid C12 + kv-pad (E20) | LM runner | 2 | 57.70 (57.24-58.16) | 7929 MiB | yes | PASS 2/2 |
+| **LM hybrid C14 + kv-pad (E20)** | LM runner | 2 | **63.30 (62.69-63.91)** | **8067 MiB** | **yes** | PASS 2/2 |
+| LM hybrid C16 + kv-pad (E18) | LM runner | 3 | 65.34 (64.96-65.58) | 8203 MiB | NO (+11 MiB) | PASS 3/3 |
+| LM hybrid C16, no kv-pad (E16) | LM runner | 1 | 34.95 | not polled | - | PASS |
+| owner doc stock (`llama-server`, 918 tok) | llama-server | 1 | 30.68 | 6918 MiB (fit log) | yes | - |
+
+## OWNER SUMMARY (AGENTS.md five-part form; autonomous decisions, NOT owner approval)
+1. **Goal.** Beat stock token generation (TG) at 8 GB VRAM / 262k context. Bar = the owner's doc: 30.68 tok/s (`llama-server`).
+   Idea under test: a per-layer GPU cache of hot experts; cache misses computed on the CPU from host RAM, no predictor.
+2. **How it works, plainly.** Each token, the router picks 8 experts per layer. Experts already on the GPU run there. The rest run
+   on 8 CPU threads that read the same weights from RAM; results are added back on the GPU. A small table tracks what is cached;
+   between tokens a simple recency score moves hot experts into the GPU cache by DMA. Routing and math are unchanged.
+3. **Glossary.** TG = token generation (one token per step, decode). PP = prompt processing (prefill). KV = attention key/value cache.
+   MoE = mixture of experts. Expert = one of 256 feed-forward blocks per layer. Slot / C = GPU-cached experts per layer.
+   n_pad = attention window pin (legacy: whole 262k cache scanned each step). kv-graph-pad = live-sized window. VRAM = GPU memory.
+   QA = needle answer-stability check (programmatic). WDDM = Windows GPU driver model (its overhead counts in the VRAM peak).
+4. **Pros / cons** (labelled):
+   - MEASURED: C14 + kv-pad = 1.80x stock in the same session (63.3 vs 35.1), 2.06x the doc bar; fits the 8 GiB peak (8067 MiB).
+   - MEASURED: the kv-pad fix is worth +88 % alone on the same engine (C16: 34.95 -> 65.7); the hybrid engine itself is worth ~2x stock.
+   - MEASURED: stock here is 35.1, not the doc's 30.7, so the bar moved with the machine; the comparison is paired, not absolute.
+   - MEASURED: C16 (65.3) is faster but peaks at 8203 MiB, 11 MiB over 8 GiB, so it does NOT meet the 8 GB shape.
+   - MEASURED: the pinned host copy of all expert banks is ~17.5 GB of RAM; this needs a 64 GB host (the rig has 62 GB).
+   - EXPECTED / UNPROVEN: the padded output enters a greedy loop after the answer (`Paris user What is the capital of France ...`).
+     QA cannot see repetition. The first divergence (step 3) is a near-tie in the control too (margin 0.24); the logit drift at steps
+     1-2 is 0.1-0.3 %, which argues against a wrong attention window, but a long-generation check is still owed.
+   - CAVEATS: one prompt family, 128 tokens, 2-3 reps per arm; stock and hybrid run in different harnesses (llama-completion vs LM);
+     QA is 128-token smoke, not the 50/512/4k ladder AGENTS.md requires; the tg-logit-margin readout is on in the LM arms.
+5. **Recommendation (autonomous).** Keep C14 + kv-pad as the 8 GB operating point for TG. Before any acceptance: (a) run the QA ladder
+   (50 and 512 tokens) on C14, (b) a 1024-token generation to test the loop, (c) re-measure stock in the LM harness or a same-harness
+   control, (d) decide whether the 17.5 GB pinned host copy is acceptable (owner decision).
+
+## DECISION LOG (continued 3)
+- D11 Diagnose the LM-vs-AER 2x by isolating variables: prompt (E15, not it), llama threads (E15, not it), attention window (E16, it).
+- D12 Fit to the 8 GiB shape by slot count, measuring VRAM with a whole-GPU poller (E20): C14 is the largest that fits.
+- D13 Accept the kv-pad fix as part of the hybrid path (it is opt-in `--kv-graph-pad`; default behaviour unchanged).
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
