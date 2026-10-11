@@ -1,0 +1,95 @@
+{
+ "session": "g14-auto24k",
+ "exe_dir": "build/llama-cuda/bin/g14",
+ "tg_tokens": 128,
+ "control": "HYB42R",
+ "qa": true,
+ "items": "N1,N2,N3,N4,K1",
+ "prompt": "build/llama-cuda/gplr07-qa-prompts/anchor-24000.txt",
+ "common": [
+  "--model",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "--prompt-file",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/anchor-24000.txt",
+  "--ubatch",
+  "512",
+  "--tg-tokens",
+  "128",
+  "--tg-logit-margin",
+  "128",
+  "--residency",
+  "moe-expert-bank",
+  "--kv-cache",
+  "q8",
+  "--allow-full-residency",
+  "--no-handoff",
+  "--pp-schedule",
+  "layer-major",
+  "--layer-slots",
+  "2",
+  "--tg-hybrid",
+  "--ctx-size",
+  "262144",
+  "--act-slab-dtype",
+  "f32",
+  "--tg-first-pp-token"
+ ],
+ "reps": 1,
+ "interleave": false,
+ "arms": [
+  {
+   "name": "HYB42R",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl"
+   },
+   "why": "LM C14 at creation; after prefill: release the scheduler compute buffers, then resize to 42 slots"
+  },
+  {
+   "name": "L78",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "78",
+    "--tg-release-compute",
+    "--kv-lazy"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl"
+   },
+   "why": "lazy KV, C78 (QA subject)"
+  },
+  {
+   "name": "AUTO",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "auto",
+    "--tg-release-compute",
+    "--kv-lazy"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_TG_VRAM_TRACE": "1"
+   },
+   "why": "lazy KV, --tg-hybrid-slots auto at a 24,000-token prompt (QA subject)"
+  }
+ ]
+}
