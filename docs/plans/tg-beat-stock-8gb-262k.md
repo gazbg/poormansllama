@@ -204,6 +204,17 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 | LM hybrid C16, no kv-pad (E16) | LM runner | 1 | 34.95 | not polled | - | PASS |
 | owner doc stock (`llama-server`, 918 tok) | llama-server | 1 | 30.68 | 6918 MiB (fit log) | yes | - |
 
+## FINAL MEASURED COMPARISON (512 TG tokens, anchor-512 prompt, same machine, 2026-10-11)
+- Stock `llama-completion -ncmoe 37` (E22 + E25, 3 reps): 36.00 / 36.64 / 36.30 => mean **36.31 tok/s**, VRAM peak 7443 MiB.
+- LM-hosted hybrid C14 + kv-pad + f32 prefill activations (E23 + E24, 3 reps): 63.65 / 63.80 / 63.31 => mean **63.59 tok/s**,
+  VRAM peak **8071 MiB** (<= 8192), QA needle PASS 3/3, output coherent and byte-identical across reps.
+- Ratio **1.75x stock** (same prompt, same day). Owner doc bar 30.68 tok/s => **2.07x**.
+- Caveat (MEASURED, E22/E23 text + code): LM's TG re-decodes the LAST PROMPT TOKEN at step 0 (`main.cpp` ~6001 and 6560), so its
+  continuation is conditioned on one duplicated token; stock is not. The first generated token therefore differs from stock
+  (`<|im_end|>` at step 0 in LM vs `You` in stock). Speed is unaffected (same work per token); content is a different, coherent
+  continuation. Fixing the start (use the prefill logits for step 0) changes every LM TG run and needs its own validation.
+- NOT yet done for acceptance: the QA ladder (50 / 4k / 24k ... per AGENTS.md; only the 512-token needle check ran), a same-harness
+  stock control, and a long-generation loop test beyond 512 tokens. These are owner-invoked gates.
 ## OWNER SUMMARY (AGENTS.md five-part form; autonomous decisions, NOT owner approval)
 1. **Goal.** Beat stock token generation (TG) at 8 GB VRAM / 262k context. Bar = the owner's doc: 30.68 tok/s (`llama-server`).
    Idea under test: a per-layer GPU cache of hot experts; cache misses computed on the CPU from host RAM, no predictor.
