@@ -163,6 +163,13 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
   overhead (`--tg-hybrid` still runs the graph-build/alloc path per token, and the PP-time fill/stage bookkeeping), (b) the CPU engine
   threads (AER: 8 threads, `-t 2` for llama; LM: 16 CPU threads contending with the engine's pinned pool), (c) the two-pool contention with the
   LM host graphs. Each is testable with an env/flag arm and needs no rewrite.
+- **E15 (session e15-same-prompt, anchor-512 prompt via `-f`, 128 tokens, AER binary, same session)** decode tok/s from llama-completion
+  `eval time`: stock `-ncmoe 37` 35.77; AER hybrid C16 (pinned `-t 2`) 68.60; AER C16 `-t 16` unpinned 69.19. => **the 2x is NOT prompt-
+  specific** (same ~2x on the anchor prompt as on the hash-map prompt) and **NOT llama-thread-count** (`-t 2` vs `-t 16` identical).
+  Conclusion (derived): the loss sits in the LM port, not in the engine design. The LM-hosted hybrid (E13: 35-37 tok/s) equals stock.
+- **Leading hypothesis for the port loss (to test in E16)**: the LM runner pins `cparams.n_pad = n_ctx` by default (legacy), so every decode
+  step's attention scans the WHOLE 262k-slot KV cache (10 full-attention layers). llama-completion keeps live-sized views. E13 ran without
+  `--kv-graph-pad 256`. Expected: removing the full-cache scan recovers most of the gap (est. 10-15 ms/token from the earlier FA numbers).
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:

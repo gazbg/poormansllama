@@ -38,13 +38,14 @@ def main():
     exe = os.path.join(ROOT, spec['exe_dir'], 'llama-completion.exe')
     outdir = os.path.join(ROOT, 'build', 'llama-cuda', spec['session'])
     os.makedirs(outdir, exist_ok=True)
-    prompt = spec['prompt']
+    prompt = spec.get('prompt', '')
     results = []
     base = idle_vram()
     print('idle VRAM used (MiB):', base, flush=True)
     for i, arm in enumerate(spec['arms']):
         name = '%02d-%s' % (i, arm['name'])
-        cmd = [exe] + spec['common'] + arm['flags'] + ['-p', prompt]
+        pargs = ['-f', spec['prompt_file']] if spec.get('prompt_file') else ['-p', prompt]
+        cmd = [exe] + spec['common'] + arm['flags'] + pargs
         env = dict(os.environ)
         env.update({k: str(v) for k, v in arm.get('env', {}).items()})
         stop = threading.Event()
