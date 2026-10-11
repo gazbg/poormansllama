@@ -170,6 +170,17 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - **Leading hypothesis for the port loss (to test in E16)**: the LM runner pins `cparams.n_pad = n_ctx` by default (legacy), so every decode
   step's attention scans the WHOLE 262k-slot KV cache (10 full-attention layers). llama-completion keeps live-sized views. E13 ran without
   `--kv-graph-pad 256`. Expected: removing the full-cache scan recovers most of the gap (est. 10-15 ms/token from the earlier FA numbers).
+- **E16 CONFIRMED (session e16-kvpad, LM-hosted hybrid, anchor-512, 128 tokens, one hold)**: the LM port loss was the full-context
+  attention scan. C16 without kv pad 34.95 tok/s (QA PASS); **C16 + `--kv-graph-pad 256` 65.71 tok/s (QA PASS)**; C32 + pad 70.95
+  (QA PASS). Same binary, same prompt; only the pad changed => the `n_pad = n_ctx` pin (legacy) cost ~30 ms/token at 262k.
+  Numerical check (derived from the traces): steps 1-2 logits differ by 0.04-0.09 (0.1-0.3 %) between padded and unpadded; step 3
+  is a near-tie in the CONTROL too (margin 0.24) and is where greedy diverges. A wrong or too-small attention window would show
+  far larger deviations. The padded text later falls into a greedy loop (`Paris user What is the capital of France assistant ...`):
+  consistent with greedy decoding of this chat template, NOT yet proven benign; QA cannot see repetition (needles only).
+- **E15 (AER engine, same prompt, n=2)**: stock 35.16, AER C16 69.65, C16 unpinned 68.38, C32 86.98 (tok/s, llama-completion).
+- **E18 (8 GB shape, LM-hosted hybrid C16 + kv pad, 3 reps, QA each, deterministic)**: 65.58 / 65.49 / 64.96 tok/s; QA PASS 3/3;
+  identical output across reps (dlogit 0.0000). VRAM peak not polled in this run (run-tg-arms had no poller at the time).
+- **E19 (stock and AER reference, same shape, 3 reps each)**: in progress at time of writing; see verdict under build/llama-cuda/e19-stock-8gb.
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:

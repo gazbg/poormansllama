@@ -20,6 +20,7 @@ Spec (JSON):
 The runner records and grades. It claims nothing.
 """
 import argparse
+import threading
 import hashlib
 import json
 import math
@@ -73,6 +74,28 @@ def run(cmd, env=None, timeout=3600):
         if isinstance(out, bytes):
             out = out.decode('utf-8', 'replace')
         return -999, time.time() - t, str(out) + ' TIMEOUT'
+
+
+def poll_vram(stop, out):
+    peak = 0
+    while not stop.is_set():
+        try:
+            r = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                               capture_output=True, text=True, timeout=10)
+            peak = max(peak, int(r.stdout.strip().splitlines()[0]))
+        except Exception:
+            pass
+        stop.wait(0.4)
+    out['peak_mib'] = peak
+
+
+def idle_vram():
+    try:
+        r = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                           capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
 
 
 def read_trace(path):
@@ -171,7 +194,8 @@ def main():
             log('MISSING REQUIRED FILE:', p)
             return 2
     t0 = time.time()
-    verdict = {'session': session, 'spec': spec, 'provenance': {
+    base_vram = idle_vram()
+    verdict = {'session': session, 'spec': spec, 'idle_vram_mib': base_vram, 'provenance': {
         'exe_sha256_16': sha16(exe), 'llama_dll_sha256_16': sha16(os.path.join(exe_dir, 'llama.dll')),
         'prompt_sha256_16': sha16(prompt), 'exe_dir': exe_dir}, 'arms': {}}
     log('provenance:', json.dumps(verdict['provenance']))
@@ -188,7 +212,11 @@ def main():
             rec['rc'] = 0 if os.path.exists(tr) else None
             out = open(lg, encoding='utf-8', errors='replace').read() if os.path.exists(lg) else ''
         else:
+            stop = threading.Event(); vr = {}
+            th = threading.Thread(target=poll_vram, args=(stop, vr), daemon=True); th.start()
             rc, dur, out = run(cmd, env=arm.get('env'))
+            stop.set(); th.join()
+            rec['vram_peak_mib'] = vr.get('peak_mib')
             with open(lg, 'w', encoding='utf-8') as f:
                 f.write(out)
             rec['rc'] = rc
