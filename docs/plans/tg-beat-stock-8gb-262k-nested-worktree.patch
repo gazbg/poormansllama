@@ -1,3 +1,683 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index c30278101..5a55cb404 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1455,6 +1455,15 @@ UseGgmlGemm2:;
+ 
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
++// Opt-in software prefetch (dst->op_params[0] = bytes ahead, 0 = off): the hybrid MoE engine streams a few MiB of weights per
++// call from DRAM, and the hardware prefetcher restarts at every 4 KiB page. Nothing else sets the hint.
++#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
++#include <xmmintrin.h>
++#define GGML_CPU_MMID_PF(p) _mm_prefetch((const char *) (p), _MM_HINT_T0)
++#else
++#define GGML_CPU_MMID_PF(p) ((void) (p))
++#endif
++
+ struct mmid_row_mapping {
+     int32_t i1;
+     int32_t i2;
+@@ -1474,7 +1483,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     const struct mmid_row_mapping * matrix_rows,
+     const size_t row_size,
+     const bool src1_cont,
+-    const void * wdata) {
++    const void * wdata,
++    const int32_t pf_bytes) {
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -1486,6 +1496,17 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     const int64_t blck_0 = 16;
+     const int64_t blck_1 = 16;
+ 
++    // rows ahead to prefetch (0 = off) and the cache lines per row
++    const int64_t pf_rows = pf_bytes > 0 ? ((int64_t) pf_bytes + (int64_t) nb01 - 1) / (int64_t) nb01 : 0;
++    if (pf_rows > 0) {
++        // the first window of this chunk
++        for (int64_t r = ir0_start; r < ir0_start + pf_rows && r < ir0_end; ++r) {
++            for (size_t o = 0; o < nb01; o += 64) {
++                GGML_CPU_MMID_PF(src0_cur + (size_t) r*nb01 + o);
++            }
++        }
++    }
++
+     float tmp[16];
+ 
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+@@ -1514,6 +1535,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                    if (pf_rows > 0 && ir1 == ir1_start && ir0 + pf_rows < ir0_end) {
++                        const char * pp = src0_cur + (size_t) (ir0 + pf_rows)*nb01;
++                        for (size_t o = 0; o < nb01; o += 64) {
++                            GGML_CPU_MMID_PF(pp + o);
++                        }
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                 }
+ 
+@@ -1561,6 +1588,8 @@ static void ggml_compute_forward_mul_mat_id(
+     GGML_ASSERT(nb1 <= nb2);
+     GGML_ASSERT(nb2 <= nb3);
+ 
++    const int32_t pf_bytes = ((const int32_t *) dst->op_params)[0]; // opt-in prefetch hint, 0 for every graph but the hybrid host leg
++
+     // row groups
+     const int n_ids = ids->ne[0]; // n_expert_used
+     const int n_as  = ne02;       // n_expert
+@@ -1694,7 +1723,7 @@ static void ggml_compute_forward_mul_mat_id(
+             ggml_compute_forward_mul_mat_id_one_chunk(
+                 dst, src0, src1, ids, cur_a,
+                 ir0_start, ir0_end, ir1_start, ir1_end,
+-                src0_cur, matrix_rows, row_size, src1_cont, wdata
++                src0_cur, matrix_rows, row_size, src1_cont, wdata, pf_bytes
+             );
+ 
+             if (nth >= nchunk0 * nchunk1) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0278a3675..5d2c9973e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -534,6 +534,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+ 
+ // pool with virtual memory
+ #if defined(GGML_USE_VMM)
++extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void);
++
+ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+ 
+@@ -651,6 +653,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ 
+             // add to the pool
+             pool_size += reserve_size;
++            if (getenv("LLAMA_CUDA_POOL_LOG") != nullptr) {
++                fprintf(stderr, "cuda pool[%d]: grew by %.2f MiB to %.2f MiB for a %zu B request (main thread has launched %lld nodes)\n", device,
++                        reserve_size/1048576.0, pool_size/1048576.0, size, (long long) ggml_backend_cuda_dbg_nodes_launched());
++            }
+ 
+             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
+             //       device, (unsigned long long) (pool_size/1024/1024),
+@@ -722,10 +728,81 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+ // cuda buffer
+ 
++// A device buffer whose address range is reserved up front and whose physical memory is committed on demand, one VMM granule at a time (LLAMA_KV_LAZY, used for the
++// KV cache only). Reading or writing an uncommitted page is an illegal address and fails loudly; the owner commits every row it will touch before the graph that touches it.
++struct ggml_cuda_lazy_buffer {
++    int         device          = 0;
++    int         physical_device = 0;
++    CUdeviceptr base            = 0;
++    size_t      size            = 0;   // reserved bytes, a multiple of the granularity
++    size_t      gran            = 0;
++    size_t      n_mapped        = 0;
++    std::vector<uint8_t>       mapped;  // one flag per granule
++    std::vector<ggml_tensor *> tensors; // the cache tensors registered by init_tensor
++
++    // map, enable access to and zero every unmapped granule overlapping [off, off + bytes); false when the driver refuses (out of memory)
++    bool commit(size_t off, size_t bytes) {
++        if (bytes == 0) {
++            return true;
++        }
++        const size_t g0 = off / gran;
++        const size_t g1 = std::min((off + bytes + gran - 1) / gran, mapped.size());
++        ggml_cuda_set_device(device);
++        for (size_t g = g0; g < g1; ++g) {
++            if (mapped[g]) {
++                continue;
++            }
++            CUmemAllocationProp prop = {};
++            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++            prop.location.id   = physical_device;
++            CUmemGenericAllocationHandle handle;
++            if (cuMemCreate(&handle, gran, &prop, 0) != CUDA_SUCCESS) {
++                return false;
++            }
++            const CUdeviceptr at = base + g*gran;
++            if (cuMemMap(at, gran, 0, handle, 0) != CUDA_SUCCESS) {
++                cuMemRelease(handle);
++                return false;
++            }
++            cuMemRelease(handle); // the mapping keeps the allocation alive
++            CUmemAccessDesc access = {};
++            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++            access.location.id   = physical_device;
++            access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++            if (cuMemSetAccess(at, gran, &access, 1) != CUDA_SUCCESS) {
++                cuMemUnmap(at, gran);
++                return false;
++            }
++            // the cache relies on zeroed padding rows (a NaN there would survive the attention mask)
++            CUDA_CHECK(cudaMemset((void *) at, 0, gran));
++            mapped[g] = 1;
++            n_mapped++;
++        }
++        return true;
++    }
++
++    ~ggml_cuda_lazy_buffer() {
++        ggml_cuda_set_device(device);
++        for (size_t g = 0; g < mapped.size(); ++g) {
++            if (mapped[g]) {
++                cuMemUnmap(base + g*gran, gran);
++            }
++        }
++        if (base != 0) {
++            cuMemAddressFree(base, size);
++        }
++    }
++};
++
++static std::vector<ggml_cuda_lazy_buffer *> g_cuda_lazy_buffers;
++static bool                                 g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
++
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
+     std::string name;
++    ggml_cuda_lazy_buffer * lazy = nullptr; // non-null: dev_ptr is a reserved range committed on demand
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+@@ -733,7 +810,12 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
+-        CUDA_CHECK(cudaFree(dev_ptr));
++        if (lazy != nullptr) {
++            g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
++            delete lazy;
++        } else {
++            CUDA_CHECK(cudaFree(dev_ptr));
++        }
+     }
+ };
+ 
+@@ -759,6 +841,13 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+         return GGML_STATUS_SUCCESS;
+     }
+ 
++    if (ctx->lazy != nullptr) {
++        // a lazily committed buffer holds the cache tensors; their padding must be empty because an uncommitted page cannot be written
++        GGML_ASSERT(ggml_backend_buft_get_alloc_size(buffer->buft, tensor) == ggml_nbytes(tensor));
++        ctx->lazy->tensors.push_back(tensor);
++        return GGML_STATUS_SUCCESS;
++    }
++
+     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         // initialize padding to 0 to avoid possible NaN values
+         const size_t original_size = ggml_nbytes(tensor);
+@@ -772,7 +861,10 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++static void ggml_cuda_input_batch_settle();
++
+ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
++    ggml_cuda_input_batch_settle();
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+@@ -780,15 +872,201 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
++// Opt-in input batching v4 (LLAMA_CUDA_INPUT_BATCH, see llama_context::process_ubatch): while a batch is open, small host->device tensor uploads are copied into
++// pinned memory and RECORDED, not issued. ggml_backend_cuda_graph_compute issues them back to back on the compute stream right before the graph's own work
++// (stream order alone orders them before every kernel: no event, no cross-stream dependency). v2 put the copies on the per-thread stream behind an event and the
++// dependent graph launch then cost ~200 us more host time; v3 queued each copy on the compute stream as it came, and the scheduler's per-input synchronize of that
++// stream then waited ~45 us for every one of them. The staging area is reused only after an event recorded behind the copies has fired.
++static constexpr size_t GGML_CUDA_INPUT_STAGE_BYTES = 8u << 20;
++static constexpr size_t GGML_CUDA_INPUT_STAGE_MAX_COPY = 1u << 20;
++static constexpr size_t GGML_CUDA_INPUT_MAX_PENDING = 64;
++struct ggml_cuda_input_copy {
++    char *       dst;
++    const char * src;
++    size_t       size;
++};
++static bool         g_cuda_input_batch_open = false;
++static bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
++static bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
++static char *       g_cuda_input_stage      = nullptr;
++static size_t       g_cuda_input_stage_used = 0;
++static bool         g_cuda_input_failed     = false;
++static cudaStream_t g_cuda_input_stream     = nullptr;
++static cudaEvent_t  g_cuda_input_event      = nullptr;
++static ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
++static size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
++static size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
++static size_t       g_cuda_input_n_direct   = 0;
++
++// diagnostics for the hybrid engine's watchdog (read through the exported getters below): how far the main thread got launching this graph's nodes,
++// whether it is inside a graph compute, and which promotion copy the engine thread is submitting
++static std::atomic<int64_t> g_dbg_nodes_launched{0};
++static std::atomic<int>     g_dbg_in_compute{0};
++static std::atomic<int>     g_dbg_aux_idx{0};
++
++extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void) { return g_dbg_nodes_launched.load(std::memory_order_relaxed); }
++extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_in_compute(void)     { return g_dbg_in_compute.load(std::memory_order_relaxed); }
++extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_aux_idx(void)        { return g_dbg_aux_idx.load(std::memory_order_relaxed); }
++
++// test knob (LLAMA_CUDA_GRAPH_RESET_EVERY=N): force a CUDA graph warmup reset on every N-th replay, so the direct (not captured) launch path that follows a
++// KV-view pad boundary is exercised often instead of once per 256 tokens
++static bool ggml_cuda_dbg_force_graph_reset() {
++    static const int every = [] {
++        const char * v = getenv("LLAMA_CUDA_GRAPH_RESET_EVERY");
++        return v != nullptr ? atoi(v) : 0;
++    }();
++    static int calls = 0;
++    return every > 0 && (++calls % every) == 0;
++}
++
++// test knob (LLAMA_CUDA_DEBUG_FREE_AT_NODE=K): the direct launch path of a decode graph (>= 800 nodes) allocates and frees 4 MiB just before node K. cudaFree
++// synchronizes the device and takes the driver lock, like the pool growth the first KV-pad boundary needs
++static int ggml_cuda_dbg_free_at() {
++    static const int at = [] {
++        const char * v = getenv("LLAMA_CUDA_DEBUG_FREE_AT_NODE");
++        return v != nullptr ? atoi(v) : -1;
++    }();
++    return at;
++}
++
++// the next device buffer allocation is reserved lazily (set by the KV cache constructor around its allocation, reset right after)
++extern "C" __declspec(dllexport) void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
++    g_cuda_lazy_next = on;
++}
++
++// commit the first `rows` rows of every cache tensor held by a lazily committed buffer (the rows beyond stay uncommitted and must never be touched).
++// Returns the physical bytes committed in total, or -1 when the driver ran out of memory (the caller fails loudly).
++extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
++    int64_t total = 0;
++    for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
++        for (ggml_tensor * t : lz->tensors) {
++            const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
++            const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
++            for (int64_t s = 0; s < t->ne[2]; ++s) {
++                if (!lz->commit(off + (size_t) s*t->nb[2], (size_t) r*t->nb[1])) {
++                    return -1;
++                }
++            }
++        }
++        total += (int64_t) (lz->n_mapped*lz->gran);
++    }
++    return total;
++}
++
++extern "C" __declspec(dllexport) bool ggml_backend_cuda_buft_is_lazy_capable(int device) {
++    return device >= 0 && device < ggml_cuda_info().device_count && ggml_cuda_info().devices[device].vmm;
++}
++
++extern "C" __declspec(dllexport) bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
++    if (g_cuda_input_batch_open || compute_stream == nullptr) {
++        return false; // no nesting
++    }
++    if (!g_cuda_input_failed && (g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr)) {
++        if (g_cuda_input_stage == nullptr && cudaMallocHost((void **) &g_cuda_input_stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_cuda_input_stage = nullptr;
++        }
++        if (g_cuda_input_event == nullptr && cudaEventCreateWithFlags(&g_cuda_input_event, cudaEventDisableTiming) != cudaSuccess) {
++            (void) cudaGetLastError();
++            g_cuda_input_event = nullptr;
++        }
++        g_cuda_input_failed = g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr;
++    }
++    if (g_cuda_input_failed) {
++        return false; // the caller then runs the original per-tensor path
++    }
++    if (g_cuda_input_in_flight) {
++        // the previous batch's copies were ordered before a compute that has long finished; this only makes reuse of the staging area safe
++        CUDA_CHECK(cudaEventSynchronize(g_cuda_input_event));
++        g_cuda_input_in_flight = false;
++    }
++    g_cuda_input_stage_used = 0;
++    g_cuda_input_n_pending  = 0;
++    g_cuda_input_dirty      = false;
++    g_cuda_input_stream     = (cudaStream_t) compute_stream;
++    g_cuda_input_batch_open = true;
++    return true;
++}
++
++// issue the recorded uploads back to back on `stream`, then an event behind them that guards reuse of the staging area
++static void ggml_cuda_input_batch_flush(cudaStream_t stream) {
++    if (g_cuda_input_n_pending == 0) {
++        return;
++    }
++    for (size_t i = 0; i < g_cuda_input_n_pending; ++i) {
++        const ggml_cuda_input_copy & c = g_cuda_input_pending[i];
++        CUDA_CHECK(cudaMemcpyAsync(c.dst, c.src, c.size, cudaMemcpyHostToDevice, stream));
++    }
++    g_cuda_input_n_pending = 0;
++    CUDA_CHECK(cudaEventRecord(g_cuda_input_event, stream)); // fires once the staged copies are done
++    g_cuda_input_in_flight = true;
++    g_cuda_input_dirty     = true;
++}
++
++// anything that reads or writes device memory outside the compute stream's order (a readback, a device copy, a direct upload) must see the recorded uploads first
++static void ggml_cuda_input_batch_settle() {
++    if (!g_cuda_input_batch_open) {
++        return;
++    }
++    ggml_cuda_input_batch_flush(g_cuda_input_stream);
++    if (g_cuda_input_dirty) {
++        CUDA_CHECK(cudaStreamSynchronize(g_cuda_input_stream));
++        g_cuda_input_dirty = false;
++    }
++}
++
++// start of every CUDA graph compute: the recorded uploads go out right before the graph's own work, on the stream the graph runs on
++static void ggml_cuda_input_batch_before_compute(cudaStream_t stream) {
++    if (g_cuda_input_batch_open && g_cuda_input_n_pending > 0) {
++        if (stream == g_cuda_input_stream) {
++            ggml_cuda_input_batch_flush(stream);
++        } else {
++            ggml_cuda_input_batch_settle();
++        }
++    }
++}
++
++extern "C" __declspec(dllexport) void ggml_backend_cuda_input_batch_end(void) {
++    if (!g_cuda_input_batch_open) {
++        return;
++    }
++    ggml_cuda_input_batch_flush(g_cuda_input_stream); // normally empty: the graph compute issued them
++    g_cuda_input_dirty      = false;
++    g_cuda_input_batch_open = false;
++    static const bool dbg = getenv("LLAMA_CUDA_INPUT_BATCH") != nullptr && getenv("LLAMA_CUDA_INPUT_BATCH")[0] == '2';
++    static int printed = 0;
++    if (dbg && printed < 6) {
++        fprintf(stderr, "ggml_cuda_input_batch: closed, %zu uploads staged, %zu direct, %zu bytes staged\n",
++                g_cuda_input_n_staged, g_cuda_input_n_direct, g_cuda_input_stage_used);
++        printed++;
++    }
++    g_cuda_input_n_staged = g_cuda_input_n_direct = 0;
++}
++
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    if (g_cuda_input_batch_open) {
++        if (size > 0 && size <= GGML_CUDA_INPUT_STAGE_MAX_COPY && g_cuda_input_n_pending < GGML_CUDA_INPUT_MAX_PENDING) {
++            const size_t at = (g_cuda_input_stage_used + 255) & ~(size_t) 255;
++            if (at + size <= GGML_CUDA_INPUT_STAGE_BYTES) {
++                memcpy(g_cuda_input_stage + at, data, size); // the caller may reuse its memory as soon as this returns
++                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_stage + at, size };
++                g_cuda_input_stage_used = at + size;
++                g_cuda_input_n_staged++;
++                return;
++            }
++        }
++        ggml_cuda_input_batch_settle(); // program order: the uploads recorded so far land before this direct one
++    }
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    g_cuda_input_n_direct++;
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++    ggml_cuda_input_batch_settle();
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+@@ -798,6 +1076,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
++    ggml_cuda_input_batch_settle();
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+@@ -808,6 +1087,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
++    ggml_cuda_input_batch_settle();
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+@@ -817,6 +1097,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+ }
+ 
+ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
++    ggml_cuda_input_batch_settle();
+     if (ggml_backend_buffer_is_cuda(src->buffer)) {
+         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
+         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+@@ -842,9 +1123,21 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+ }
+ 
+ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
++    ggml_cuda_input_batch_settle();
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    if (ctx->lazy != nullptr) {
++        // only the committed granules exist
++        ggml_cuda_lazy_buffer * lz = ctx->lazy;
++        for (size_t g = 0; g < lz->mapped.size(); ++g) {
++            if (lz->mapped[g]) {
++                CUDA_CHECK(cudaMemsetAsync((void *) (lz->base + g*lz->gran), value, lz->gran, cudaStreamPerThread));
++            }
++        }
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        return;
++    }
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+@@ -884,6 +1177,32 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+ 
+     ggml_cuda_set_device(buft_ctx->device);
+ 
++    if (g_cuda_lazy_next) {
++        // LLAMA_KV_LAZY: reserve the range, commit nothing (see ggml_backend_cuda_lazy_commit_rows)
++        if (!ggml_cuda_info().devices[buft_ctx->device].vmm) {
++            GGML_LOG_ERROR("%s: LLAMA_KV_LAZY needs CUDA virtual memory management, which device %d does not report\n", __func__, buft_ctx->device);
++            return nullptr;
++        }
++        ggml_cuda_lazy_buffer * lz = new ggml_cuda_lazy_buffer();
++        lz->device          = buft_ctx->device;
++        lz->physical_device = ggml_cuda_get_physical_device(buft_ctx->device);
++        lz->gran            = ggml_cuda_info().devices[buft_ctx->device].vmm_granularity;
++        lz->size            = lz->gran * ((size + lz->gran - 1) / lz->gran);
++        if (cuMemAddressReserve(&lz->base, lz->size, 0, 0, 0) != CUDA_SUCCESS) {
++            GGML_LOG_ERROR("%s: reserving %.2f MiB of address space failed\n", __func__, lz->size / 1024.0 / 1024.0);
++            lz->base = 0;
++            delete lz;
++            return nullptr;
++        }
++        lz->mapped.assign(lz->size / lz->gran, 0);
++        ggml_backend_cuda_buffer_context * lctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) lz->base);
++        lctx->lazy = lz;
++        g_cuda_lazy_buffers.push_back(lz);
++        GGML_LOG_INFO("%s: reserved %.2f MiB of address space for a lazily committed buffer on device %d (granule %.1f MiB)\n", __func__,
++                      size / 1024.0 / 1024.0, buft_ctx->device, lz->gran / 1024.0 / 1024.0);
++        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, lctx, size);
++    }
++
+     void * dev_ptr;
+     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+     if (err != cudaSuccess) {
+@@ -4018,6 +4337,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
++    int  dbg_eval_nodes = 0; // nodes launched by this evaluation (LLAMA_CUDA_DEBUG_FREE_AT_NODE)
+ 
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+@@ -4185,6 +4505,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                g_dbg_nodes_launched.fetch_add(1, std::memory_order_relaxed);
++                if (!use_cuda_graph && cgraph->n_nodes >= 800 && ggml_cuda_dbg_free_at() >= 0 && dbg_eval_nodes++ == ggml_cuda_dbg_free_at()) {
++                    void * dbg_p = nullptr;
++                    if (cudaMalloc(&dbg_p, 4u << 20) == cudaSuccess) {
++                        CUDA_CHECK(cudaFree(dbg_p));
++                    } else {
++                        (void) cudaGetLastError();
++                    }
++                }
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -4255,6 +4584,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_input_batch_before_compute(cuda_ctx->stream());
++    g_dbg_in_compute.store(1, std::memory_order_relaxed);
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+@@ -4282,7 +4613,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+             } else {
+                 // Post-warmup: normal CUDA graph operation
+-                if (properties_changed) {
++                if (properties_changed || ggml_cuda_dbg_force_graph_reset()) {
+                     // Properties changed - reset warmup, execute directly until stable again
+                     graph->warmup_complete = false;
+                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+@@ -4307,6 +4638,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    g_dbg_in_compute.store(0, std::memory_order_relaxed);
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -4805,12 +5137,15 @@ bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
+     }();
+     if (copy_mode == 2) {
+         for (size_t i = 0; i < count; ++i) {
++            g_dbg_aux_idx.store((int) i + 1, std::memory_order_relaxed);
+             const cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream);
+             if (e != cudaSuccess) {
++                g_dbg_aux_idx.store(0, std::memory_order_relaxed);
+                 (void) cudaGetLastError();
+                 return false;
+             }
+         }
++        g_dbg_aux_idx.store(0, std::memory_order_relaxed);
+         return true;
+     }
+     // same attribute shape as ggml_backend_cuda_copy_batch_async; the hybrid
+diff --git a/ggml/src/ggml-cuda/moe-hybrid.cu b/ggml/src/ggml-cuda/moe-hybrid.cu
+index e0d51986b..d585b58c9 100644
+--- a/ggml/src/ggml-cuda/moe-hybrid.cu
++++ b/ggml/src/ggml-cuda/moe-hybrid.cu
+@@ -8,7 +8,19 @@
+ // full stream order. A lost or failed host reply traps instead of continuing
+ // with a partial sum.
+ 
+-static constexpr uint64_t MOE_HYBRID_TIMEOUT_NS = 500ull * 1000ull * 1000ull;
++// default device-side wait limit: 5 s. A 500 ms limit turns a long host stall into a crash (g7-timeout: an injected 1.2 s stall); g7-timeout also proved a resident
++// wait_add survives a 4 s host stall under WDDM (no TDR) and the run completes with identical text. The one 500 ms+ event seen in the field was NOT a stall: it was the
++// first-KV-pad-boundary deadlock (engine thread blocked in a CUDA call while the launching thread held the driver lock), removed by the dedicated copy thread
++// (docs/plans/tg-beat-stock-8gb-262k.md, G5). LLAMA_MOE_HYBRID_TIMEOUT_MS overrides.
++static constexpr uint64_t MOE_HYBRID_TIMEOUT_NS = 5000ull * 1000ull * 1000ull;
++
++// LLAMA_MOE_HYBRID_TIMEOUT_MS, set by the host engine at init (0 = MOE_HYBRID_TIMEOUT_NS); the launch passes it by value
++static int g_moe_hybrid_timeout_ms = 0;
++
++// exported without touching ggml-cuda.h (every CUDA translation unit includes it); the declaration lives in src/llama-moe-hybrid.cpp
++extern "C" __declspec(dllexport) void ggml_backend_cuda_moe_hybrid_set_timeout_ms(int ms) {
++    g_moe_hybrid_timeout_ms = ms > 0 ? ms : 0;
++}
+ 
+ static __device__ __forceinline__ uint64_t moe_hybrid_globaltimer() {
+     uint64_t t;
+@@ -106,7 +118,8 @@ static __global__ void moe_hybrid_wait_add_f32(
+         float         * dst,
+         const int il,
+         const int n_embd,
+-        const int vec) {
++        const int vec,
++        const uint64_t timeout_ns) {
+     __shared__ int s_ok;
+ 
+     const int tid   = threadIdx.x;
+@@ -130,7 +143,7 @@ static __global__ void moe_hybrid_wait_add_f32(
+         const uint64_t t0  = moe_hybrid_globaltimer();
+         int ok = 1;
+         while (mb->res_seq != seq) {
+-            if (moe_hybrid_globaltimer() - t0 > MOE_HYBRID_TIMEOUT_NS) {
++            if (moe_hybrid_globaltimer() - t0 > timeout_ns) {
+                 ok = 0;
+                 break;
+             }
+@@ -224,6 +237,7 @@ void ggml_cuda_op_moe_hybrid_wait_add(ggml_backend_cuda_context & ctx, ggml_tens
+     moe_hybrid_wait_add_f32<<<1, 1024, 0, ctx.stream()>>>(
+         (const float *) cur->data, (const int32_t *) pub->data, mb,
+         (float *) dst->data, il, (int) cur->ne[0],
+-        moe_hybrid_vec_ok(cur->ne[0], cur->data, dst->data) && moe_hybrid_vec_ok(cur->ne[0], mb->y, mb->y));
++        moe_hybrid_vec_ok(cur->ne[0], cur->data, dst->data) && moe_hybrid_vec_ok(cur->ne[0], mb->y, mb->y),
++        g_moe_hybrid_timeout_ms > 0 ? (uint64_t) g_moe_hybrid_timeout_ms * 1000000ull : MOE_HYBRID_TIMEOUT_NS);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c4468b64..d495cf1db 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -10,6 +10,18 @@
+ #include "llama-memory-hybrid.h"
+ #ifdef LLAMA_LAYER_STREAMING
+ #include "llama-layer-streaming.h"
++// defined in ggml/src/ggml-cuda/ggml-cuda.cu (not in ggml-cuda.h: every CUDA translation unit includes that header)
++#include "ggml-cuda.h"
++extern "C" {
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++bool ggml_backend_cuda_input_batch_begin(void * compute_stream);
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++void ggml_backend_cuda_input_batch_end(void);
++}
+ #include "llama-moe-hybrid.h"
+ #endif
+ #include "llama-mmap.h"
+@@ -1423,6 +1435,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++#ifdef LLAMA_LAYER_STREAMING
++    // opt-in (LLAMA_CUDA_INPUT_BATCH=1; 2 = with diagnostics): the small host->device input uploads of this decode -- made by set_inputs and by the
++    // scheduler's split-input copies inside graph_compute -- skip their per-tensor synchronize; the CUDA graph compute waits for them by event
++    static const bool input_batch = getenv("LLAMA_CUDA_INPUT_BATCH") != nullptr;
++    bool batched = false;
++    if (input_batch) {
++        for (auto & b : backends) {
++            if (ggml_backend_is_cuda(b.get())) {
++                batched = ggml_backend_cuda_input_batch_begin(ggml_backend_cuda_stream_handle(b.get(), 0)); // the compute stream the graph runs on
++                break;
++            }
++        }
++    }
++#endif
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -1434,6 +1460,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++#ifdef LLAMA_LAYER_STREAMING
++    if (batched) {
++        ggml_backend_cuda_input_batch_end();
++    }
++#endif
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
 diff --git a/src/llama-context.h b/src/llama-context.h
 index 928850a73..6c4228b21 100644
 --- a/src/llama-context.h
@@ -21,8 +701,55 @@ index 928850a73..6c4228b21 100644
  #endif
  
      // reserve a graph with a dummy ubatch of the specified size
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 9cfeb5479..1f1c44340 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -5,6 +5,17 @@
+ #include "llama-model.h"
+ #include "llama-context.h"
+ 
++#ifdef LLAMA_LAYER_STREAMING
++// defined in ggml/src/ggml-cuda/ggml-cuda.cu (opt-in lazily committed KV buffer, env LLAMA_KV_LAZY)
++#include "ggml-cuda.h"
++extern "C" {
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++void ggml_backend_cuda_lazy_set_next_alloc(bool on);
++}
++#endif
++
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
+@@ -280,7 +291,24 @@ llama_kv_cache::llama_kv_cache(
+                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+             }
+         } else {
++#ifdef LLAMA_LAYER_STREAMING
++            // opt-in (runner flag --kv-lazy sets LLAMA_KV_LAZY): reserve the CUDA KV buffer, let the runner commit the rows the run uses
++            bool kv_lazy = false;
++            if (getenv("LLAMA_KV_LAZY") != nullptr) {
++                for (int i_dev = 0; i_dev < ggml_backend_cuda_get_device_count(); ++i_dev) {
++                    kv_lazy = kv_lazy || buft == ggml_backend_cuda_buffer_type(i_dev);
++                }
++            }
++            if (kv_lazy) {
++                ggml_backend_cuda_lazy_set_next_alloc(true);
++            }
++#endif
+             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
++#ifdef LLAMA_LAYER_STREAMING
++            if (kv_lazy) {
++                ggml_backend_cuda_lazy_set_next_alloc(false);
++            }
++#endif
+         }
+         if (!buf) {
+             throw std::runtime_error("failed to allocate buffer for kv cache");
 diff --git a/src/llama-layer-streaming.cpp b/src/llama-layer-streaming.cpp
-index ed091c288..33d72bd9a 100644
+index ed091c288..43279d5f5 100644
 --- a/src/llama-layer-streaming.cpp
 +++ b/src/llama-layer-streaming.cpp
 @@ -21,6 +21,7 @@
@@ -33,7 +760,7 @@ index ed091c288..33d72bd9a 100644
  #include "llama-expert-split-policy.h"
  
  #include <chrono>
-@@ -4535,6 +4536,18 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
+@@ -4535,6 +4536,22 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
      return ctx->layer_major_pp_first_token();
  }
  
@@ -45,6 +772,10 @@ index ed091c288..33d72bd9a 100644
 +    return llama_moe_hybrid_resize_impl(n_slot);
 +}
 +
++bool llama_moe_hybrid_cache_info(int64_t * cache_bytes, int * n_slot) {
++    return llama_moe_hybrid_cache_info_impl(cache_bytes, n_slot);
++}
++
 +int64_t llama_layer_streaming_reserve_decode(llama_context * ctx) {
 +    return ctx->reserve_for_decode();
 +}
@@ -52,7 +783,7 @@ index ed091c288..33d72bd9a 100644
  // T-GPLR-03: argmax of the last output row of the PP logits. The layer-major
  // controller exposes the last chunk's result tensors on gf_res_prev but never
  // fills the context's host logits buffer (it bypasses decode()), so read the
-@@ -4565,6 +4578,62 @@ int64_t llama_context::layer_major_pp_first_token() {
+@@ -4565,6 +4582,62 @@ int64_t llama_context::layer_major_pp_first_token() {
      return best;
  }
  
@@ -115,7 +846,7 @@ index ed091c288..33d72bd9a 100644
  // One owner for the structured failure shape (error_msg -> failed -> error
  // event -> GGML_STATUS_FAILED); byte-identical to the inline copies it
  // replaces -- traces and checkers parse these exact strings.
-@@ -7896,6 +7965,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
+@@ -7896,6 +7969,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
          (long long) ggml_time_us());
  }
  
@@ -140,7 +871,7 @@ index ed091c288..33d72bd9a 100644
      if (tel_out == nullptr) {
          return;
 diff --git a/src/llama-layer-streaming.h b/src/llama-layer-streaming.h
-index f5304f17d..c9fd4eb9f 100644
+index f5304f17d..1f294d6f9 100644
 --- a/src/llama-layer-streaming.h
 +++ b/src/llama-layer-streaming.h
 @@ -1136,6 +1136,9 @@ struct LLAMA_API llama_layer_streaming {
@@ -153,7 +884,7 @@ index f5304f17d..c9fd4eb9f 100644
      // T-Q38HG-06: MTP draft/accept counters (drafted, accepted, acceptance rate)
      void tel_mtp(int64_t n_tokens, int64_t drafted, int64_t accepted);
  
-@@ -2574,4 +2577,15 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
+@@ -2574,4 +2577,18 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
  // tensor directly. Returns -1 when unavailable.
  LLAMA_API int64_t llama_layer_major_pp_first_token(llama_context * ctx);
  
@@ -165,15 +896,67 @@ index f5304f17d..c9fd4eb9f 100644
 +// Between decodes only. Returns false (nothing changed) when there is no hybrid engine or the slot count is invalid.
 +LLAMA_API bool llama_moe_hybrid_resize(int n_slot);
 +
++// the hybrid slot cache's current size in bytes and slot count (--tg-hybrid-slots auto); false when there is no engine
++LLAMA_API bool llama_moe_hybrid_cache_info(int64_t * cache_bytes, int * n_slot);
++
 +// Opt-in (--tg-release-compute): see llama_context::reserve_for_decode. Returns bytes released, or -1.
 +LLAMA_API int64_t llama_layer_streaming_reserve_decode(llama_context * ctx);
 +
  #endif // LLAMA_LAYER_STREAMING
 diff --git a/src/llama-moe-hybrid.cpp b/src/llama-moe-hybrid.cpp
-index 0bf14d81c..37c00f2ce 100644
+index 0bf14d81c..048fb757d 100644
 --- a/src/llama-moe-hybrid.cpp
 +++ b/src/llama-moe-hybrid.cpp
-@@ -140,6 +140,8 @@ struct moe_hybrid_engine {
+@@ -28,6 +28,36 @@
+ #include <thread>
+ #include <vector>
+ 
++// defined in ggml/src/ggml-cuda/moe-hybrid.cu (not in ggml-cuda.h: every CUDA translation unit includes that header)
++extern "C" {
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++void ggml_backend_cuda_moe_hybrid_set_timeout_ms(int ms);
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++int64_t ggml_backend_cuda_dbg_nodes_launched(void);
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++int ggml_backend_cuda_dbg_in_compute(void);
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++int ggml_backend_cuda_dbg_aux_idx(void);
++}
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
++
+ #if defined(_M_X64) || defined(__x86_64__)
+ #include <immintrin.h>
+ #define MOE_HYBRID_PAUSE() _mm_pause()
+@@ -116,6 +146,11 @@ struct moe_hybrid_engine {
+     int    cpu_first  = 0;
+     int    cpu_stride = 2;
+     int    poll       = 100;
++    int    pf_bytes   = 0; // LLAMA_MOE_HYBRID_PF: software-prefetch distance of the host mul_mat_id kernels in bytes (0 = off)
++    int    timeout_ms = 0; // LLAMA_MOE_HYBRID_TIMEOUT_MS: device-side wait limit (0 = built-in 500 ms)
++    FILE * trace_fp   = nullptr; // LLAMA_MOE_HYBRID_TRACE: per-token routing dump for offline policy replay
++    int64_t dbg_stall_req = 0; // LLAMA_MOE_HYBRID_DEBUG_STALL=<request>:<ms>: test-only host stall at that request number
++    int     dbg_stall_ms  = 0;
+ 
+     // model host expert tensors per layer
+     std::vector<ggml_tensor *> h_up, h_gate, h_down;
+@@ -140,6 +175,8 @@ struct moe_hybrid_engine {
      std::vector<int32_t>          slot_expert; // [n_layer*n_slot]
      std::vector<double>           ema;
      std::vector<double>           tie;
@@ -182,10 +965,18 @@ index 0bf14d81c..37c00f2ce 100644
      std::vector<moe_hybrid_promo> pending;
      std::vector<moe_hybrid_pair>  pairs;
      std::vector<void *>           dma_dst;
-@@ -184,6 +186,19 @@ struct moe_hybrid_engine {
+@@ -184,6 +221,27 @@ struct moe_hybrid_engine {
      std::thread                        th;
      std::atomic<bool>                  stop{false};
      std::atomic<uint32_t>              wake_gen{0};
++
++    // default ON (LLAMA_MOE_HYBRID_DMA_THREAD=0 disables): the promotion copies are submitted by a thread of their own instead of by the request-serving engine thread, so a CUDA call
++    // that blocks (the driver is shared with the main thread's kernel launches) can delay a promotion but never a reply the GPU is spinning on. dma_state 3 = handed over
++    std::thread                        dma_th;
++    std::mutex                         dma_mtx;
++    std::condition_variable            dma_cv;
++    bool                               dma_stop = false;     // guarded by dma_mtx
++    bool                               dma_thread_on = false;
 +
 +    // opt-in diagnostics (env LLAMA_MOE_HYBRID_WATCHDOG_MS > 0): a watchdog thread reports a host request that stays unanswered,
 +    // with the phase the host engine thread is in (0 polling for a request, 1 serving it, 2 submitting promotion copies)
@@ -202,7 +993,14 @@ index 0bf14d81c..37c00f2ce 100644
      std::mutex                         mtx;
      std::condition_variable            cv;
      ggml_backend_t                     cpu = nullptr;
-@@ -202,6 +217,7 @@ struct moe_hybrid_engine {
+@@ -196,12 +254,14 @@ struct moe_hybrid_engine {
+     double                             compute_sum[GGML_MOE_HYBRID_MAX_USED + 1] = {}; // CPU graph time by miss count
+     int64_t                            n_dma_engine   = 0;
+     double                             dma_submit_sum = 0.0;
++    double                             dma_submit_max = 0.0;
+ 
+     ~moe_hybrid_engine() { shutdown(); }
+ 
      void init(const llm_graph_context & g, const llama_model & mdl, ggml_backend_t be, int slots);
      void shutdown();
      void on_token();
@@ -210,15 +1008,53 @@ index 0bf14d81c..37c00f2ce 100644
  
      void wake() {
          {
-@@ -242,6 +258,7 @@ struct moe_hybrid_engine {
+@@ -242,6 +302,8 @@ struct moe_hybrid_engine {
      std::string build_host_graph(moe_hybrid_host_graph & hg, int l, int m);
      void        run(std::promise<std::string> ready);
      void        serve();
++    void        dma_loop();
 +    void        watchdog();
  };
  
  // host expert tensors must be plain, contiguous host memory the DMA can read and the CPU can compute on
-@@ -350,6 +367,8 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+@@ -276,6 +338,36 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+     cpu_first  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_FIRST", 0);
+     cpu_stride = moe_hybrid_env_int("LLAMA_MOE_HYBRID_STRIDE", 2);
+     poll       = moe_hybrid_env_int("LLAMA_MOE_HYBRID_POLL", 100);
++    pf_bytes   = moe_hybrid_env_int("LLAMA_MOE_HYBRID_PF", 0);
++    timeout_ms = moe_hybrid_env_int("LLAMA_MOE_HYBRID_TIMEOUT_MS", 0);
++    if (const char * tp_path = getenv("LLAMA_MOE_HYBRID_TRACE"); tp_path != nullptr && *tp_path != '\0') {
++        trace_fp = fopen(tp_path, "wb");
++        if (trace_fp == nullptr) {
++            GGML_ABORT("moe_hybrid: cannot open routing trace %s", tp_path);
++        }
++        const int32_t hdr[4] = { (int32_t) g.n_layer, (int32_t) g.hparams.n_expert_used, (int32_t) g.n_expert, GGML_MOE_HYBRID_MAX_USED };
++        fwrite("MOETRC01", 1, 8, trace_fp);
++        fwrite(hdr, sizeof(int32_t), 4, trace_fp);
++    }
++#ifdef _WIN32
++    if (const int prio = moe_hybrid_env_int("LLAMA_MOE_HYBRID_PRIO", 0); prio > 0) {
++        const DWORD cls = prio >= 2 ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS;
++        if (SetPriorityClass(GetCurrentProcess(), cls)) {
++            LLAMA_LOG_INFO("%s: moe_hybrid: process priority class raised (%s)\n", __func__, prio >= 2 ? "high" : "above normal");
++        } else {
++            LLAMA_LOG_WARN("%s: moe_hybrid: SetPriorityClass failed (%lu)\n", __func__, (unsigned long) GetLastError());
++        }
++    }
++#endif
++    ggml_backend_cuda_moe_hybrid_set_timeout_ms(timeout_ms);
++    if (const char * ds = getenv("LLAMA_MOE_HYBRID_DEBUG_STALL"); ds != nullptr && *ds != '\0') {
++        long long r = 0; int ms = 0;
++        if (sscanf(ds, "%lld:%d", &r, &ms) == 2 && r > 0 && ms > 0) {
++            dbg_stall_req = r;
++            dbg_stall_ms  = ms;
++            LLAMA_LOG_WARN("%s: moe_hybrid: DEBUG stall injection armed: host request %lld sleeps %d ms\n", __func__, r, ms);
++        }
++    }
+ 
+     if (n_used < 1 || n_used > GGML_MOE_HYBRID_MAX_USED || n_embd > GGML_MOE_HYBRID_MAX_EMBD || n_layer > GGML_MOE_HYBRID_MAX_LAYER) {
+         GGML_ABORT("moe_hybrid: unsupported shape n_expert_used=%d n_embd=%d n_layer=%d", n_used, n_embd, n_layer);
+@@ -350,6 +442,8 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
      if (fmax <= 0 || *std::min_element(freq.begin(), freq.end()) < 0) {
          GGML_ABORT("moe_hybrid: invalid frequency counts");
      }
@@ -227,18 +1063,32 @@ index 0bf14d81c..37c00f2ce 100644
  
      // page-lock the host expert ranges so promotions DMA straight from the model's memory
      const auto t_reg = moe_clock::now();
-@@ -497,12 +516,97 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+@@ -487,6 +581,11 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+         fflush(log);
+     }
+ 
++    dma_thread_on = moe_hybrid_env_int("LLAMA_MOE_HYBRID_DMA_THREAD", 1) != 0; // default ON since G5 (see docs/plans/tg-beat-stock-8gb-262k.md)
++    if (dma_thread_on) {
++        dma_th = std::thread([this]() { dma_loop(); });
++    }
++
+     // host miss engine
+     std::promise<std::string> ready;
+     std::future<std::string>  fut = ready.get_future();
+@@ -497,12 +596,97 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
          GGML_ABORT("moe_hybrid: host engine init failed: %s", err.c_str());
      }
  
+-    LLAMA_LOG_INFO("%s: moe_hybrid: %d slots x %d layers (%.1f MiB VRAM), B=%d lambda=%g, engine %d threads from CPU %d stride %d poll %d, "
 +    wd_ms = moe_hybrid_env_int("LLAMA_MOE_HYBRID_WATCHDOG_MS", 0);
 +    if (wd_ms > 0) {
 +        wd_th = std::thread([this]() { watchdog(); });
 +    }
 +
-     LLAMA_LOG_INFO("%s: moe_hybrid: %d slots x %d layers (%.1f MiB VRAM), B=%d lambda=%g, engine %d threads from CPU %d stride %d poll %d, "
++    LLAMA_LOG_INFO("%s: moe_hybrid: %d slots x %d layers (%.1f MiB VRAM), B=%d lambda=%g, engine %d threads from CPU %d stride %d poll %d pf %d, "
                     "registered %.1f MiB in %.1f ms, fill %.1f ms, init %.1f ms\n", __func__,
-                    n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll,
+-                   n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll,
++                   n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll, pf_bytes,
                     reg_bytes/1048576.0, reg_ms, fill_ms, moe_hybrid_us(t_init)/1e3);
  }
  
@@ -325,7 +1175,17 @@ index 0bf14d81c..37c00f2ce 100644
  std::string moe_hybrid_engine::build_host_graph(moe_hybrid_host_graph & hg, int l, int m) {
      ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(64, false), nullptr, true };
      hg.ctx = ggml_init(ip);
-@@ -624,6 +728,7 @@ void moe_hybrid_engine::serve() {
+@@ -523,6 +707,9 @@ std::string moe_hybrid_engine::build_host_graph(moe_hybrid_host_graph & hg, int
+     ggml_tensor * gate = ggml_mul_mat_id(ctx, h_gate[l], cur, hg.ids); // [n_ff, m, 1]
+     ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+     ggml_tensor * ex   = ggml_mul_mat_id(ctx, h_down[l], act, hg.ids); // [n_embd, m, 1]
++    ((int32_t *) up->op_params)[0]   = pf_bytes; // opt-in prefetch distance, read by ggml-cpu's mul_mat_id
++    ((int32_t *) gate->op_params)[0] = pf_bytes;
++    ((int32_t *) ex->op_params)[0]   = pf_bytes;
+     ex = ggml_mul(ctx, ex, hg.w);
+ 
+     hg.gf = ggml_new_graph_custom(ctx, 64, false);
+@@ -624,6 +811,7 @@ void moe_hybrid_engine::serve() {
          if (seq == served) {
              MOE_HYBRID_PAUSE();
              if ((++spins & 4095) == 0) {
@@ -333,7 +1193,7 @@ index 0bf14d81c..37c00f2ce 100644
                  const uint32_t gen = wake_gen.load(std::memory_order_acquire);
                  if (gen != seen_gen) {
                      seen_gen = gen;
-@@ -640,6 +745,10 @@ void moe_hybrid_engine::serve() {
+@@ -640,10 +828,18 @@ void moe_hybrid_engine::serve() {
          }
          std::atomic_thread_fence(std::memory_order_acquire);
          const auto t0 = moe_clock::now();
@@ -341,20 +1201,32 @@ index 0bf14d81c..37c00f2ce 100644
 +        sv_t_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count(), std::memory_order_relaxed);
 +        sv_phase.store(1, std::memory_order_relaxed);
 +        sv_sub.store(11, std::memory_order_relaxed);
++        if (dbg_stall_ms > 0 && n_requests + 1 == dbg_stall_req) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(dbg_stall_ms)); // test-only
++        }
  
          const int il    = mb->layer;
          const int nmiss = mb->nmiss;
-@@ -659,7 +768,9 @@ void moe_hybrid_engine::serve() {
+         int32_t   err   = 0;
++        double    in_us = 0.0, comp_us = 0.0;   // stage times of this request (diagnostics)
+         if (il < 0 || il >= n_layer || nmiss < 1 || nmiss > n_used) {
+             err = 1;
+         } else {
+@@ -659,8 +855,12 @@ void moe_hybrid_engine::serve() {
              memcpy(hg.ids->data, mb->ids, (size_t) nmiss*sizeof(int32_t));
              memcpy(hg.w->data,   mb->w,   (size_t) nmiss*sizeof(float));
              const auto        tc = moe_clock::now();
++            in_us = moe_hybrid_us(t0);
 +            sv_sub.store(12, std::memory_order_relaxed);
              const ggml_status st = ggml_backend_graph_compute(cpu, hg.gf);
+-            compute_sum[nmiss] += moe_hybrid_us(tc);
 +            sv_sub.store(13, std::memory_order_relaxed);
-             compute_sum[nmiss] += moe_hybrid_us(tc);
++            comp_us = moe_hybrid_us(tc);
++            compute_sum[nmiss] += comp_us;
              if (st != GGML_STATUS_SUCCESS) {
                  err = 2;
-@@ -674,6 +785,7 @@ void moe_hybrid_engine::serve() {
+             } else {
+@@ -674,29 +874,142 @@ void moe_hybrid_engine::serve() {
          std::atomic_thread_fence(std::memory_order_release);
          mb->res_seq = seq;
          served = seq;
@@ -362,17 +1234,41 @@ index 0bf14d81c..37c00f2ce 100644
  
          const double us = moe_hybrid_us(t0);
          n_requests++;
-@@ -686,17 +798,79 @@ void moe_hybrid_engine::serve() {
+         serve_sum += us;
+         serve_max  = std::max(serve_max, us);
++        if (us > 5000.0) {
++            LLAMA_LOG_WARN("moe_hybrid: slow host request #%lld: layer %d nmiss %d took %.1f ms (copy-in %.1f, graph compute %.1f, rest %.1f), dma_state %d\n",
++                           (long long) n_requests, il, nmiss, us/1e3, in_us/1e3, comp_us/1e3, (us - in_us - comp_us)/1e3, dma_state.load());
++        }
+         nmiss_hist[err == 0 ? nmiss : 0]++;
+         active = moe_clock::now();
+ 
+         // the token's inputs are uploaded by now: start the promotion copies queued by on_token
          int queued = 1;
-         if (dma_state.load(std::memory_order_relaxed) == 1 &&
+-        if (dma_state.load(std::memory_order_relaxed) == 1 &&
++        if (dma_thread_on) {
++            if (dma_state.load(std::memory_order_relaxed) == 1 &&
++                dma_state.compare_exchange_strong(queued, 3, std::memory_order_acquire)) {
++                { std::lock_guard<std::mutex> lk(dma_mtx); } // order the notify after the waiter's predicate check
++                dma_cv.notify_one();
++            }
++        } else if (dma_state.load(std::memory_order_relaxed) == 1 &&
              dma_state.compare_exchange_strong(queued, 2, std::memory_order_acquire)) {
 +            sv_t_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(moe_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
 +            sv_phase.store(2, std::memory_order_relaxed);
++            sv_sub.store(21, std::memory_order_relaxed);
              submit_dma();
++            sv_sub.store(22, std::memory_order_relaxed);
              ggml_backend_cuda_event_record_aux(cuda, ev);
++            sv_sub.store(23, std::memory_order_relaxed);
              ggml_backend_cuda_aux_flush(cuda);
++            sv_sub.store(24, std::memory_order_relaxed);
              n_dma_engine++;
              dma_submit_sum += moe_hybrid_us(active);
++            dma_submit_max  = std::max(dma_submit_max, moe_hybrid_us(active));
++            if (moe_hybrid_us(active) > 5000.0) {
++                LLAMA_LOG_WARN("moe_hybrid: slow DMA submission #%lld took %.1f ms\n", (long long) n_dma_engine, moe_hybrid_us(active)/1e3);
++            }
              dma_state.store(0, std::memory_order_release);
 +            sv_phase.store(0, std::memory_order_relaxed);
              active = moe_clock::now();
@@ -380,6 +1276,33 @@ index 0bf14d81c..37c00f2ce 100644
      }
  }
  
++void moe_hybrid_engine::dma_loop() {
++    std::unique_lock<std::mutex> lk(dma_mtx);
++    for (;;) {
++        dma_cv.wait(lk, [&] { return dma_stop || dma_state.load(std::memory_order_acquire) == 3; });
++        if (dma_state.load(std::memory_order_acquire) == 3) {
++            lk.unlock();
++            const auto t0 = moe_clock::now();
++            submit_dma();
++            ggml_backend_cuda_event_record_aux(cuda, ev);
++            ggml_backend_cuda_aux_flush(cuda);
++            n_dma_engine++;
++            const double us = moe_hybrid_us(t0);
++            dma_submit_sum += us;
++            dma_submit_max  = std::max(dma_submit_max, us);
++            if (us > 5000.0) {
++                LLAMA_LOG_WARN("moe_hybrid: slow DMA submission #%lld took %.1f ms (dma thread)\n", (long long) n_dma_engine, us/1e3);
++            }
++            dma_state.store(0, std::memory_order_release);
++            lk.lock();
++            continue;
++        }
++        if (dma_stop) {
++            break;
++        }
++    }
++}
++
 +// Opt-in diagnostics. Polls the mailbox every 2 ms; when the same request stays unanswered for wd_ms it reports once, with the
 +// phase of the host engine thread. A device-side wait times out (and traps the context) after 500 ms; this says WHERE the host was.
 +void moe_hybrid_engine::watchdog() {
@@ -389,6 +1312,7 @@ index 0bf14d81c..37c00f2ce 100644
 +    bool     reported_pend = false;
 +    uint64_t hb_last  = 0;
 +    auto     hb_t     = moe_clock::now();
++    int64_t  nodes_at_since = 0;
 +    while (!wd_stop.load(std::memory_order_relaxed)) {
 +        std::this_thread::sleep_for(std::chrono::milliseconds(2));
 +        {   // keep the heartbeat age current even when no request is pending
@@ -405,6 +1329,7 @@ index 0bf14d81c..37c00f2ce 100644
 +            since    = moe_clock::now();
 +            reported = false;
 +            reported_pend = false;
++            nodes_at_since = ggml_backend_cuda_dbg_nodes_launched();
 +        }
 +        if (req == res) {
 +            continue;
@@ -435,6 +1360,9 @@ index 0bf14d81c..37c00f2ce 100644
 +                           (int) req, pend_ms, (int) res, (int) mb->layer, (int) mb->nmiss, sv_phase.load(), sv_sub.load(),
 +                           (double) (now_ns - sv_t_ns.load())/1e6, (int) sv_seq.load(), hb_age_ms, dma_state.load(), (int) stop.load(),
 +                           (unsigned) wake_gen.load());
++            LLAMA_LOG_WARN("%s: moe_hybrid watchdog (cont.): promotion copy index being submitted %d, graph nodes launched since the request went pending %lld, "
++                           "main thread inside a graph compute %d\n", __func__, ggml_backend_cuda_dbg_aux_idx(),
++                           (long long) (ggml_backend_cuda_dbg_nodes_launched() - nodes_at_since), ggml_backend_cuda_dbg_in_compute());
 +        }
 +    }
 +}
@@ -442,7 +1370,19 @@ index 0bf14d81c..37c00f2ce 100644
  void moe_hybrid_engine::on_token() {
      wake();
      const auto t0 = moe_clock::now();
-@@ -913,6 +1087,12 @@ void moe_hybrid_engine::shutdown() {
+@@ -772,6 +1085,11 @@ void moe_hybrid_engine::on_token() {
+                 v *= lambda;
+             }
+             have = true;
++            if (trace_fp != nullptr) {
++                const int32_t tok = (int32_t) n_tokens;
++                fwrite(&tok, sizeof(int32_t), 1, trace_fp);
++                fwrite(trace, sizeof(int32_t), (size_t) n_layer*GGML_MOE_HYBRID_MAX_USED, trace_fp);
++            }
+         }
+         for (int k = 0; k < n_used; ++k) {
+             const int e = tr[k];
+@@ -913,11 +1231,25 @@ void moe_hybrid_engine::shutdown() {
          return;
      }
      down = true;
@@ -455,10 +1395,66 @@ index 0bf14d81c..37c00f2ce 100644
      if (th.joinable()) {
          stop.store(true);
          wake();
-@@ -1045,6 +1225,28 @@ public:
+         th.join();
+     }
++    if (dma_th.joinable()) {
++        {
++            std::lock_guard<std::mutex> lk(dma_mtx);
++            dma_stop = true;
++        }
++        dma_cv.notify_one();
++        dma_th.join();
++    }
+     // copies still queued would only feed promotions that are never published
+     dma_dst.clear();
+     dma_src.clear();
+@@ -934,12 +1266,12 @@ void moe_hybrid_engine::shutdown() {
+         }
+         LLAMA_LOG_INFO("moe_hybrid: tokens %lld, hit rate %.4f (%lld/%lld), promotions/token %.2f, pending waits %lld, "
+                        "on_token avg %.1f max %.1f us | host requests %lld, serve avg %.1f max %.1f us, nmiss hist [err,1..%d] %s | "
+-                       "promotion batches engine %lld (submit avg %.1f us) main %lld\n",
++                       "promotion batches engine %lld (submit avg %.1f max %.1f us) main %lld\n",
+                        (long long) n_tokens, n_lookups ? (double) n_hits/n_lookups : 0.0, (long long) n_hits, (long long) n_lookups,
+                        n_tokens ? (double) n_promotions/n_tokens : 0.0, (long long) n_waits,
+                        n_tokens ? on_token_sum/n_tokens : 0.0, on_token_max,
+                        (long long) n_requests, n_requests ? serve_sum/n_requests : 0.0, serve_max, n_used, hist,
+-                       (long long) n_dma_engine, n_dma_engine ? dma_submit_sum/n_dma_engine : 0.0, (long long) n_dma_main);
++                       (long long) n_dma_engine, n_dma_engine ? dma_submit_sum/n_dma_engine : 0.0, dma_submit_max, (long long) n_dma_main);
+         if (log) {
+             fprintf(log, "{\"event\":\"summary\",\"tokens\":%lld,\"hits\":%lld,\"lookups\":%lld,\"promotions\":%lld,\"waits\":%lld,"
+                          "\"on_token_avg_us\":%.2f,\"on_token_max_us\":%.1f,\"requests\":%lld,\"serve_avg_us\":%.2f,\"serve_max_us\":%.1f,"
+@@ -971,6 +1303,10 @@ void moe_hybrid_engine::shutdown() {
+         fclose(log);
+         log = nullptr;
+     }
++    if (trace_fp) {
++        fclose(trace_fp);
++        trace_fp = nullptr;
++    }
+     if (ev) {
+         ggml_backend_event_free(ev);
+         ev = nullptr;
+@@ -1045,6 +1381,45 @@ public:
  
  } // namespace
  
++bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot) {
++    moe_hybrid_engine * eng = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
++        if (g_moe_hybrid_engines.size() != 1) {
++            return false;
++        }
++        eng = g_moe_hybrid_engines.begin()->second.get();
++    }
++    if (eng->cache_buf == nullptr) {
++        return false;
++    }
++    *cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
++    *n_slot      = eng->n_slot;
++    return true;
++}
++
 +bool llama_moe_hybrid_resize_impl(int n_slot) {
 +    moe_hybrid_engine * eng = nullptr;
 +    {
@@ -485,10 +1481,10 @@ index 0bf14d81c..37c00f2ce 100644
                                           ggml_tensor * cur, ggml_tensor ** pub) {
      *pub = nullptr;
 diff --git a/src/llama-moe-hybrid.h b/src/llama-moe-hybrid.h
-index c50757539..6ca425adb 100644
+index c50757539..718b3e4d4 100644
 --- a/src/llama-moe-hybrid.h
 +++ b/src/llama-moe-hybrid.h
-@@ -28,3 +28,8 @@ ggml_tensor * llama_moe_hybrid_build_wait(const llm_graph_context & g, ggml_tens
+@@ -28,3 +28,11 @@ ggml_tensor * llama_moe_hybrid_build_wait(const llm_graph_context & g, ggml_tens
  
  // stop and free the engine bound to this backend, if any
  void llama_moe_hybrid_release(ggml_backend_t backend);
@@ -497,22 +1493,128 @@ index c50757539..6ca425adb 100644
 +// before the new one is allocated and the new one is refilled from the frequency prior. Keeps env LLAMA_MOE_HYBRID in step.
 +// Returns false and changes nothing when there is no engine or the slot count is invalid.
 +bool llama_moe_hybrid_resize_impl(int n_slot);
++
++// bytes the slot cache of the one engine in this process holds now and its slot count (the zero slot makes the size (n_slot + 1) x one slot row). False when there is no engine.
++bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);
 diff --git a/tools/layer-streaming/main.cpp b/tools/layer-streaming/main.cpp
-index 16b384858..5cbd24cc8 100644
+index 16b384858..dcb903bba 100644
 --- a/tools/layer-streaming/main.cpp
 +++ b/tools/layer-streaming/main.cpp
-@@ -3248,7 +3248,10 @@ int main(int argc, char ** argv) {
+@@ -26,13 +26,86 @@
+ #include "ggml-backend.h"
+ #include "ggml-cuda.h"
+ 
++#ifdef _WIN32
++extern "C" {
++__declspec(dllimport) void * __stdcall LoadLibraryA(const char * name);
++__declspec(dllimport) void * __stdcall GetProcAddress(void * module, const char * name);
++}
++#endif
++
++// The device's memory use as nvidia-smi / NVML report it (the unit a VRAM cap is stated in). cudaMemGetInfo's total - free is a constant 1,080 MiB higher on this machine, so the two cannot be mixed.
++// NVML ships with the driver and is loaded at run time (nothing is linked). False when it is not available.
++static bool ls_nvml_used_bytes(int device, uint64_t * used) {
++#ifdef _WIN32
++    struct nvml_mem_t { unsigned long long total, free, used; };
++    typedef int (*fn_init_t)(void);
++    typedef int (*fn_handle_t)(unsigned int, void **);
++    typedef int (*fn_mem_t)(void *, nvml_mem_t *);
++    static void *       lib      = LoadLibraryA("nvml.dll");
++    if (lib == nullptr) {
++        return false;
++    }
++    static fn_init_t    p_init   = (fn_init_t)   GetProcAddress(lib, "nvmlInit_v2");
++    static fn_handle_t  p_handle = (fn_handle_t) GetProcAddress(lib, "nvmlDeviceGetHandleByIndex_v2");
++    static fn_mem_t     p_mem    = (fn_mem_t)    GetProcAddress(lib, "nvmlDeviceGetMemoryInfo");
++    if (p_init == nullptr || p_handle == nullptr || p_mem == nullptr) {
++        return false;
++    }
++    static const int    rc_init  = p_init();
++    if (rc_init != 0) {
++        return false;
++    }
++    void * h = nullptr;
++    if (p_handle((unsigned int) device, &h) != 0) {
++        return false;
++    }
++    nvml_mem_t m = {};
++    if (p_mem(h, &m) != 0) {
++        return false;
++    }
++    *used = (uint64_t) m.used;
++    return true;
++#else
++    (void) device;
++    (void) used;
++    return false;
++#endif
++}
++
++// LLAMA_TG_VRAM_TRACE=1: the device's memory use at a named point (measurement only)
++static void ls_vram_trace(int device, const char * what) {
++    if (getenv("LLAMA_TG_VRAM_TRACE") == nullptr) {
++        return;
++    }
++    size_t f = 0, t = 0;
++    ggml_backend_cuda_get_device_memory(device, &f, &t);
++    uint64_t nv = 0;
++    const bool have_nv = ls_nvml_used_bytes(device, &nv);
++    fprintf(stderr, "vram-trace: %-34s cudaMemGetInfo in use %.1f MiB, NVML in use %.1f MiB\n", what, (double) (t - f)/1048576.0, have_nv ? (double) nv/1048576.0 : -1.0);
++    fflush(stderr);
++}
++
++// defined in ggml/src/ggml-cuda/ggml-cuda.cu (opt-in lazily committed KV buffer, --kv-lazy)
++extern "C" {
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
++#ifdef _WIN32
++__declspec(dllimport)
++#endif
++bool ggml_backend_cuda_buft_is_lazy_capable(int device);
++}
++
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <functional>
++#include <thread>
+ #include <map>
+ #include <string>
+ #include <unordered_map>
+@@ -57,6 +130,11 @@ static void usage(const char * prog) {
+         "  --no-mmap              load the model into ordinary host memory\n"
+         "  --model-env NAME       read the model path from environment variable NAME\n"
+         "  --kv-cache S           f16 (default), q8, or q4 for both K and V\n"
++        "  --kv-lazy              reserve the CUDA KV cache as address space and commit only the rows this run\n"
++        "                         uses (prompt + generated tokens + 1024), so an unused 262,144-token window costs no\n"
++        "                         VRAM. Needs --kv-graph-pad N>0 (attention must not read the whole cache) and CUDA\n"
++        "                         virtual memory management. The freed VRAM is spent by the caller, e.g. a bigger\n"
++        "                         --tg-hybrid-slots; a run that outgrows its committed rows fails loudly.\n"
+         "  --kv-graph-pad N       KV graph-length granularity passed to llama_context_params.n_pad\n"
+         "                         (default 0 = legacy: n_pad = n_ctx, which pins every attention view\n"
+         "                         to the whole allocated cache). N>0 makes llama_kv_cache::get_n_kv()\n"
+@@ -3248,7 +3326,14 @@ int main(int argc, char ** argv) {
      // step 3 is in place, because on its own it would build the TG view before any KV
      // cell exists and silently under-read. See the usage text and the plan block.
      long long kv_graph_pad = 0;
++    bool kv_lazy = false; // --kv-lazy: commit the KV cache rows on demand instead of the whole window
 +    bool tg_first_pp = false; // --tg-first-pp-token: generated token 0 = argmax of the PP logits (stock semantics), not a re-decode of the last prompt token
      bool tg_hybrid = false; // --tg-hybrid: after PP, decode through the stock graph path (AER hybrid engine, env LLAMA_MOE_HYBRID)
-+    int  tg_hybrid_slots = 0; // --tg-hybrid-slots N: after PP released its weight slots, resize the hybrid VRAM cache to N slots per layer
++    int  tg_hybrid_slots = 0; // --tg-hybrid-slots N: after PP released its weight slots, resize the hybrid VRAM cache to N slots per layer; -1 = auto
++    long long tg_vram_cap_mib    = 8192; // --tg-vram-cap-mib: the whole-device VRAM the decode phase may use when --tg-hybrid-slots is auto
++    long long tg_vram_safety_mib = 160;  // --tg-vram-safety-mib: held back from the cap for allocator slack and graph capture
++    long long tg_vram_reserved_mib = 0;  // --tg-vram-reserved-mib: what cudaMemGetInfo counts above nvidia-smi (1080 on the dev machine); only used when NVML cannot be loaded
 +    bool tg_release_compute = false; // --tg-release-compute: before decode, re-reserve the scheduler compute buffers for single-token decode
      int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
      int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
      // T-GPLR-72: host-backend thread count. Default 16 = the value that was
-@@ -3406,8 +3409,14 @@ int main(int argc, char ** argv) {
+@@ -3406,10 +3491,27 @@ int main(int argc, char ** argv) {
              // T-GPLR-04: --ctx-size is honored in run mode as the explicit
              // context/KV capacity, independent of the PP token count.
              run_ctx_size = ctx_size;
@@ -521,13 +1623,41 @@ index 16b384858..5cbd24cc8 100644
          } else if (arg == "--tg-hybrid") {
              tg_hybrid = true;
 +        } else if (arg == "--tg-hybrid-slots") {
-+            tg_hybrid_slots = atoi(arg_value(argc, argv, i, "--tg-hybrid-slots").c_str());
++            {
++                const std::string v = arg_value(argc, argv, i, "--tg-hybrid-slots");
++                tg_hybrid_slots = (v == "auto") ? -1 : atoi(v.c_str());
++            }
++        } else if (arg == "--tg-vram-cap-mib") {
++            tg_vram_cap_mib = atoll(arg_value(argc, argv, i, "--tg-vram-cap-mib").c_str());
++        } else if (arg == "--tg-vram-safety-mib") {
++            tg_vram_safety_mib = atoll(arg_value(argc, argv, i, "--tg-vram-safety-mib").c_str());
++        } else if (arg == "--tg-vram-reserved-mib") {
++            tg_vram_reserved_mib = atoll(arg_value(argc, argv, i, "--tg-vram-reserved-mib").c_str());
 +        } else if (arg == "--tg-release-compute") {
 +            tg_release_compute = true;
          } else if (arg == "--kv-graph-pad") {
              kv_graph_pad = atoll(arg_value(argc, argv, i, "--kv-graph-pad").c_str());
++        } else if (arg == "--kv-lazy") {
++            kv_lazy = true;
          } else if (arg == "--residency-budget-mib") {
-@@ -4606,7 +4615,7 @@ int main(int argc, char ** argv) {
+             residency_budget_mib = atoll(arg_value(argc, argv, i, "--residency-budget-mib").c_str());
+         } else if (arg == "--reserve-mib") {
+@@ -3909,6 +4011,14 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "error: --pp-tokens and --ubatch must be > 0\n");
+         return 2;
+     }
++    if (kv_lazy && kv_graph_pad <= 0) {
++        fprintf(stderr, "error: --kv-lazy needs --kv-graph-pad N>0: without it every attention view spans the whole cache and would read rows that are never committed\n");
++        return 2;
++    }
++    if (tg_hybrid_slots < 0 && (!tg_hybrid || tg_vram_cap_mib <= tg_vram_safety_mib)) {
++        fprintf(stderr, "error: --tg-hybrid-slots auto needs --tg-hybrid and --tg-vram-cap-mib above --tg-vram-safety-mib\n");
++        return 2;
++    }
+     if (pp_repeat < 1 || pp_repeat > 16) {
+         fprintf(stderr, "error: --pp-repeat must be in 1..16\n");
+         return 2;
+@@ -4606,7 +4716,7 @@ int main(int argc, char ** argv) {
      // cover that MTP draft width or output_reserve aborts at the first
      // verify round. Must remain nonzero in all cases for graph
      // reservation.
@@ -536,7 +1666,42 @@ index 16b384858..5cbd24cc8 100644
          ? (mtp ? (uint32_t) (1 + mtp_draft) : 1)
          : (uint32_t) pp_tokens;
      // T-GPLR-72: was hardcoded 16/16; now a flag whose default is that same 16.
-@@ -5651,7 +5660,7 @@ int main(int argc, char ** argv) {
+@@ -4694,11 +4804,34 @@ int main(int argc, char ** argv) {
+     llama_ls_vram_budget vram;
+     ls_vram_budget_measure_start(vram, device, reserve_mib, residency_budget_mib);
+ 
++    if (kv_lazy) {
++        if (!ggml_backend_cuda_buft_is_lazy_capable(device)) {
++            fprintf(stderr, "error: --kv-lazy needs CUDA virtual memory management, which device %d does not report\n", device);
++            return 2;
++        }
++#ifdef _WIN32
++        _putenv_s("LLAMA_KV_LAZY", "1");
++#else
++        setenv("LLAMA_KV_LAZY", "1", 1);
++#endif
++    }
+     llama_context * ctx = llama_new_context_with_model(model, cparams);
+     if (ctx == nullptr) {
+         fprintf(stderr, "error: failed to create context (is VRAM sufficient?)\n");
+         return 1;
+     }
++    if (kv_lazy) {
++        // every row the run can touch: prompt + generated tokens, plus a margin that covers the attention kernels' 256-row tiles and the pad granularity
++        const int64_t kv_rows = std::min<int64_t>((int64_t) n_ctx_total, (int64_t) pp_tokens + (int64_t) tg_tokens + 1024);
++        const int64_t kv_bytes = ggml_backend_cuda_lazy_commit_rows(kv_rows);
++        if (kv_bytes < 0) {
++            fprintf(stderr, "error: --kv-lazy: the driver could not commit %lld KV rows (out of device memory)\n", (long long) kv_rows);
++            return 1;
++        }
++        fprintf(stderr, "kv-lazy: committed %.1f MiB of KV cache (%lld of %d rows) instead of the whole window\n",
++                (double) kv_bytes / 1048576.0, (long long) kv_rows, n_ctx_total);
++        fflush(stderr);
++    }
+ 
+     // ------------------------------------------------------------------
+     // T-GPLR-05: forced `off` — the normal llama.cpp path inside the
+@@ -5651,7 +5784,7 @@ int main(int argc, char ** argv) {
              batch.pos[i]   = i;
              batch.n_seq_id[i] = 1;
              batch.seq_id[i][0] = 0;
@@ -545,7 +1710,7 @@ index 16b384858..5cbd24cc8 100644
          }
          batch.n_tokens = pp_tokens;
  
-@@ -5923,7 +5932,7 @@ int main(int argc, char ** argv) {
+@@ -5923,7 +6056,7 @@ int main(int argc, char ** argv) {
                          ub.pos[i]     = off + i;
                          ub.n_seq_id[i] = 1;
                          ub.seq_id[i][0] = 0;
@@ -554,7 +1719,47 @@ index 16b384858..5cbd24cc8 100644
                      }
                      ub.n_tokens = n_tok;
                      ret = llama_decode(ctx, ub);
-@@ -6555,7 +6564,62 @@ int main(int argc, char ** argv) {
+@@ -6000,11 +6133,29 @@ int main(int argc, char ** argv) {
+             ? (llama_token) (pp_tokens - 1)
+             : prompt_tokens[pp_tokens - 1]; // last PP token; first generated comes from logits
+ 
++        ls_vram_trace(device, "before begin_tg_stock");
+         if (tg_hybrid && !ls.begin_tg_stock()) {
+             fprintf(stderr, "error: --tg-hybrid release failed: %s\n", ls.error_msg.c_str());
+             ls.failed = true;
+             exit_status = 1;
+         }
++        // Opt-in: prefill's weight slots are gone now, so give that VRAM to the decode cache. With --tg-release-compute the scheduler
++        // buffers must be released first (they are still needed until the prefill logits were read), so that case resizes later.
++        // LLAMA_TG_RESIZE_LATE=1 forces the late position without the release (an A/B switch for the ordering, no other use).
++        const bool resize_late = tg_release_compute || tg_hybrid_slots < 0 || getenv("LLAMA_TG_RESIZE_LATE") != nullptr;
++        if (tg_hybrid && tg_hybrid_slots > 0 && !resize_late && exit_status == 0) {
++            const int64_t t_rs0 = ggml_time_us();
++            if (!llama_moe_hybrid_resize(tg_hybrid_slots)) {
++                fprintf(stderr, "error: --tg-hybrid-slots %d: no hybrid engine to resize (is LLAMA_MOE_HYBRID set?) or invalid slot count\n",
++                        tg_hybrid_slots);
++                ls.failed = true;
++                exit_status = 1;
++            } else {
++                fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms\n", tg_hybrid_slots,
++                        (double) (ggml_time_us() - t_rs0) / 1e3);
++            }
++        }
++        ls_vram_trace(device, "after begin_tg_stock");
+         ls.phase = 1;
+ 
+         // T-GPLR-71: arm the phase-scoped attention-view granularity. This is
+@@ -6098,7 +6249,8 @@ int main(int argc, char ** argv) {
+         // filled by PP, so reset them so the TG phase_summary reports TG-only
+         // transfer/wait/compute and ubatch counts (T-Q38LS-05)
+         ls.reset_stats();
+-        const int64_t t0 = ggml_time_us();
++        int64_t t0 = ggml_time_us();
++        int64_t host_dec_us = 0, host_fetch_us = 0, host_samp_us = 0, host_steps = 0; // measurement only: llama_decode, the logits fetch (the GPU wait), the runner's own sampling
+ 
+         // MTP acceptance counters (T-Q38HG-06) + batch-verify counters
+         // (T-GPLR-06 step 2)
+@@ -6555,7 +6707,100 @@ int main(int argc, char ** argv) {
              // --- standard greedy TG (unchanged) ---
              // exit_status guard: a failed TG setup (e.g. row-set activation)
              // must not keep decoding (T-GPLR-13 probe evidence).
@@ -602,19 +1807,90 @@ index 16b384858..5cbd24cc8 100644
 +                            (double) freed / 1048576.0, (double) (ggml_time_us() - t_rc0) / 1e3);
 +                }
 +            }
-+            if (tg_hybrid && tg_hybrid_slots > 0 && exit_status == 0) {
++            ls_vram_trace(device, "after the compute-buffer release");
++            if (tg_hybrid && tg_hybrid_slots != 0 && resize_late && exit_status == 0) {
 +                const int64_t t_rs0 = ggml_time_us();
-+                if (!llama_moe_hybrid_resize(tg_hybrid_slots)) {
++                int slots = tg_hybrid_slots;
++                if (slots < 0) {
++                    // auto: the largest cache whose whole-device total stays under the cap. The device total already holds the old cache, which the resize frees first.
++                    int64_t cache_bytes = 0;
++                    int     cur_slots   = 0;
++                    size_t  free_now = 0, total_now = 0;
++                    if (!llama_moe_hybrid_cache_info(&cache_bytes, &cur_slots) || cur_slots < 1) {
++                        fprintf(stderr, "error: --tg-hybrid-slots auto: no hybrid engine (is LLAMA_MOE_HYBRID set?)\n");
++                        ls.failed = true;
++                        exit_status = 1;
++                    } else {
++                        // the cap is stated in nvidia-smi units: NVML if it can be loaded, else cudaMemGetInfo minus --tg-vram-reserved-mib
++                        const int64_t MiB = 1048576;
++                        uint64_t      nv_used = 0;
++                        int64_t       used_now = 0;
++                        const char *  src = "NVML";
++                        if (ls_nvml_used_bytes(device, &nv_used)) {
++                            used_now = (int64_t) nv_used;
++                        } else {
++                            ggml_backend_cuda_get_device_memory(device, &free_now, &total_now);
++                            used_now = (int64_t) total_now - (int64_t) free_now - tg_vram_reserved_mib*MiB;
++                            src      = "cudaMemGetInfo";
++                        }
++                        const int64_t row_bytes = cache_bytes / (cur_slots + 1);
++                        const int64_t room      = tg_vram_cap_mib*MiB - (used_now - cache_bytes) - tg_vram_safety_mib*MiB;
++                        slots = (int) std::min<int64_t>(256, std::max<int64_t>(cur_slots, room / row_bytes - 1));
++                        fprintf(stderr, "tg-hybrid: auto slots: device in use %.1f MiB per %s (cache %.1f MiB at %d slots, one slot row %.2f MiB), cap %lld MiB, safety %lld MiB -> %d slots\n",
++                                (double) used_now/MiB, src, (double) cache_bytes/MiB, cur_slots, (double) row_bytes/MiB, tg_vram_cap_mib, tg_vram_safety_mib, slots);
++                    }
++                }
++                const int64_t t_rs1 = ggml_time_us();
++                if (exit_status == 0 && !llama_moe_hybrid_resize(slots)) {
 +                    fprintf(stderr, "error: --tg-hybrid-slots %d: no hybrid engine to resize (is LLAMA_MOE_HYBRID set?) or invalid slot count\n",
-+                            tg_hybrid_slots);
++                            slots);
 +                    ls.failed = true;
 +                    exit_status = 1;
-+                } else {
-+                    fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms\n", tg_hybrid_slots,
-+                            (double) (ggml_time_us() - t_rs0) / 1e3);
++                } else if (exit_status == 0) {
++                    fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms (%.1f ms including the auto sizing)\n", slots,
++                            (double) (ggml_time_us() - t_rs1) / 1e3, (double) (ggml_time_us() - t_rs0) / 1e3);
++                    ls_vram_trace(device, "after the cache resize");
 +                }
++            }
++            if (resize_late && exit_status == 0) {
++                // the release and the resize above are PP->TG transition work, not decode: the TG timer starts here, as it does when that work
++                // runs at the early position (before t0). Their cost is printed on their own lines.
++                t0 = ggml_time_us();
 +            }
 +            for (int t = 0; t < tg_steps && exit_status == 0; ++t) {
                  batch.token[0]   = cur;
                  batch.pos[0]     = pp_tokens + t;
                  batch.n_seq_id[0] = 1;
+@@ -6563,7 +6808,9 @@ int main(int argc, char ** argv) {
+                 batch.logits[0]  = true;
+                 batch.n_tokens   = 1;
+ 
++                const int64_t t_h0 = ggml_time_us();
+                 const int ret = llama_decode(ctx, batch);
++                const int64_t t_h1 = ggml_time_us();
+                 if (ret != 0) {
+                     fprintf(stderr, "error: TG decode step %d failed with %d: %s\n", t, ret, ls.error_msg.c_str());
+                     ls.failed = true;
+@@ -6572,6 +6819,7 @@ int main(int argc, char ** argv) {
+                 }
+ 
+                 const float * logits = llama_get_logits_ith(ctx, 0);
++                const int64_t t_h2 = ggml_time_us();
+                 if (logits == nullptr) {
+                     fprintf(stderr, "error: no logits at TG step %d\n", t);
+                     ls.failed = true;
+@@ -6607,6 +6855,14 @@ int main(int argc, char ** argv) {
+                 cur = best;
+                 generated.push_back(cur);
+                 rep_ring.accept(cur);
++                host_dec_us   += t_h1 - t_h0;
++                host_fetch_us += t_h2 - t_h1;
++                host_samp_us  += ggml_time_us() - t_h2;
++                host_steps++;
++            }
++            if (host_steps > 0) {
++                fprintf(stderr, "tg host timing over %lld steps: llama_decode (host side, up to the graph launch) %.1f us/step, logits fetch (the GPU wait) %.1f us/step, runner copy + penalty + top-2 scan + telemetry %.1f us/step\n",
++                        (long long) host_steps, (double) host_dec_us/host_steps, (double) host_fetch_us/host_steps, (double) host_samp_us/host_steps);
+             }
+         }
+ 

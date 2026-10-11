@@ -94,7 +94,7 @@ def one_run(spec, arm, rep, sdir):
                 rec['http'] = st
                 js = json.loads(txt)
                 t = js.get('timings', {})
-                one = {k: t.get(k) for k in ('prompt_n', 'prompt_per_second', 'predicted_n', 'predicted_ms', 'predicted_per_second')}
+                one = {k: t.get(k) for k in ('prompt_n', 'prompt_per_second', 'predicted_n', 'predicted_ms', 'predicted_per_second', 'draft_n', 'draft_n_accepted')}
                 rec['requests'].append(one)
                 if qi == 0:
                     rec['content_head'] = (js.get('content') or '')[:120]

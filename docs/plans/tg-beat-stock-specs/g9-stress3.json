@@ -1,0 +1,159 @@
+{
+ "session": "g9-stress3",
+ "exe_dir": "build/llama-cuda/bin/g9c",
+ "tg_tokens": 512,
+ "control": "F110",
+ "qa": false,
+ "items": "N1,N2,N3,N4,K1",
+ "prompt": "build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+ "common": [
+  "--model",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "--prompt-file",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+  "--ubatch",
+  "512",
+  "--tg-tokens",
+  "512",
+  "--tg-logit-margin",
+  "512",
+  "--residency",
+  "moe-expert-bank",
+  "--kv-cache",
+  "q8",
+  "--allow-full-residency",
+  "--no-handoff",
+  "--pp-schedule",
+  "layer-major",
+  "--layer-slots",
+  "2",
+  "--tg-hybrid",
+  "--ctx-size",
+  "262144",
+  "--act-slab-dtype",
+  "f32",
+  "--tg-first-pp-token"
+ ],
+ "reps": 8,
+ "interleave": true,
+ "arms": [
+  {
+   "name": "F110",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_GRAPH_RESET_EVERY": "4",
+    "LLAMA_MOE_HYBRID_WATCHDOG_MS": "100",
+    "LLAMA_CUDA_DEBUG_FREE_AT_NODE": "110",
+    "LLAMA_MOE_HYBRID_TIMEOUT_MS": "1000",
+    "LLAMA_CUDA_POOL_LOG": "1"
+   },
+   "why": "forced graph reset every 4th replay + cudaMalloc/cudaFree(4 MiB) before the 110th node of every direct decode launch; engine thread submits the promotion copies; device timeout 1 s"
+  },
+  {
+   "name": "F110D",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_GRAPH_RESET_EVERY": "4",
+    "LLAMA_MOE_HYBRID_WATCHDOG_MS": "100",
+    "LLAMA_CUDA_DEBUG_FREE_AT_NODE": "110",
+    "LLAMA_MOE_HYBRID_TIMEOUT_MS": "1000",
+    "LLAMA_CUDA_POOL_LOG": "1",
+    "LLAMA_MOE_HYBRID_DMA_THREAD": "1"
+   },
+   "why": "forced graph reset every 4th replay + cudaMalloc/cudaFree(4 MiB) before the 110th node of every direct decode launch; promotion copies on a dedicated DMA thread; device timeout 1 s"
+  },
+  {
+   "name": "F140",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_GRAPH_RESET_EVERY": "4",
+    "LLAMA_MOE_HYBRID_WATCHDOG_MS": "100",
+    "LLAMA_CUDA_DEBUG_FREE_AT_NODE": "140",
+    "LLAMA_MOE_HYBRID_TIMEOUT_MS": "1000",
+    "LLAMA_CUDA_POOL_LOG": "1"
+   },
+   "why": "forced graph reset every 4th replay + cudaMalloc/cudaFree(4 MiB) before the 140th node of every direct decode launch; engine thread submits the promotion copies; device timeout 1 s"
+  },
+  {
+   "name": "F140D",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_GRAPH_RESET_EVERY": "4",
+    "LLAMA_MOE_HYBRID_WATCHDOG_MS": "100",
+    "LLAMA_CUDA_DEBUG_FREE_AT_NODE": "140",
+    "LLAMA_MOE_HYBRID_TIMEOUT_MS": "1000",
+    "LLAMA_CUDA_POOL_LOG": "1",
+    "LLAMA_MOE_HYBRID_DMA_THREAD": "1"
+   },
+   "why": "forced graph reset every 4th replay + cudaMalloc/cudaFree(4 MiB) before the 140th node of every direct decode launch; promotion copies on a dedicated DMA thread; device timeout 1 s"
+  }
+ ],
+ "stock_common": [
+  "-m",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "-f",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+  "-ngl",
+  "99",
+  "-fa",
+  "on",
+  "-ctk",
+  "q8_0",
+  "-ctv",
+  "q8_0",
+  "-lm",
+  "none",
+  "-fit",
+  "off",
+  "-c",
+  "262000",
+  "-n",
+  "512",
+  "--ignore-eos",
+  "--temp",
+  "0",
+  "-no-cnv",
+  "--no-display-prompt"
+ ],
+ "poll_ms": 50
+}

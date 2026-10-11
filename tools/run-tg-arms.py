@@ -383,6 +383,17 @@ def main():
         rec['guards'] = {k: len(re.findall(p, out)) for k, p in GUARD_PATTERNS.items()}
         hits = [ln for ln in out.splitlines() if any(re.search(p, ln) for p in GUARD_PATTERNS.values())]
         rec['guard_lines'] = hits[:5]
+        # PP->TG transition work the runner prints on its own lines (outside the TG timer since the g6 build): release of the
+        # scheduler buffers (--tg-release-compute) and the hybrid cache resize (--tg-hybrid-slots)
+        tr_m = {}
+        m_rel = re.search(r're-reserved for decode, ([0-9.]+) MiB released in ([0-9.]+) ms', out)
+        if m_rel:
+            tr_m['release_mib'], tr_m['release_ms'] = float(m_rel.group(1)), float(m_rel.group(2))
+        m_rs = re.search(r'cache resized to (\d+) slots per layer in ([0-9.]+) ms', out)
+        if m_rs:
+            tr_m['resize_slots'], tr_m['resize_ms'] = int(m_rs.group(1)), float(m_rs.group(2))
+        if tr_m:
+            rec['transition'] = tr_m
         if rec['rc'] not in (0, None):
             rec['log_tail'] = out[-1200:]
             log('  tail: ' + out[-600:].replace('\n', ' | '))
