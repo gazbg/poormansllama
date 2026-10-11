@@ -181,6 +181,18 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - **E18 (8 GB shape, LM-hosted hybrid C16 + kv pad, 3 reps, QA each, deterministic)**: 65.58 / 65.49 / 64.96 tok/s; QA PASS 3/3;
   identical output across reps (dlogit 0.0000). VRAM peak not polled in this run (run-tg-arms had no poller at the time).
 - **E19 (stock and AER reference, same shape, 3 reps each)**: in progress at time of writing; see verdict under build/llama-cuda/e19-stock-8gb.
+## CORRECTION (2026-10-11, E21-E24): every LM-hosted number above with bf16 activations is INVALID for the claim
+- Root cause of the degenerate output (measured): the LM runner's DEFAULT prefill activation dtype is **bf16** (`act_slab_dtype_str`
+  default `"bf16"`, T-GPLR-12). With bf16 the hybrid path diverges from stock/AER at ~step 3 and falls into a repetition loop
+  (E21: C14+pad bf16 512 tokens loops; E22: C14 WITHOUT pad also loops => the KV pad is NOT the cause).
+- Fix verified (E23/E24): `--act-slab-dtype f32`. Same binary, same flags: 512 tokens are coherent (copy of the document like stock),
+  QA PASS, deterministic across reps (byte-identical text).
+- The speed of the bf16 runs is real but measured on a broken generation; the rates below are for the f32 path only.
+- VALID 8 GB point: **C14 + kv-pad + f32, 512 tokens**: 63.65 (E23), 63.80 and 63.31 (E24) => mean 63.59 tok/s, VRAM peak 8071 MiB
+  (<= 8192 MiB). C16 bf16 peaked 8203 MiB, so it cannot meet the 8 GB shape even before the dtype fix.
+- Stock at 512 tokens (same prompt): 36.00 (E22, one rep; E25 adds two reps, see below).
+- Also to re-check: any LM run that relied on the bf16 default (semantic-QA entries in docs/currentstate.md) may carry the same
+  divergence; the needle QA passed on the bf16 runs even though the text looped, so QA alone did not catch it.
 ## RESULT TABLE (goal shape, anchor-512 prompt, 128 TG tokens, decode tok/s, whole-GPU VRAM peak, idle 0 MiB)
 | arm | harness | n | tok/s mean (range) | VRAM peak | fits 8192 MiB | QA (needles) |
 |---|---|---|---|---|---|---|
