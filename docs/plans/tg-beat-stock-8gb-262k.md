@@ -387,6 +387,8 @@ agent's own, written before the certified runs.
 61.73 tok/s against 37.35 for stock on the identical prompt (1.65x; 2.01x the owner's 30.68 bar), within 8071 MiB of whole-GPU VRAM, with
 answer stability, no extra degeneration and prefill logits that agree with stock.
 
+**Commit:** docs and tools `6a8da3d` (outer repo, local only, never pushed). The nested llama.cpp working-tree changes are NOT committed (D17); `docs/plans/tg-beat-stock-8gb-262k-nested-worktree.patch` (sha256 prefix a8e83ca67e44354f) is their record.
+
 **This acceptance does NOT certify:** PP speed (317 vs 349 tok/s at 511 tokens, stock ahead); any other model, GPU, driver or filled-context
 size; CPU power or thermal cost; production fitness; byte or token identity with stock (the text parts company by near-tie flips and answer
 stability is the gate). The nested llama.cpp changes behind it are uncommitted (D17), so the build is reproducible only from the working tree
