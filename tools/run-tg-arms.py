@@ -162,6 +162,26 @@ def idle_vram():
         return None
 
 
+def start_load(n):
+    """n busy-loop python processes at normal priority (arm key `load`): a controlled stand-in for other heavy host work."""
+    n = int(n or 0)
+    return [subprocess.Popen([sys.executable, '-c', 'while True: pass'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(n)]
+
+
+def stop_load(procs):
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    for p in procs:
+        try:
+            p.wait(timeout=10)
+        except Exception:
+            pass
+
+
 def load_rep():
     sp = importlib.util.spec_from_file_location('check_repetition', REP)
     m = importlib.util.module_from_spec(sp)
@@ -269,7 +289,8 @@ def main():
     reps = int(spec.get('reps', 1))
     has_stock = any(arm.get('engine') == 'stock' for arm in spec['arms'])
     has_lm = any(arm.get('engine') != 'stock' for arm in spec['arms'])
-    need = [prompt] + ([exe] if has_lm else []) + ([stock_exe] if has_stock else [])
+    arm_exes = [os.path.join(ROOT, arm['exe_dir'], 'llama-layer-streaming.exe') for arm in spec['arms'] if arm.get('exe_dir') and arm.get('engine') != 'stock']
+    need = [prompt] + ([exe] if has_lm else []) + arm_exes + ([stock_exe] if has_stock else [])
     for p in need:
         if not os.path.exists(p):
             log('MISSING REQUIRED FILE:', p)
@@ -308,10 +329,15 @@ def main():
         if stock:
             cmd = [stock_exe] + scommon + arm.get('flags', [])
         else:
-            cmd = [exe] + common + arm.get('flags', []) + ['--telemetry', tr, '--tg-text', tx]
+            arm_exe = os.path.join(ROOT, arm['exe_dir'], 'llama-layer-streaming.exe') if arm.get('exe_dir') else exe  # per-arm side-copied build for A/B across builds
+            cmd = [arm_exe] + common + arm.get('flags', []) + ['--telemetry', tr, '--tg-text', tx]
         rec = {'base': base, 'rep': rep, 'engine': 'stock' if stock else 'lm', 'flags': arm.get('flags', []),
                'env': env, 'why': arm.get('why', ''), 'trace': tr, 'tgtext': tx, 'log': lg,
                'cmd': ' '.join(cmd)}
+        if arm.get('exe_dir') and not stock:
+            rec['exe_dir'] = arm['exe_dir']
+            rec['exe_sha256_16'] = sha16(arm_exe)
+            rec['llama_dll_sha256_16'] = sha16(os.path.join(ROOT, arm['exe_dir'], 'llama.dll'))
         if a.grade_only:
             rec['rc'] = 0 if (os.path.exists(tr) or os.path.exists(tx)) else None
             out = open(lg, encoding='utf-8', errors='replace').read() if os.path.exists(lg) else ''
@@ -319,11 +345,22 @@ def main():
                 rec['stock_tok_s'], rec['stock_runs'] = stock_tok_s(out)
         else:
             stop = threading.Event(); vr = {}
-            if spec.get('poll_ms'):
-                th = threading.Thread(target=poll_vram_fast, args=(stop, vr, int(spec['poll_ms'])), daemon=True)
+            loadp = start_load(arm.get('load'))
+            if loadp:
+                time.sleep(1.0)  # let the load reach every core before the arm starts
+                rec['load'] = len(loadp)
+            # per-arm override: 'none' (no VRAM poller at all), 'call' (one nvidia-smi spawn per sample), 'loop' (one long-lived
+            # nvidia-smi --loop-ms). NVML queries take driver locks, so the poller itself can stall CUDA calls of the process under test.
+            mode = arm.get('poll') or ('loop' if spec.get('poll_ms') else 'call')
+            if mode == 'none':
+                th = None
+            elif mode == 'loop':
+                th = threading.Thread(target=poll_vram_fast, args=(stop, vr, int(spec.get('poll_ms') or 50)), daemon=True)
             else:
                 th = threading.Thread(target=poll_vram, args=(stop, vr), daemon=True)
-            th.start()
+            if th is not None:
+                th.start()
+            rec['poll_mode'] = mode
             if stock:
                 rc, dur, so, se = run_split(cmd, env=env)
                 with open(tx, 'w', encoding='utf-8') as f:
@@ -332,7 +369,10 @@ def main():
                 rec['stock_tok_s'], rec['stock_runs'] = stock_tok_s(se)
             else:
                 rc, dur, out = run(cmd, env=env)
-            stop.set(); th.join()
+            stop.set()
+            if th is not None:
+                th.join()
+            stop_load(loadp)
             rec['vram_peak_mib'] = vr.get('peak_mib')
             rec['vram_samples'] = vr.get('samples')
             with open(lg, 'w', encoding='utf-8') as f:

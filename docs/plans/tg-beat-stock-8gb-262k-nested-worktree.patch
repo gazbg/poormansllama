@@ -1,8 +1,8 @@
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 928850a73..736b100e5 100644
+index 928850a73..6c4228b21 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -291,6 +291,12 @@ public:
+@@ -291,6 +291,18 @@ public:
      // bypasses decode(), so the host logits buffer is never populated; this
      // reads the exposed result tensor directly. Returns -1 when unavailable.
      int64_t layer_major_pp_first_token();
@@ -12,14 +12,28 @@ index 928850a73..736b100e5 100644
 +    // token. Writes up to k (id, logit) pairs, best first. Returns the number
 +    // written, or -1 when unavailable.
 +    int layer_major_pp_topk(int k, int64_t * ids, float * vals);
++
++    // Opt-in (--tg-release-compute): after prefill, release the scheduler's worst-case compute buffers (sized for the prefill
++    // ubatch) and reserve again for single-token decode only. The caller must already have read whatever it needs from the
++    // prefill graph results, and must not decode more than one token per ubatch afterwards. Returns the bytes released (sum
++    // over backends), or -1 on failure.
++    int64_t reserve_for_decode();
  #endif
  
      // reserve a graph with a dummy ubatch of the specified size
 diff --git a/src/llama-layer-streaming.cpp b/src/llama-layer-streaming.cpp
-index ed091c288..cb8f1e92c 100644
+index ed091c288..33d72bd9a 100644
 --- a/src/llama-layer-streaming.cpp
 +++ b/src/llama-layer-streaming.cpp
-@@ -4535,6 +4535,10 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
+@@ -21,6 +21,7 @@
+ #ifdef LLAMA_LAYER_STREAMING
+ 
+ #include "llama-layer-streaming.h"
++#include "llama-moe-hybrid.h"
+ #include "llama-expert-split-policy.h"
+ 
+ #include <chrono>
+@@ -4535,6 +4536,18 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
      return ctx->layer_major_pp_first_token();
  }
  
@@ -27,10 +41,18 @@ index ed091c288..cb8f1e92c 100644
 +    return ctx->layer_major_pp_topk(k, ids, vals);
 +}
 +
++bool llama_moe_hybrid_resize(int n_slot) {
++    return llama_moe_hybrid_resize_impl(n_slot);
++}
++
++int64_t llama_layer_streaming_reserve_decode(llama_context * ctx) {
++    return ctx->reserve_for_decode();
++}
++
  // T-GPLR-03: argmax of the last output row of the PP logits. The layer-major
  // controller exposes the last chunk's result tensors on gf_res_prev but never
  // fills the context's host logits buffer (it bypasses decode()), so read the
-@@ -4565,6 +4569,40 @@ int64_t llama_context::layer_major_pp_first_token() {
+@@ -4565,6 +4578,62 @@ int64_t llama_context::layer_major_pp_first_token() {
      return best;
  }
  
@@ -68,10 +90,32 @@ index ed091c288..cb8f1e92c 100644
 +    return kk;
 +}
 +
++// Opt-in (--tg-release-compute), see llama-context.h. Everything prefill put in the scheduler's compute buffers is dead once the
++// last prefill logits have been read, and a single-token decode needs a small fraction of it, so the worst-case reserve is redone
++// for n_ubatch = 1. The old scheduler, and with it the old compute buffers, is freed by the reset inside sched_reserve().
++int64_t llama_context::reserve_for_decode() {
++    if (!sched) {
++        return -1;
++    }
++    synchronize();
++    auto total = [this]() {
++        size_t s = 0;
++        for (ggml_backend_t b : backend_ptrs) {
++            s += ggml_backend_sched_get_buffer_size(sched.get(), b);
++        }
++        return s;
++    };
++    const size_t before = total();
++    cparams.n_ubatch   = 1;
++    sched_need_reserve = true;
++    sched_reserve();
++    return (int64_t) before - (int64_t) total();
++}
++
  // One owner for the structured failure shape (error_msg -> failed -> error
  // event -> GGML_STATUS_FAILED); byte-identical to the inline copies it
  // replaces -- traces and checkers parse these exact strings.
-@@ -7896,6 +7934,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
+@@ -7896,6 +7965,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
          (long long) ggml_time_us());
  }
  
@@ -96,7 +140,7 @@ index ed091c288..cb8f1e92c 100644
      if (tel_out == nullptr) {
          return;
 diff --git a/src/llama-layer-streaming.h b/src/llama-layer-streaming.h
-index f5304f17d..01e174407 100644
+index f5304f17d..c9fd4eb9f 100644
 --- a/src/llama-layer-streaming.h
 +++ b/src/llama-layer-streaming.h
 @@ -1136,6 +1136,9 @@ struct LLAMA_API llama_layer_streaming {
@@ -109,7 +153,7 @@ index f5304f17d..01e174407 100644
      // T-Q38HG-06: MTP draft/accept counters (drafted, accepted, acceptance rate)
      void tel_mtp(int64_t n_tokens, int64_t drafted, int64_t accepted);
  
-@@ -2574,4 +2577,8 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
+@@ -2574,4 +2577,15 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
  // tensor directly. Returns -1 when unavailable.
  LLAMA_API int64_t llama_layer_major_pp_first_token(llama_context * ctx);
  
@@ -117,20 +161,358 @@ index f5304f17d..01e174407 100644
 +// Returns the number of entries written, or -1 when unavailable.
 +LLAMA_API int llama_layer_major_pp_topk(llama_context * ctx, int k, int64_t * ids, float * vals);
 +
++// Opt-in (--tg-hybrid-slots): resize the hybrid MoE engine's VRAM cache after prefill released its weight slots.
++// Between decodes only. Returns false (nothing changed) when there is no hybrid engine or the slot count is invalid.
++LLAMA_API bool llama_moe_hybrid_resize(int n_slot);
++
++// Opt-in (--tg-release-compute): see llama_context::reserve_for_decode. Returns bytes released, or -1.
++LLAMA_API int64_t llama_layer_streaming_reserve_decode(llama_context * ctx);
++
  #endif // LLAMA_LAYER_STREAMING
+diff --git a/src/llama-moe-hybrid.cpp b/src/llama-moe-hybrid.cpp
+index 0bf14d81c..37c00f2ce 100644
+--- a/src/llama-moe-hybrid.cpp
++++ b/src/llama-moe-hybrid.cpp
+@@ -140,6 +140,8 @@ struct moe_hybrid_engine {
+     std::vector<int32_t>          slot_expert; // [n_layer*n_slot]
+     std::vector<double>           ema;
+     std::vector<double>           tie;
++    std::vector<int64_t>          freq_;       // expert frequency prior (kept for resize)
++    int64_t                       fmax_ = 0;
+     std::vector<moe_hybrid_promo> pending;
+     std::vector<moe_hybrid_pair>  pairs;
+     std::vector<void *>           dma_dst;
+@@ -184,6 +186,19 @@ struct moe_hybrid_engine {
+     std::thread                        th;
+     std::atomic<bool>                  stop{false};
+     std::atomic<uint32_t>              wake_gen{0};
++
++    // opt-in diagnostics (env LLAMA_MOE_HYBRID_WATCHDOG_MS > 0): a watchdog thread reports a host request that stays unanswered,
++    // with the phase the host engine thread is in (0 polling for a request, 1 serving it, 2 submitting promotion copies)
++    std::thread                        wd_th;
++    std::atomic<bool>                  wd_stop{false};
++    std::atomic<int>                   sv_phase{0};
++    std::atomic<int64_t>               sv_t_ns{0};
++    std::atomic<int32_t>               sv_seq{0};
++    std::atomic<uint64_t>              sv_spins{0};  // heartbeat: +1 per 4096 polls of the request loop, so a thread that is not running stops counting
++    std::atomic<int>                   sv_sub{0};    // inside a request: 11 copying inputs, 12 in the CPU graph compute, 13 copying the result
++    int                                wd_ms = 0;
++    double                             wd_max_ms = 0.0;  // worst pending time the watchdog observed (written by the watchdog thread only)
++    int64_t                            wd_n_pend = 0;    // requests observed pending at two consecutive samples
+     std::mutex                         mtx;
+     std::condition_variable            cv;
+     ggml_backend_t                     cpu = nullptr;
+@@ -202,6 +217,7 @@ struct moe_hybrid_engine {
+     void init(const llm_graph_context & g, const llama_model & mdl, ggml_backend_t be, int slots);
+     void shutdown();
+     void on_token();
++    bool resize(int new_slots);
+ 
+     void wake() {
+         {
+@@ -242,6 +258,7 @@ struct moe_hybrid_engine {
+     std::string build_host_graph(moe_hybrid_host_graph & hg, int l, int m);
+     void        run(std::promise<std::string> ready);
+     void        serve();
++    void        watchdog();
+ };
+ 
+ // host expert tensors must be plain, contiguous host memory the DMA can read and the CPU can compute on
+@@ -350,6 +367,8 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+     if (fmax <= 0 || *std::min_element(freq.begin(), freq.end()) < 0) {
+         GGML_ABORT("moe_hybrid: invalid frequency counts");
+     }
++    freq_ = freq;
++    fmax_ = fmax;
+ 
+     // page-lock the host expert ranges so promotions DMA straight from the model's memory
+     const auto t_reg = moe_clock::now();
+@@ -497,12 +516,97 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
+         GGML_ABORT("moe_hybrid: host engine init failed: %s", err.c_str());
+     }
+ 
++    wd_ms = moe_hybrid_env_int("LLAMA_MOE_HYBRID_WATCHDOG_MS", 0);
++    if (wd_ms > 0) {
++        wd_th = std::thread([this]() { watchdog(); });
++    }
++
+     LLAMA_LOG_INFO("%s: moe_hybrid: %d slots x %d layers (%.1f MiB VRAM), B=%d lambda=%g, engine %d threads from CPU %d stride %d poll %d, "
+                    "registered %.1f MiB in %.1f ms, fill %.1f ms, init %.1f ms\n", __func__,
+                    n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll,
+                    reg_bytes/1048576.0, reg_ms, fill_ms, moe_hybrid_us(t_init)/1e3);
+ }
+ 
++// Resize the VRAM cache between two decodes. The layer-streaming runner calls this right after prefill released its weight
++// slots, so the decode phase can use that VRAM for a bigger cache. The caller guarantees that no hybrid graph is executing
++// (host engine idle, nothing queued). The old cache is freed BEFORE the new one is allocated, so the two never coexist; the
++// initial fill is the same frequency-ordered one init() does, and the publish sequence in `state` survives. Returns false
++// and changes nothing when the request is invalid or the engine is not idle.
++bool moe_hybrid_engine::resize(int new_slots) {
++    if (new_slots == n_slot) {
++        return true;
++    }
++    if (new_slots < 1 || new_slots > n_expert || freq_.empty() || cache_buf == nullptr || dma_state.load() != 0) {
++        return false;
++    }
++    const auto t0 = moe_clock::now();
++    ggml_backend_cuda_aux_synchronize(cuda);
++
++    int32_t st[16] = {};
++    ggml_backend_tensor_get(state, st, 0, sizeof(st));
++
++    ggml_backend_buffer_free(cache_buf);
++    cache_buf = nullptr;
++    ggml_free(cache_ctx);
++    cache_ctx = nullptr;
++    n_slot = new_slots;
++
++    ggml_init_params ip = { ggml_tensor_overhead()*(3*(size_t) n_layer + 1), nullptr, true };
++    cache_ctx = ggml_init(ip);
++    if (cache_ctx == nullptr) {
++        GGML_ABORT("moe_hybrid: cache context allocation failed");
++    }
++    for (int il = 0; il < n_layer; ++il) {
++        ggml_tensor ** dst[3] = { &c_up[il], &c_gate[il], &c_down[il] };
++        const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
++        for (int k = 0; k < 3; ++k) {
++            ggml_tensor * t = ggml_new_tensor_3d(cache_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], n_slot + 1);
++            GGML_ASSERT(t->nb[1] == src[k]->nb[1] && t->nb[2] == src[k]->nb[2]);
++            ggml_format_name(t, "moe_hybrid.%d.%d", il, k);
++            *dst[k] = t;
++        }
++    }
++    state = ggml_new_tensor_1d(cache_ctx, GGML_TYPE_I32, 16);
++    ggml_set_name(state, "moe_hybrid.state");
++    cache_buf = ggml_backend_alloc_ctx_tensors_from_buft(cache_ctx, ggml_backend_get_default_buffer_type(cuda));
++    if (cache_buf == nullptr) {
++        GGML_ABORT("moe_hybrid: VRAM cache allocation failed (%d slots per layer)", n_slot);
++    }
++    ggml_backend_buffer_set_usage(cache_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_buffer_clear(cache_buf, 0);
++    ggml_backend_tensor_set(state, st, 0, sizeof(st));
++
++    // policy state and initial fill, exactly as init() does for the new slot count
++    const size_t ne = (size_t) n_layer*n_expert;
++    map.assign(ne, -1);
++    slot_of.assign(ne, -1);
++    slot_expert.assign((size_t) n_layer*n_slot, -1);
++    ema.assign(ne, 0.0);
++    pending.clear();
++    pairs.clear();
++    dma_dst.clear();
++    dma_src.clear();
++    dma_size.clear();
++    std::vector<int> order(n_expert);
++    for (int il = 0; il < n_layer; ++il) {
++        std::iota(order.begin(), order.end(), 0);
++        const int64_t * fl = freq_.data() + (size_t) il*n_expert;
++        std::stable_sort(order.begin(), order.end(), [fl](int a, int b) { return fl[a] > fl[b]; });
++        for (int s = 0; s < n_slot; ++s) {
++            const int e = order[s];
++            map[(size_t) il*n_expert + e]     = s;
++            slot_of[(size_t) il*n_expert + e] = s;
++            slot_expert[(size_t) il*n_slot + s] = e;
++            queue_expert(il, e, s);
++        }
++        submit_dma();
++    }
++    ggml_backend_cuda_aux_synchronize(cuda);
++    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms\n", __func__,
++                   n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, moe_hybrid_us(t0)/1e3);
++    return true;
++}
++
+ std::string moe_hybrid_engine::build_host_graph(moe_hybrid_host_graph & hg, int l, int m) {
+     ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(64, false), nullptr, true };
+     hg.ctx = ggml_init(ip);
+@@ -624,6 +728,7 @@ void moe_hybrid_engine::serve() {
+         if (seq == served) {
+             MOE_HYBRID_PAUSE();
+             if ((++spins & 4095) == 0) {
++                sv_spins.fetch_add(1, std::memory_order_relaxed);
+                 const uint32_t gen = wake_gen.load(std::memory_order_acquire);
+                 if (gen != seen_gen) {
+                     seen_gen = gen;
+@@ -640,6 +745,10 @@ void moe_hybrid_engine::serve() {
+         }
+         std::atomic_thread_fence(std::memory_order_acquire);
+         const auto t0 = moe_clock::now();
++        sv_seq.store(seq, std::memory_order_relaxed);
++        sv_t_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count(), std::memory_order_relaxed);
++        sv_phase.store(1, std::memory_order_relaxed);
++        sv_sub.store(11, std::memory_order_relaxed);
+ 
+         const int il    = mb->layer;
+         const int nmiss = mb->nmiss;
+@@ -659,7 +768,9 @@ void moe_hybrid_engine::serve() {
+             memcpy(hg.ids->data, mb->ids, (size_t) nmiss*sizeof(int32_t));
+             memcpy(hg.w->data,   mb->w,   (size_t) nmiss*sizeof(float));
+             const auto        tc = moe_clock::now();
++            sv_sub.store(12, std::memory_order_relaxed);
+             const ggml_status st = ggml_backend_graph_compute(cpu, hg.gf);
++            sv_sub.store(13, std::memory_order_relaxed);
+             compute_sum[nmiss] += moe_hybrid_us(tc);
+             if (st != GGML_STATUS_SUCCESS) {
+                 err = 2;
+@@ -674,6 +785,7 @@ void moe_hybrid_engine::serve() {
+         std::atomic_thread_fence(std::memory_order_release);
+         mb->res_seq = seq;
+         served = seq;
++        sv_phase.store(0, std::memory_order_relaxed);
+ 
+         const double us = moe_hybrid_us(t0);
+         n_requests++;
+@@ -686,17 +798,79 @@ void moe_hybrid_engine::serve() {
+         int queued = 1;
+         if (dma_state.load(std::memory_order_relaxed) == 1 &&
+             dma_state.compare_exchange_strong(queued, 2, std::memory_order_acquire)) {
++            sv_t_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(moe_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
++            sv_phase.store(2, std::memory_order_relaxed);
+             submit_dma();
+             ggml_backend_cuda_event_record_aux(cuda, ev);
+             ggml_backend_cuda_aux_flush(cuda);
+             n_dma_engine++;
+             dma_submit_sum += moe_hybrid_us(active);
+             dma_state.store(0, std::memory_order_release);
++            sv_phase.store(0, std::memory_order_relaxed);
+             active = moe_clock::now();
+         }
+     }
+ }
+ 
++// Opt-in diagnostics. Polls the mailbox every 2 ms; when the same request stays unanswered for wd_ms it reports once, with the
++// phase of the host engine thread. A device-side wait times out (and traps the context) after 500 ms; this says WHERE the host was.
++void moe_hybrid_engine::watchdog() {
++    int32_t  last_req = 0;
++    auto     since    = moe_clock::now();
++    bool     reported = false;
++    bool     reported_pend = false;
++    uint64_t hb_last  = 0;
++    auto     hb_t     = moe_clock::now();
++    while (!wd_stop.load(std::memory_order_relaxed)) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++        {   // keep the heartbeat age current even when no request is pending
++            const uint64_t hb = sv_spins.load(std::memory_order_relaxed);
++            if (hb != hb_last) {
++                hb_last = hb;
++                hb_t    = moe_clock::now();
++            }
++        }
++        const int32_t req = mb->req_seq;
++        const int32_t res = mb->res_seq;
++        if (req != last_req) {
++            last_req = req;
++            since    = moe_clock::now();
++            reported = false;
++            reported_pend = false;
++        }
++        if (req == res) {
++            continue;
++        }
++        const double pend_ms = moe_hybrid_us(since)/1e3;
++        if (pend_ms > wd_max_ms) {
++            wd_max_ms = pend_ms;
++        }
++        if (pend_ms >= 5.0 && !reported_pend) {
++            reported_pend = true;
++            wd_n_pend++;
++        }
++        if (pend_ms >= (double) wd_ms && !reported) {
++            reported = true;
++            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(moe_clock::now().time_since_epoch()).count();
++            // heartbeat age: how long ago the request loop last counted. Huge while the phase is 0 means the engine thread is NOT RUNNING
++            // (descheduled); small means it is polling but does not see the request.
++            const uint64_t hb_now = sv_spins.load(std::memory_order_relaxed);
++            double hb_age_ms = 0.0;
++            if (hb_now != hb_last) {
++                hb_last = hb_now;
++                hb_t    = moe_clock::now();
++            } else {
++                hb_age_ms = moe_hybrid_us(hb_t)/1e3;
++            }
++            LLAMA_LOG_WARN("%s: moe_hybrid watchdog: request %d unanswered for %.1f ms (res_seq %d, layer %d, nmiss %d); host engine phase %d.%d "
++                           "for %.1f ms (last request seen %d), heartbeat age %.1f ms, dma_state %d, stop %d, wake_gen %u\n", __func__,
++                           (int) req, pend_ms, (int) res, (int) mb->layer, (int) mb->nmiss, sv_phase.load(), sv_sub.load(),
++                           (double) (now_ns - sv_t_ns.load())/1e6, (int) sv_seq.load(), hb_age_ms, dma_state.load(), (int) stop.load(),
++                           (unsigned) wake_gen.load());
++        }
++    }
++}
++
+ void moe_hybrid_engine::on_token() {
+     wake();
+     const auto t0 = moe_clock::now();
+@@ -913,6 +1087,12 @@ void moe_hybrid_engine::shutdown() {
+         return;
+     }
+     down = true;
++    wd_stop.store(true);
++    if (wd_th.joinable()) {
++        wd_th.join();
++        LLAMA_LOG_INFO("%s: moe_hybrid watchdog summary: %lld requests observed pending for 5 ms or more, worst observed pending %.1f ms\n",
++                       __func__, (long long) wd_n_pend, wd_max_ms);
++    }
+     if (th.joinable()) {
+         stop.store(true);
+         wake();
+@@ -1045,6 +1225,28 @@ public:
+ 
+ } // namespace
+ 
++bool llama_moe_hybrid_resize_impl(int n_slot) {
++    moe_hybrid_engine * eng = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
++        if (g_moe_hybrid_engines.size() != 1) {
++            return false;
++        }
++        eng = g_moe_hybrid_engines.begin()->second.get();
++    }
++    if (!eng->resize(n_slot)) {
++        return false;
++    }
++    char v[16];
++    snprintf(v, sizeof(v), "%d", n_slot);
++#ifdef _WIN32
++    _putenv_s("LLAMA_MOE_HYBRID", v);
++#else
++    setenv("LLAMA_MOE_HYBRID", v, 1);
++#endif
++    return true;
++}
++
+ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llama_model & model, int il,
+                                          ggml_tensor * cur, ggml_tensor ** pub) {
+     *pub = nullptr;
+diff --git a/src/llama-moe-hybrid.h b/src/llama-moe-hybrid.h
+index c50757539..6ca425adb 100644
+--- a/src/llama-moe-hybrid.h
++++ b/src/llama-moe-hybrid.h
+@@ -28,3 +28,8 @@ ggml_tensor * llama_moe_hybrid_build_wait(const llm_graph_context & g, ggml_tens
+ 
+ // stop and free the engine bound to this backend, if any
+ void llama_moe_hybrid_release(ggml_backend_t backend);
++
++// Resize the VRAM slot cache of the one engine in this process (between decodes only; opt-in). The old cache is freed
++// before the new one is allocated and the new one is refilled from the frequency prior. Keeps env LLAMA_MOE_HYBRID in step.
++// Returns false and changes nothing when there is no engine or the slot count is invalid.
++bool llama_moe_hybrid_resize_impl(int n_slot);
 diff --git a/tools/layer-streaming/main.cpp b/tools/layer-streaming/main.cpp
-index 16b384858..505cccc8a 100644
+index 16b384858..5cbd24cc8 100644
 --- a/tools/layer-streaming/main.cpp
 +++ b/tools/layer-streaming/main.cpp
-@@ -3248,6 +3248,7 @@ int main(int argc, char ** argv) {
+@@ -3248,7 +3248,10 @@ int main(int argc, char ** argv) {
      // step 3 is in place, because on its own it would build the TG view before any KV
      // cell exists and silently under-read. See the usage text and the plan block.
      long long kv_graph_pad = 0;
 +    bool tg_first_pp = false; // --tg-first-pp-token: generated token 0 = argmax of the PP logits (stock semantics), not a re-decode of the last prompt token
      bool tg_hybrid = false; // --tg-hybrid: after PP, decode through the stock graph path (AER hybrid engine, env LLAMA_MOE_HYBRID)
++    int  tg_hybrid_slots = 0; // --tg-hybrid-slots N: after PP released its weight slots, resize the hybrid VRAM cache to N slots per layer
++    bool tg_release_compute = false; // --tg-release-compute: before decode, re-reserve the scheduler compute buffers for single-token decode
      int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
      int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
-@@ -3406,6 +3407,8 @@ int main(int argc, char ** argv) {
+     // T-GPLR-72: host-backend thread count. Default 16 = the value that was
+@@ -3406,8 +3409,14 @@ int main(int argc, char ** argv) {
              // T-GPLR-04: --ctx-size is honored in run mode as the explicit
              // context/KV capacity, independent of the PP token count.
              run_ctx_size = ctx_size;
@@ -138,8 +520,14 @@ index 16b384858..505cccc8a 100644
 +            tg_first_pp = true;
          } else if (arg == "--tg-hybrid") {
              tg_hybrid = true;
++        } else if (arg == "--tg-hybrid-slots") {
++            tg_hybrid_slots = atoi(arg_value(argc, argv, i, "--tg-hybrid-slots").c_str());
++        } else if (arg == "--tg-release-compute") {
++            tg_release_compute = true;
          } else if (arg == "--kv-graph-pad") {
-@@ -4606,7 +4609,7 @@ int main(int argc, char ** argv) {
+             kv_graph_pad = atoll(arg_value(argc, argv, i, "--kv-graph-pad").c_str());
+         } else if (arg == "--residency-budget-mib") {
+@@ -4606,7 +4615,7 @@ int main(int argc, char ** argv) {
      // cover that MTP draft width or output_reserve aborts at the first
      // verify round. Must remain nonzero in all cases for graph
      // reservation.
@@ -148,7 +536,7 @@ index 16b384858..505cccc8a 100644
          ? (mtp ? (uint32_t) (1 + mtp_draft) : 1)
          : (uint32_t) pp_tokens;
      // T-GPLR-72: was hardcoded 16/16; now a flag whose default is that same 16.
-@@ -5651,7 +5654,7 @@ int main(int argc, char ** argv) {
+@@ -5651,7 +5660,7 @@ int main(int argc, char ** argv) {
              batch.pos[i]   = i;
              batch.n_seq_id[i] = 1;
              batch.seq_id[i][0] = 0;
@@ -157,7 +545,7 @@ index 16b384858..505cccc8a 100644
          }
          batch.n_tokens = pp_tokens;
  
-@@ -5923,7 +5926,7 @@ int main(int argc, char ** argv) {
+@@ -5923,7 +5932,7 @@ int main(int argc, char ** argv) {
                          ub.pos[i]     = off + i;
                          ub.n_seq_id[i] = 1;
                          ub.seq_id[i][0] = 0;
@@ -166,7 +554,7 @@ index 16b384858..505cccc8a 100644
                      }
                      ub.n_tokens = n_tok;
                      ret = llama_decode(ctx, ub);
-@@ -6555,7 +6558,36 @@ int main(int argc, char ** argv) {
+@@ -6555,7 +6564,62 @@ int main(int argc, char ** argv) {
              // --- standard greedy TG (unchanged) ---
              // exit_status guard: a failed TG setup (e.g. row-set activation)
              // must not keep decoding (T-GPLR-13 probe evidence).
@@ -198,6 +586,32 @@ index 16b384858..505cccc8a 100644
 +                                i + 1, (long long) pp_top_ids[i], (double) pp_top_vals[i]);
 +                    }
 +                    fflush(stderr);
++                }
++            }
++            // Opt-in: the prefill logits have been read, so give decode the VRAM prefill needed. Order matters for the peak: release the
++            // scheduler's worst-case compute buffers first, then grow the hybrid cache (which frees the old cache before it allocates).
++            if (tg_hybrid && tg_release_compute && exit_status == 0) {
++                const int64_t t_rc0 = ggml_time_us();
++                const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
++                if (freed < 0) {
++                    fprintf(stderr, "error: --tg-release-compute: scheduler re-reserve failed\n");
++                    ls.failed = true;
++                    exit_status = 1;
++                } else {
++                    fprintf(stderr, "tg-hybrid: scheduler compute buffers re-reserved for decode, %.1f MiB released in %.1f ms\n",
++                            (double) freed / 1048576.0, (double) (ggml_time_us() - t_rc0) / 1e3);
++                }
++            }
++            if (tg_hybrid && tg_hybrid_slots > 0 && exit_status == 0) {
++                const int64_t t_rs0 = ggml_time_us();
++                if (!llama_moe_hybrid_resize(tg_hybrid_slots)) {
++                    fprintf(stderr, "error: --tg-hybrid-slots %d: no hybrid engine to resize (is LLAMA_MOE_HYBRID set?) or invalid slot count\n",
++                            tg_hybrid_slots);
++                    ls.failed = true;
++                    exit_status = 1;
++                } else {
++                    fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms\n", tg_hybrid_slots,
++                            (double) (ggml_time_us() - t_rs0) / 1e3);
 +                }
 +            }
 +            for (int t = 0; t < tg_steps && exit_status == 0; ++t) {

@@ -1,6 +1,6 @@
 # Goal: beat stock llama.cpp TG at 8 GB VRAM / 262k context (autonomous mode)
 
-**Status: IN PROGRESS (state saved at a reboot, 2026-10-10 ~23:20).**
+**Status (2026-10-11): GOAL ACCEPTED by the agent (G1: 1.65x stock, certified) and improved by G2 (decode-phase cache resize, about 2x stock, agent-accepted); one reliability risk is open (IDEA LEDGER row 15). Sections below the Results log are history; read ACCEPTANCE RESULT G-TG8, G2 ACCEPTANCE RESULT and IDEA LEDGER first.**
 **Authority:** owner `/goal` message (2026-10-10): "work autonomously, make decision to achieve ... Beat the
 `docs/llamacpp 8gb vram 262k base.md` in term of TG ... find, explore, implement, prove the best optimizations ...
 ideas must be disproven only after full implementation and analysis, with the reason ... caching and scheduling
@@ -397,6 +397,191 @@ and the patch saved at `docs/plans/tg-beat-stock-8gb-262k-nested-worktree.patch`
 **Handed to the owner:** the five decisions in the owner summary (pinned RAM and spinning threads; nested commit policy; the doc-size debt that
 makes the host suite fail; whether `--tg-first-pp-token` becomes the default; whether to open pushes or upstream material).
 
+## G2 CONTRACT (agent's own; written 2026-10-11 BEFORE any G2 run) - decode-phase cache resize
+Why: the stop-hook asked for every disproof to be shown with its root cause, and doing that audit exposed an unexplained +1.0 GiB and ~19% between the
+LM-hosted hybrid and the same engine in plain `llama-completion`. Diagnostics (`g1-aer`, `g1-tl`, `g1-aer-prose`, `g1-aer-code`, exploratory, not part of
+this contract) found: (1) the hybrid's 1024 MiB cache is allocated at context creation, so it sits in VRAM together with the prefill weight slots (1044 MB)
+and activation slab; the 8071 MiB whole-run peak is the PREFILL peak, decode runs near 7.07 GiB; (2) the ~19% was mostly a CONTENT confound (plain
+`llama-completion` generates a repeating loop on the anchor prompt, which raises expert reuse); on non-repetitive text the harness effect is 2-4%;
+(3) cache size is the real lever: plain C28 fits 7985-7995 MiB and is +13% (prose) to +18% (code) over C14.
+Hypothesis H-R: allocating the decode cache AFTER prefill released its slots (`--tg-hybrid-slots 28`, opt-in) lets the LM-hosted path use C28 inside
+8192 MiB and recovers most of that gain, with identical arithmetic.
+Subject: LM runner + hybrid, `LLAMA_MOE_HYBRID=14` at context creation, `--tg-hybrid-slots 28` after prefill, build `bin/g2` (a NEW build; g1 stays the
+certified record of G1). Workloads: `div-code.txt` and `div-prose.txt` (free text, no repetition; on code all engines generate the SAME text) and
+`anchor-512-nonl.txt` (QA), 512 TG tokens, ctx 262144 (stock 262000), q8 KV, greedy, 2 reps interleaved in one mutex hold per prompt.
+| # | Criterion (falsifiable) |
+|---|---|
+| G2-1 | On code AND prose: mean tok/s of HYB28 >= 1.10 x HYB14 (same LM binary, no resize) and >= 1.80 x STK (stock `-ncmoe 37`), min(HYB28 reps) > max(STK reps) |
+| G2-2 | Whole-GPU `memory.used` peak of HYB28 <= 8192 MiB, read by the 50 ms poller, on every prompt |
+| G2-3 | Needle QA at 511 tokens (anchor, nonl): HYB28 positive pass, negative control fails as designed |
+| G2-4 | HYB28 vs HYB14 (same harness, same prompt): same-context dlogit median <= 0.30 up to the first divergence (the largest drift recorded between valid configurations was 0.22 median) |
+| G2-5 | Default inertness: HYB14 on `bin/g2` within +-3% of the `bin/g1` HYB14 mean on the same prompt (anchor 61.73, prose 64.86, code 66.06), host-engine ctest still 100% |
+| G2-6 | Every G2 session attested through `with-gpu-lock.ps1` WITHOUT `-AllowUnprovenanced`; `bin/g2` newer than every nested source |
+| G2-7 | Plan, `currentstate.md` and the idea ledger updated |
+Rule: ACCEPT G2 iff G2-1..G2-7 hold. If G2-1 fails the hypothesis is recorded as disproven with its root cause (measured), not hidden. G1 stays accepted
+either way. Reported, not gated: C26/C29 neighbours, plain-path C28, parameter sweeps (B, lambda, threads), llama-server pairing.
+Prediction (fixed now): HYB28 / HYB14 = +13% (prose) to +17% (code), i.e. 73-78 tok/s; resize cost under 0.5 s before the first decode.
+
+## G2 RESULTS (2026-10-11)
+Build `build/llama-cuda/bin/g2` (G1's tree plus the opt-in resize): source digest `0B5648EE9EC98D3C`, `llama.dll` `c53896ce2c042b01`, LM exe `e14b50e4f1764a8a`,
+stock exe `2e553236ba0bbff3`; every file newer than the newest source (08:19 > 08:18:57). All sessions through `with-gpu-lock.ps1`, none waived, VRAM peaks from
+one long-lived `nvidia-smi --loop-ms=50`. The reliability soak and the sweeps ran on `bin/g3` (g2 plus an opt-in watchdog, digest `6CCBC609EABFE355`).
+
+### How the audit found it (exploratory sessions on the attested g1 build; not part of the contract)
+- VRAM arithmetic from the HYB log: the hybrid's 1024.1 MiB cache is allocated at context creation (`sched_reserve` -> single-token graph reserve), when the prefill
+  weight slots (1,044,389,888 B = 996.0 MiB) and slab (8.0 MiB) are also resident. The 8071 MiB whole-run peak is the PREFILL peak; decode runs near 7.07 GiB.
+- Engine timelines (`tools/hybrid-timeline.py` on `LLAMA_MOE_HYBRID_LOG`), anchor prompt, microseconds per token:
+
+| run | span | stall (GPU waits for host) | host gap | span+gap | layers with a miss |
+|---|---|---|---|---|---|
+| LM runner C14 | 14,020 | 9,107 | 2,019 | 16,039 | 39.98 |
+| LM runner C14, `--tg-logit-margin 0` | 14,034 | 9,118 | 2,007 | 16,042 | 39.98 |
+| plain `llama-completion` C14 | 11,289 | 6,289 | 2,129 | 13,418 | 38.69 |
+| plain `llama-completion` C28 | 7,510 | 2,551 | 2,082 | 9,592 | 23.53 |
+
+The host gap is the same everywhere, so it is not runner overhead. The difference is in the stall, and it follows the text: on the anchor prompt plain completion
+loops (distinct-gram ratio 0.07 vs 0.62) and the loop raises the hit rate. On prompts where all engines generate the SAME text the harness effect is small:
+
+| prompt | LM C14 | plain C14 | plain C28 | stock |
+|---|---|---|---|---|
+| code (identical text in every arm) | 66.06 | 67.61 (+2.3%) | 79.46 | 37.70 |
+| prose | 64.86 | 67.66 (+4.3%) | 76.39 | 37.41 |
+
+### Contract sessions (2 reps interleaved each; tok/s means; peaks from the 50 ms poller)
+| prompt | STK | HYB14 (G1 config) | HYB28 (resize, G2) | plain C28 | HYB28/HYB14 | HYB28/STK | HYB28 peak |
+|---|---|---|---|---|---|---|---|
+| code, 24 tokens (`g2-code`) | 37.83 | 67.28 | **78.01** | 79.56 | 1.159x | 2.062x | 7641 MiB |
+| prose, 37 tokens (`g2-prose`) | 37.91 | 66.35 | **76.86** | 78.68 | 1.158x | 2.027x | 7793 MiB |
+| anchor, 511 tokens, needle QA (`g2-anchor`) | 37.80 | 62.21 | **72.92** | n/a | 1.172x | 1.929x | 8071 MiB |
+
+On the anchor the whole-run peak is unchanged by the resize (8071 MiB = the prefill peak): the C28 decode footprint fits inside memory prefill already used.
+The prediction fixed in advance was +13% (prose) to +17% (code), 73-78 tok/s, resize under 0.5 s: measured +15.8% / +15.9% / +17.2%, 214.5 ms at C30.
+Same-context logit drift of HYB28 against HYB14 up to the first divergence: 0.104 (prose, step 92), 0.133 (code, step 428), 0.169 (anchor, step 119).
+
+### Cache size curve (`g2-curve`, code prompt, identical text in every arm, 2 reps; C30 has one rep because the other hit the timeout trap, row 15)
+| C | 14 | 28 | 30 | 36 | 42 | 48 |
+|---|---|---|---|---|---|---|
+| tok/s | 67.45 | 78.21 | 79.03 | 82.48 | 86.10 | 88.42 |
+| peak, code prompt (MiB) | 7641 | 7641 | 7739 | 8149 | 8557 | 8967 |
+
+VRAM on the 511-token shape (the one that sets the 8 GiB line; `g2-scan`, `g2-ubscan`): decode peak is about `8002 + 73.15 x (C - 28)` MiB: C30 8159, C32 8295,
+C36 8569, C40 8841. The cap is reached at C30; the recommended operating point is C28 (8071 MiB, 121 MiB headroom).
+Speeds in `g2-scan` are NOT comparable across C (the generated text, and so the hit rate, changes with C on that prompt); use the code-prompt curve.
+
+### The doc's own tool: llama-server with the owner's exact flags (sessions `g3-server*`, `g3-serverw*`, `g3-serverw2*`; build bin/g3, attested)
+Stock = `-ctk q8_0 -ctv q8_0 --flash-attn on -c 262000 --batch-size 8192 --ubatch-size 512 --fit-target 16000` (the doc's configuration). Hybrid arms add `--fit off -ngl 99
+-ncmoe 40 -t 2 --cpu-strict 1 -Cr 30-31` and the engine env (C = 26 or 28, B 16, frequency prior). One greedy `/completion` per request (temperature 0, ignore_eos, 512
+tokens, no prompt cache), three requests per server launch, two launches per arm; TG is the server's own `timings.predicted_per_second`; VRAM from one 50 ms nvidia-smi across
+the server's life. "warm" = requests 2 and 3 (n = 4 per arm); "first" = request 1.
+
+| prompt | arm | first request | warm | warm / stock | peak VRAM |
+|---|---|---|---|---|---|
+| code | stock | 27.60 | 33.77 (33.41-34.09) | 1.00x | 7201 MiB |
+| code | hybrid C28 | 47.27 | 76.15 (75.07-76.93) | 2.26x | 8179 MiB |
+| code | hybrid C26 | 47.52 | 74.96 (74.52-75.69) | 2.22x | 8043 MiB |
+| prose | stock | 28.67 | 32.98 (32.79-33.06) | 1.00x | 7203 MiB |
+| prose | hybrid C28 | 49.55 | 77.32 (75.45-78.79) | 2.34x | 8233 MiB (41 MiB over 8192) |
+| prose | hybrid C26 | 48.67 | 75.05 (74.66-75.85) | 2.28x | 8097 MiB |
+
+- The stock server reproduces the owner's measurement on this machine (doc 28.05-30.68; here 27.6-28.7 on the first request, 33.0-33.8 warm), so this is the doc's
+  tool and the doc's regime. The hybrid at C26 is inside 8192 MiB for both prompts: **about 75 tok/s, 2.2-2.3x warm stock and about 2.4x the 30.68 bar.**
+- The first request is slow for BOTH: the server loads the experts with mmap, and the first pass faults cold pages from disk (the 24-token prefill took 2.4 s, 99.7 ms per
+  token). The hybrid's first request ran at about 20 tok/s for roughly 100 tokens and then at 81 tok/s (server `tg_3s` line). A first request is therefore a cold-start
+  measure, not a decode-speed measure; the doc's own 918-token number mixes both.
+- The server path was not the slower one: an earlier single-request pairing (`g3-server`) reported 49.2 / 48.9 tok/s for C28 only because the first request carried the cold start.
+
+### Stress and soak
+`g2-stress`: 1024 tokens (each run crosses three or four padded-window rebuilds), 8 unresized and 8 C30 runs interleaved: 0 failures; 67.36 (67.06-67.59) vs 78.73
+(77.72-79.18) tok/s, +16.9%. `g3-soak` (the g3 build, watchdog on): 80 runs, 0 failures; HYB 68.01 (64.18-68.89) vs H30 79.81 (77.51-80.84) tok/s, +17.3%. Host-engine stalls above 20 ms hit 5 of 80 runs (about 103 ms, once 24 ms), 2 unresized and 3 resized, all within the first 22 runs; ledger row 15.
+
+### Other measurements (reported, not gated)
+- Parameter sweep on the plain path, C28, code prompt, 2 reps (`g3-sweep`): default 79.14; B8 79.62, B32 77.70, B64 76.41; lambda 0.90 78.50, 0.99 79.37;
+  threads 6 / 10 / 12 = 77.56 / 79.27 / 79.53; poll 10 / 1000 = 79.50 / 79.33; backend sampling (`-bs`) 79.10. Nothing beats the defaults by more than noise.
+- Prefill ubatch (`g2-ubscan`, 64-token runs, VRAM and prefill only): scheduler compute buffer 936.45 / 796.75 / 726.50 MiB at ubatch 511 / 256 / 128; prefill
+  317 / 302 / 282 tok/s.
+
+## G2 ACCEPTANCE RESULT (agent's own autonomous acceptance under the owner's grant; NOT owner approval)
+Mechanical evaluation: `python tools/check-g2-contract.py` (thresholds are constants copied from the G2 contract above):
+
+```
+G2-1  PASS code: HYB28 78.01 / HYB14 67.28 = 1.159x, / STK 37.83 = 2.062x, min>maxSTK True; prose: HYB28 76.86 / HYB14 66.35 = 1.158x, / STK 37.91 = 2.027x, min>maxSTK True (need >= 1.10x and >= 1.80x)
+G2-2  PASS HYB28 whole-GPU peaks (50 ms poller) {'code': 7641, 'prose': 7793, 'anchor': 8071} <= 8192 MiB
+G2-3  PASS anchor (511 tokens) HYB28 needle QA positive pass and negative control fails as designed in 2/2 reps
+G2-4  PASS HYB28 vs HYB14 same-context dlogit median up to the first divergence {'code': 0.13280150000000113, 'prose': 0.10409000000000113, 'anchor': 0.1688200000000002} <= 0.30
+G2-5  PASS HYB14 g2 vs g1: {'anchor': '+0.8%', 'prose': '+2.3%', 'code': '+1.9%'} (need within +-3%); host engine ctest 78/78
+G2-6  PASS 3 core sessions attested without waiver (g2-code, g2-prose, g2-anchor)
+G2-7  PASS plan has G2 result + idea ledger: True / True; currentstate entry: True
+
+RELIABILITY (reported, not gated): resized arms 34, non-zero exits 1 ['g2-curve/H30#2 rc=3221226505']
+CONTRACT G2: ALL G2-1..G2-7 HOLD (mechanical evaluation; acceptance is the agent's own decision, not owner approval)
+```
+
+**Decision: ACCEPTED**, for exactly the claim G2 defines: with `--tg-hybrid-slots 28`, the LM-hosted hybrid decodes 15.8-17.2% faster than G1's C14 configuration and 1.93-2.06x
+faster than stock on the same prompts, inside the same 8071 MiB whole-run peak, with unchanged answer stability and a logit drift under 0.17 against the unresized run.
+G1 stays accepted on its own evidence. G2 was run on build `bin/g2`; the default path (flag off) reproduces G1 within +-3% (G2-5).
+
+**Reliability caveat, stated plainly.** One of the resized runs died with a device-side timeout trap (a host reply later than 500 ms; ledger row 15). The
+immediate cause is established; why the reply was late is not. An 80-run soak (40 unresized, 40 resized, interleaved) then ran clean: 0 failures. It showed the host engine can stall for about 100 ms (5 of 80 runs, in both arms), all of them early in the soak while other host activity was running, which is why the evidence points at contention, not resize. Treat the resized path as research-grade until that is closed.
+
+**This acceptance does NOT certify:** a fix for the timeout; any cache size above C30 on the 511-token shape (it does not fit 8192 MiB; ledger row 12 sizes the next step);
+other models, GPUs, drivers or filled contexts; PP speed; production fitness. The nested llama.cpp changes remain uncommitted (D17); the patch file is refreshed to the
+current working tree.
+
+## G3 CONTRACT (agent's own; written 2026-10-11 BEFORE any G3 run) - release the prefill-sized scheduler buffers; behavior under host contention
+Why. G2 left two sized items. (a) Ledger row 12: the scheduler's CUDA compute buffer (936.45 MiB, reserved for the 511-token prefill ubatch) stays allocated during
+decode, which only needs n_tokens = 1; releasing it should admit about C42 inside 8192 MiB (est. +9% over C28, from the clean curve 78.21 -> 86.10). (b) Ledger row 15
+and the owner summary's "behavior while other heavy CPU work runs": the soak pointed at host contention but did not test it.
+Mechanism for (a), opt-in, default off: `--tg-release-compute` calls `llama_context::reserve_for_decode()` after the prefill logits were read, which sets
+`cparams.n_ubatch = 1` and re-runs `sched_reserve()` (new scheduler, old compute buffers freed), BEFORE `--tg-hybrid-slots` grows the cache, so the peak never holds both.
+Build `bin/g4` = g3 + this + watchdog v2 (heartbeat, sub-phase, observed-pending summary; opt-in diagnostics). Workloads, arms and prompts as in G2; code and prose
+are free text with identical output across engines on code; the anchor (511 tokens, nonl) sets the VRAM line and runs needle QA.
+| # | Criterion (falsifiable) |
+|---|---|
+| G3-1 | The re-reserve releases >= 700 MiB (runner log line) and the whole-run peak (50 ms poller) of HYB42R = `--tg-hybrid-slots 42 --tg-release-compute` on the anchor is <= 8192 MiB |
+| G3-2 | On code AND prose: mean tok/s of HYB42R >= 1.06 x HYB28 and >= 2.00 x STK, min(HYB42R reps) > max(HYB28 reps) |
+| G3-3 | Anchor needle QA: HYB42R positive pass, negative control fails as designed; same-context dlogit median vs HYB28 <= 0.30 |
+| G3-4 | No failure in >= 12 HYB42R runs (every non-zero exit is reported with its log) |
+| G3-5 | Default inertness: HYB14 and HYB28 on `bin/g4` within +-3% of their `bin/g3` means; host engine ctest 100% |
+| G3-6 | All G3 sessions attested without waiver; plan, currentstate and ledger updated |
+Rule: ACCEPT iff G3-1..G3-6 hold; if G3-2 fails the hypothesis is recorded as disproven with its measured cause. G2 and G1 stand either way.
+Prediction (fixed now): released about 880-900 MiB; C42 peak about 8130 MiB; HYB42R / HYB28 = +9..10% (code about 86 tok/s, prose about 84).
+Contention test (reported, not gated; predictions fixed now). N busy-loop processes at normal priority (`load` arm key; N = 0, 8, 24 of 32 logical CPUs) around HYB28 runs
+with the watchdog v2 at 20 ms: (i) tok/s falls less than 10% at N = 8 and less than 35% at N = 24; (ii) host-engine stalls above 20 ms appear in the loaded arms more often
+than in the unloaded one; (iii) a stalled request shows a stagnant heartbeat (engine thread not running), not a polling thread that fails to see the request; (iv) no device
+timeout trap at N = 8. A refuted prediction is recorded with its measured cause.
+
+**Amendment A3 (2026-10-11, written BEFORE any G3 result was read) - baselines for G3-5.** The contract says "their `bin/g3` means", but no `bin/g3` session ran HYB28
+in the LM runner, and the only `bin/g3` HYB14 run in it is `g3-soak` (code prompt, 40 reps). `bin/g3` is `bin/g2` plus the opt-in watchdog; neither touches the default path.
+So G3-5 compares g4's HYB14 with the `g3-soak` HYB mean (code) AND the `g2-<prompt>` HYB means, and g4's HYB28 with the `g2-<prompt>` HYB28 means; the deviation scored
+is the worst over the available baselines. The +-3% threshold is unchanged. Mechanical check: `python tools/check-g3-contract.py` (thresholds are constants copied from this contract).
+
+## IDEA LEDGER (written 2026-10-11 to answer the stop-hook audit: "show that each idea was disproven only after full implementation, with its root cause")
+Status key. CONFIRMED: the idea works as built. REPLACED: the idea is kept, the implementation was changed because of the measured cause. DISPROVEN: the
+hypothesis was tested and is false, with the cause. OPEN: not implemented or not tested, so NOT disproven. Evidence names a session under
+`build/llama-cuda/` or an entry in this file (E-numbers). Sessions named g1-*, g2-*, g3-* are attested (no waiver); earlier E-sessions are the
+pre-contract exploration and were run with `-AllowUnprovenanced`, which is why G1/G2 re-measure what matters.
+
+| # | Idea or hypothesis | How far it was taken | Result | Root cause or reason, and how it was shown | Status |
+|---|---|---|---|---|---|
+| 1 | Owner idea: reactive K-cache in the layer-streaming executor. After a layer finishes, missing experts load in the background; at token t+1 the misses are computed on the CPU from host weights; no predictor. | Built end to end (row-set staging, host leg, executor guard, scan instruments). Nine sessions E1-E9. | Correct after two bug fixes, but SLOWER than the PCIe-bound control: 12.36 vs 17.24 tok/s (E7). | A FIXED 450-500 us per layer for any CPU split through the ggml scheduler. Linear fit `ffn_compute = 574 + 8.8 x host rows` us (E8; expert math only about 10 us/row). More threads do not shrink it: 441 / 502 / 461 / 500 / 563 us at the 4-thread per-call pool / 2 / 4 / 8 / 16 threads (E9). Cause located by reading the scheduler: whole-stream sync, pageable D2H/H2D, split dispatch (research-cpu, 120-180 us + 30-70 us). | REPLACED by row 2 |
+| 2 | The same idea with the cost removed: per-layer GPU slot cache, pinned device-mapped mailbox, 8 spinning CPU threads compute the misses, EMA admission by background DMA, no predictor (the "AER hybrid" engine). | Ported into the LM tree (D9), three build fixes (E12), then measured. | WORKS. G1: 61.73 vs 37.35 tok/s stock, 1.65x. G2: 78 tok/s, 2.0x. | n/a | CONFIRMED |
+| 3 | The first CPU-leg runs produced garbage text. | Two hypotheses, each with an A/B hook in the binary. | Two independent defects, both fixed. (a) Stale slab: with the legacy state rule the guard aborts at TG step 1 with the exact message; with the fixed rule 512 steps are finite (E1). (b) Persistent-graph allocation overlap: ggml-alloc treats tensors with `data != NULL` as external, so computed nodes keep run-1 addresses while the scheduler plans its CPU<->device copy tensors fresh each run and can overlap them; disabling the reset reproduces divergence at step 1 (E7). | Proven by A/B | CONFIRMED |
+| 4 | The LM-hosted hybrid equals stock instead of 2x (E13: 35-37 tok/s vs the AER binary's 70-86 in E10). | Five hypotheses, each tested. | (i) the prompt: DISPROVEN, the AER binary shows the same 2x on the anchor prompt (E15). (ii) llama thread count: DISPROVEN, `-t 2` and `-t 16` identical (E15). (iii) engine CPU affinity: DISPROVEN, 77.48 unpinned vs 76.66 pinned (g1-aer). (iv) per-token graph build: DISPROVEN, `graph_prep_us` is 17,383 in total over 512 tokens and the CUDA graph is reused every step; stock reuses 508 of 511. (v) full-context attention scan: CONFIRMED. | `n_pad = n_ctx` made every decode step scan all 262144 KV slots. Changing only `--kv-graph-pad 256`: 34.95 -> 65.71 tok/s (E16). | CONFIRMED / DISPROVEN as listed |
+| 5 | bf16 prefill activations are harmless. | A/B f32 vs bf16 with QA and a repetition read. | DISPROVEN: bf16 output loops from step about 3; f32 is coherent and byte-identical across reps (E21-E24). The KV pad is not the cause (E22 loops without it too). | The LM default act-slab dtype is bf16 (T-GPLR-12); needle QA cannot see repetition. | CONFIRMED fix |
+| 6 | LM prefill differs from stock (E30: first token `Q` vs `\n\n`). | Logit-level probe with a pre-registered prediction. | DISPROVEN: a prompt artifact. On the identical prompt LM's top-1 is 271 as predicted; stock gap(271 over 198) 3.375 vs LM 3.514, Delta 0.14 against a 2.42 limit. | `llama-completion -f` strips one trailing newline; the LM runner does not. | PROMPT ARTIFACT |
+| 7 | The LM runner's per-token host work costs speed (telemetry, logits copy, stderr print). | A/B, the engine's own timeline, and a read-only code audit by a subagent. | DISPROVEN: `--tg-logit-margin 0` gives 61.06 vs 62.38 tok/s (noise). The engine's host gap is 2.0 ms in the runner and 2.1 ms in plain completion. The audit puts every runner-only item at 0.15-0.6 ms in total. | The 2 ms gap is common to both harnesses (lm_head, 1 MiB logits D2H and sync, decode path, input upload, launch). | NO EFFECT |
+| 8 | "The same engine is 19% faster in plain llama-completion" (76.7 vs 62.2 tok/s on the anchor prompt). | Engine timelines on three prompts. | DISPROVEN as a harness effect: a CONTENT confound. Plain completion falls into a repeating loop on the anchor (distinct-gram ratio 0.07 vs 0.62), which raises the cache hit rate (0.5454 vs 0.3365). On identical text the harness effect is +2.3% (code, 67.61 vs 66.06) and +4.3% (prose). | Different generated text gives different routing; g1-tl, g1-aer-code, g1-aer-prose | CONFOUND |
+| 9 | 8071 MiB is the hybrid's decode footprint, so C16 cannot fit 8 GiB. | Log arithmetic plus the 50 ms poller. | DISPROVEN: 8071 MiB is the PREFILL peak. The hybrid cache (1024.1 MiB, allocated at context creation), the prefill weight slots (996.0 MiB) and the activation slab (8.0 MiB) are all resident; decode runs near 7.07 GiB after `begin_tg_stock` releases 1,044,389,888 + 8,372,224 bytes. | Cache allocation order, not capacity | ROOT CAUSE (led to row 10) |
+| 10 | Allocate the decode cache AFTER prefill released its slots (`--tg-hybrid-slots`, opt-in) and recover that VRAM. | Built (engine `resize`), prediction fixed in advance (+13..17%), 3 prompts x 2 reps, 8+8 stress pairs, host tests. | CONFIRMED: +15.9% code, +15.8% prose, +17.2% anchor; whole-run peak unchanged at 8071 MiB; QA passes; logit drift 0.10-0.17. | G2 sessions | CONFIRMED |
+| 11 | A smaller prefill ubatch frees VRAM for more slots. | VRAM scan, 6 arms. | DISPROVEN (small): scheduler compute buffer 936.45 / 796.75 / 726.50 MiB at ubatch 511 / 256 / 128; at C40 the peaks are 8841 / 8689 / 8613 MiB; prefill falls 317 -> 282 tok/s. | About 660 MiB of the buffer does not depend on ubatch; the proportional part is the 262144-wide mask (about 190 MiB). | NOT WORTH IT |
+| 12 | More cache slots keep paying. | Clean curve on the code prompt (identical text), 2 reps. | CONFIRMED, cap-bound: C14 67.45, C28 78.21, C30 79.03, C36 82.48, C42 86.10, C48 88.42 tok/s. Decode peak on the 511-token shape is about `8002 + 73.15 x (C-28)` MiB, so the cap is reached at C30 (8159 MiB). | The ~900 MiB scheduler compute buffer is sized for the 511-token prefill but decode needs n_tokens = 1; releasing it after prefill would admit about C42 (est. +9%). Not implemented. | OPEN (sized next step) |
+| 13 | Tune the engine (promotion budget B, EMA lambda, thread count, poll level). | 12 arms x 2 reps on the plain path, C28, identical text. | NO GAIN: every setting within +-2% of the default; worse are B32 (-1.8%), B64 (-3.4%) and 6 threads (-2.0%). | A flat optimum near the shipped defaults; large B costs promotion DMA (inferred). | CLOSED |
+| 14 | On-device greedy sampling (`-bs`) to shrink the 2 ms inter-token gap. | 2 reps, plain path. | NO GAIN: 79.10 vs 79.14 tok/s, +48 MiB VRAM. | The gap is not the logits copy or sampling. | DISPROVEN |
+| 15 | Reliability of the resized hybrid, and what the one timeout trap was. | Watchdog added (opt-in `LLAMA_MOE_HYBRID_WATCHDOG_MS`), `tools/hybrid-stalls.py`, 16 stress runs, an 80-run soak (`g3-soak`: 40 unresized + 40 resized, interleaved, 512 tokens). | Soak: **80 runs, 0 failures**, and the resize gain replicates over 40 reps each: 68.01 -> 79.81 tok/s (+17.3%). One trap in about 29 earlier resized runs (second C30 rep, `seq 8743 timed out (res_seq 8742)`), none in about 150 other hybrid runs. The soak did show host-engine STALLS (worst single `serve` time 24-204 ms against a normal 3 ms): 5 of 80 runs, 2 unresized and 3 resized, so NOT resize-specific. | The immediate cause is a host reply later than the 500 ms device-side timeout. The stalls are about 103 ms (and once 204 ms), identical in unresized and resized runs, and ALL FIVE fell in the first 22 soak runs, while this session was running other tool calls and three read-only subagents; the last 58 runs, with the session idle (blocked on a usage limit), had none. So the cause is contention from other host activity on the engine's pinned, spinning threads, not the engine logic. The watchdog's first report: request 11171 unanswered 110.6 ms while the engine thread had been serving it only 18.4 ms. | CONTENTION-CAUSED, not resize-caused; the 500 ms device timeout is fragile on a loaded host (tested in G3) |
+| 16 | MTP self-speculation (est. 1.35x). | NOT implemented. | n/a | This tree does not load the model's nextn tensors for qwen35moe (load log: "unused tensor blk.40.nextn.*"), and the hybrid hook serves only n_tokens == 1, so verification batches would take the slow path. | OPEN (not disproven) |
+| 17 | Predictors and prewarm (second-touch admission cuts PCIe fills about 3x; co-activation prewarm +5 pp hit rate). | Analysis only (cache-sim agent), not built. | n/a | The mailbox engine's EMA admission already runs without a predictor. | OPEN (not disproven) |
+| 18 | An async fused host executor inside the LM scheduler (E5). | Not built separately. | n/a | Superseded by row 2, which removes the same cost. | REPLACED |
+
 ## OWNER SUMMARY (AGENTS.md five-part form; autonomous decisions, NOT owner approval) - REWRITTEN 2026-10-11 from the certified G1 results
 1. **Goal.** Beat the token-generation speed of `docs/llamacpp 8gb vram 262k base.md` (30.68 tok/s, llama-server) at an 8 GB VRAM / 262k-context
    shape, by caching and scheduling that raise GPU utilization, and prove it. Idea tested: keep a small per-layer cache of the experts that were
@@ -441,31 +626,30 @@ makes the host suite fail; whether `--tg-first-pp-token` becomes the default; wh
 - D11 Diagnose the LM-vs-AER 2x by isolating variables: prompt (E15, not it), llama threads (E15, not it), attention window (E16, it).
 - D12 Fit to the 8 GiB shape by slot count, measuring VRAM with a whole-GPU poller (E20): C14 is the largest that fits.
 - D13 Accept the kv-pad fix as part of the hybrid path (it is opt-in `--kv-graph-pad`; default behaviour unchanged).
-## Experiment queue (each needs prediction, check, result recorded here)
-1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
-   Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
-   prediction: finite over 512 steps. Runner: adapt `tools/run-gplr82-s3off.py` (supports `--session`; ARMS list
-   hard-coded; needs env support) or write `tools/run-tg-arms.py`. Needs the anchor prompt copied (see above).
-2. **E2 B1 oracle**: explain the step-1 garbage with the CPU leg and decoupling OFF (shadow device reference of the
-   same rows, compare host_out vs device tail per layer/token).
-3. **E3 reassociation control**: 8-wide matmuls with A2dev's association; expect bit-identical to A2dev.
-4. **E4 hybrid at the 8 GB shape**: K=4, correct S3, measure TG vs stock paired; decompose per-layer fixed overhead.
-5. **E5 async host executor** (host leg concurrent with GPU head leg, fused kernel) if F7 overhead dominates.
-6. **E6 MTP self-speculation** payoff (stock baseline had no speculation).
+## Experiment queue - OUTCOMES (the original queue was written at the start of the goal; every item is now closed or explicitly open)
+| # | Queued item | Outcome |
+|---|---|---|
+| 1 | E1 guard proof (legacy state rule must abort loudly, fixed rule must run finite) | DONE, E1: the legacy rule aborts at TG step 1 with the exact message; the fixed rule is finite over 512 steps (ledger row 3). |
+| 2 | E2 explain the step-1 garbage with the CPU leg and decoupling OFF | DONE, E2/E3/E7: persistent-graph allocation overlap, proven by A/B (ledger row 3). |
+| 3 | E3 reassociation control (8-wide matmuls with the device-tail association) | NOT RUN: moot once the split-FFN path was dropped in favour of the mailbox engine (D9). Not disproven; the question it asked (does summation order explain the drift) was answered differently by E30/C6 (Delta 0.14). |
+| 4 | E4 hybrid at the 8 GB shape, K=4, decompose the per-layer overhead | DONE through D9: overhead decomposed in E8/E9 (450-500 us fixed scheduler cost), engine timelines in G2; shape measured in G1/G2. |
+| 5 | E5 async fused host executor inside the LM scheduler | REPLACED by the mailbox engine, which removes the same cost (ledger rows 1-2, 18). |
+| 6 | E6 MTP self-speculation payoff | OPEN, not implemented (ledger row 16: nextn tensors not loaded for qwen35moe in this tree; the hybrid hook serves n_tokens == 1 only). |
 
-## Parallel agents (launched 23:1x; all read-only; they die at reboot)
-Scratch root: `C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad\`
-- `research-caching/` literature on expert caching/scheduling (KTransformers, Fiddler, MoE-Infinity, HOBBIT, ...).
-- `research-cpu/` CPU expert kernels + overlap, ranks the ~250 us overhead sources, designs a fused host executor.
-- `cache-sim/` offline policy simulator on all route traces (LRU/LFU/ARC, layer-adaptive capacity, admission, TG model).
-- `mtp-spec/` MTP self-speculation payoff model + prior MTP work in worktree `5e3cb7b5-...`.
-- NOT launched yet: **stock-gap** (reproduce stock paired with ours, decompose its 32.6 ms; use side-copied binaries,
-  mutex, llama-bench/llama-cli, never bind 0.0.0.0) and **branch-mining** (idea ledger from branches `optimizaionV1`
-  ("TG at 8/16 GB blocked" - find exactly what blocked), freebuff/*, docs/tg-expert-path-reconciliation.md, with a flag
-  on any disproof that rests on a flawed implementation).
+## Parallel agents - what each returned
+- `research-caching`, `research-cpu`, `cache-sim`, `mtp-spec`, `branch-mining`: findings are in "Agent findings" above (labelled D = derived, M = measured).
+- `stock-gap`: replaced by the paired stock measurements in E10/E19 and, certified, G1/G2 (including the stock thread/offload sweep).
+- 2026-10-11 (stop-hook audit): a read-only subagent audited the LM runner's per-token host work. Its report matched the engine timelines: the ~2 ms inter-token gap
+  is common to both harnesses, every runner-only item costs 0.15-0.6 ms in total, and the one lever common to both (on-device greedy sampling) measured no gain (ledger row 14).
 
-## Resume checklist
-1. `git -C <worktree> status`; nested `git -C third_party/llama.cpp status` (expect the edits above).
-2. Copy the anchor prompt; confirm `build/llama-cuda/bin/Release/*.exe|dll` exist (else rebuild, ~13 min full).
-3. Check scratch dirs for agent output; relaunch the unfinished agents from the descriptions above.
-4. Run E1 under `tools/with-gpu-lock.ps1 -AllowUnprovenanced` (dot-source arm-verdict.ps1 rules from AGENTS.md).
+## Resume checklist (current)
+1. `git -C <worktree> status`. Outer repo: AGENTS.md may be uncommitted (owner review). Nested `third_party/llama.cpp` has UNCOMMITTED edits (D17); their record is
+   `docs/plans/tg-beat-stock-8gb-262k-nested-worktree.patch` (refreshed at each acceptance).
+2. Builds are side-copied and never reused after a source edit: `build/llama-cuda/bin/g1` (G1), `bin/g2` (G2), `bin/g3` (g2 + watchdog), later ones if listed in the G3 notes.
+   Rebuild with `cmake --build build/llama-cuda --config Release --target llama-layer-streaming llama-completion llama-tokenize llama-server --parallel 12`
+   (the full build also fails to link the unrelated upstream `test-unicode`).
+3. Engine-vs-engine runs use `anchor-512-nonl.txt` (llama-completion `-f` strips a trailing newline), free-text prompts `div-code.txt` / `div-prose.txt`, never the
+   repeating anchor text for hit-rate-sensitive comparisons.
+4. Re-run the checks: `python tools/check-g1-contract.py`, `python tools/check-g2-contract.py`, `python tools/check-repetition.py --selftest`, the host engine ctest
+   pattern in `build/llama-cuda/host-include.txt` / `host-exclude.txt`.
+5. All GPU work through `tools/with-gpu-lock.ps1`, with the exe named on the wrapped command line (`--attest`), never `-AllowUnprovenanced`.
