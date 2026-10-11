@@ -795,6 +795,8 @@ gained), automatic sizing of the cache (G6 uses explicit slot counts), other mod
 | G6-4 refusals | `llama-layer-streaming --kv-lazy` without `--kv-graph-pad` exits 2 with its message in 0.2 s, before any model load or CUDA call (also `--tg-hybrid-slots auto` without `--tg-hybrid`: exit 2) | PASS |
 | G6-5 inertness | non-lazy HYB42R control 86.97 vs 85.61 (`g9-ab`, +1.6%) and 86.36 (`g8-code`, +0.7%) | PASS |
 
+Soak after the contract (`g14-long`, build g14, 2,048 generated tokens per run, watchdog 100 ms, 3 reps each of L82B and AUTO): 6 runs, 48 pad boundaries crossed, **0 failures**, speed steady over the whole generation (L82B 107.26, AUTO 105.53 tok/s; 106.83-107.84 and 105.17-106.15). The watchdog reported three host stalls of 111 ms (engine inside the CPU graph compute, 16-120 ms): the known rare single-step stalls of ledger row 27, survived by the 5 s device limit; the always-on slow-request line counts about the same rate in the g11 sessions as in g7 / g8 (2 requests above 100 ms in 36 reliability runs).
+
 **Decision: ACCEPTED** (agent's own autonomous acceptance), for exactly the claim the contract defines: with `--kv-lazy` the 262,144-token window costs only the rows a run touches, the VRAM it frees buys expert cache
 (C78: +17.3% on the code prompt; C82: +19%), and nothing else changes at equal slots. Why it works: `--kv-graph-pad` already makes decode attention read only the live rows, so the 2.7 GiB the window reserves
 is dead weight at short contexts, and VRAM was the binding constraint on the cache (ledger rows 10-12). **Not certified:** any run that fills the window. The cost per committed row is 10,880 B (10 attention layers x K and V x 544 B), i.e. 0.0146 expert-cache
