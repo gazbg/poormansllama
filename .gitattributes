@@ -1,0 +1,2 @@
+# unified-diff files carry blank context lines that look like trailing whitespace
+docs/plans/*.patch -whitespace

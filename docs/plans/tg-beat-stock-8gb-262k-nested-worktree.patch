@@ -1,0 +1,206 @@
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 928850a73..736b100e5 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -291,6 +291,12 @@ public:
+     // bypasses decode(), so the host logits buffer is never populated; this
+     // reads the exposed result tensor directly. Returns -1 when unavailable.
+     int64_t layer_major_pp_first_token();
++
++    // Opt-in diagnostics (--tg-logit-margin): top-k of the last PP output row,
++    // the distribution P(.|prompt) a normal-path sampler reads for its first
++    // token. Writes up to k (id, logit) pairs, best first. Returns the number
++    // written, or -1 when unavailable.
++    int layer_major_pp_topk(int k, int64_t * ids, float * vals);
+ #endif
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+diff --git a/src/llama-layer-streaming.cpp b/src/llama-layer-streaming.cpp
+index ed091c288..cb8f1e92c 100644
+--- a/src/llama-layer-streaming.cpp
++++ b/src/llama-layer-streaming.cpp
+@@ -4535,6 +4535,10 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
+     return ctx->layer_major_pp_first_token();
+ }
+ 
++int llama_layer_major_pp_topk(llama_context * ctx, int k, int64_t * ids, float * vals) {
++    return ctx->layer_major_pp_topk(k, ids, vals);
++}
++
+ // T-GPLR-03: argmax of the last output row of the PP logits. The layer-major
+ // controller exposes the last chunk's result tensors on gf_res_prev but never
+ // fills the context's host logits buffer (it bypasses decode()), so read the
+@@ -4565,6 +4569,40 @@ int64_t llama_context::layer_major_pp_first_token() {
+     return best;
+ }
+ 
++// Opt-in diagnostics: the same last-row read as layer_major_pp_first_token, but
++// returning the top-k (id, logit) pairs so two engines can be compared at the
++// logit level instead of by first-token identity. Read-only.
++int llama_context::layer_major_pp_topk(int k, int64_t * ids, float * vals) {
++    if (gf_res_prev == nullptr || k <= 0 || ids == nullptr || vals == nullptr) {
++        return -1;
++    }
++    ggml_tensor * t = gf_res_prev->get_logits();
++    if (t == nullptr || t->data == nullptr || t->ne[0] <= 0 || t->ne[1] <= 0) {
++        return -1;
++    }
++    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++    if (backend_res == nullptr) {
++        return -1;
++    }
++    const int64_t n_vocab = t->ne[0];
++    const int64_t n_out   = t->ne[1];
++    std::vector<float> row((size_t) n_vocab);
++    ggml_backend_tensor_get(t, row.data(), (size_t) (n_out - 1) * t->nb[1], (size_t) n_vocab * sizeof(float));
++    const int kk = (int) std::min<int64_t>((int64_t) k, n_vocab);
++    std::vector<int64_t> idx((size_t) n_vocab);
++    for (int64_t v = 0; v < n_vocab; ++v) {
++        idx[(size_t) v] = v;
++    }
++    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&row](int64_t a, int64_t b) {
++        return row[(size_t) a] > row[(size_t) b];
++    });
++    for (int i = 0; i < kk; ++i) {
++        ids[i]  = idx[(size_t) i];
++        vals[i] = row[(size_t) idx[(size_t) i]];
++    }
++    return kk;
++}
++
+ // One owner for the structured failure shape (error_msg -> failed -> error
+ // event -> GGML_STATUS_FAILED); byte-identical to the inline copies it
+ // replaces -- traces and checkers parse these exact strings.
+@@ -7896,6 +7934,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
+         (long long) ggml_time_us());
+ }
+ 
++// Opt-in (tg_logit_margin > 0): the top-n (id, logit) of the last prompt position,
++// one line per run. Read-only annotation; a default run's trace is unchanged.
++void llama_layer_streaming::tel_pp_last_logits(int n, const int64_t * ids, const float * vals) {
++    if (tel_out == nullptr || tg_logit_margin <= 0 || n <= 0) {
++        return;
++    }
++    std::string out = "{\"event\":\"pp_last_logits\",\"run_id\":" + std::to_string(run_id) + ",\"top\":[";
++    char buf[96];
++    for (int i = 0; i < n; ++i) {
++        snprintf(buf, sizeof(buf), "%s{\"id\":%lld,\"logit\":%.6f}", i > 0 ? "," : "",
++                 (long long) ids[i], (double) vals[i]);
++        out += buf;
++    }
++    out += "]}";
++    tel_write(tel_out, out.c_str());
++}
++
+ void llama_layer_streaming::tel_tg_tokens(const std::vector<int64_t> & ids) {
+     if (tel_out == nullptr) {
+         return;
+diff --git a/src/llama-layer-streaming.h b/src/llama-layer-streaming.h
+index f5304f17d..01e174407 100644
+--- a/src/llama-layer-streaming.h
++++ b/src/llama-layer-streaming.h
+@@ -1136,6 +1136,9 @@ struct LLAMA_API llama_layer_streaming {
+     // event annotates the pick; it never perturbs it.
+     void tel_tg_logits(int step, int64_t top1_id, float top1_logit, int64_t top2_id,
+                        float top2_logit);
++    // Same gate (tg_logit_margin > 0): one `pp_last_logits` line with the top-n
++    // (id, logit) of the last prompt position, read-only.
++    void tel_pp_last_logits(int n, const int64_t * ids, const float * vals);
+     // T-Q38HG-06: MTP draft/accept counters (drafted, accepted, acceptance rate)
+     void tel_mtp(int64_t n_tokens, int64_t drafted, int64_t accepted);
+ 
+@@ -2574,4 +2577,8 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
+ // tensor directly. Returns -1 when unavailable.
+ LLAMA_API int64_t llama_layer_major_pp_first_token(llama_context * ctx);
+ 
++// Opt-in diagnostics: top-k (id, logit) of the last PP output row, best first.
++// Returns the number of entries written, or -1 when unavailable.
++LLAMA_API int llama_layer_major_pp_topk(llama_context * ctx, int k, int64_t * ids, float * vals);
++
+ #endif // LLAMA_LAYER_STREAMING
+diff --git a/tools/layer-streaming/main.cpp b/tools/layer-streaming/main.cpp
+index 16b384858..505cccc8a 100644
+--- a/tools/layer-streaming/main.cpp
++++ b/tools/layer-streaming/main.cpp
+@@ -3248,6 +3248,7 @@ int main(int argc, char ** argv) {
+     // step 3 is in place, because on its own it would build the TG view before any KV
+     // cell exists and silently under-read. See the usage text and the plan block.
+     long long kv_graph_pad = 0;
++    bool tg_first_pp = false; // --tg-first-pp-token: generated token 0 = argmax of the PP logits (stock semantics), not a re-decode of the last prompt token
+     bool tg_hybrid = false; // --tg-hybrid: after PP, decode through the stock graph path (AER hybrid engine, env LLAMA_MOE_HYBRID)
+     int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
+     int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
+@@ -3406,6 +3407,8 @@ int main(int argc, char ** argv) {
+             // T-GPLR-04: --ctx-size is honored in run mode as the explicit
+             // context/KV capacity, independent of the PP token count.
+             run_ctx_size = ctx_size;
++        } else if (arg == "--tg-first-pp-token") {
++            tg_first_pp = true;
+         } else if (arg == "--tg-hybrid") {
+             tg_hybrid = true;
+         } else if (arg == "--kv-graph-pad") {
+@@ -4606,7 +4609,7 @@ int main(int argc, char ** argv) {
+     // cover that MTP draft width or output_reserve aborts at the first
+     // verify round. Must remain nonzero in all cases for graph
+     // reservation.
+-    cparams.n_outputs_max = pp_no_logits
++    cparams.n_outputs_max = (pp_no_logits || tg_first_pp)
+         ? (mtp ? (uint32_t) (1 + mtp_draft) : 1)
+         : (uint32_t) pp_tokens;
+     // T-GPLR-72: was hardcoded 16/16; now a flag whose default is that same 16.
+@@ -5651,7 +5654,7 @@ int main(int argc, char ** argv) {
+             batch.pos[i]   = i;
+             batch.n_seq_id[i] = 1;
+             batch.seq_id[i][0] = 0;
+-            batch.logits[i] = !pp_no_logits;
++            batch.logits[i] = !pp_no_logits || (tg_first_pp && i == pp_tokens - 1);
+         }
+         batch.n_tokens = pp_tokens;
+ 
+@@ -5923,7 +5926,7 @@ int main(int argc, char ** argv) {
+                         ub.pos[i]     = off + i;
+                         ub.n_seq_id[i] = 1;
+                         ub.seq_id[i][0] = 0;
+-                        ub.logits[i]   = !pp_no_logits;
++                        ub.logits[i]   = !pp_no_logits || (tg_first_pp && off + i == pp_tokens - 1);
+                     }
+                     ub.n_tokens = n_tok;
+                     ret = llama_decode(ctx, ub);
+@@ -6555,7 +6558,36 @@ int main(int argc, char ** argv) {
+             // --- standard greedy TG (unchanged) ---
+             // exit_status guard: a failed TG setup (e.g. row-set activation)
+             // must not keep decoding (T-GPLR-13 probe evidence).
+-            for (int t = 0; t < tg_tokens && exit_status == 0; ++t) {
++            int tg_steps = tg_tokens;
++            if (tg_first_pp && exit_status == 0) {
++                const int64_t pp_first_tok = llama_layer_major_pp_first_token(ctx);
++                if (pp_first_tok < 0) {
++                    fprintf(stderr, "error: --tg-first-pp-token needs the PP logits (drop --pp-no-logits)\n");
++                    ls.failed = true;
++                    exit_status = 1;
++                } else if (tg_tokens > 0) {
++                    cur = (llama_token) pp_first_tok;
++                    generated.push_back(cur);
++                    rep_ring.accept(cur);
++                    tg_steps = tg_tokens - 1;
++                }
++            }
++            // Opt-in (--tg-logit-margin): top-8 of P(.|prompt) at the last prompt
++            // position, for a logit-level comparison against another engine.
++            if (tg_logit_margin > 0 && exit_status == 0) {
++                int64_t pp_top_ids[8];
++                float   pp_top_vals[8];
++                const int n_top = llama_layer_major_pp_topk(ctx, 8, pp_top_ids, pp_top_vals);
++                if (n_top > 0) {
++                    ls.tel_pp_last_logits(n_top, pp_top_ids, pp_top_vals);
++                    for (int i = 0; i < n_top; ++i) {
++                        fprintf(stderr, "PP: last-position top%d id %lld logit %.6f\n",
++                                i + 1, (long long) pp_top_ids[i], (double) pp_top_vals[i]);
++                    }
++                    fflush(stderr);
++                }
++            }
++            for (int t = 0; t < tg_steps && exit_status == 0; ++t) {
+                 batch.token[0]   = cur;
+                 batch.pos[0]     = pp_tokens + t;
+                 batch.n_seq_id[0] = 1;

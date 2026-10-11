@@ -24,6 +24,22 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-10-11 (GPU held for 14 sessions through `tools/with-gpu-lock.ps1`, none with `-AllowUnprovenanced`; every wrapper verdict PROVENANCE PASS, `gpu_pre`/`gpu_post` clean): G-TG8 -- the LM-hosted AER hybrid decode beats stock TG 1.65x within 8071 MiB; the agent's own acceptance against a contract written before the runs
+
+**Asked.** (Owner `/goal`, autonomous mode) Beat the TG of `docs/llamacpp 8gb vram 262k base.md` (30.68 tok/s) at an 8 GB VRAM / 262k shape with caching and scheduling; prove it; find the root cause of any idea that fails.
+
+**Answer.** Accepted by the agent (NOT owner approval) under `docs/plans/tg-beat-stock-8gb-262k.md`, "ACCEPTANCE CONTRACT G-TG8": all nine criteria hold (`python tools/check-g1-contract.py`).
+
+- **Speed (measured).** Identical 511-token prompt, 512 TG tokens, 3 reps interleaved in one mutex hold: hybrid (C14 + `--kv-graph-pad 256` + `--act-slab-dtype f32`) **61.73 tok/s** (61.19-62.36); same-harness control (hybrid off) 34.22; stock `llama-completion -ncmoe 37` **37.35** (37.28-37.39). 1.65x stock, 1.80x the control, 2.01x the owner's bar. Whole-GPU peak 8071 MiB (stock 7443, control 7045).
+- **Holds elsewhere (measured).** Free prose 1.74x and code 1.77x over stock; a uniform frequency prior is as fast (62.71), so nothing depends on where `aer-freq-train.txt` came from; the best-tuned stock under 8 GiB is about 38 tok/s (thread and offload sweep), so the control was not under-tuned.
+- **Answer stability (measured).** Needle QA (positive passes, negative control fails) at 50 / 511 / 4096 / 24000 prompt tokens; the 24000-token run peaks at 8439 MiB (reported, not gated). A 2048-token generation is no more repetitive than the control (distinct-6-gram ratio 0.218 vs 0.230).
+- **Prefill agreement (measured).** On the same prompt the LM last-position top-2 (ids 271, 198) differ by 3.514 logits; stock's gap, by `--logit-bias` bisection, is 3.375 (`-ub 128` 3.625, f16 KV 3.375): Delta 0.11-0.14 against a 2.42 limit.
+- **Corrections to earlier entries.** The 63.6 vs 36.3 (1.75x) headline is superseded: its stock binary was the waived, unattested `aer-v4` build and the prompts differed by one token. The earlier "LM prefill differs from stock" (token 1 `Q` vs `\n\n`) was that same mismatch: `llama-completion -f` strips ONE trailing newline (`common/arg.cpp:1796-1799`), the LM runner does not. Use `anchor-512-nonl.txt` for any engine-vs-engine run.
+- **New code, default off.** `pp_last_logits` telemetry (top-8 at the last prompt position, only with `--tg-logit-margin N>0`; a default trace has none, checked); `tools/check-repetition.py` (selftest 5/5), `tools/stock-logit-gap.py`, `tools/check-g1-contract.py`; `tools/run-tg-arms.py` gained interleaved reps and stock-engine arms.
+- **Checks.** Host-suite engine steps 78/78 on the g1 build. The suite's own first step, the doc-size guard, FAILS (`docs/plans/generic-prefill-layer-residency-plan.md` 485,036 B vs 480,000 B, unchanged since `a5fa223`, predates this work; amendment A1 evaluates the engine steps directly).
+- **Gaps / risk.** The nested llama.cpp changes are uncommitted because its `AGENTS.md` demands per-commit human approval; they are saved as `docs/plans/tg-beat-stock-8gb-262k-nested-worktree.patch` (sha256 prefix a8e83ca67e44354f). About 17.5 GiB of pinned RAM and 8 spinning CPU threads; PP is not claimed (317 vs 349 tok/s at 511 tokens, stock ahead); one model, one GPU, contexts filled only to 24k; text after the answer is junk in every engine because `--ignore-eos` is on.
+- **For the owner.** Pinned RAM and spinning threads; the nested commit policy; the doc-size debt that fails the host suite; whether `--tg-first-pp-token` becomes the default; whether to open pushes (this goal needed none). Decisions D14-D20 are in the plan.
+
 ## 2026-10-10 (GPU held, `tools/with-gpu-lock.ps1` tag `gplr82-oprows-cuda`, `gpu_pre`/`gpu_post` clean; verdict UNCERTIFIED for the pre-existing dirty nested tree): T-GPLR-82 -- the per-op row-count hypothesis is REFUTED by measurement, and the handoff for the next agent is written
 
 **Asked.** Test per-op whether the same expert rows produce different values when computed in a 2-wide versus an 8-wide `MUL_MAT_ID` batch, to explain the 1.3e-3 relative step-0 shift that survives with no CPU compute.
