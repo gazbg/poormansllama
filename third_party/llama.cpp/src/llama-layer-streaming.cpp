@@ -1598,13 +1598,18 @@ bool llama_layer_streaming::ls_register_pkg_source(int il, llama_layer_streaming
         slot.reg_bytes = 0;
     }
     char err[256] = {0};
+    // --tg-hybrid: the hybrid engine may already have pinned the whole expert bank (its own registration covers these pages); a span that is already mapped is pinned, so the DMA is valid
     if (!ggml_backend_cuda_register_host_range(base, bytes, err, sizeof(err))) {
-        error_msg = "mmap-registered staging: cudaHostRegister failed for logical layer " + std::to_string(il) +
-                    " (" + std::to_string(bytes) + " bytes): " + err;
-        return false;   // loud refusal: never silently fall back to the copy hop
+        if (strstr(err, "already mapped") == nullptr) {
+            error_msg = "mmap-registered staging: cudaHostRegister failed for logical layer " + std::to_string(il) +
+                        " (" + std::to_string(bytes) + " bytes): " + err;
+            return false;   // loud refusal: never silently fall back to the copy hop
+        }
+        // pages already pinned by the hybrid engine: DMA is valid, but this slot does not own the pin and must not unpin it
+    } else {
+        slot.reg_base  = base;
+        slot.reg_bytes = bytes;
     }
-    slot.reg_base  = base;
-    slot.reg_bytes = bytes;
     if (tel_out != nullptr) {
         tel_write(tel_out, "{\"event\":\"mmap_register\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,"
                   "\"bytes\":%zu,\"members\":%zu,\"base\":%llu,\"t_us\":%lld}",
@@ -1698,11 +1703,20 @@ bool llama_layer_streaming::register_all_pkg_sources(int64_t & bytes_out, double
         const void * base  = (const void *) glo;
         const size_t bytes = (size_t) (ghi - glo);
         char err[256] = {0};
-        if (!ggml_backend_cuda_register_host_range(base, bytes, err, sizeof(err))) {
+        const bool pinned_here = ggml_backend_cuda_register_host_range(base, bytes, err, sizeof(err));
+        if (!pinned_here && strstr(err, "already mapped") == nullptr) {
             error_msg = "mmap-registered staging (register-once): cudaHostRegister failed for logical layer " +
                         std::to_string(spans[si].il) + " (" + std::to_string(bytes) + " bytes): " + err;
             unregister_all_pkg_sources();   // leave the box unpinned on refusal
             return false;
+        }
+        // already pinned by the hybrid engine (--tg-hybrid): DMA is valid; this run does not own the pin
+        if (!pinned_here) {
+            for (size_t k = si; k <= sj; ++k) {
+                all_reg_covered[(size_t) spans[k].il] = true;
+            }
+            si = sj + 1;
+            continue;
         }
         // Ownership: the group's FIRST layer carries the registration (base and
         // byte extent, so footprint and teardown stay single-counted); the rest

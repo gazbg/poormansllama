@@ -380,7 +380,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
         for (const range & r : merged) {
             char err[256] = {};
             if (!ggml_backend_cuda_register_host_range((const void *) r.lo, r.hi - r.lo, err, sizeof(err))) {
-                if (strstr(err, "already") != nullptr) {
+                if (strstr(err, "already mapped") != nullptr) {
                     continue; // the layer-streaming runner pinned this range first; DMA works, and it stays the owner of the pin
                 }
                 GGML_ABORT("moe_hybrid: host range registration failed (%zu bytes): %s", (size_t) (r.hi - r.lo), err);
