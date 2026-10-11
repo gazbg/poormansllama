@@ -209,12 +209,36 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
 - LM-hosted hybrid C14 + kv-pad + f32 prefill activations (E23 + E24, 3 reps): 63.65 / 63.80 / 63.31 => mean **63.59 tok/s**,
   VRAM peak **8071 MiB** (<= 8192), QA needle PASS 3/3, output coherent and byte-identical across reps.
 - Ratio **1.75x stock** (same prompt, same day). Owner doc bar 30.68 tok/s => **2.07x**.
-- Caveat (MEASURED, E22/E23 text + code): LM's TG re-decodes the LAST PROMPT TOKEN at step 0 (`main.cpp` ~6001 and 6560), so its
-  continuation is conditioned on one duplicated token; stock is not. The first generated token therefore differs from stock
-  (`<|im_end|>` at step 0 in LM vs `You` in stock). Speed is unaffected (same work per token); content is a different, coherent
-  continuation. Fixing the start (use the prefill logits for step 0) changes every LM TG run and needs its own validation.
+- Caveat (MEASURED, E22/E23 text + code): LM's default TG re-decodes the LAST PROMPT TOKEN at step 0 (`main.cpp` ~6001 and 6560),
+  so its continuation is conditioned on one duplicated token; stock is not. Speed is unaffected (same work per token).
+  `--tg-first-pp-token` (opt-in, E26/E30) removes the duplicate: token 1 becomes the PP argmax. See E30 below for what that token is.
+  CORRECTION (2026-10-11, E30c): the earlier statement that stock's first token is `You` was WRONG. `You` is the first word of the
+  prompt, echoed by `llama-completion` unless `--no-display-prompt` is given. Stock's first generated tokens are `<think>` `</think>` `QX-`.
 - NOT yet done for acceptance: the QA ladder (50 / 4k / 24k ... per AGENTS.md; only the 512-token needle check ran), a same-harness
   stock control, and a long-generation loop test beyond 512 tokens. These are owner-invoked gates.
+## E30 FIRST-TOKEN CHECK (2026-10-11, anchor-512, ctx 262144, q8 KV, GPU mutex)
+| Arm | Engine and flags | Generated text, start | Provenance | Result |
+|---|---|---|---|---|
+| E30a | stock `llama-completion -n 1`, prompt echo ON | `You are answering questions...` = prompt echo, not a token | aer-v4 binary | **SUPERSEDED**: misread as "stock token 1 = You" |
+| E30b LMNH1 | LM `e26-firstpp`, `--tg-first-pp-token --tg-hybrid --kv-graph-pad 256`, **no** hybrid env, 512 TG tokens (`tg_tokens:1` in the spec is NOT what ran; the command has `--tg-tokens 512`) | `Q` `X-7741 TR-2918 MK-5501 LD-8834 Paris`, then repeats the prompt to 512 tokens | exe and llama.dll hashes in `e30-ppcheck-verdict.json`; wrapper refused for want of binary identity, **waived** with `-AllowUnprovenanced` (recorded in `build/llama-cuda/verdicts/provenance-waivers.log`) | rc 0, guards 0, 34.15 tok/s, poller VRAM peak 7045 MiB; the `peak VRAM` console line (3265.56 MiB) is the known-wrong field, not used |
+| E30c | stock `llama-completion -n 8 --no-display-prompt -ncmoe 37 --temp 0 -no-cnv` on `aer-v4` | `<think>` `</think>` `QX-` (8 tokens) | aer-v4 binary predates its sources: **REFUSED, waived**; this control is **UNCERTIFIED** | rc 0 |
+Launch failures (not evidence): E30c first two tries failed to launch, one on a `cmd` parse error (`'build' is not recognized`, a
+relative exe path written with `/`) and one on a sharing violation under a bash-mangled `cmd` call; both waived-logged, neither
+produced output. The mangled bash call also left a stray empty file `C` in the worktree root (deleted).
+
+FINDINGS
+- MEASURED: LM token 1 with the PP argmax (`Q`, id 48; inferred from byte-level id = byte - 33, not checked against the tokenizer) is
+  NOT stock's token 1 (`<think>`). Both continue `QX-7741 ...`, so the needle answer is the same and the first divergence is at the last
+  prompt position.
+- MEASURED: E30b with `--tg-first-pp-token` gives a correct needle answer, coherent for 512 tokens.
+- UNPROVEN: why token 1 differs. Candidates: a near-tie between `<think>` and `Q` (margin unknown, no logits dumped), or a real
+  prefill-logit difference in layer-major PP (act slab f32, q8 KV, streaming expert bank). Discriminator: top-5 logits at the last prompt
+  position from both engines on the same prompt.
+- AGENTS.md: first-token identity is not an acceptance criterion, so this does not fail the QA gate. It does block any claim that LM
+  prefill is equivalent to stock. Stays OPEN.
+- DECISION D14 (autonomous, reversible): keep `--tg-first-pp-token` opt-in. The PP argmax is not yet checked against stock, so making it
+  the default would replace one unverified start with another.
+
 ## OWNER SUMMARY (AGENTS.md five-part form; autonomous decisions, NOT owner approval)
 1. **Goal.** Beat stock token generation (TG) at 8 GB VRAM / 262k context. Bar = the owner's doc: 30.68 tok/s (`llama-server`).
    Idea under test: a per-layer GPU cache of hot experts; cache misses computed on the CPU from host RAM, no predictor.
@@ -238,7 +262,9 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
      QA is 128-token smoke, not the 50/512/4k ladder AGENTS.md requires; the tg-logit-margin readout is on in the LM arms.
 5. **Recommendation (autonomous).** Keep C14 + kv-pad as the 8 GB operating point for TG. Before any acceptance: (a) run the QA ladder
    (50 and 512 tokens) on C14, (b) a 1024-token generation to test the loop, (c) re-measure stock in the LM harness or a same-harness
-   control, (d) decide whether the 17.5 GB pinned host copy is acceptable (owner decision).
+   control, (d) decide whether the 17.5 GB pinned host copy is acceptable (owner decision), (e) explain the token-1 difference from
+   stock (E30: LM `Q` vs stock `<think>`) with a top-5 logit comparison at the last prompt position, (f) the 4k/24k QA ladder (owner-invoked).
+   (c) and the E30 control are UNCERTIFIED on provenance: the stock control binary predates its sources (waived, recorded).
 
 ## DECISION LOG (continued 3)
 - D11 Diagnose the LM-vs-AER 2x by isolating variables: prompt (E15, not it), llama threads (E15, not it), attention window (E16, it).
