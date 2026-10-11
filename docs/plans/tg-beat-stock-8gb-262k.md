@@ -152,6 +152,17 @@ paired against a re-run of stock on the same machine/day** (cross-session drift 
   pages); (2) hybrid tolerance matches the real CUDA text 'already mapped'. Result: rc 0, 47 TG tokens, coherent answer containing all
   anchor needles (QX-7741 TR-2918 MK-5501 LD-8834 Paris), hybrid timeline present (span 26.5 ms over 47 tokens, stall 10.5 ms, host serve 11.6 ms).
   Not yet graded by the QA checker, not yet measured for speed.
+- **E13 (session e13-lm-hybrid, goal shape `-c 262144`, q8, layer-major PP 50k? no: anchor-512 PP, 128 TG tokens, `--tg-hybrid`, one mutex hold)**:
+  LM-hosted hybrid C16 35.15, C24 36.72, C32 37.50 tok/s; **QA PASS on all three arms** (positive pass, negative control fails as designed,
+  guards silent). Divergence from the first token onward is the expected answer-stability drift (dlogit median 0.24-0.25, first flip step 42).
+- **E14 (stock in the LM harness)**: REFUSED (rc 2): LM's layer-major TG cap (`--tg-tokens <= 3` without handoff) makes a stock LM TG arm
+  impossible at this shape. Stock comparator therefore stays E10 (`llama-completion -ncmoe 37`, 38.8 tok/s, same day), with the caveat that
+  the harnesses differ (LM vs llama-completion; prompt and PP path differ).
+- **Interpretation (derived, not a win yet)**: the LM-hosted hybrid is **~35-37.5 tok/s**, which is *below* the AER-binary hybrid (70-86 tok/s, E10)
+  and roughly at stock (38.8). The 2x AER result did not survive the port into LM. Hypotheses to disprove next: (a) the LM-side per-token
+  overhead (`--tg-hybrid` still runs the graph-build/alloc path per token, and the PP-time fill/stage bookkeeping), (b) the CPU engine
+  threads (AER: 8 threads, `-t 2` for llama; LM: 16 CPU threads contending with the engine's pinned pool), (c) the two-pool contention with the
+  LM host graphs. Each is testable with an env/flag arm and needs no rewrite.
 ## Experiment queue (each needs prediction, check, result recorded here)
 1. **E1 guard proof**: arm B2 (`--experts-host 2 --experts-host-budget 100`, K=2) with `LLAMA_LS_TEST_LEGACY_S3_STATE=1`.
    Prediction: loud abort "slot slab was not written this round" within the first ~10 steps. Then without the hook:
