@@ -1378,6 +1378,10 @@ ENTRY (`ggml_time_init` at the top of `main`), not backend init.
   to after a caller `fclose`d it (undefined behaviour) - the shared test's first case does exactly that,
   which is how the first version of this fix was caught before it shipped.
 
+## PCIe link power state of the laptop GPU (measured 2026-10-13, G23 addendum)
+
+The link of the RTX 5090 Laptop GPU (Gen4 x8, 15.75 GB/s) downshifts when the GPU idles: after about 10 s of GPU utilisation under about 10% `pcie.link.gen.current` goes 4 -> 2 -> 1 (width stays 8), a 32 MiB pinned host-to-device copy takes 2.33 -> 9.15 -> 18.3 ms, and after the idle phase it takes 13-16 back-to-back copies (0.24-0.29 s) to climb back to Gen4 (no penalty after an idle of 5 s or less). A tiny kernel per millisecond, a 10% duty-cycle kernel and a 4 KiB copy per millisecond do NOT prevent it; a continuously spinning kernel (100% utilisation) does. Standalone probe: `tools/pcie-state-bench` (modes 0-5, `build.bat`); live view: `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current,clocks.sm --format=csv -lms 250`. Consequences: a CPU-bound phase longer than ~10 s makes every GPU transfer in it up to 8x slower (the runner's CPU-only prefill, `g79`-`g84`); a transfer-bound timed region that starts after ~12 s of GPU idle pays ~0.25 s at its start. The layer-major and hybrid prefills keep the link busy and are not affected. Do not change the power plan or the driver's power-management mode to hide it (system settings are out of scope); `--gpu-keepalive 1` of the runner is the opt-in software repair.
+
 ## Canonical Build Commands
 
 All commands run from the workspace root in Git Bash.

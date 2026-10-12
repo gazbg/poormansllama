@@ -7,6 +7,7 @@
     python tools/g23-table.py final  [N ...]    g68-<N>: the final-build comparison (STK STKNO STKU LM2W LM2P HYC HY4P HY4Q HY8Q), C2-C5 (default N = 29 63 125 256 511 1023 2047)
     python tools/g23-table.py ident  [N ...]    g69-ident-<N>: B4 on the final build, three reps (default N = 63 256 1023)
     python tools/g23-table.py deep   [N ...]    g70-pacedeep-<N>: paced copies on longer prompts (default N = 4096 24000 50000)
+    python tools/g23-table.py keep   [N ...]    g84-<N> (CPU-only paths against stock, with and without --gpu-keepalive) and g85-<N> (cold and warm pass), both passes shown (default N = 511 1023 / 63 256 1023)
 
 The prefill wall of a stock arm is the `prompt eval time` of llama-completion; of a runner arm the LAST `PP: N tokens in X ms` line (the warm pass of --pp-repeat 2). Token identity comes from the
 `tg_tokens` event of the runner trace. Reps are paired by their rep id (the arms of a rep run in one counterbalanced round).
@@ -37,6 +38,11 @@ def prefill(text):
     for m in re.finditer(r"PP: (\d+) tokens in ([\d.]+) ms", text):
         pass
     return (float(m.group(2)), int(m.group(1))) if m else None
+
+
+def passes(text):
+    """every `PP: N tokens in X ms` line (one per in-process pass)"""
+    return [float(m.group(2)) for m in re.finditer(r"PP: (\d+) tokens in ([\d.]+) ms", text)]
 
 
 def tg_ids(trace):
@@ -78,7 +84,7 @@ def collect(session, arms):
         for p in sorted(glob.glob(os.path.join(d, "%s-%s_r*.log" % (session, a)))):
             r = int(re.search(r"_r(\d+)\.log$", p).group(1))
             v = prefill(read(p))
-            rec = {"ms": v[0] if v else None, "tokens": v[1] if v else None, "log": p}
+            rec = {"ms": v[0] if v else None, "tokens": v[1] if v else None, "log": p, "passes": passes(read(p))}
             tr = p[:-4] + ".jsonl"
             rec["ids"] = tg_ids(tr)
             rec["trace"] = tr
@@ -277,8 +283,27 @@ def deep(ns):
         print()
 
 
+def keep(ns):
+    for n in ns:
+        for session, arms in (("g84-%d" % n, ("STKNO", "SP0X", "SP0K", "HYC", "HYCK")), ("g85-%d" % n, ("LM2P", "LM2PK", "HY4P", "HY4PK"))):
+            data = collect(session, arms)
+            reps = sorted({r for a in data for r in data[a]})
+            if not reps:
+                continue
+            print("== %s: prefill wall ms per pass (pass 1 = cold process, last pass = warm), per rep" % session)
+            for a in arms:
+                if not data[a]:
+                    continue
+                cells = []
+                for r in reps:
+                    p = data[a][r]["passes"] if r in data[a] else []
+                    cells.append("/".join("%.0f" % x for x in p) if p else (("%.0f" % data[a][r]["ms"]) if r in data[a] and data[a][r]["ms"] else "-"))
+                print("  %-6s %s" % (a, "   ".join("rep%d %s" % (r, c) for r, c in zip(reps, cells))))
+            print()
+
+
 def main(argv):
-    if not argv or argv[0] not in ("hybrid", "stock", "pace", "final", "ident", "deep"):
+    if not argv or argv[0] not in ("hybrid", "stock", "pace", "final", "ident", "deep", "keep"):
         print(__doc__)
         return 2
     kind, ns = argv[0], [int(x) for x in argv[1:]]
@@ -292,6 +317,8 @@ def main(argv):
         ident(ns or [63, 256, 1023])
     elif kind == "deep":
         deep(ns or [4096, 24000, 50000])
+    elif kind == "keep":
+        keep(ns or [63, 256, 511, 1023])
     else:
         pace(ns or [63, 256, 1023])
     return 0

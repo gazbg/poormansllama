@@ -1,0 +1,123 @@
+"""G23 fix 5 (found by the nsys timelines g80 and the link monitors g81-g83; root cause of ledger row 63): after ~10 s of GPU utilisation under ~10% the PCIe link of this laptop falls Gen4 -> Gen2 -> Gen1 (a 32 MiB
+host-to-device copy takes 2.33 -> 9.15 -> 18.3 ms) and needs ~0.25 s of traffic to climb back; only a busy GPU keeps Gen4 (tools/pcie-state-bench: a spinning kernel keeps it, a tiny kernel per ms, a 10% duty cycle or a 4 KiB
+copy per ms does not). --gpu-keepalive 1 runs a one-block spin kernel on a private stream of the CUDA device for the whole run (4 ms slices at the maximum clock, so a TDR can never fire). Default 0 = off.
+Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+CU = NEST + r"\ggml\src\ggml-cuda\ggml-cuda.cu"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(CU, [
+    (r'''#include <mutex>
+#include <cstdarg>
+''', r'''#include <mutex>
+#include <thread>
+#include <cstdarg>
+'''),
+    (r'''extern "C" __declspec(dllexport) bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
+''', r'''// G23 (ledger row 63): keep the GPU, and with it the PCIe link, out of its idle state. On the laptop GPU the link falls from Gen4 to Gen1 after ~10 s of GPU utilisation under ~10% (a 32 MiB host-to-device copy
+// 2.33 -> 18.3 ms) and needs ~0.25 s of traffic to climb back; a one-block spin kernel (100% utilisation, one SM) keeps it up (tools/pcie-state-bench). The kernel spins ~4 ms of maximum-clock cycles per launch.
+static __global__ void ggml_cuda_keepalive_spin(long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) {
+    }
+}
+
+static std::thread       g_cuda_keepalive_thread;
+static std::atomic<bool> g_cuda_keepalive_stop{false};
+
+extern "C" __declspec(dllexport) int ggml_backend_cuda_keepalive(int device, int on) {
+    if (on) {
+        if (g_cuda_keepalive_thread.joinable()) {
+            return 1;
+        }
+        g_cuda_keepalive_stop.store(false);
+        g_cuda_keepalive_thread = std::thread([device] {
+            cudaSetDevice(device);
+            cudaStream_t s = nullptr;
+            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+            int clock_khz = 0;
+            cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+            const long long cycles = (long long) std::max(clock_khz, 1000000) * 4;
+            while (!g_cuda_keepalive_stop.load()) {
+                ggml_cuda_keepalive_spin<<<1, 32, 0, s>>>(cycles);
+                cudaStreamSynchronize(s);
+            }
+            cudaStreamDestroy(s);
+        });
+        return 1;
+    }
+    if (g_cuda_keepalive_thread.joinable()) {
+        g_cuda_keepalive_stop.store(true);
+        g_cuda_keepalive_thread.join();
+    }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
+'''),
+])
+
+patch(M, [
+    (r'''int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
+''', r'''int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int ggml_backend_cuda_keepalive(int device, int on);
+'''),
+    (r'''    int  pp_threadpool = 0;            // G22: an explicit persistent CPU threadpool for the prefill (as the stock tools attach), detached before the generation (0 = off)
+''', r'''    int  pp_threadpool = 0;            // G22: an explicit persistent CPU threadpool for the prefill (as the stock tools attach), detached before the generation (0 = off)
+    int  gpu_keepalive = 0;            // G23: a spin kernel on one SM for the whole run, so that the PCIe link stays at Gen4 while the GPU would idle (0 = off)
+'''),
+    (r'''        } else if (arg == "--pp-threadpool") {
+''', r'''        } else if (arg == "--gpu-keepalive") {
+            gpu_keepalive = atoi(arg_value(argc, argv, i, "--gpu-keepalive").c_str());
+            if (gpu_keepalive != 0 && gpu_keepalive != 1) {
+                fprintf(stderr, "error: --gpu-keepalive must be 0 or 1\n");
+                return 2;
+            }
+        } else if (arg == "--pp-threadpool") {
+'''),
+    (r'''        "  --pp-threadpool N    G22: attach an explicit persistent CPU threadpool''', r'''        "  --gpu-keepalive N    G23: run a one-block spin kernel on a private stream for the whole run (default 0 = off). After ~10 s of GPU\n"
+        "                       utilisation under ~10%% the PCIe link of the laptop GPU falls from Gen4 to Gen1 (a bank copy 8x slower) and needs\n"
+        "                       ~0.25 s of traffic to climb back; a busy GPU keeps it up. Costs the GPU's idle power. See tools/pcie-state-bench\n"
+        "  --pp-threadpool N    G22: attach an explicit persistent CPU threadpool'''),
+    (r'''    ls_free_watch_start(device);
+    // G22: the explicit CPU threadpool of the prefill (see --pp-threadpool); freed before the generation starts
+''', r'''    ls_free_watch_start(device);
+    // G23: the keep-alive kernel (see --gpu-keepalive); stopped by the guard on every way out of main()
+    struct ls_keepalive_guard {
+        bool on = false;
+        ~ls_keepalive_guard() {
+            if (on) {
+                ggml_backend_cuda_keepalive(0, 0);
+            }
+        }
+    } keepalive_guard;
+    if (gpu_keepalive != 0) {
+        ggml_backend_cuda_keepalive(device, 1);
+        keepalive_guard.on = true;
+        fprintf(stderr, "gpu-keepalive: a spin kernel keeps the GPU busy for the whole run\n");
+    }
+    // G22: the explicit CPU threadpool of the prefill (see --pp-threadpool); freed before the generation starts
+'''),
+    # the generation runs without the keep-alive kernel (its behaviour is not part of this change)
+    (r'''    if (pp_tp != nullptr) {
+        // the polling workers would compete with the lean host team of the decode
+''', r'''    if (keepalive_guard.on) {
+        ggml_backend_cuda_keepalive(0, 0);
+        keepalive_guard.on = false;
+    }
+    if (pp_tp != nullptr) {
+        // the polling workers would compete with the lean host team of the decode
+'''),
+])
+print("G23 fix 5 done")
