@@ -1,0 +1,14 @@
+@echo off
+rem Syntax-only compile (cl /Zs) of the PATCHED SCRATCH COPIES of the three stage C files, with the flags of the real build (read from the .tlog command logs). Nothing in the nested tree is touched.
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
+set NEST=C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp
+set SCR=C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad\nest-copy
+set INC=/I"%SCR%\src" /I"%NEST%\src" /I"%NEST%\include" /I"%NEST%\ggml\include" /I"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\include"
+set COMMON=/nologo /W1 /WX- /diagnostics:column /O2 /Ob2 /D _MBCS /D WIN32 /D _WINDOWS /D NDEBUG /D LLAMA_LAYER_STREAMING /D _CRT_SECURE_NO_WARNINGS /D GGML_USE_CPU /D GGML_USE_CUDA /D GGML_SHARED /D GGML_BACKEND_SHARED /EHsc /MD /std:c++17 /TP /utf-8 /bigobj
+echo === llama-layer-streaming.cpp
+cl /Zs %INC% %COMMON% /D _WINDLL /D LLAMA_BUILD /D LLAMA_SHARED /D llama_EXPORTS "%SCR%\src\llama-layer-streaming.cpp"
+echo === main.cpp
+cl /Zs %INC% /I"%NEST%\tools\layer-streaming" %COMMON% /D LLAMA_SHARED "%SCR%\tools\layer-streaming\main.cpp"
+echo === test-layer-streaming-cpu-leg.cpp
+cl /Zs %INC% %COMMON% /D LLAMA_SHARED "%SCR%\tests\test-layer-streaming-cpu-leg.cpp"
+echo === done

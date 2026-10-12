@@ -1,0 +1,315 @@
+"""G22 stage C: CPU-leg layers in the layer-major prefill (--pp-cpu-layers). Exact-match edits; every `old` must occur exactly once.
+Apply ONLY when no attested session is running and no g40 session is queued (the provenance gate flags a binary older than a changed source)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+# ---------------------------------------------------------------- header
+patch(H, [
+    ("""    // optional subset of layers to execute (empty = all layers); used by the
+    // one-layer boundary proof. KV/state of skipped layers is untouched.
+    std::vector<int> exec_layers;
+""", """    // optional subset of layers to execute (empty = all layers); used by the
+    // one-layer boundary proof. KV/state of skipped layers is untouched.
+    std::vector<int> exec_layers;
+
+    // G22: layers whose routed-expert FFN runs on the CPU in the layer-major prefill (empty = none). Such a layer has no slot, no copy and no consumer
+    // event; its graphs are built against the model's own host layer tensors, so the scheduler places the expert matmuls on the CPU backend while the
+    // attention, router and shared expert stay on the GPU. Set by the runner before the prebuild (--pp-cpu-layers); only phase 0 reads it.
+    std::vector<uint8_t> pp_cpu_leg;
+    bool is_cpu_leg(int il) const { return il >= 0 && il < (int) pp_cpu_leg.size() && pp_cpu_leg[il] != 0; }
+    bool has_cpu_leg() const {
+        for (uint8_t v : pp_cpu_leg) {
+            if (v != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool set_pp_cpu_layers(const std::vector<int> & layers);
+    // the next layer after il that the async feed streams (CPU-leg layers are skipped; -1 = none); public so that a host test can drive the feed order
+    int next_streamed_layer(int il) const { return af_next_layer(il); }
+"""),
+    ("""    const llama_layer & slot_layer(int il) const {
+        // T-GPLR-16: partial handoff (NCMOE-style mixed placement). Decided""",
+     """    const llama_layer & slot_layer(int il) const {
+        // G22: a CPU-leg layer of the layer-major prefill reads its experts from the host banks (no slot, no copy)
+        if (phase == 0 && !handoff_active && il < n_layer && is_cpu_leg(il)) {
+            return *host_layers[il];
+        }
+        // T-GPLR-16: partial handoff (NCMOE-style mixed placement). Decided"""),
+])
+
+# ---------------------------------------------------------------- source
+patch(C, [
+    ("""int llama_layer_streaming::af_next_layer(int il) const {
+    if (exec_layers.empty()) {
+        return il + 1 < n_layer ? il + 1 : -1;
+    }
+    for (size_t i = 0; i < exec_layers.size(); ++i) {
+        if (exec_layers[i] == il) {
+            return i + 1 < exec_layers.size() ? exec_layers[i + 1] : -1;
+        }
+    }
+    return -1;
+}
+""", """int llama_layer_streaming::af_next_layer(int il) const {
+    auto step = [&](int from) -> int {
+        if (exec_layers.empty()) {
+            return from + 1 < n_layer ? from + 1 : -1;
+        }
+        for (size_t i = 0; i < exec_layers.size(); ++i) {
+            if (exec_layers[i] == from) {
+                return i + 1 < exec_layers.size() ? exec_layers[i + 1] : -1;
+            }
+        }
+        return -1;
+    };
+    int nxt = step(il);
+    while (nxt >= 0 && is_cpu_leg(nxt)) {   // G22: a CPU-leg layer streams nothing, the feed skips it
+        nxt = step(nxt);
+    }
+    return nxt;
+}
+
+bool llama_layer_streaming::set_pp_cpu_layers(const std::vector<int> & layers) {
+    pp_cpu_leg.assign((size_t) n_layer, 0);
+    for (int il : layers) {
+        if (il < 0 || il >= n_layer) {
+            error_msg = "set_pp_cpu_layers: layer " + std::to_string(il) + " out of range [0, " + std::to_string(n_layer) + ")";
+            pp_cpu_leg.clear();
+            return false;
+        }
+        pp_cpu_leg[(size_t) il] = 1;
+    }
+    return true;
+}
+"""),
+    # preload: one streamed layer per slot, CPU-leg layers skipped
+    ("""        int preloaded = 0;
+        int last_pre = -1;
+        for (int il = 0; il < ls->n_layer && preloaded < ls->n_slots; ++il) {
+            if (!should_exec(il)) continue;
+            bool copied = false;""", """        int preloaded = 0;
+        int last_pre = -1;
+        // G22: with CPU-leg layers two streamed layers can share a slot; preload the first streamed layer of each slot only
+        std::vector<uint8_t> slot_taken((size_t) ls->n_slots, 0);
+        for (int il = 0; il < ls->n_layer && preloaded < ls->n_slots; ++il) {
+            if (!should_exec(il) || ls->is_cpu_leg(il)) continue;
+            if (slot_taken[(size_t) (il % ls->n_slots)]) continue;
+            slot_taken[(size_t) (il % ls->n_slots)] = 1;
+            bool copied = false;"""),
+    # the CPU backend's thread count (the controller bypasses graph_compute)
+    ("""    // 1. embed every chunk (writes slab A[c]); no slot work
+    const int64_t t_led_embed0 = ggml_time_us();""", """    // G22: the controller calls the scheduler directly, so the CPU backend would keep its default thread count; a CPU-leg layer needs the batch count
+    if (ls->has_cpu_leg()) {
+        for (const auto & fn : set_n_threads_fns) {
+            fn.second(fn.first, (int) cparams.n_threads_batch);
+        }
+        if (ls->af) {
+            // several copies are requested ahead while the CPU computes (the feed queue is 1-deep by default and drops a request that finds it full)
+            std::lock_guard<std::mutex> lk(ls->af->mtx);
+            ls->af_depth = std::max<int>(ls->af_depth, ls->n_slots);
+        }
+    }
+
+    // 1. embed every chunk (writes slab A[c]); no slot work
+    const int64_t t_led_embed0 = ggml_time_us();"""),
+    # the sweep: slot work only for streamed layers
+    ("""    for (int il = 0; il < ls->n_layer; ++il) {
+        if (!should_exec(il)) continue;
+
+        const int64_t t_slot0 = ggml_time_us();
+        const size_t req_bytes = ls->package_bytes(il);
+        const int64_t t_slotreq0 = ggml_time_us();
+        ls->tel_slot_request(il, ls->phase, req_bytes);
+        const double slotreq_span = (double) (ggml_time_us() - t_slotreq0);
+
+        bool copied = false;
+        if (!ls->load_layer(il, copied)) {
+            ls->tel_error(ls->error_msg.c_str());
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
+        double wait_us = 0.0, host_submit_us = 0.0, ready_latency_us = 0.0;
+        if (!ls->wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
+            ls->tel_error(ls->error_msg.c_str());
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
+        // T-GPLR-25: with the async-feed worker on, the NEXT executed layer's
+        // copy is enqueued as soon as this layer's copy has been consumed —
+        // the worker submits it into the just-released next slot while every
+        // chunk of this layer computes. enqueue is a no-op when off.
+        {
+            const int nxt = ls->af_next_layer(il);
+            if (nxt >= 0 && ls->af) {
+                std::lock_guard<std::mutex> lk(ls->af->mtx);
+                if (ls->af->queue.size() < (size_t) ls->af_depth) {
+                    ls->af->queue.push_back(nxt);
+                    ls->af->cv.notify_one();
+                }
+            }
+        }
+        const bool ready_at_consumption = (wait_us < 100.0);
+        ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls->slots[il % ls->n_slots].ev_copy_ready);
+        const int64_t t_slot1 = ggml_time_us();
+""", """    for (int il = 0; il < ls->n_layer; ++il) {
+        if (!should_exec(il)) continue;
+        const bool cpu_il = ls->is_cpu_leg(il);   // G22: no slot, no copy, no consumer event
+
+        const int64_t t_slot0 = ggml_time_us();
+        double slotreq_span = 0.0;
+        double wait_us = 0.0, host_submit_us = 0.0, ready_latency_us = 0.0;
+        bool ready_at_consumption = true;
+        if (!cpu_il) {
+            const size_t req_bytes = ls->package_bytes(il);
+            const int64_t t_slotreq0 = ggml_time_us();
+            ls->tel_slot_request(il, ls->phase, req_bytes);
+            slotreq_span = (double) (ggml_time_us() - t_slotreq0);
+
+            bool copied = false;
+            if (!ls->load_layer(il, copied)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            if (!ls->wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            // T-GPLR-25: with the async-feed worker on, the NEXT executed layer's
+            // copy is enqueued as soon as this layer's copy has been consumed —
+            // the worker submits it into the just-released next slot while every
+            // chunk of this layer computes. enqueue is a no-op when off.
+            {
+                const int nxt = ls->af_next_layer(il);
+                if (nxt >= 0 && ls->af) {
+                    std::lock_guard<std::mutex> lk(ls->af->mtx);
+                    if (ls->af->queue.size() < (size_t) ls->af_depth) {
+                        ls->af->queue.push_back(nxt);
+                        ls->af->cv.notify_one();
+                    }
+                }
+            }
+            ready_at_consumption = (wait_us < 100.0);
+            ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls->slots[il % ls->n_slots].ev_copy_ready);
+        }
+        const int64_t t_slot1 = ggml_time_us();
+"""),
+    ("""        ls->record_consumer_done(il, backend_cuda);
+        ls->add_layer_stats(il, host_submit_us + ready_latency_us, wait_us, layer_compute_us, layer_setup_us,
+                            layer_compute_us + layer_setup_us, ready_at_consumption);
+        const int next = il + ls->n_slots;
+        if (next < ls->n_layer && should_exec(next)) {""", """        if (!cpu_il) {
+            ls->record_consumer_done(il, backend_cuda);
+        }
+        ls->add_layer_stats(il, host_submit_us + ready_latency_us, wait_us, layer_compute_us, layer_setup_us,
+                            layer_compute_us + layer_setup_us, ready_at_consumption);
+        // G22: the successor in this slot is the next STREAMED layer of the same slot (a CPU-leg layer holds no slot)
+        int next = il + ls->n_slots;
+        while (next < ls->n_layer && ls->is_cpu_leg(next)) {
+            next += ls->n_slots;
+        }
+        if (!cpu_il && next < ls->n_layer && should_exec(next)) {"""),
+])
+
+# ---------------------------------------------------------------- runner
+patch(M, [
+    ("""    bool layer_major_explicit = false; // T-GPLR-12: --pp-schedule actually passed
+""", """    bool layer_major_explicit = false; // T-GPLR-12: --pp-schedule actually passed
+    std::string pp_cpu_layers_arg;     // G22: --pp-cpu-layers (comma list, "all" or "none")
+"""),
+    ("""        } else if (arg == "--pp-schedule") {
+            pp_schedule = arg_value(argc, argv, i, "--pp-schedule");
+            layer_major_explicit = (pp_schedule == "layer-major");
+""", """        } else if (arg == "--pp-schedule") {
+            pp_schedule = arg_value(argc, argv, i, "--pp-schedule");
+            layer_major_explicit = (pp_schedule == "layer-major");
+        } else if (arg == "--pp-cpu-layers") {
+            pp_cpu_layers_arg = arg_value(argc, argv, i, "--pp-cpu-layers");
+"""),
+    ("""        "  --pp-schedule S      PP schedule: batch-major (default) or layer-major (opt-in experiment)\\n"
+""", """        "  --pp-schedule S      PP schedule: batch-major (default) or layer-major (opt-in experiment)\\n"
+        "  --pp-cpu-layers L    G22: layer-major prefill only. Comma list of logical layers (or 'all') whose routed-expert FFN\\n"
+        "                       runs on the CPU from the host banks instead of streaming the bank to a slot; the attention,\\n"
+        "                       router and shared expert stay on the GPU. The copy engine loads the banks of the other layers\\n"
+        "                       while the CPU computes. Disables the scheduler's op offload. Refused with --mtp.\\n"
+"""),
+    ("""    cparams.n_threads       = (int32_t) cpu_threads;
+    cparams.n_threads_batch = (int32_t) cpu_threads;
+    // T-Q38HG-06: the target may roll back""", """    cparams.n_threads       = (int32_t) cpu_threads;
+    cparams.n_threads_batch = (int32_t) cpu_threads;
+    // G22: the CPU leg of the layer-major prefill must run on the CPU; the scheduler would otherwise copy the experts of a batch of 32 or more
+    // tokens to the GPU through the same link the prefill is trying to keep for the streamed banks
+    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        cparams.op_offload = false;
+    }
+    // T-Q38HG-06: the target may roll back"""),
+    ("""    ls.exec_layers = boundary_layers;
+""", """    ls.exec_layers = boundary_layers;
+    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        if (pp_schedule != "layer-major" || mtp) {
+            fprintf(stderr, "error: --pp-cpu-layers needs --pp-schedule layer-major and no --mtp\\n");
+            return 2;
+        }
+        std::vector<int> cpu_list;
+        if (pp_cpu_layers_arg == "all") {
+            for (int il = 0; il < ls.n_layer; ++il) {
+                cpu_list.push_back(il);
+            }
+        } else {
+            size_t pos = 0;
+            while (pos < pp_cpu_layers_arg.size()) {
+                size_t end = pp_cpu_layers_arg.find(',', pos);
+                if (end == std::string::npos) {
+                    end = pp_cpu_layers_arg.size();
+                }
+                const std::string tok = pp_cpu_layers_arg.substr(pos, end - pos);
+                if (!tok.empty()) {
+                    cpu_list.push_back(atoi(tok.c_str()));
+                }
+                pos = end + 1;
+            }
+        }
+        if (!ls.set_pp_cpu_layers(cpu_list)) {
+            fprintf(stderr, "error: --pp-cpu-layers: %s\\n", ls.error_msg.c_str());
+            return 2;
+        }
+        fprintf(stderr, "pp-cpu-layers: %zu of %d layers run their routed experts on the CPU in the layer-major prefill (op offload off)\\n", cpu_list.size(), ls.n_layer);
+    }
+"""),
+])
+# the new host test and its registration (the test source sits next to this script as test-layer-streaming-cpu-leg.cpp.txt)
+TESTS = NEST + r"\tests"
+patch(TESTS + r"\CMakeLists.txt", [
+    ("""    llama_build_and_test(test-layer-streaming-tg-view.cpp)
+    target_compile_definitions(test-layer-streaming-tg-view PRIVATE LLAMA_LAYER_STREAMING)
+""", """    llama_build_and_test(test-layer-streaming-tg-view.cpp)
+    target_compile_definitions(test-layer-streaming-tg-view PRIVATE LLAMA_LAYER_STREAMING)
+
+    # G22 stage C: host-only proof of the CPU-leg routing of the layer-major prefill (slot_layer() reads the host layer of a CPU-leg layer in phase 0
+    # only, the async feed skips such layers and offers the next STREAMED layer). No CUDA, no model load.
+    llama_build_and_test(test-layer-streaming-cpu-leg.cpp)
+    target_compile_definitions(test-layer-streaming-cpu-leg PRIVATE LLAMA_LAYER_STREAMING)
+"""),
+])
+if not os.environ.get("PATCH_DRY"):
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "test-layer-streaming-cpu-leg.cpp.txt")
+    if not os.path.exists(src):
+        src = os.path.join(here, "test-layer-streaming-cpu-leg.cpp")
+    shutil.copyfile(src, TESTS + r"\test-layer-streaming-cpu-leg.cpp")
+    print("copied the host test")
+print("G22 stage C edits applied")
