@@ -1,13 +1,18 @@
 """G22 stage C: the interleaved CPU/GPU layer-major prefill (--pp-cpu-layers) against the all-GPU layer-major prefill and the stock prefill, per prompt length.
+Contract: docs/plans/tg-beat-stock-8gb-262k.md, "G23 CONTRACT" (C2-C5).
 
-    python mk_g50.py [EXE_DIR]   writes build/llama-cuda/specs/g50-<N>.json (+ copies next to this file); default EXE_DIR build/llama-cuda/bin/g41
+    python mk_g50.py [EXE_DIR]   writes build/llama-cuda/specs/g50-<N>.json (+ copies next to this file); default EXE_DIR build/llama-cuda/bin/g43
 
-Arms per session (prompt sweep-<N>.txt of g46, 8 generated tokens, 2 counterbalanced reps; only the prefill is of interest):
-    STK    stock llama-completion, the owner's flags
-    LM2    the layer-major prefill of g46 (ubatch 2048, 2 layer slots with the async feed, f32 slab): every bank streamed
+Arms per session (prompt sweep-<N>.txt of g46, 8 generated tokens, 2 counterbalanced reps; only the prefill is of interest; the runner arms run `--pp-repeat 2` and the table tools read the LAST pass):
+    STK    stock llama-completion, the owner's flags (op offload on, ubatch 512)
+    STKNO  the same with --no-op-offload
+    STKU   the same with -ub 2048
+    LM2W   the layer-major prefill of the final configuration (ubatch 2048, 2 layer slots with the async feed, f32 slab): every bank streamed
     HYC    every layer on the CPU leg (--pp-cpu-layers all): the CPU path through the layer-major controller, no bank streamed
     HY2    the model's best static plan for 2 slots (tools/g22-model.py, c = 41 ms, DRAM contention 1.163): the CPU layers named in --pp-cpu-layers
+    HY2P   the same plan with paced bank copies (16 MiB x 2)
     HY4    the same for 4 slots (--layer-slots 4)
+    HY4P   the 4-slot plan with paced bank copies
 The plans are printed next to the arm names so that a session record shows exactly what was run.
 """
 import copy
@@ -23,11 +28,12 @@ import mk_g46  # noqa: E402
 import mk_qa   # noqa: E402
 
 ROOT = mk_g21.root
-EXE = sys.argv[1] if len(sys.argv) > 1 else "build/llama-cuda/bin/g41"
+EXE = sys.argv[1] if len(sys.argv) > 1 else "build/llama-cuda/bin/g43"
 OUT = os.path.join(ROOT, "build", "llama-cuda", "specs")
 PROMPTS = mk_g46.PROMPTS
 MODEL = mk_g21.MODEL
 NS = (32, 64, 128, 256, 512, 1024, 2048)
+PACE = ["--pp-copy-piece-mib", "16", "--pp-copy-window", "2"]
 
 _spec = importlib.util.spec_from_file_location("g22model", os.path.join(ROOT, "tools", "g22-model.py"))
 g22 = importlib.util.module_from_spec(_spec)
@@ -57,7 +63,7 @@ for n in NS:
         a["name"] = name
         fl = list(a["flags"])
         fl[fl.index("--ubatch") + 1] = "2048"
-        fl += ["--layer-slots", str(slots), "--act-slab-dtype", "f32"] + extra
+        fl += ["--layer-slots", str(slots), "--act-slab-dtype", "f32", "--pp-repeat", "2"] + extra
         a["flags"] = fl
         a["env"]["LLAMA_FATTN_GQA8"] = "1"
         a["why"] = why
@@ -66,13 +72,23 @@ for n in NS:
     tokens = {32: 29, 64: 63, 128: 125, 256: 256, 512: 511, 1024: 1023, 2048: 2047}[n]   # the real token counts of the sweep prompts
     l2, t2, g2 = plan_for(tokens, 2)
     l4, t4, g4 = plan_for(tokens, 4)
-    lm2 = lm_arm("LM2", 2, [], "all-GPU layer-major prefill: ubatch 2048, two layer slots with the async feed, f32 slab")
+    lm2 = lm_arm("LM2W", 2, [], "all-GPU layer-major prefill: ubatch 2048, two layer slots with the async feed, f32 slab, warm second pass")
     hyc = lm_arm("HYC", 2, ["--pp-cpu-layers", "all"], "every layer on the CPU leg, no bank streamed")
     hy2 = lm_arm("HY2", 2, ["--pp-cpu-layers", l2], "model plan, 2 slots: %d GPU layers, predicted %.0f ms; CPU layers %s" % (g2, t2, l2))
+    hy2p = lm_arm("HY2P", 2, ["--pp-cpu-layers", l2] + PACE, "the 2-slot plan with paced bank copies (16 MiB x 2)")
     hy4 = lm_arm("HY4", 4, ["--pp-cpu-layers", l4], "model plan, 4 slots: %d GPU layers, predicted %.0f ms; CPU layers %s" % (g4, t4, l4))
-    stk = {"name": "STK", "engine": "stock", "flags": ["-ncmoe", "37", "-t", "16", "--no-mmap"], "env": {}, "why": "stock llama-completion, the owner's document configuration"}
+    hy4p = lm_arm("HY4P", 4, ["--pp-cpu-layers", l4] + PACE, "the 4-slot plan with paced bank copies (16 MiB x 2)")
+    stk = {"name": "STK", "engine": "stock", "flags": ["-ncmoe", "37", "-t", "16", "--no-mmap"], "env": {}, "why": "stock llama-completion, the owner's document configuration (op offload on, ubatch 512)"}
+    stkno = copy.deepcopy(stk)
+    stkno["name"] = "STKNO"
+    stkno["flags"] = stk["flags"] + ["--no-op-offload"]
+    stkno["why"] = "the same with --no-op-offload: the expert FFN of the CPU layers runs on the CPU"
+    stku = copy.deepcopy(stk)
+    stku["name"] = "STKU"
+    stku["flags"] = stk["flags"] + ["-ub", "2048"]
+    stku["why"] = "the owner's flags with ubatch 2048"
     prompt = PROMPTS.replace("\\", "/") + "/sweep-%d.txt" % n
-    spec.update({"qa": False, "tg_tokens": 8, "reps": 2, "interleave": True, "counterbalance": True, "arms": [stk, lm2, hyc, hy2, hy4], "control": "STK"})
+    spec.update({"qa": False, "tg_tokens": 8, "reps": 2, "interleave": True, "counterbalance": True, "arms": [stk, stkno, stku, lm2, hyc, hy2, hy2p, hy4, hy4p], "control": "STK"})
     spec["stock_common"] = ["-m", MODEL, "-f", prompt, "-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-lm", "none", "-fit", "off", "-c", "262000", "-n", "8",
                             "--ignore-eos", "--temp", "0", "-no-cnv", "--no-display-prompt"]
     json.dump(spec, open(os.path.join(OUT, session + ".json"), "w"), indent=1)

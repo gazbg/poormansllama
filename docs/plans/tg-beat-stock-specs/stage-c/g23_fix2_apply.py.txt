@@ -1,0 +1,109 @@
+"""G23 fix 2 (found by the g42 smoke session and the host test): (a) the checker's slot_evict rule and the copy_submit rule share one 'layer served by a slot' helper that skips CPU-leg layers;
+(b) the stock prompt path must not run the layer-major per-pass prebuild on pass 2 (the slab is released); (c) set_pp_cpu_layers emitted its event even without a telemetry sink and called
+ggml_time_us() before ggml_time_init() in the host test (an integer divide by zero). Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(C, [
+    (r'''    std::string lst;
+    for (int il = 0; il < n_layer; ++il) {
+        if (pp_cpu_leg[(size_t) il] != 0) {
+            lst += (lst.empty() ? "" : ",") + std::to_string(il);
+        }
+    }
+    tel_write(tel_out, "{\"event\":\"pp_cpu_layers\",\"run_id\":%llu,\"layers\":\"%s\",\"t_us\":%lld}",
+        (unsigned long long) run_id, lst.c_str(), (long long) ggml_time_us());
+    return true;
+}
+''', r'''    if (tel_out != nullptr) {
+        std::string lst;
+        for (int il = 0; il < n_layer; ++il) {
+            if (pp_cpu_leg[(size_t) il] != 0) {
+                lst += (lst.empty() ? "" : ",") + std::to_string(il);
+            }
+        }
+        tel_write(tel_out, "{\"event\":\"pp_cpu_layers\",\"run_id\":%llu,\"layers\":\"%s\",\"t_us\":%lld}",
+            (unsigned long long) run_id, lst.c_str(), (long long) ggml_time_us());
+    }
+    return true;
+}
+'''),
+])
+
+patch(M, [
+    # --- (a) one helper for the layer a slot serves at generation `gen`
+    (r'''    std::unordered_set<int> cpu_leg_layers;
+
+    // layer-major (SDD section 13): per-layer ascending chunk order and
+''', r'''    std::unordered_set<int> cpu_leg_layers;
+    // the layer that slot `slot` serves at generation `gen` (generations wrap every pass): slot + ((gen-1) mod per_slot) * n_slots; a CPU-leg layer streams no bank, so it is
+    // skipped and the slot cycles through its streamed layers only
+    auto served_layer = [&](long long slot, long long gen) -> long long {
+        if (cpu_leg_layers.empty()) {
+            const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+            return slot + ((gen - 1) % per_slot) * n_slots;
+        }
+        std::vector<long long> served;
+        for (long long l = slot; l < n_layer; l += n_slots) {
+            if (!cpu_leg_layers.count((int) l)) {
+                served.push_back(l);
+            }
+        }
+        return served.empty() ? -1 : served[(size_t) ((gen - 1) % (long long) served.size())];
+    };
+
+    // layer-major (SDD section 13): per-layer ascending chunk order and
+'''),
+    (r'''                long long expect_layer;
+                if (cpu_leg_layers.empty()) {
+                    const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+                    expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+                } else {
+                    // a CPU-leg layer streams no bank: slot s serves its streamed layers s + k * n_slots in order
+                    std::vector<long long> served;
+                    for (long long l = slot; l < n_layer; l += n_slots) {
+                        if (!cpu_leg_layers.count((int) l)) {
+                            served.push_back(l);
+                        }
+                    }
+                    expect_layer = served.empty() ? -1 : served[(size_t) ((gen - 1) % (long long) served.size())];
+                }
+                if (layer != expect_layer) {
+                    err("copy_submit layer violates deterministic slot policy");
+                }
+''', r'''                const long long expect_layer = served_layer(slot, gen);
+                if (layer != expect_layer) {
+                    err("copy_submit layer violates deterministic slot policy");
+                }
+'''),
+    (r'''            const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+            const long long expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+            if (layer != expect_layer) {
+                err("slot_evict layer is not the prior resident layer");
+            }
+        }
+    }
+    fclose(f);
+''', r'''            const long long expect_layer = served_layer(slot, gen);
+            if (layer != expect_layer) {
+                err("slot_evict layer is not the prior resident layer");
+            }
+        }
+    }
+    fclose(f);
+'''),
+    # --- (b) the stock prompt path has no slab and no layer-major graph sets to rebuild
+    (r'''                if (pp_prebuild_per_pass == 1) {
+''', r'''                if (pp_prebuild_per_pass == 1 && !stock_prefill) {
+'''),
+])
+print("G23 fix 2 done")

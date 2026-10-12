@@ -1,0 +1,80 @@
+"""G23 fix 3 (found in the HY4P trace of g50-512, warm pass): (a) layer 0 of a CPU-leg plan took 177 ms instead of 56 because its result copy waited for the S unpaced preload banks that the main
+thread had queued; the preload now goes through the paced feed worker when pacing and a CPU leg are both on; (b) banks 21 and 25 were requested while the 4-deep feed queue was full, the requests
+were dropped and the main thread waited 33 ms for each; with pacing or a CPU leg the queue is no longer bounded (a request is a distinct bank, so it cannot grow beyond the layer count);
+(c) the worker serves the smallest queued layer first (the bank that is needed first), not the oldest request. Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+C = NEST + r"\src\llama-layer-streaming.cpp"
+
+patch(C, [
+    # --- (c) the worker pops the smallest queued layer in the paced / CPU-leg modes
+    (r'''                il = queue.front();
+                queue.pop_front();
+                busy = true;
+''', r'''                if (owner->pp_copy_piece_bytes > 0 || owner->has_cpu_leg()) {
+                    // G22: serve the bank that is needed first
+                    auto it = std::min_element(queue.begin(), queue.end());
+                    il = *it;
+                    queue.erase(it);
+                } else {
+                    il = queue.front();
+                    queue.pop_front();
+                }
+                busy = true;
+'''),
+    # --- (b) no depth bound in the paced / CPU-leg modes
+    (r'''    std::lock_guard<std::mutex> lk(af->mtx);
+    if (af->queue.size() >= (size_t) af_depth) {
+        return;
+    }
+    if ((pp_copy_piece_bytes > 0 || has_cpu_leg()) && std::find(af->queue.begin(), af->queue.end(), il) != af->queue.end()) {
+        return;
+    }
+''', r'''    std::lock_guard<std::mutex> lk(af->mtx);
+    const bool exact = pp_copy_piece_bytes > 0 || has_cpu_leg();
+    if (!exact && af->queue.size() >= (size_t) af_depth) {
+        return;
+    }
+    if (exact && std::find(af->queue.begin(), af->queue.end(), il) != af->queue.end()) {
+        return;   // a layer that is already queued is not queued twice; the queue is not bounded in these modes (a request is a distinct bank)
+    }
+'''),
+    # --- (a) the preload through the paced worker
+    (r'''            slot_taken[(size_t) (il % ls->n_slots)] = 1;
+            bool copied = false;
+            if (!ls->load_layer(il, copied)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            last_pre = il;
+            preloaded++;
+''', r'''            slot_taken[(size_t) (il % ls->n_slots)] = 1;
+            if (ls->pp_copy_piece_bytes > 0 && ls->has_cpu_leg() && ls->af) {
+                // G22: the preload banks go through the PACED feed worker: S unpaced banks queued by the main thread block the small copies of the first CPU-leg layers
+                // (build g43: layer 0 took 177 ms instead of 56)
+                std::lock_guard<std::mutex> lk(ls->af->mtx);
+                ls->af->queue.push_back(il);
+                ls->af->cv.notify_one();
+                last_pre = il;
+                preloaded++;
+                continue;
+            }
+            bool copied = false;
+            if (!ls->load_layer(il, copied)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            last_pre = il;
+            preloaded++;
+'''),
+])
+print("G23 fix 3 done")

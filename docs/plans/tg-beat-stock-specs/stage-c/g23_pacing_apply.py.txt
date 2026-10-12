@@ -1,0 +1,361 @@
+"""G22 stage B: paced bank copies (--pp-copy-piece-mib / --pp-copy-window). Exact-match edits; every `old` must occur exactly once.
+Run AFTER the stage C edits (it patches the sweep text they produced). Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+# ---------------------------------------------------------------- header
+patch(H, [
+    (r'''    bool af_submitted = false;
+};
+''', r'''    bool af_submitted = false;
+
+    // G22 stage B: the logical layer the async-feed worker is issuing into this slot with af->mtx RELEASED (paced copies block the worker for the
+    // length of the DMA); -1 = none. load_layer / wait_slot_ready of this slot wait on af->cv_stage until it is -1 again.
+    int32_t stage_il = -1;
+};
+'''),
+    (r'''    bool set_pp_copy_overlap(bool on);
+    bool pp_copy_overlap = false;
+''', r'''    bool set_pp_copy_overlap(bool on);
+    bool pp_copy_overlap = false;
+
+    // G22 stage B: paced bank copies. A bank is one 144 MiB command per member, and a small host-to-device copy that the compute stream issues while
+    // a bank is in flight waits for ALL of it (31.5 ms measured: tools/ce-hol-bench, nsys g54-nsys-pp). With piece_bytes > 0 the async-feed worker
+    // issues each member in pieces and keeps at most `window` pieces in flight (before piece i it waits for the event of piece i-window), so a small
+    // copy waits for about `window` pieces instead. Costs ~30 us of host round trip per piece (ce-hol-bench: 2.5% of the bank time at 16 MiB x 2).
+    // piece_bytes == 0 = off = the historical path, byte for byte. Call after init(); only the async-feed worker paces (the main thread's preload
+    // and on-demand staging stay unpaced). The worker releases af->mtx while it issues a paced bank (slot.stage_il guards the slot).
+    bool set_pp_copy_pacing(size_t piece_bytes, int window);
+    size_t pp_copy_piece_bytes = 0;
+    int    pp_copy_window = 2;
+'''),
+    (r'''                       int * submit_batch_out = nullptr);
+''', r'''                       int * submit_batch_out = nullptr,
+                       bool paced = false);
+    // G22 stage B state: the pacing event ring (owned by the worker thread, the only issuer) and the last bank's counters for telemetry
+    std::vector<void *> pace_ev;
+    uint32_t paced_pieces_last  = 0;
+    double   paced_wait_us_last = 0.0;
+    // G22: queue a layer for the feed worker (the historical rule; with paced copies or a CPU leg a layer that is already queued is not queued twice)
+    void af_push(int il);
+'''),
+])
+
+# ---------------------------------------------------------------- source
+patch(C, [
+    (r'''    std::condition_variable cv;
+    std::deque<int>         queue;      // logical layers to stage
+''', r'''    std::condition_variable cv;
+    std::condition_variable cv_stage;   // G22 stage B: a paced stage finished issuing (slot.stage_il cleared)
+    std::deque<int>         queue;      // logical layers to stage
+'''),
+    # --- stage_members: signature
+    (r'''                                          char * staging, size_t * staged_out,
+                                          int * submit_batch_out) {
+''', r'''                                          char * staging, size_t * staged_out,
+                                          int * submit_batch_out, bool paced) {
+'''),
+    # --- stage_members: the submission lambda
+    (r'''    auto submit = [&](ggml_tensor * dst_t, const void * src_p, size_t bytes) -> bool {
+        if (pp_copy_overlap) {
+            if (backend_compute == nullptr) {
+                error_msg = "copy-overlap is on but the CUDA compute backend is unresolved; "
+                            "refusing to fall back to the copy-stream staging path";
+                return false;
+            }
+            ggml_backend_cuda_memcpy_1d_aux(backend_compute, (char *) dst_t->data, src_p, bytes);
+            return true;
+        }
+        ggml_backend_tensor_set_async(backend, dst_t, src_p, 0, bytes);
+        return true;
+    };
+''', r'''    // G22 stage B: one H2D of `len` bytes at byte offset `off` of the member (off == 0 and len == bytes is the historical single command)
+    auto issue_range = [&](ggml_tensor * dst_t, const void * src_p, size_t off, size_t len) -> bool {
+        if (pp_copy_overlap) {
+            if (backend_compute == nullptr) {
+                error_msg = "copy-overlap is on but the CUDA compute backend is unresolved; "
+                            "refusing to fall back to the copy-stream staging path";
+                return false;
+            }
+            ggml_backend_cuda_memcpy_1d_aux(backend_compute, (char *) dst_t->data + off, (const char *) src_p + off, len);
+            return true;
+        }
+        ggml_backend_tensor_set_async(backend, dst_t, (const char *) src_p + off, off, len);
+        return true;
+    };
+    uint32_t pace_issued  = 0;      // pieces issued for this bank (the ring index counts across the members)
+    double   pace_wait_us = 0.0;    // host time spent waiting for the event of piece i - window
+    const bool pace_on = paced && pp_copy_piece_bytes > 0 && !pace_ev.empty();
+    auto submit = [&](ggml_tensor * dst_t, const void * src_p, size_t bytes) -> bool {
+        if (!pace_on || bytes <= pp_copy_piece_bytes) {
+            return issue_range(dst_t, src_p, 0, bytes);
+        }
+        const uint32_t win = (uint32_t) pace_ev.size();
+        for (size_t off = 0; off < bytes; off += pp_copy_piece_bytes) {
+            const size_t len = std::min(pp_copy_piece_bytes, bytes - off);
+            if (pace_issued >= win) {
+                // at most `win` pieces in flight: wait for the piece issued `win` pieces ago
+                const int64_t tw0 = ggml_time_us();
+                ggml_backend_event_synchronize((ggml_backend_event_t) pace_ev[pace_issued % win]);
+                pace_wait_us += (double) (ggml_time_us() - tw0);
+            }
+            if (!issue_range(dst_t, src_p, off, len)) {
+                return false;
+            }
+            ls_stage_record(pace_ev[pace_issued % win]);
+            pace_issued++;
+        }
+        return true;
+    };
+'''),
+    # --- stage_members: counters out
+    (r'''    recon_end_bank();
+    *staged_out = staging_off;
+    if (submit_batch_out != nullptr) {
+''', r'''    recon_end_bank();
+    *staged_out = staging_off;
+    if (pace_on) {
+        paced_pieces_last  = pace_issued;
+        paced_wait_us_last = pace_wait_us;
+    }
+    if (submit_batch_out != nullptr) {
+'''),
+    # --- af_submit_copy: release the mutex around a paced bank
+    (r'''    const bool staged_ok = stage_members(backend_copy, pkg, slot.layers.at(il), il, gen, slot,
+                                         pool_base, pool_bytes, pool_valid, staging, &staging_off,
+                                         &sb_path_af);
+    pp_pool_release(il, pool_base, staging_off, staged_ok);
+''', r'''    // G22 stage B: a paced bank blocks this thread for the length of the DMA (it waits for the event of piece i-window), so the shared mutex is
+    // released around it. The slot is marked as being staged: load_layer / wait_slot_ready of this slot wait on cv_stage (a second stager, the main
+    // thread's on-demand path, would write the same bank). Everything else the paced section touches is private to this thread.
+    const bool paced = pp_copy_piece_bytes > 0 && !pace_ev.empty();
+    if (paced) {
+        slot.stage_il = il;
+        lk.unlock();
+    }
+    const bool staged_ok = stage_members(backend_copy, pkg, slot.layers.at(il), il, gen, slot,
+                                         pool_base, pool_bytes, pool_valid, staging, &staging_off,
+                                         &sb_path_af, paced);
+    if (paced) {
+        lk.lock();
+        slot.stage_il = -1;
+        af->cv_stage.notify_all();
+    }
+    pp_pool_release(il, pool_base, staging_off, staged_ok);
+'''),
+    # --- load_layer guard
+    (r'''    } af_guard{af_lk, this};
+
+    llama_layer_streaming_slot & slot = slots[il % n_slots];
+''', r'''    } af_guard{af_lk, this};
+
+    llama_layer_streaming_slot & slot = slots[il % n_slots];
+    // G22 stage B: the worker may be issuing a paced bank into this very slot with the mutex released; staging it a second time would write the bank twice
+    while (af && slot.stage_il != -1) {
+        af->cv_stage.wait(af_lk);
+    }
+'''),
+    # --- wait_slot_ready guard
+    (r'''    llama_layer_streaming_slot & slot = slots[il % n_slots];
+
+    if (slot.logical_layer != il) {
+        error_msg = "wait_slot_ready: slot " + std::to_string(il % n_slots) +
+''', r'''    llama_layer_streaming_slot & slot = slots[il % n_slots];
+    // G22 stage B: bookkeeping of a paced bank is published when its last piece is issued
+    while (af && slot.stage_il != -1) {
+        af->cv_stage.wait(af_lk);
+    }
+
+    if (slot.logical_layer != il) {
+        error_msg = "wait_slot_ready: slot " + std::to_string(il % n_slots) +
+'''),
+    # --- the setter, after set_pp_copy_overlap
+    (r'''    pp_copy_overlap = on;
+    return true;
+}
+''', r'''    pp_copy_overlap = on;
+    return true;
+}
+
+// G22 stage B: paced bank copies (see the header). The pacing events live on the copy device, so this needs init(); the async-feed worker is the only
+// issuer, so the ring needs no lock. A queue depth of 2 lets one request wait while the worker is busy with a whole bank.
+bool llama_layer_streaming::set_pp_copy_pacing(size_t piece_bytes, int window) {
+    if (piece_bytes == 0) {
+        pp_copy_piece_bytes = 0;
+        return true;
+    }
+    if (piece_bytes < ((size_t) 1 << 20) || window < 1 || window > 16) {
+        error_msg = "set_pp_copy_pacing: the piece must be at least 1 MiB and the window 1..16";
+        return false;
+    }
+    if (backend_copy == nullptr) {
+        error_msg = "set_pp_copy_pacing: the copy backend is not initialised (call after init)";
+        return false;
+    }
+    if (!pace_ev.empty()) {
+        error_msg = "set_pp_copy_pacing: already configured";
+        return false;
+    }
+    ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
+    for (int i = 0; i < window; ++i) {
+        ggml_backend_event_t ev = ggml_backend_event_new(dev_copy);
+        if (ev == nullptr) {
+            for (void * e : pace_ev) {
+                ggml_backend_event_free((ggml_backend_event_t) e);
+            }
+            pace_ev.clear();
+            error_msg = "set_pp_copy_pacing: event creation failed";
+            return false;
+        }
+        pace_ev.push_back((void *) ev);
+    }
+    pp_copy_piece_bytes = piece_bytes;
+    pp_copy_window      = window;
+    if (af != nullptr) {
+        std::lock_guard<std::mutex> lk(af->mtx);
+        af_depth = std::max(af_depth, 2);
+    }
+    tel_write(tel_out, "{\"event\":\"pp_copy_pacing\",\"run_id\":%llu,\"piece_bytes\":%zu,\"window\":%d,\"t_us\":%lld}",
+        (unsigned long long) run_id, piece_bytes, window, (long long) ggml_time_us());
+    return true;
+}
+
+void llama_layer_streaming::af_push(int il) {
+    if (!af) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(af->mtx);
+    if (af->queue.size() >= (size_t) af_depth) {
+        return;
+    }
+    if ((pp_copy_piece_bytes > 0 || has_cpu_leg()) && std::find(af->queue.begin(), af->queue.end(), il) != af->queue.end()) {
+        return;
+    }
+    af->queue.push_back(il);
+    af->cv.notify_one();
+}
+'''),
+    # --- destructor: free the pacing events before the copy backend goes
+    (r'''    if (ctx_handoff != nullptr) {
+        ggml_free(ctx_handoff);
+        ctx_handoff = nullptr;
+    }
+    if (backend_copy != nullptr) {
+        ggml_backend_free(backend_copy);
+''', r'''    for (void * e : pace_ev) {
+        ggml_backend_event_free((ggml_backend_event_t) e);
+    }
+    pace_ev.clear();
+    if (ctx_handoff != nullptr) {
+        ggml_free(ctx_handoff);
+        ctx_handoff = nullptr;
+    }
+    if (backend_copy != nullptr) {
+        ggml_backend_free(backend_copy);
+'''),
+    # --- telemetry: pieces and wait of a paced bank
+    (r'''void llama_layer_streaming::tel_async_feed_submit(int il, int slot, uint32_t generation) {
+''', r'''void llama_layer_streaming::tel_async_feed_submit(int il, int slot, uint32_t generation) {
+    if (pp_copy_piece_bytes > 0) {
+        tel_write(tel_out, "{\"event\":\"async_feed_submit\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,\"generation\":%u,\"phase\":%d,\"pieces\":%u,\"pace_wait_us\":%.1f,\"t_us\":%lld}",
+            (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation, phase, paced_pieces_last, paced_wait_us_last, (long long) ggml_time_us());
+        return;
+    }
+'''),
+    # --- the sweep: the two request sites use af_push
+    (r'''            {
+                const int nxt = ls->af_next_layer(il);
+                if (nxt >= 0 && ls->af) {
+                    std::lock_guard<std::mutex> lk(ls->af->mtx);
+                    if (ls->af->queue.size() < (size_t) ls->af_depth) {
+                        ls->af->queue.push_back(nxt);
+                        ls->af->cv.notify_one();
+                    }
+                }
+            }
+            ready_at_consumption = (wait_us < 100.0);
+''', r'''            {
+                const int nxt = ls->af_next_layer(il);
+                if (nxt >= 0 && ls->af) {
+                    ls->af_push(nxt);
+                }
+            }
+            ready_at_consumption = (wait_us < 100.0);
+'''),
+    (r'''                std::lock_guard<std::mutex> afd_lk(ls->af->mtx);
+                if (ls->af->queue.size() < (size_t) ls->af_depth) {
+                    ls->af->queue.push_back(next);
+                    ls->af->cv.notify_one();
+                }
+''', r'''                ls->af_push(next);
+'''),
+])
+
+# ---------------------------------------------------------------- runner
+patch(M, [
+    (r'''    bool pp_copy_overlap = false;    // T-GPLR-35: staging DMAs on the compute context's aux stream (default 0 = off)
+''', r'''    bool pp_copy_overlap = false;    // T-GPLR-35: staging DMAs on the compute context's aux stream (default 0 = off)
+    int  pp_copy_piece_mib = 0;      // G22 stage B: paced bank copies, piece size in MiB (0 = off)
+    int  pp_copy_window = 2;         // G22 stage B: pieces in flight
+'''),
+    (r'''        } else if (arg == "--pp-mctx-recon") {
+''', r'''        } else if (arg == "--pp-copy-piece-mib") {
+            // G22 stage B: paced bank copies (pieces of N MiB, at most --pp-copy-window in flight); 0 = off (default)
+            pp_copy_piece_mib = atoi(arg_value(argc, argv, i, "--pp-copy-piece-mib").c_str());
+            if (pp_copy_piece_mib < 0 || pp_copy_piece_mib > 144) {
+                fprintf(stderr, "error: --pp-copy-piece-mib must be 0 (off) or 1..144\n");
+                return 2;
+            }
+        } else if (arg == "--pp-copy-window") {
+            pp_copy_window = atoi(arg_value(argc, argv, i, "--pp-copy-window").c_str());
+            if (pp_copy_window < 1 || pp_copy_window > 16) {
+                fprintf(stderr, "error: --pp-copy-window must be 1..16\n");
+                return 2;
+            }
+        } else if (arg == "--pp-mctx-recon") {
+'''),
+    (r'''        "                         loudly instead of falling back to the serialized copy-stream path)\n"
+''', r'''        "                         loudly instead of falling back to the serialized copy-stream path)\n"
+        "  --pp-copy-piece-mib N G22 stage B: paced bank copies. The feed worker issues each 144 MiB member in pieces of\n"
+        "                         N MiB and keeps at most --pp-copy-window pieces in flight, so a small host-to-device copy\n"
+        "                         of the compute stream (an attention layer's inputs, the result of a CPU-leg layer) waits\n"
+        "                         for a few pieces instead of the whole bank. Costs ~2.5%% of the copy rate at 16 MiB x 2.\n"
+        "                         Default 0 = off; needs --pp-async-feed 1 and --pp-schedule layer-major\n"
+        "  --pp-copy-window N    G22 stage B: pieces in flight with --pp-copy-piece-mib (default 2)\n"
+'''),
+    (r'''    if (pp_async_feed > 0 && !ls.set_pp_async_feed(pp_async_feed)) {
+        fprintf(stderr, "error: async-feed configure failed: %s\n", ls.error_msg.c_str());
+        ls.tel_run_refused("async_feed_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
+        return 1;
+    }
+''', r'''    if (pp_async_feed > 0 && !ls.set_pp_async_feed(pp_async_feed)) {
+        fprintf(stderr, "error: async-feed configure failed: %s\n", ls.error_msg.c_str());
+        ls.tel_run_refused("async_feed_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
+        return 1;
+    }
+    // G22 stage B: paced bank copies (only the feed worker paces, so the worker must exist)
+    if (pp_copy_piece_mib > 0) {
+        if (pp_async_feed <= 0 || pp_schedule != "layer-major") {
+            fprintf(stderr, "error: --pp-copy-piece-mib needs --pp-async-feed 1 and --pp-schedule layer-major\n");
+            ls.tel_run_refused("copy_pacing_configure", "needs --pp-async-feed 1 and --pp-schedule layer-major", 1, 0, 0, "none");
+            return 2;
+        }
+        if (!ls.set_pp_copy_pacing(((size_t) pp_copy_piece_mib) << 20, pp_copy_window)) {
+            fprintf(stderr, "error: copy-pacing configure failed: %s\n", ls.error_msg.c_str());
+            ls.tel_run_refused("copy_pacing_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
+    }
+'''),
+])
+print("G22 stage B edits done")

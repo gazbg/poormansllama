@@ -1,0 +1,110 @@
+"""G22 stage A: the stock graph path for short prompts (--pp-stock-below / --pp-stock-offload). Exact-match edits of the runner only.
+Run AFTER the stage C and stage B edits. Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    # --- variables
+    (r'''    std::string pp_cpu_layers_arg;     // G22: --pp-cpu-layers (comma list, "all" or "none")
+''', r'''    std::string pp_cpu_layers_arg;     // G22: --pp-cpu-layers (comma list, "all" or "none")
+    int  pp_stock_below = 0;           // G22 stage A: a prompt shorter than N tokens runs through the stock graph path instead of the layer-major prefill (0 = off)
+    int  pp_stock_offload = 1;         // G22 stage A: scheduler op offload on that path (1 = stock default: the experts a batch uses are copied to the GPU; 0 = they stay on the CPU)
+'''),
+    # --- parsing
+    (r'''        } else if (arg == "--pp-cpu-layers") {
+            pp_cpu_layers_arg = arg_value(argc, argv, i, "--pp-cpu-layers");
+''', r'''        } else if (arg == "--pp-cpu-layers") {
+            pp_cpu_layers_arg = arg_value(argc, argv, i, "--pp-cpu-layers");
+        } else if (arg == "--pp-stock-below") {
+            pp_stock_below = atoi(arg_value(argc, argv, i, "--pp-stock-below").c_str());
+            if (pp_stock_below < 0) {
+                fprintf(stderr, "error: --pp-stock-below must be >= 0\n");
+                return 2;
+            }
+        } else if (arg == "--pp-stock-offload") {
+            pp_stock_offload = atoi(arg_value(argc, argv, i, "--pp-stock-offload").c_str());
+            if (pp_stock_offload != 0 && pp_stock_offload != 1) {
+                fprintf(stderr, "error: --pp-stock-offload must be 0 or 1\n");
+                return 2;
+            }
+'''),
+    # --- help
+    (r'''        "                       while the CPU computes. Disables the scheduler's op offload. Refused with --mtp.\n"
+''', r'''        "                       while the CPU computes. Disables the scheduler's op offload. Refused with --mtp.\n"
+        "  --pp-stock-below N   G22 stage A: a prompt of fewer than N tokens is NOT prefilled layer by layer; it is decoded through the\n"
+        "                       stock graph path (the path the hybrid decode uses: experts in host memory, attention on the GPU), as\n"
+        "                       llama-completion does. The layer-major prefill streams all 40 expert banks (a floor of ~1.3 s); the stock\n"
+        "                       path copies only the experts a ubatch uses, or computes them on the CPU. Needs --tg-hybrid; refused with\n"
+        "                       --mtp. Default 0 = off\n"
+        "  --pp-stock-offload N G22 stage A: scheduler op offload on the stock prompt path (default 1 = stock behaviour: a batch of 32 or\n"
+        "                       more tokens copies the experts it uses to the GPU; 0 = the experts stay on the CPU, which is faster below ~200 tokens)\n"
+'''),
+    # --- validation
+    (r'''    if (pp_async_feed < 0 || pp_async_feed > 1) {
+        fprintf(stderr, "error: --pp-async-feed must be 0 (off) or 1 (one-layer-ahead worker feed; requires --layer-slots >= 2)\n");
+        return 2;
+    }
+''', r'''    if (pp_async_feed < 0 || pp_async_feed > 1) {
+        fprintf(stderr, "error: --pp-async-feed must be 0 (off) or 1 (one-layer-ahead worker feed; requires --layer-slots >= 2)\n");
+        return 2;
+    }
+    if (pp_stock_below > 0 && (!tg_hybrid || mtp)) {
+        fprintf(stderr, "error: --pp-stock-below needs --tg-hybrid (the stock graph path is the hybrid decode path) and cannot be combined with --mtp\n");
+        return 2;
+    }
+'''),
+    # --- op offload (extends the stage C edit)
+    (r'''    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        cparams.op_offload = false;
+    }
+''', r'''    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        cparams.op_offload = false;
+    }
+    // G22 stage A: the stock prompt path keeps the experts on the CPU when asked (the scheduler decides per context, so this is fixed by the requested prompt length)
+    if (pp_stock_below > 0 && pp_tokens < pp_stock_below && pp_stock_offload == 0) {
+        cparams.op_offload = false;
+    }
+'''),
+    # --- the pass loop: the stock path decision
+    (r'''            for (int pp_pass_i = 0; pp_pass_i < pp_repeat && exit_status == 0; ++pp_pass_i) {
+''', r'''            // G22 stage A: a short prompt goes through the stock graph path. The prefill slots and the activation slab are released and the decode
+            // runs on the stock graph path from here on (exactly what the TG phase does after the layer-major prefill), so the prompt is decoded by
+            // llama_decode in ubatches of --ubatch tokens: experts a ubatch uses are copied to the GPU (op offload) or computed on the CPU (--pp-stock-offload 0).
+            const bool stock_prefill = pp_stock_below > 0 && pp_tokens < pp_stock_below && tg_hybrid && !mtp;
+            bool stock_prefill_armed = false;
+            if (stock_prefill) {
+                fprintf(stderr, "pp-stock: %d prompt tokens < %d, prefill through the stock graph path (op offload %s, ubatch %d)\n",
+                        pp_tokens, pp_stock_below, pp_stock_offload ? "on" : "off", ubatch);
+            }
+            for (int pp_pass_i = 0; pp_pass_i < pp_repeat && exit_status == 0; ++pp_pass_i) {
+'''),
+    # --- the branch
+    (r'''            } else if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+                // layer-major PP (SDD section 13, T-Q38LM-02): drive the full
+''', r'''            } else if (stock_prefill) {
+                if (!stock_prefill_armed) {
+                    if (!ls.begin_tg_stock()) {
+                        fprintf(stderr, "error: pp-stock: release failed: %s\n", ls.error_msg.c_str());
+                        ls.failed = true;
+                    }
+                    ls.phase = 1;
+                    if (kv_graph_pad > 0 && ctx != nullptr && !ctx->set_attn_view_pad((uint32_t) kv_graph_pad)) {
+                        fprintf(stderr, "error: pp-stock: --kv-graph-pad %lld is not supported by this memory type\n", kv_graph_pad);
+                        ls.failed = true;
+                    }
+                    stock_prefill_armed = true;
+                }
+                ret = ls.failed ? 1 : llama_decode(ctx, batch);
+            } else if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+                // layer-major PP (SDD section 13, T-Q38LM-02): drive the full
+'''),
+])
+print("G22 stage A edits done")

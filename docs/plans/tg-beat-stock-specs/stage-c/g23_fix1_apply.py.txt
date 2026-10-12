@@ -1,0 +1,203 @@
+"""G23 fix 1 (found by the first smoke session g55-smoke-63): (a) the stock prompt path asked for 63 outputs while the context reserves 1; (b) the telemetry checker did not know CPU-leg layers
+(no copy events); (c) a stale duplicate request re-staged a CONSUMED layer, late enough with paced copies to run into the slot teardown after the prefill; (d) the feed worker is waited for
+before the slots are torn down. Exact-match edits; every `old` must occur exactly once. Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(H, [
+    (r'''    void af_push(int il);
+''', r'''    void af_push(int il);
+    // G22: wait until the feed worker has nothing queued and nothing in flight (before the slots are torn down or reused for another purpose)
+    void af_wait_idle();
+'''),
+])
+
+patch(C, [
+    # --- worker: busy flag, idle notification
+    (r'''                il = queue.front();
+                queue.pop_front();
+            }
+            const int64_t t0 = ggml_time_us();
+''', r'''                il = queue.front();
+                queue.pop_front();
+                busy = true;
+            }
+            const int64_t t0 = ggml_time_us();
+'''),
+    (r'''                } else {
+                    n_err++;
+                }
+            }
+        }
+    }
+};
+''', r'''                } else {
+                    n_err++;
+                }
+                busy = false;
+            }
+            cv_stage.notify_all();
+        }
+    }
+};
+'''),
+    (r'''    std::vector<uint8_t>    free_slot;
+    bool                    stop = false;
+    llama_layer_streaming * owner = nullptr;
+''', r'''    std::vector<uint8_t>    free_slot;
+    bool                    stop = false;
+    bool                    busy = false;   // G22: a popped request is being processed
+    llama_layer_streaming * owner = nullptr;
+'''),
+    # --- af_submit_copy: a layer the slot already holds needs no second copy
+    (r'''    llama_layer_streaming_slot & slot = slots[s];
+
+    // the slot must have been released by the main thread (consumer done).
+''', r'''    llama_layer_streaming_slot & slot = slots[s];
+
+    // G22: a layer the slot already holds (staged earlier in this pass, consumed or not) needs no second copy. A stale duplicate request used to be caught only
+    // while the slot was still claimed (free_slot == 0); once the layer was consumed it was staged over itself. With paced copies (a worker busy for a whole bank)
+    // that happened late enough to run into the slot teardown after the prefill (CUDA "invalid argument"). Gated so that the historical path is untouched.
+    if ((pp_copy_piece_bytes > 0 || has_cpu_leg()) && slot.logical_layer == il && slot.generation > 0) {
+        return true;
+    }
+
+    // the slot must have been released by the main thread (consumer done).
+'''),
+    # --- af_wait_idle, next to af_push
+    (r'''void llama_layer_streaming::af_push(int il) {
+''', r'''void llama_layer_streaming::af_wait_idle() {
+    if (!af) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(af->mtx);
+    af->cv_stage.wait(lk, [this] { return af->queue.empty() && !af->busy; });
+}
+
+void llama_layer_streaming::af_push(int il) {
+'''),
+    # --- the end of the layer-major pass: the worker is idle before the copy stream is drained
+    (r'''    // drain the copy stream so no copies are pending when the pass ends
+    ls->ls_stage_drain();
+''', r'''    // G22: with paced copies or a CPU leg a request can still be queued or in flight here; the worker must be idle before the slots can be torn down
+    if (ls->pp_copy_piece_bytes > 0 || ls->has_cpu_leg()) {
+        ls->af_wait_idle();
+    }
+    // drain the copy stream so no copies are pending when the pass ends
+    ls->ls_stage_drain();
+'''),
+    # --- begin_tg_stock: never release a slot a worker request may still write
+    (r'''bool llama_layer_streaming::begin_tg_stock() {
+    size_t slot_bytes = 0;
+''', r'''bool llama_layer_streaming::begin_tg_stock() {
+    af_wait_idle();   // G22: a worker request still queued or in flight would write into a slot buffer that is released below
+    size_t slot_bytes = 0;
+'''),
+    # --- the CPU-leg list in the trace (the telemetry checker needs it)
+    (r'''        pp_cpu_leg[(size_t) il] = 1;
+    }
+    return true;
+}
+''', r'''        pp_cpu_leg[(size_t) il] = 1;
+    }
+    std::string lst;
+    for (int il = 0; il < n_layer; ++il) {
+        if (pp_cpu_leg[(size_t) il] != 0) {
+            lst += (lst.empty() ? "" : ",") + std::to_string(il);
+        }
+    }
+    tel_write(tel_out, "{\"event\":\"pp_cpu_layers\",\"run_id\":%llu,\"layers\":\"%s\",\"t_us\":%lld}",
+        (unsigned long long) run_id, lst.c_str(), (long long) ggml_time_us());
+    return true;
+}
+'''),
+])
+
+patch(M, [
+    # --- (a) the stock prompt path: one output (the last prompt position)
+    (r'''                ret = ls.failed ? 1 : llama_decode(ctx, batch);
+''', r'''                // the context reserves a single output row (--tg-first-pp-token / --pp-no-logits): only the last prompt position asks for logits
+                for (int i = 0; i < pp_tokens; ++i) {
+                    batch.logits[i] = (i == pp_tokens - 1);
+                }
+                ret = ls.failed ? 1 : llama_decode(ctx, batch);
+'''),
+    # --- (b) the checker: state
+    (r'''        long long last_copy_layer = -1;
+    };
+    std::unordered_map<int, slot_state> slots;
+
+    // layer-major (SDD section 13): per-layer ascending chunk order and
+''', r'''        long long last_copy_layer = -1;
+    };
+    std::unordered_map<int, slot_state> slots;
+    // G22: layers whose routed experts run on the CPU in the layer-major prefill (event pp_cpu_layers): they stream no bank, so they have no copy events
+    std::unordered_set<int> cpu_leg_layers;
+
+    // layer-major (SDD section 13): per-layer ascending chunk order and
+'''),
+    # --- (b) the checker: the event
+    (r'''        } else if (event == "slot_request") {
+            bool f_layer = false, f_slot = false;
+            const long long layer = json::integer(line, "layer", &f_layer);
+''', r'''        } else if (event == "pp_cpu_layers") {
+            const std::string lst = json::value(line, "layers");
+            size_t pos = 0;
+            while (pos < lst.size()) {
+                size_t end = lst.find(',', pos);
+                if (end == std::string::npos) {
+                    end = lst.size();
+                }
+                if (end > pos) {
+                    cpu_leg_layers.insert(atoi(lst.substr(pos, end - pos).c_str()));
+                }
+                pos = end + 1;
+            }
+        } else if (event == "slot_request") {
+            bool f_layer = false, f_slot = false;
+            const long long layer = json::integer(line, "layer", &f_layer);
+'''),
+    # --- (b) the checker: the deterministic slot policy skips CPU-leg layers
+    (r'''                const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+                const long long expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+                if (layer != expect_layer) {
+                    err("copy_submit layer violates deterministic slot policy");
+                }
+''', r'''                long long expect_layer;
+                if (cpu_leg_layers.empty()) {
+                    const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+                    expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+                } else {
+                    // a CPU-leg layer streams no bank: slot s serves its streamed layers s + k * n_slots in order
+                    std::vector<long long> served;
+                    for (long long l = slot; l < n_layer; l += n_slots) {
+                        if (!cpu_leg_layers.count((int) l)) {
+                            served.push_back(l);
+                        }
+                    }
+                    expect_layer = served.empty() ? -1 : served[(size_t) ((gen - 1) % (long long) served.size())];
+                }
+                if (layer != expect_layer) {
+                    err("copy_submit layer violates deterministic slot policy");
+                }
+'''),
+    # --- (b) the checker: no copy-completed rule for a CPU-leg layer
+    (r'''                if (!rowset_mode && st.last_copy_layer != layer) {
+                    err("layer_compute before matching copy_complete");
+                }
+''', r'''                if (!rowset_mode && st.last_copy_layer != layer && !cpu_leg_layers.count((int) layer)) {
+                    err("layer_compute before matching copy_complete");
+                }
+'''),
+])
+print("G23 fix 1 done")

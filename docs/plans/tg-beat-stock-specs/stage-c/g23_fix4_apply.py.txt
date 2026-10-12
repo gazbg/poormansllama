@@ -1,0 +1,81 @@
+"""G23 fix 4 (hypothesis H5 of criterion C5; g64 falsified H1, g65 tests H2): the stock tools attach an EXPLICIT persistent CPU threadpool (common_threadpools::init: workers that poll, power throttling
+switched off for them by ggml_thread_apply_priority, one pool shared by generation and batch). The runner attaches none, so its CPU matmuls run on OpenMP regions whose threads Windows 11 places and throttles
+freely: the CPU path of the runner (SP0, HYC) is 30-60% slower than the stock binary's from ~500 tokens and varies by up to 1.6x between reps. --pp-threadpool 1 attaches such a pool for the PREFILL and
+detaches and frees it before the generation (a polling pool would compete with the lean host team of the decode). Default 0 = off. Apply ONLY when no attested session is running or queued."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''#include "ggml-backend.h"
+#include "ggml-cuda.h"
+''', r'''#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-cuda.h"
+'''),
+    (r'''    int  pp_stock_offload = 1;         // G22 stage A: scheduler op offload on that path (1 = stock default: the experts a batch uses are copied to the GPU; 0 = they stay on the CPU)
+''', r'''    int  pp_stock_offload = 1;         // G22 stage A: scheduler op offload on that path (1 = stock default: the experts a batch uses are copied to the GPU; 0 = they stay on the CPU)
+    int  pp_threadpool = 0;            // G22: an explicit persistent CPU threadpool for the prefill (as the stock tools attach), detached before the generation (0 = off)
+'''),
+    (r'''        } else if (arg == "--pp-stock-offload") {
+''', r'''        } else if (arg == "--pp-threadpool") {
+            pp_threadpool = atoi(arg_value(argc, argv, i, "--pp-threadpool").c_str());
+            if (pp_threadpool != 0 && pp_threadpool != 1) {
+                fprintf(stderr, "error: --pp-threadpool must be 0 or 1\n");
+                return 2;
+            }
+        } else if (arg == "--pp-stock-offload") {
+'''),
+    (r'''        "  --pp-stock-offload N G22 stage A: scheduler op offload on the stock prompt path (default 1 = stock behaviour: a batch of 32 or\n"
+''', r'''        "  --pp-threadpool N    G22: attach an explicit persistent CPU threadpool (workers poll, power throttling off, one pool for generation and batch,\n"
+        "                       --cpu-threads threads) for the prefill, as the stock tools do, and detach it before the generation. Without it the CPU\n"
+        "                       matmuls of the prefill (--pp-stock-below, --pp-cpu-layers) run on OpenMP regions. Default 0 = off\n"
+        "  --pp-stock-offload N G22 stage A: scheduler op offload on the stock prompt path (default 1 = stock behaviour: a batch of 32 or\n"
+'''),
+    (r'''    ls_free_watch_start(device);
+    if (kv_lazy) {
+''', r'''    ls_free_watch_start(device);
+    // G22: the explicit CPU threadpool of the prefill (see --pp-threadpool); freed before the generation starts
+    ggml_threadpool_t pp_tp = nullptr;
+    void (*pp_tp_free)(ggml_threadpool_t) = nullptr;
+    if (pp_threadpool != 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_reg_t cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+        auto * tp_new  = cpu_reg ? (decltype(ggml_threadpool_new) *)  ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new")  : nullptr;
+        pp_tp_free     = cpu_reg ? (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free") : nullptr;
+        if (tp_new != nullptr && pp_tp_free != nullptr) {
+            struct ggml_threadpool_params tpp;
+            ggml_threadpool_params_init(&tpp, cpu_threads);
+            tpp.prio = GGML_SCHED_PRIO_NORMAL;
+            tpp.poll = 50;
+            pp_tp = tp_new(&tpp);
+        }
+        if (pp_tp == nullptr) {
+            fprintf(stderr, "error: --pp-threadpool: the CPU backend does not offer a threadpool\n");
+            return 1;
+        }
+        llama_attach_threadpool(ctx, pp_tp, nullptr);
+        fprintf(stderr, "pp-threadpool: explicit CPU threadpool of %d threads attached for the prefill\n", cpu_threads);
+    }
+    if (kv_lazy) {
+'''),
+    (r'''    if (exit_status == 0 && tg_tokens > 0) {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+''', r'''    if (pp_tp != nullptr) {
+        // the polling workers would compete with the lean host team of the decode
+        llama_detach_threadpool(ctx);
+        pp_tp_free(pp_tp);
+        pp_tp = nullptr;
+    }
+    if (exit_status == 0 && tg_tokens > 0) {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+'''),
+])
+print("G23 fix 4 done")
