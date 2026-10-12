@@ -1,0 +1,139 @@
+{
+ "session": "g15-fit",
+ "exe_dir": "build/llama-cuda/bin/g15",
+ "tg_tokens": 512,
+ "control": "AUTO0",
+ "qa": false,
+ "items": "N1,N2,N3,N4,K1",
+ "prompt": "build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+ "common": [
+  "--model",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "--prompt-file",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+  "--ubatch",
+  "512",
+  "--tg-tokens",
+  "512",
+  "--tg-logit-margin",
+  "512",
+  "--residency",
+  "moe-expert-bank",
+  "--kv-cache",
+  "q8",
+  "--allow-full-residency",
+  "--no-handoff",
+  "--pp-schedule",
+  "layer-major",
+  "--layer-slots",
+  "2",
+  "--tg-hybrid",
+  "--ctx-size",
+  "262144",
+  "--act-slab-dtype",
+  "f32",
+  "--tg-first-pp-token"
+ ],
+ "reps": 3,
+ "interleave": true,
+ "arms": [
+  {
+   "name": "AUTO0",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "auto",
+    "--tg-release-compute",
+    "--kv-lazy",
+    "--tg-vram-cap-mib",
+    "0"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_INPUT_BATCH": "1"
+   },
+   "why": "lazy KV + --tg-hybrid-slots auto --tg-vram-cap-mib 0 (fit to the allocator's free memory) + input batching"
+  },
+  {
+   "name": "L82B",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "82",
+    "--tg-release-compute",
+    "--kv-lazy"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl",
+    "LLAMA_CUDA_INPUT_BATCH": "1"
+   },
+   "why": "explicit 82 slots under the ballast (expected: does not fit, fails loudly)"
+  },
+  {
+   "name": "HYB42R",
+   "flags": [
+    "--kv-graph-pad",
+    "256",
+    "--tg-hybrid-slots",
+    "42",
+    "--tg-release-compute"
+   ],
+   "env": {
+    "LLAMA_MOE_HYBRID": "14",
+    "LLAMA_MOE_HYBRID_B": "16",
+    "LLAMA_MOE_HYBRID_FREQ": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/aer-freq-train.txt",
+    "LLAMA_MOE_HYBRID_LOG": "{sdir}/hybrid_{name}.jsonl"
+   },
+   "why": "non-lazy 42 slots under the ballast (expected: does not fit)"
+  },
+  {
+   "name": "STKfit",
+   "engine": "stock",
+   "flags": [
+    "-fit",
+    "on",
+    "--fit-target",
+    "256"
+   ],
+   "env": {},
+   "why": "stock llama-completion with the owner's flags, llama.cpp's own auto-fit (--fit-target 256) under the ballast"
+  }
+ ],
+ "stock_common": [
+  "-m",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "-f",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/div-code.txt",
+  "-ngl",
+  "99",
+  "-fa",
+  "on",
+  "-ctk",
+  "q8_0",
+  "-ctv",
+  "q8_0",
+  "-lm",
+  "none",
+  "-fit",
+  "off",
+  "-c",
+  "262000",
+  "-n",
+  "512",
+  "--ignore-eos",
+  "--temp",
+  "0",
+  "-no-cnv",
+  "--no-display-prompt"
+ ],
+ "poll_ms": 50,
+ "ballast_mib": 16000
+}

@@ -45,6 +45,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, 'build', 'llama-cuda')
 MODEL = 'C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf'
 CHK = os.path.join(ROOT, 'tools', 'semantic-qa', 'check-answer.py')
+BALLAST_EXE = os.path.join(BUILD, 'bin', 'tools', 'vram-ballast.exe')   # tools/vram-ballast.cu: holds N MiB of device memory (arm / session key ballast_mib)
 REP = os.path.join(ROOT, 'tools', 'check-repetition.py')
 GUARD_PATTERNS = {
     'stale_slab': r'slot slab was not written this round',
@@ -162,6 +163,36 @@ def idle_vram():
         return None
 
 
+def power_state():
+    """Mains / battery state of the machine (Windows GetSystemPowerStatus) and the GPU's clock and power-cap view.
+    Measured 2026-10-11 (g19-fs): the same build and flags ran 49 tok/s on battery against 108 on mains, GPU-only timeline segments 2.6x longer, host CPU
+    graphs 1.5x longer, with clocks_event_reasons.sw_power_cap active. A timing session on battery is a different machine; every arm records this."""
+    st = {'ac_line': None, 'battery_pct': None, 'gpu_sm_mhz': None, 'gpu_power_cap': None, 'gpu_power_w': None, 'gpu_temp_c': None}
+    try:
+        import ctypes
+
+        class SPS(ctypes.Structure):
+            _fields_ = [('ACLineStatus', ctypes.c_ubyte), ('BatteryFlag', ctypes.c_ubyte), ('BatteryLifePercent', ctypes.c_ubyte),
+                        ('SystemStatusFlag', ctypes.c_ubyte), ('BatteryLifeTime', ctypes.c_ulong), ('BatteryFullLifeTime', ctypes.c_ulong)]
+        s = SPS()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)):
+            st['ac_line'] = {0: 'battery', 1: 'mains'}.get(int(s.ACLineStatus), 'unknown')
+            st['battery_pct'] = int(s.BatteryLifePercent) if int(s.BatteryLifePercent) != 255 else None
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(['nvidia-smi', '--query-gpu=clocks.sm,clocks_event_reasons.sw_power_cap,power.draw,temperature.gpu',
+                            '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=10)
+        f = [x.strip() for x in r.stdout.strip().splitlines()[0].split(',')]
+        st['gpu_sm_mhz'] = int(float(f[0]))
+        st['gpu_power_cap'] = f[1]
+        st['gpu_power_w'] = float(f[2])
+        st['gpu_temp_c'] = int(float(f[3]))
+    except Exception:
+        pass
+    return st
+
+
 def start_load(n):
     """n busy-loop python processes at normal priority (arm key `load`): a controlled stand-in for other heavy host work."""
     n = int(n or 0)
@@ -265,6 +296,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--spec', required=True)
     ap.add_argument('--grade-only', action='store_true')
+    ap.add_argument('--allow-battery', action='store_true',
+                    help='run a timing session on battery power anyway; the verdict records power=battery (relative evidence only)')
     ap.add_argument('--attest', nargs='*', default=[],
                     help='exe paths named only so the wrapper provenance gate can attest them (ignored here)')
     a = ap.parse_args()
@@ -298,10 +331,19 @@ def main():
     if has_stock and not scommon:
         log('stock arm without stock_common')
         return 2
+    # a timing session needs mains power (see power_state): refuse loudly on battery unless the spec or the command line says otherwise, and then mark the verdict
+    pw0 = power_state()
+    if pw0['ac_line'] == 'battery' and not (a.allow_battery or spec.get('allow_battery')):
+        log('REFUSED: the machine is on battery (%s%%), the GPU/CPU run power-capped and every timing is a different machine. Plug in, or pass --allow-battery '
+            '(the verdict is then marked power=battery and is relative evidence only).' % pw0['battery_pct'])
+        return 3
     plan = []
     if spec.get('interleave'):
         for r in range(1, reps + 1):
-            for arm in spec['arms']:
+            order = list(spec['arms'])
+            if spec.get('counterbalance') and r % 2 == 0:
+                order.reverse()   # A B | B A | A B ...: a monotone drift (thermal, battery) cancels between the two arms of a pair instead of favouring the first
+            for arm in order:
                 plan.append((arm, r))
     else:
         for arm in spec['arms']:
@@ -309,7 +351,7 @@ def main():
                 plan.append((arm, r))
     t0 = time.time()
     base_vram = idle_vram()
-    verdict = {'session': session, 'spec': spec, 'idle_vram_mib': base_vram, 'attest': a.attest,
+    verdict = {'session': session, 'spec': spec, 'idle_vram_mib': base_vram, 'attest': a.attest, 'power': pw0,
                'provenance': {
                    'exe_sha256_16': sha16(exe) if has_lm else None,
                    'llama_dll_sha256_16': sha16(os.path.join(exe_dir, 'llama.dll')),
@@ -345,6 +387,25 @@ def main():
                 rec['stock_tok_s'], rec['stock_runs'] = stock_tok_s(out)
         else:
             stop = threading.Event(); vr = {}
+            rec['power_before'] = power_state()
+            # ballast_mib (arm or session key): another process holds that much device memory for the arm, so the process under test sees exactly (free - ballast) MiB
+            # through cudaMemGetInfo / cudaMalloc. The owner's llama-server flag --fit-target 16000 is the same constraint seen from the other side (16000 MiB must stay free).
+            ballast = None
+            bmib = int(arm.get('ballast_mib', spec.get('ballast_mib', 0)) or 0)
+            if bmib > 0:
+                ballast = subprocess.Popen([BALLAST_EXE, str(bmib)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                bl = ballast.stdout.readline().strip()
+                rec['ballast'] = bl
+                log('  ' + bl)
+                if 'ballast ready' not in bl:
+                    log('  ballast failed: arm skipped')
+                    ballast.kill()
+                    rec['rc'] = -998
+                    rec['wall_s'] = 0.0
+                    rec['vram_peak_mib'] = None
+                    rec['vram_samples'] = 0
+                    verdict['arms'][name] = rec
+                    continue
             loadp = start_load(arm.get('load'))
             if loadp:
                 time.sleep(1.0)  # let the load reach every core before the arm starts
@@ -373,13 +434,23 @@ def main():
             if th is not None:
                 th.join()
             stop_load(loadp)
-            rec['vram_peak_mib'] = vr.get('peak_mib')
+            if ballast is not None:
+                try:
+                    ballast.stdin.close()
+                    ballast.wait(timeout=30)
+                except Exception:
+                    ballast.kill()
+                time.sleep(1.0)
+            rec['vram_peak_raw_mib'] = vr.get('peak_mib')
+            rec['vram_peak_mib'] = (vr.get('peak_mib') - bmib) if (vr.get('peak_mib') is not None and bmib > 0) else vr.get('peak_mib')   # the ballast's own memory is not the arm's
             rec['vram_samples'] = vr.get('samples')
             with open(lg, 'w', encoding='utf-8') as f:
                 f.write(out)
             rec['rc'] = rc
             rec['wall_s'] = round(dur, 1)
-            log('ARM %-8s rc=%s wall=%.1fs  %s' % (name, rc, dur, rec['why']))
+            rec['power_after'] = power_state()
+            log('ARM %-8s rc=%s wall=%.1fs  %s  [%s, gpu %s MHz, %s W%s]' % (name, rc, dur, rec['why'], rec['power_after']['ac_line'], rec['power_after']['gpu_sm_mhz'],
+                rec['power_after']['gpu_power_w'], ', POWER-CAPPED' if str(rec['power_after']['gpu_power_cap']).strip() == 'Active' else ''))
         rec['guards'] = {k: len(re.findall(p, out)) for k, p in GUARD_PATTERNS.items()}
         hits = [ln for ln in out.splitlines() if any(re.search(p, ln) for p in GUARD_PATTERNS.values())]
         rec['guard_lines'] = hits[:5]
