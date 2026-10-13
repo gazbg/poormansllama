@@ -1,0 +1,106 @@
+"""G27 (sampled decoding for the hybrid runner; contract in the plan): opt-in `--tg-sampler doc` + `--tg-seed N` for the serial TG loop. The runner decodes greedily by default; the
+owner's llama-server samples (top-k 20, top-p 0.95, min-p 0.05, temperature 1.0), and the hybrid engine's speed depends on the generated text through the expert-cache hit rate, so a
+sampled run is the like-for-like comparison with the document. Default (flag absent) = byte-for-byte the old code path: one `if (tg_sampler_on)` that is false.
+New files: tools/layer-streaming/doc-sampler.h (stage-c/g27_doc_sampler.h.txt), tools/layer-streaming/tests/doc-sampler-test.cpp (stage-c/g27_doc_sampler_test.cpp.txt, host-only).
+Apply ONLY when no attested session is running or queued:  set G22_APPLY=1 (PATCH_DRY=1 first, optionally against a COPY via G22_NEST)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+STAGE = WT + r"\docs\plans\tg-beat-stock-specs\stage-c"
+
+patch(M, [
+    (r'''#include "top2-exact.h"
+''', r'''#include "top2-exact.h"
+#include "doc-sampler.h"
+'''),
+    (r'''        "  --rep-last-n N        repeat-penalty window (default 64)\n"
+''', r'''        "  --rep-last-n N        repeat-penalty window (default 64)\n"
+        "  --tg-sampler MODE     G27: off (greedy, default) or doc = the sampler chain of the owner's llama-server (top-k 20, top-p 0.95,\n"
+        "                        min-p 0.05, temperature 1.0, seeded draw) in the serial TG loop; refused with --mtp\n"
+        "  --tg-seed N           G27: seed of the doc sampler (default 1)\n"
+'''),
+    (r'''    int    rep_last_n = 64;          // T-GPLR-06: repeat-penalty window
+''', r'''    int    rep_last_n = 64;          // T-GPLR-06: repeat-penalty window
+    std::string tg_sampler_str = "off"; // G27: off (greedy, default) | doc (top-k 20 -> top-p 0.95 -> min-p 0.05 -> temp 1.0 -> seeded draw) in the serial TG loop
+    long long   tg_seed = 1;            // G27: seed of the doc sampler
+'''),
+    (r'''        } else if (arg == "--rep-last-n") {
+            rep_last_n = atoi(arg_value(argc, argv, i, "--rep-last-n").c_str());
+''', r'''        } else if (arg == "--rep-last-n") {
+            rep_last_n = atoi(arg_value(argc, argv, i, "--rep-last-n").c_str());
+        } else if (arg == "--tg-sampler") {
+            tg_sampler_str = arg_value(argc, argv, i, "--tg-sampler");
+        } else if (arg == "--tg-seed") {
+            tg_seed = atoll(arg_value(argc, argv, i, "--tg-seed").c_str());
+'''),
+    (r'''        { mtp,
+          "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
+''', r'''        { mtp,
+          "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
+        { tg_sampler_str != "off",
+          "--residency off is incompatible with --tg-sampler (the sampler lives in the streaming runner's serial TG loop, not in the normal llama.cpp path)" },
+'''),
+    (r'''    if (mtp && mtp_draft < 1) {
+        fprintf(stderr, "error: --mtp-draft must be >= 1\n");
+''', r'''    if (tg_sampler_str != "off" && tg_sampler_str != "doc") {
+        fprintf(stderr, "error: --tg-sampler must be off or doc (got '%s')\n", tg_sampler_str.c_str());
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && mtp) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --mtp (the MTP verify path is greedy-exact by construction)\n");
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && tg_probe_nosample) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --tg-probe-nosample (the probe never reads the logits)\n");
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && rep_penalty != 1.0) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --rep-penalty (the penalty belongs to the greedy pick; the sampled token would ignore it)\n");
+        return 2;
+    }
+    const bool tg_sampler_on = (tg_sampler_str == "doc");
+    std::mt19937_64 tg_rng((uint64_t) tg_seed);
+    if (tg_sampler_on) {
+        fprintf(stderr, "tg-sampler: doc (top-k 20, top-p 0.95, min-p 0.05, temperature 1.0), seed %lld: the generated tokens are SAMPLED, not greedy (token 0 is the prefill's greedy argmax when --tg-first-pp-token is on)\n", tg_seed);
+    }
+    if (mtp && mtp_draft < 1) {
+        fprintf(stderr, "error: --mtp-draft must be >= 1\n");
+'''),
+    (r'''                ls.tel_tg_logits(t, (int64_t) best, best_val, (int64_t) second_tok, second_val);
+                cur = best;
+                generated.push_back(cur);
+                rep_ring.accept(cur);
+                host_dec_us   += t_h1 - t_h0;
+''', r'''                ls.tel_tg_logits(t, (int64_t) best, best_val, (int64_t) second_tok, second_val);
+                cur = best;
+                if (tg_sampler_on) {
+                    // G27: the greedy pick above stays in the trace (margin, top-2); the token that is generated is the sampled one
+                    cur = (llama_token) ls_doc_sample(logits, n_vocab, ls_doc_sampler_params(), tg_rng);
+                    if (cur < 0) {
+                        fprintf(stderr, "error: --tg-sampler doc drew no token at TG step %d (an all-NaN logits row)\n", t);
+                        ls.failed = true;
+                        exit_status = 1;
+                        break;
+                    }
+                }
+                generated.push_back(cur);
+                rep_ring.accept(cur);
+                host_dec_us   += t_h1 - t_h0;
+'''),
+])
+
+if os.environ.get("PATCH_DRY"):
+    print("DRY: new files would be copied:", STAGE + r"\g27_doc_sampler.h.txt", "->", NEST + r"\tools\layer-streaming\doc-sampler.h")
+else:
+    shutil.copyfile(STAGE + r"\g27_doc_sampler.h.txt", NEST + r"\tools\layer-streaming\doc-sampler.h")
+    shutil.copyfile(STAGE + r"\g27_doc_sampler_test.cpp.txt", NEST + r"\tools\layer-streaming\tests\doc-sampler-test.cpp")
+    print("copied doc-sampler.h and tests/doc-sampler-test.cpp")

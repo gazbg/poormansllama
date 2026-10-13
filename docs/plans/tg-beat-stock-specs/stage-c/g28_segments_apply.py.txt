@@ -1,0 +1,355 @@
+"""G28 (segmented layer-major prefill; contract in the plan): opt-in `--pp-segment-tokens S`. The layer-major prefill keeps the inter-layer activations of the WHOLE prompt in a GPU slab
+(16 KiB per prompt token in f32), which breaks the owner's "16,000 MiB stay free during the whole run" rule at long prompts. With S the chunk list is processed in segments of S tokens:
+for each segment the memory contexts of its chunks are applied, the chunks are embedded, the sweep over all layers runs, and the output graphs run, against a slab that holds ONE segment.
+Per layer the chunks are still visited in ascending order, so the arithmetic is the unsegmented one; each segment streams the layer banks once more. Default (flag absent) = one segment =
+the historical order (the apply loop is moved into a lambda and called once at the same place; the stage loops run once over all chunks).
+Touches: src/llama-layer-streaming.h/.cpp, tools/layer-streaming/main.cpp (flag, validation, checker act_bind per segment), new src/llama-ls-segments.h (stage-c/g28_ls_segments.h.txt),
+new tests/test-layer-streaming-segments.cpp (stage-c/g28_test_segments.cpp.txt, host-only) + its registration in tests/CMakeLists.txt.
+Apply ONLY when no attested session is running or queued:  set G22_APPLY=1 (PATCH_DRY=1 first; optionally against a COPY via G22_NEST). Apply g27_sampler_apply first (independent anchors)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+T = NEST + r"\tests\CMakeLists.txt"
+STAGE = WT + r"\docs\plans\tg-beat-stock-specs\stage-c"
+
+patch(H, [
+    (r'''    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens);
+''', r'''    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg = -1);   // G28: seg >= 0 adds the segment index of a segmented prefill
+'''),
+    (r'''    bool set_pp_copy_pacing(size_t piece_bytes, int window);
+    size_t pp_copy_piece_bytes = 0;
+    int    pp_copy_window = 2;
+''', r'''    bool set_pp_copy_pacing(size_t piece_bytes, int window);
+    size_t pp_copy_piece_bytes = 0;
+    int    pp_copy_window = 2;
+
+    // G28: segmented layer-major prefill. pp_seg_tokens > 0 processes the chunk list in segments of that many tokens (a positive multiple of the chunk width): the activation slab holds ONE
+    // segment (slab_tokens tokens per half, set by init) instead of the whole prompt, and each segment streams the layer banks once more. 0 = off = the historical single sweep. Call before init().
+    // The arithmetic lives in llama-ls-segments.h (host-testable).
+    bool set_pp_segment_tokens(int64_t tokens);
+    int64_t pp_seg_tokens = 0;
+    int64_t slab_tokens   = 0;
+    void tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end);
+'''),
+])
+
+patch(C, [
+    (r'''#include "llama-moe-hybrid.h"
+''', r'''#include "llama-moe-hybrid.h"
+#include "llama-ls-segments.h"
+'''),
+    # G29 (found in g88-bm200k, arm BM1024, rc=1): the duplicate-staging guard of G22 was gated to the paced / CPU-leg modes, so on the default path a stale request in the async-feed queue
+    # staged layer 26 a second time over its own, already consumed, slot at ubatch 189 of 196 (a wasted 35 ms copy and a check-telemetry violation on every later event: "copy_submit layer
+    # violates deterministic slot policy"). The data was never wrong (same bytes into a released slot), but the run is rc=1 and its QA grade is not evaluated. The guard is now unconditional.
+    (r'''    if ((pp_copy_piece_bytes > 0 || has_cpu_leg()) && slot.logical_layer == il && slot.generation > 0) {
+        return true;
+    }
+''', r'''    if (slot.logical_layer == il && slot.generation > 0) {   // G29: unconditional (was gated to the paced / CPU-leg modes; see the note at the top of this edit script)
+        return true;
+    }
+'''),
+    # init(): the slab holds one segment
+    (r'''        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) pp_tokens * slab_elt;
+''', r'''        // G28: with --pp-segment-tokens one slab half holds ONE segment, not the whole prompt
+        slab_tokens = ls_slab_tokens(pp_tokens, pp_seg_tokens);
+        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) slab_tokens * slab_elt;
+'''),
+    # act_bind walk: segment-relative offsets + the segment index
+    (r'''                    const size_t slab_elt = ggml_type_size(act_slab_dtype);
+                    size_t off_walk = 0;
+                    for (size_t c = 0; c < chunks.size(); ++c) {
+                        tel_act_bind((int32_t) c, 0, off_walk, chunks[c].n_tokens);
+                        tel_act_bind((int32_t) c, 1, off_walk, chunks[c].n_tokens);
+                        off_walk += (size_t) chunks[c].n_tokens * (size_t) n_embd_io * slab_elt;
+                    }
+''', r'''                    const size_t slab_elt = ggml_type_size(act_slab_dtype);
+                    // G28: without --pp-segment-tokens seg_chunks_walk is <= 0 and these are the historical cumulative offsets (one segment); with it the offsets restart at every segment
+                    // boundary (the slices of different segments alias by design) and every bind carries its segment index so the checker judges aliasing per segment
+                    const int64_t seg_chunks_walk = ls_segment_chunks(pp_seg_tokens, chunks.empty() ? 0 : chunks[0].n_tokens, (int64_t) chunks.size());
+                    const std::vector<size_t> walk_off = ls_segment_slab_offsets(chunks.data(), chunks.size(), seg_chunks_walk, (int64_t) n_embd_io, slab_elt);
+                    for (size_t c = 0; c < chunks.size(); ++c) {
+                        const int64_t seg_of = seg_chunks_walk > 0 ? ls_segment_of((int64_t) c, seg_chunks_walk) : -1;
+                        tel_act_bind((int32_t) c, 0, walk_off[c], chunks[c].n_tokens, seg_of);
+                        tel_act_bind((int32_t) c, 1, walk_off[c], chunks[c].n_tokens, seg_of);
+                    }
+'''),
+    (r'''void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens) {
+    tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"t_us\":%lld}",
+''', r'''void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg) {
+    if (seg >= 0) {
+        tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"seg\":%lld,\"t_us\":%lld}",
+            (unsigned long long) run_id, chunk_id, slab, off_bytes,
+            (size_t) n_tokens * n_embd_io * ggml_type_size(act_slab_dtype),
+            (long long) seg, (long long) ggml_time_us());
+        return;
+    }
+    tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"t_us\":%lld}",
+'''),
+    # the setter and the segment event
+    (r'''bool llama_layer_streaming::set_pp_recon(bool on) {
+''', r'''// G28: segmented layer-major prefill (see the header). Before init(): the slab is sized from it.
+bool llama_layer_streaming::set_pp_segment_tokens(int64_t tokens) {
+    if (tokens < 0) {
+        error_msg = "set_pp_segment_tokens: negative size";
+        return false;
+    }
+    pp_seg_tokens = tokens;
+    return true;
+}
+
+void llama_layer_streaming::tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end) {
+    tel_write(tel_out, "{\"event\":\"pp_segment\",\"run_id\":%llu,\"seg\":%lld,\"n_segs\":%lld,\"chunk_begin\":%lld,\"chunk_end\":%lld,\"t_us\":%lld}",
+        (unsigned long long) run_id, (long long) seg, (long long) n_segs, (long long) chunk_begin, (long long) chunk_end, (long long) ggml_time_us());
+}
+
+bool llama_layer_streaming::set_pp_recon(bool on) {
+'''),
+    # slab_slice: the B half starts after ONE segment's half, not after the whole prompt's (found by the haiku reviewer: the first begin_set would assert in ggml_backend_tensor_alloc)
+    (r'''    const size_t slice_bytes = region.bytes;
+    const size_t half_bytes  = region.half;
+''', r'''    const size_t slice_bytes = region.bytes;
+    // G28: with segments one slab half holds ONE segment (slab_tokens tokens), not the whole prompt that region.half sums; without them the two are the same number
+    const size_t half_bytes  = (ls.pp_seg_tokens > 0 && ls.slab_tokens > 0)
+        ? (size_t) ls.slab_tokens * (size_t) ls.n_embd_io * ggml_type_size(ls.act_slab_dtype)
+        : region.half;
+'''),
+    # layer_major_pp: segment plan
+    (r'''    const int64_t n_chunks = ls->n_chunks;
+    // T-GPLR-41: identify which --pp-repeat pass this controller invocation is
+''', r'''    const int64_t n_chunks = ls->n_chunks;
+    // G28: chunks per segment. Without --pp-segment-tokens (the default) this is n_chunks: ONE segment, the historical order. With it the stages below (embed, preload, sweep over all layers,
+    // output) run per segment against a slab that holds one segment; per layer the chunks are still visited in ascending order, so the arithmetic is unchanged.
+    int64_t seg_chunks = n_chunks;
+    if (ls->pp_seg_tokens > 0 && n_chunks > 1) {
+        const int64_t sc = ls_segment_chunks(ls->pp_seg_tokens, ls->chunks.empty() ? 0 : ls->chunks[0].n_tokens, n_chunks);
+        if (sc < 1 || !ls->pw_probe) {
+            ls->error_msg = "layer_major_pp: --pp-segment-tokens " + std::to_string((long long) ls->pp_seg_tokens) +
+                            " is not a positive multiple of the chunk width, or the per-width sets (pw_probe) are off";
+            ls->failed = true;
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
+        seg_chunks = sc;
+    }
+    const int64_t n_segs = seg_chunks > 0 ? (n_chunks + seg_chunks - 1) / seg_chunks : 1;   // seg_chunks == 0 only for an empty chunk list, which the guard below refuses
+    // T-GPLR-41: identify which --pp-repeat pass this controller invocation is
+'''),
+    # layer_major_pp: the apply loop becomes a lambda over a chunk range, called once for the first segment at the same place
+    (r'''    std::vector<std::vector<uint8_t>> chunk_input_snap(n_chunks); // T-Q38PW-00 probe snapshots
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        // T-Q38CTX-01: build the chunk from its immutable descriptor (real
+''', r'''    std::vector<std::vector<uint8_t>> chunk_input_snap(n_chunks); // T-Q38PW-00 probe snapshots
+    // G28: the apply loop is a lambda over a chunk range. The historical call right after it applies the chunks of the first segment (all chunks without --pp-segment-tokens), at the same
+    // place and in the same order as before; later segments are applied when they start.
+    auto apply_chunks = [&](int64_t c_begin, int64_t c_end) -> int {
+    for (int64_t c = c_begin; c < c_end; ++c) {
+        // T-Q38CTX-01: build the chunk from its immutable descriptor (real
+'''),
+    (r'''                ls->tel_mctx_kvview(pass_idx41, c, il41, k_ne2_41, v_ne2_41,
+                                    kst41, vst41, ksrc41, vsrc41);
+            }
+        }
+    }
+
+    // locate the CUDA compute backend (for copy-event ordering)
+''', r'''                ls->tel_mctx_kvview(pass_idx41, c, il41, k_ne2_41, v_ne2_41,
+                                    kst41, vst41, ksrc41, vsrc41);
+            }
+        }
+    }
+    return 0;
+    };
+    {
+        const int ar = apply_chunks(0, std::min<int64_t>(n_chunks, seg_chunks));
+        if (ar != 0) {
+            return ar;
+        }
+    }
+
+    // locate the CUDA compute backend (for copy-event ordering)
+'''),
+    # slab offsets per segment
+    (r'''        slab_half = (size_t) ls->n_embd_io * (size_t) ls->pp_tokens * slab_elt;
+        size_t off = 0;
+        for (int c = 0; c < n_chunks; ++c) {
+            slab_off_c[c] = off;
+            off += (size_t) ls->chunks[c].n_tokens * (size_t) ls->n_embd_io * slab_elt;
+        }
+''', r'''        // G28: one slab half holds one SEGMENT (slab_tokens tokens: the whole prompt without --pp-segment-tokens); the offsets restart at every segment boundary
+        slab_half = (size_t) ls->n_embd_io * (size_t) ls->slab_tokens * slab_elt;
+        slab_off_c = ls_segment_slab_offsets(ls->chunks.data(), ls->chunks.size(), seg_chunks, (int64_t) ls->n_embd_io, slab_elt);
+        if (slab_off_c.size() != (size_t) n_chunks) {
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
+'''),
+    # stage loop: segment prologue + embed range
+    (r'''    // 1. embed every chunk (writes slab A[c]); no slot work
+    const int64_t t_led_embed0 = ggml_time_us();
+    for (int c = 0; c < n_chunks; ++c) {
+''', r'''    // G28: one iteration over all chunks without --pp-segment-tokens (the historical order); with it, stages 1-4 run once per segment
+    for (int64_t seg = 0; seg < n_segs; ++seg) {
+    const int64_t seg_c0 = seg * seg_chunks;
+    const int64_t seg_c1 = std::min<int64_t>(n_chunks, seg_c0 + seg_chunks);
+    if (seg > 0) {
+        // the previous segment is complete for every layer: release its memory contexts and input snapshots, then apply this segment's chunks (the KV cells and the recurrent state
+        // continue where the previous segment left them, exactly as across chunks)
+        for (int64_t cp = seg_c0 - seg_chunks; cp < seg_c0; ++cp) {
+            chunk_mctx[cp].reset();
+            chunk_ubatch[cp] = nullptr;
+            std::vector<uint8_t>().swap(chunk_input_snap[cp]);
+        }
+        const int ar = apply_chunks(seg_c0, seg_c1);
+        if (ar != 0) {
+            return ar;
+        }
+    }
+    if (n_segs > 1) {
+        ls->tel_pp_segment(seg, n_segs, seg_c0, seg_c1);
+    }
+
+    // 1. embed every chunk (writes slab A[c]); no slot work
+    const int64_t t_led_embed0 = ggml_time_us();
+    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+'''),
+    (r'''    led_embed = (double) (ggml_time_us() - t_led_embed0);
+''', r'''    led_embed += (double) (ggml_time_us() - t_led_embed0);
+'''),
+    (r'''    led_preload = (double) (ggml_time_us() - t_led_pre0);
+''', r'''    led_preload += (double) (ggml_time_us() - t_led_pre0);
+'''),
+    (r'''        double layer_compute_us = 0.0, layer_setup_us = 0.0;
+        for (int c = 0; c < n_chunks; ++c) {
+''', r'''        double layer_compute_us = 0.0, layer_setup_us = 0.0;
+        for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+'''),
+    (r'''    led_sweep = (double) (ggml_time_us() - t_led_sweep0);
+''', r'''    led_sweep += (double) (ggml_time_us() - t_led_sweep0);
+'''),
+    (r'''    const int64_t t_led_out0 = ggml_time_us();
+    for (int c = 0; c < n_chunks; ++c) {
+''', r'''    const int64_t t_led_out0 = ggml_time_us();
+    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+'''),
+    (r'''    led_output = (double) (ggml_time_us() - t_led_out0);
+''', r'''    led_output += (double) (ggml_time_us() - t_led_out0);
+    }   // G28: end of the segment loop
+'''),
+])
+
+patch(M, [
+    (r'''        { mtp,
+          "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
+''', r'''        { mtp,
+          "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
+        { pp_segment_tokens != 0,
+          "--residency off is incompatible with --pp-segment-tokens (segmentation is a layer-major prefill mode)" },
+'''),
+    (r'''    int tg_logit_margin = 0;         // T-GPLR-54 A2: per-step logit readout (0 = off)
+''', r'''    int tg_logit_margin = 0;         // T-GPLR-54 A2: per-step logit readout (0 = off)
+    long long pp_segment_tokens = 0; // G28: --pp-segment-tokens: segmented layer-major prefill, segment size in tokens (0 = off = one sweep over the whole prompt)
+'''),
+    (r'''        "  --prompt TEXT         real prompt text (overrides synthetic ids; LLAMA_MTP_PAD_PROMPT=1 pads it to a ubatch multiple for --mtp)\n"
+''', r'''        "  --pp-segment-tokens N G28: segmented layer-major prefill: process the prompt in segments of N tokens (a multiple of --ubatch, at least 4 x --ubatch); the activation slab\n"
+        "                        holds one segment (16 KiB per token in f32) instead of the whole prompt, each segment streams the layer banks once more; arithmetic unchanged (default 0 = off)\n"
+        "  --prompt TEXT         real prompt text (overrides synthetic ids; LLAMA_MTP_PAD_PROMPT=1 pads it to a ubatch multiple for --mtp)\n"
+'''),
+    (r'''        } else if (arg == "--prompt") {
+            prompt_text = arg_value(argc, argv, i, "--prompt");
+''', r'''        } else if (arg == "--pp-segment-tokens") {
+            pp_segment_tokens = atoll(arg_value(argc, argv, i, "--pp-segment-tokens").c_str());
+        } else if (arg == "--prompt") {
+            prompt_text = arg_value(argc, argv, i, "--prompt");
+'''),
+    (r'''        fprintf(stderr, "error: --pw-probe requires --pp-schedule layer-major\n");
+        return 2;
+    }
+''', r'''        fprintf(stderr, "error: --pw-probe requires --pp-schedule layer-major\n");
+        return 2;
+    }
+    // G28: segmented layer-major prefill
+    if (pp_segment_tokens != 0) {
+        if (pp_segment_tokens < 0 || schedule != LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+            fprintf(stderr, "error: --pp-segment-tokens needs a positive size and --pp-schedule layer-major\n");
+            return 2;
+        }
+        if (!pw_probe) {
+            fprintf(stderr, "error: --pp-segment-tokens needs the per-width sets (do not pass --no-pw-probe): the segment-relative slab offsets are patched per launch\n");
+            return 2;
+        }
+        if (pp_segment_tokens % ubatch != 0 || pp_segment_tokens < 4LL * ubatch) {
+            fprintf(stderr, "error: --pp-segment-tokens %lld must be a multiple of --ubatch %d and at least 4 x --ubatch\n", pp_segment_tokens, ubatch);
+            return 2;
+        }
+        if (mtp || pp_copy_piece_mib > 0 || (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") || pp_stock_below > 0) {
+            fprintf(stderr, "error: --pp-segment-tokens is not validated with --mtp, paced copies (--pp-copy-piece-mib), the CPU leg (--pp-cpu-layers) or the stock prefill path (--pp-stock-below)\n");
+            return 2;
+        }
+        fprintf(stderr, "pp-segment: segments of %lld tokens (%lld chunks of %d): the activation slab holds one segment, each segment streams the layer banks once more\n",
+                pp_segment_tokens, pp_segment_tokens / ubatch, ubatch);
+    }
+'''),
+    (r'''    const size_t act_slab_bytes = (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR)
+        ? (size_t) llama_model_n_embd_inp(model) * (size_t) pp_tokens * 2 * slab_elt
+        : 0;
+''', r'''    // G28: with --pp-segment-tokens the slab holds one segment
+    const int64_t slab_tokens_main = (pp_segment_tokens > 0 && pp_segment_tokens < (long long) pp_tokens) ? (int64_t) pp_segment_tokens : (int64_t) pp_tokens;
+    const size_t act_slab_bytes = (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR)
+        ? (size_t) llama_model_n_embd_inp(model) * (size_t) slab_tokens_main * 2 * slab_elt
+        : 0;
+'''),
+    (r'''    llama_layer_streaming ls;
+    const bool use_implicit_causal_mask = schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR;
+''', r'''    llama_layer_streaming ls;
+    if (!ls.set_pp_segment_tokens(pp_segment_tokens)) {
+        fprintf(stderr, "error: %s\n", ls.error_msg.c_str());
+        return 2;
+    }
+    const bool use_implicit_causal_mask = schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR;
+'''),
+    # checker: act_bind aliasing is judged per segment
+    (r'''    std::unordered_map<long long, int> lm_act_binds;          // chunk -> binds seen (must end at 2)
+''', r'''    std::unordered_map<long long, int> lm_act_binds;          // chunk -> binds seen (must end at 2)
+    long long lm_act_seg_cur = -1;                            // G28: segment of the act_bind events being read (absent seg field = no segmentation)
+'''),
+    (r'''                auto & offmap = (slab == 0) ? lm_act_off_A : lm_act_off_B;
+''', r'''                // G28: the slices of different prefill segments alias by design; the non-aliasing rule is judged per segment (the seg field is absent without --pp-segment-tokens)
+                bool f_seg = false;
+                const long long bseg = json::integer(line, "seg", &f_seg);
+                if (f_seg && bseg != lm_act_seg_cur) {
+                    lm_act_off_A.clear();
+                    lm_act_off_B.clear();
+                    lm_act_seg_cur = bseg;
+                }
+                auto & offmap = (slab == 0) ? lm_act_off_A : lm_act_off_B;
+'''),
+])
+
+patch(T, [
+    (r'''    target_compile_definitions(test-layer-streaming-cpu-leg PRIVATE LLAMA_LAYER_STREAMING)
+''', r'''    target_compile_definitions(test-layer-streaming-cpu-leg PRIVATE LLAMA_LAYER_STREAMING)
+
+    # G28: host-only proof of the segmented layer-major prefill arithmetic (src/llama-ls-segments.h: chunks per segment, segment-relative slab offsets, slab size). Header-only, no libraries.
+    add_executable(test-layer-streaming-segments test-layer-streaming-segments.cpp)
+    add_test(NAME test-layer-streaming-segments COMMAND $<TARGET_FILE:test-layer-streaming-segments>)
+    set_property(TEST test-layer-streaming-segments PROPERTY LABELS main)
+'''),
+])
+
+if os.environ.get("PATCH_DRY"):
+    print("DRY: new files would be copied: llama-ls-segments.h, test-layer-streaming-segments.cpp")
+else:
+    shutil.copyfile(STAGE + r"\g28_ls_segments.h.txt", NEST + r"\src\llama-ls-segments.h")
+    shutil.copyfile(STAGE + r"\g28_test_segments.cpp.txt", NEST + r"\tests\test-layer-streaming-segments.cpp")
+    print("copied src/llama-ls-segments.h and tests/test-layer-streaming-segments.cpp")

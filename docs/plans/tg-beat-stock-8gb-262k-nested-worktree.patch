@@ -1322,18 +1322,19 @@ index c166442ac..ac7687694 100644
      ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
      ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 diff --git a/src/llama-layer-streaming.cpp b/src/llama-layer-streaming.cpp
-index ed091c288..94b4f2421 100644
+index ed091c288..df1af23ea 100644
 --- a/src/llama-layer-streaming.cpp
 +++ b/src/llama-layer-streaming.cpp
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,8 @@
  #ifdef LLAMA_LAYER_STREAMING
  
  #include "llama-layer-streaming.h"
 +#include "llama-moe-hybrid.h"
++#include "llama-ls-segments.h"
  #include "llama-expert-split-policy.h"
  
  #include <chrono>
-@@ -1477,11 +1478,13 @@ struct llama_layer_streaming::af_worker {
+@@ -1477,11 +1479,13 @@ struct llama_layer_streaming::af_worker {
      std::thread             thread;
      std::mutex              mtx;
      std::condition_variable cv;
@@ -1347,7 +1348,7 @@ index ed091c288..94b4f2421 100644
      llama_layer_streaming * owner = nullptr;
  
      // stats (guarded by mtx)
-@@ -1500,8 +1503,16 @@ struct llama_layer_streaming::af_worker {
+@@ -1500,8 +1504,16 @@ struct llama_layer_streaming::af_worker {
                  if (stop && queue.empty()) {
                      return;
                  }
@@ -1366,7 +1367,7 @@ index ed091c288..94b4f2421 100644
              }
              const int64_t t0 = ggml_time_us();
              const bool ok = owner->af_submit_copy(il);
-@@ -1516,7 +1527,9 @@ struct llama_layer_streaming::af_worker {
+@@ -1516,7 +1528,9 @@ struct llama_layer_streaming::af_worker {
                  } else {
                      n_err++;
                  }
@@ -1376,7 +1377,7 @@ index ed091c288..94b4f2421 100644
          }
      }
  };
-@@ -1526,15 +1539,45 @@ void llama_layer_streaming::af_worker_deleter::operator()(af_worker * w) const {
+@@ -1526,15 +1540,45 @@ void llama_layer_streaming::af_worker_deleter::operator()(af_worker * w) const {
  }
  
  int llama_layer_streaming::af_next_layer(int il) const {
@@ -1428,7 +1429,7 @@ index ed091c288..94b4f2421 100644
  }
  
  // T-GPLR-37: direct mmap-sourced staging helpers. The registered span is the
-@@ -2020,7 +2063,7 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
+@@ -2020,7 +2064,7 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
                                            llama_layer_streaming_slot & slot,
                                            char * pool_base, size_t pool_bytes, bool pool_valid,
                                            char * staging, size_t * staged_out,
@@ -1437,7 +1438,7 @@ index ed091c288..94b4f2421 100644
      // T-GPLR-56 A3: paced registration is issued HERE, before a single copy for
      // this layer is enqueued, so the group covering a bounded distance ahead of
      // the sweep is locked (and its deferred commit started) while this layer's
-@@ -2065,17 +2108,42 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
+@@ -2065,17 +2109,42 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
      // backend's context, so every staging/compute ordering wait is
      // intra-context. A missing compute backend with the flag on is a loud
      // failure — never a silent fallback to the serialized path.
@@ -1483,7 +1484,7 @@ index ed091c288..94b4f2421 100644
          return true;
      };
  
-@@ -2144,6 +2212,10 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
+@@ -2144,6 +2213,10 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
      }
      recon_end_bank();
      *staged_out = staging_off;
@@ -1494,21 +1495,21 @@ index ed091c288..94b4f2421 100644
      if (submit_batch_out != nullptr) {
          *submit_batch_out = submit_batch_path;
      }
-@@ -2165,6 +2237,13 @@ bool llama_layer_streaming::af_submit_copy(int il) {
+@@ -2165,6 +2238,13 @@ bool llama_layer_streaming::af_submit_copy(int il) {
      std::unique_lock<std::mutex> lk(af->mtx);
      llama_layer_streaming_slot & slot = slots[s];
  
 +    // G22: a layer the slot already holds (staged earlier in this pass, consumed or not) needs no second copy. A stale duplicate request used to be caught only
 +    // while the slot was still claimed (free_slot == 0); once the layer was consumed it was staged over itself. With paced copies (a worker busy for a whole bank)
 +    // that happened late enough to run into the slot teardown after the prefill (CUDA "invalid argument"). Gated so that the historical path is untouched.
-+    if ((pp_copy_piece_bytes > 0 || has_cpu_leg()) && slot.logical_layer == il && slot.generation > 0) {
++    if (slot.logical_layer == il && slot.generation > 0) {   // G29: unconditional (was gated to the paced / CPU-leg modes; see the note at the top of this edit script)
 +        return true;
 +    }
 +
      // the slot must have been released by the main thread (consumer done).
      // A slot that already holds THIS logical layer resident (preload or a
      // prior generation) needs no staging: return success without touching
-@@ -2245,9 +2324,22 @@ bool llama_layer_streaming::af_submit_copy(int il) {
+@@ -2245,9 +2325,22 @@ bool llama_layer_streaming::af_submit_copy(int il) {
      char * staging = slot.buf_staging ? (char *) ggml_backend_buffer_get_base(slot.buf_staging.get()) : nullptr;
      size_t staging_off = 0;
      int sb_path_af = 0; // T-GPLR-33: the taken submission path (0/1/2)
@@ -1532,7 +1533,7 @@ index ed091c288..94b4f2421 100644
      pp_pool_release(il, pool_base, staging_off, staged_ok);
      if (!staged_ok) {
          return false;
-@@ -2376,6 +2468,73 @@ bool llama_layer_streaming::set_pp_copy_overlap(bool on) {
+@@ -2376,6 +2469,88 @@ bool llama_layer_streaming::set_pp_copy_overlap(bool on) {
      return true;
  }
  
@@ -1603,10 +1604,25 @@ index ed091c288..94b4f2421 100644
 +    af->cv.notify_one();
 +}
 +
++// G28: segmented layer-major prefill (see the header). Before init(): the slab is sized from it.
++bool llama_layer_streaming::set_pp_segment_tokens(int64_t tokens) {
++    if (tokens < 0) {
++        error_msg = "set_pp_segment_tokens: negative size";
++        return false;
++    }
++    pp_seg_tokens = tokens;
++    return true;
++}
++
++void llama_layer_streaming::tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end) {
++    tel_write(tel_out, "{\"event\":\"pp_segment\",\"run_id\":%llu,\"seg\":%lld,\"n_segs\":%lld,\"chunk_begin\":%lld,\"chunk_end\":%lld,\"t_us\":%lld}",
++        (unsigned long long) run_id, (long long) seg, (long long) n_segs, (long long) chunk_begin, (long long) chunk_end, (long long) ggml_time_us());
++}
++
  bool llama_layer_streaming::set_pp_recon(bool on) {
      pp_recon = on;
      return true;
-@@ -2916,6 +3075,11 @@ void llama_layer_streaming::tel_async_feed_init(int depth, int n_slots_) {
+@@ -2916,6 +3091,11 @@ void llama_layer_streaming::tel_async_feed_init(int depth, int n_slots_) {
  }
  
  void llama_layer_streaming::tel_async_feed_submit(int il, int slot, uint32_t generation) {
@@ -1618,7 +1634,7 @@ index ed091c288..94b4f2421 100644
      tel_write(tel_out, "{\"event\":\"async_feed_submit\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,\"generation\":%u,\"phase\":%d,\"t_us\":%lld}",
          (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation, phase, (long long) ggml_time_us());
  }
-@@ -3121,6 +3285,10 @@ llama_layer_streaming::~llama_layer_streaming() {
+@@ -3121,6 +3301,10 @@ llama_layer_streaming::~llama_layer_streaming() {
              slot.ev_af_gate = nullptr;
          }
      }
@@ -1629,7 +1645,49 @@ index ed091c288..94b4f2421 100644
      if (ctx_handoff != nullptr) {
          ggml_free(ctx_handoff);
          ctx_handoff = nullptr;
-@@ -4030,6 +4198,10 @@ bool llama_layer_streaming::load_layer(int il, bool & copied) {
+@@ -3473,7 +3657,9 @@ bool llama_layer_streaming::init(const llama_model & model, int n_slots_, int de
+     // use buf_act).
+     if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+         const size_t slab_elt = ggml_type_size(act_slab_dtype);
+-        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) pp_tokens * slab_elt;
++        // G28: with --pp-segment-tokens one slab half holds ONE segment, not the whole prompt
++        slab_tokens = ls_slab_tokens(pp_tokens, pp_seg_tokens);
++        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) slab_tokens * slab_elt;
+         buf_slab.reset(ggml_backend_buft_alloc_buffer(buft_cuda, 2 * slab_half_bytes));
+         if (!buf_slab) {
+             error_msg = "failed to allocate layer-major activation slabs (" +
+@@ -3678,7 +3864,10 @@ static bool slab_slice(llama_layer_streaming & ls, ggml_context * ctx, int which
+         return false;
+     }
+     const size_t slice_bytes = region.bytes;
+-    const size_t half_bytes  = region.half;
++    // G28: with segments one slab half holds ONE segment (slab_tokens tokens), not the whole prompt that region.half sums; without them the two are the same number
++    const size_t half_bytes  = (ls.pp_seg_tokens > 0 && ls.slab_tokens > 0)
++        ? (size_t) ls.slab_tokens * (size_t) ls.n_embd_io * ggml_type_size(ls.act_slab_dtype)
++        : region.half;
+     if (off + slice_bytes > half_bytes) {
+         ls.error_msg = "layer-major activation slab " + std::string(which ? "B" : "A") + " exhausted (" +
+                        std::to_string(off + slice_bytes) + ">" + std::to_string(half_bytes) + ")";
+@@ -3829,11 +4018,14 @@ llama_layer_streaming::graph_set * llama_layer_streaming::begin_set(int mode, in
+                     tel_act_bind(chunk_id, 1, off_B, n_tokens);
+                 } else if (chunk_id == 0) {
+                     const size_t slab_elt = ggml_type_size(act_slab_dtype);
+-                    size_t off_walk = 0;
++                    // G28: without --pp-segment-tokens seg_chunks_walk is <= 0 and these are the historical cumulative offsets (one segment); with it the offsets restart at every segment
++                    // boundary (the slices of different segments alias by design) and every bind carries its segment index so the checker judges aliasing per segment
++                    const int64_t seg_chunks_walk = ls_segment_chunks(pp_seg_tokens, chunks.empty() ? 0 : chunks[0].n_tokens, (int64_t) chunks.size());
++                    const std::vector<size_t> walk_off = ls_segment_slab_offsets(chunks.data(), chunks.size(), seg_chunks_walk, (int64_t) n_embd_io, slab_elt);
+                     for (size_t c = 0; c < chunks.size(); ++c) {
+-                        tel_act_bind((int32_t) c, 0, off_walk, chunks[c].n_tokens);
+-                        tel_act_bind((int32_t) c, 1, off_walk, chunks[c].n_tokens);
+-                        off_walk += (size_t) chunks[c].n_tokens * (size_t) n_embd_io * slab_elt;
++                        const int64_t seg_of = seg_chunks_walk > 0 ? ls_segment_of((int64_t) c, seg_chunks_walk) : -1;
++                        tel_act_bind((int32_t) c, 0, walk_off[c], chunks[c].n_tokens, seg_of);
++                        tel_act_bind((int32_t) c, 1, walk_off[c], chunks[c].n_tokens, seg_of);
+                     }
+                 }
+             }
+@@ -4030,6 +4222,10 @@ bool llama_layer_streaming::load_layer(int il, bool & copied) {
      } af_guard{af_lk, this};
  
      llama_layer_streaming_slot & slot = slots[il % n_slots];
@@ -1640,7 +1698,7 @@ index ed091c288..94b4f2421 100644
  
      // T-GPLR-16: partial handoff — identical no-copy handling to the full
      // handoff branch below. Migrating banks (il >= partial_from) are
-@@ -4234,6 +4406,10 @@ bool llama_layer_streaming::wait_slot_ready(int il, double & wait_us, double & h
+@@ -4234,6 +4430,10 @@ bool llama_layer_streaming::wait_slot_ready(int il, double & wait_us, double & h
      }
  
      llama_layer_streaming_slot & slot = slots[il % n_slots];
@@ -1651,7 +1709,7 @@ index ed091c288..94b4f2421 100644
  
      if (slot.logical_layer != il) {
          error_msg = "wait_slot_ready: slot " + std::to_string(il % n_slots) +
-@@ -4535,6 +4711,22 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
+@@ -4535,6 +4735,22 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
      return ctx->layer_major_pp_first_token();
  }
  
@@ -1674,7 +1732,7 @@ index ed091c288..94b4f2421 100644
  // T-GPLR-03: argmax of the last output row of the PP logits. The layer-major
  // controller exposes the last chunk's result tensors on gf_res_prev but never
  // fills the context's host logits buffer (it bypasses decode()), so read the
-@@ -4565,6 +4757,64 @@ int64_t llama_context::layer_major_pp_first_token() {
+@@ -4565,6 +4781,64 @@ int64_t llama_context::layer_major_pp_first_token() {
      return best;
  }
  
@@ -1739,7 +1797,138 @@ index ed091c288..94b4f2421 100644
  // One owner for the structured failure shape (error_msg -> failed -> error
  // event -> GGML_STATUS_FAILED); byte-identical to the inline copies it
  // replaces -- traces and checkers parse these exact strings.
-@@ -6552,6 +6802,18 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+@@ -6172,6 +6446,21 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+     const bool    output_all = cparams.embeddings;
+     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+     const int64_t n_chunks = ls->n_chunks;
++    // G28: chunks per segment. Without --pp-segment-tokens (the default) this is n_chunks: ONE segment, the historical order. With it the stages below (embed, preload, sweep over all layers,
++    // output) run per segment against a slab that holds one segment; per layer the chunks are still visited in ascending order, so the arithmetic is unchanged.
++    int64_t seg_chunks = n_chunks;
++    if (ls->pp_seg_tokens > 0 && n_chunks > 1) {
++        const int64_t sc = ls_segment_chunks(ls->pp_seg_tokens, ls->chunks.empty() ? 0 : ls->chunks[0].n_tokens, n_chunks);
++        if (sc < 1 || !ls->pw_probe) {
++            ls->error_msg = "layer_major_pp: --pp-segment-tokens " + std::to_string((long long) ls->pp_seg_tokens) +
++                            " is not a positive multiple of the chunk width, or the per-width sets (pw_probe) are off";
++            ls->failed = true;
++            ret = GGML_STATUS_FAILED;
++            return -2;
++        }
++        seg_chunks = sc;
++    }
++    const int64_t n_segs = seg_chunks > 0 ? (n_chunks + seg_chunks - 1) / seg_chunks : 1;   // seg_chunks == 0 only for an empty chunk list, which the guard below refuses
+     // T-GPLR-41: identify which --pp-repeat pass this controller invocation is
+     // (1-based). Monotonic across the process: the runner invokes layer_major_pp
+     // exactly once per prefill pass, so the counter equals the pass number.
+@@ -6194,7 +6483,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+     std::vector<const llama_ubatch *>     chunk_ubatch(n_chunks);
+     std::vector<llama_layer_streaming::graph_set *> sets(n_chunks);
+     std::vector<std::vector<uint8_t>> chunk_input_snap(n_chunks); // T-Q38PW-00 probe snapshots
+-    for (int64_t c = 0; c < n_chunks; ++c) {
++    // G28: the apply loop is a lambda over a chunk range. The historical call right after it applies the chunks of the first segment (all chunks without --pp-segment-tokens), at the same
++    // place and in the same order as before; later segments are applied when they start.
++    auto apply_chunks = [&](int64_t c_begin, int64_t c_end) -> int {
++    for (int64_t c = c_begin; c < c_end; ++c) {
+         // T-Q38CTX-01: build the chunk from its immutable descriptor (real
+         // width + token_start) so the final tail chunk is a real 1..ubatch
+         // token chunk, never a padded one.
+@@ -6377,6 +6669,14 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+             }
+         }
+     }
++    return 0;
++    };
++    {
++        const int ar = apply_chunks(0, std::min<int64_t>(n_chunks, seg_chunks));
++        if (ar != 0) {
++            return ar;
++        }
++    }
+ 
+     // locate the CUDA compute backend (for copy-event ordering)
+     ggml_backend_t backend_cuda = nullptr;
+@@ -6404,6 +6704,63 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+         return -2;
+     }
+ 
++    // G28b: reserve the scheduler's compute buffers for the LARGEST graph of every built phase-0 set BEFORE the first graph of this pass executes. The persistent graphs keep the tensor addresses they got
++    // at their first allocation (ggml_gallocr_init_tensor only assigns when data is NULL), so a compute buffer that grows LATER (the output graph, which holds the logits, is the largest and runs last) frees the
++    // old buffer under every graph that already ran. One sweep never notices; a second sweep (the next segment) reads freed memory ("invalid argument" in the first copy of layer 1). Only with segments.
++    if (ls->pp_seg_tokens > 0 && n_segs > 1) {
++        const int n_be = ggml_backend_sched_get_n_backends(sched.get());
++        std::vector<size_t>        best(n_be, 0);
++        std::vector<ggml_cgraph *> best_g(n_be, nullptr);
++        std::vector<size_t>        sizes(n_be, 0);
++        // split_graph rewires node sources when it introduces cross-backend copies (the copies live in the scheduler's context, freed on the next reset): snapshot and restore, as run_graph does
++        auto with_pristine_graph = [&](ggml_cgraph * g, auto && fn) {
++            std::vector<ggml_tensor *> saved((size_t) g->n_nodes * GGML_MAX_SRC);
++            for (int k = 0; k < g->n_nodes; ++k) {
++                for (int j = 0; j < GGML_MAX_SRC; ++j) saved[(size_t) k * GGML_MAX_SRC + j] = g->nodes[k]->src[j];
++            }
++            fn();
++            for (int k = 0; k < g->n_nodes; ++k) {
++                for (int j = 0; j < GGML_MAX_SRC; ++j) g->nodes[k]->src[j] = saved[(size_t) k * GGML_MAX_SRC + j];
++            }
++        };
++        for (auto & s : ls->sets) {
++            if (!s.built || s.mode != 0) {
++                continue;
++            }
++            for (ggml_cgraph * g : s.graphs) {
++                if (g == nullptr) {
++                    continue;
++                }
++                std::fill(sizes.begin(), sizes.end(), (size_t) 0);
++                with_pristine_graph(g, [&]() { ggml_backend_sched_reserve_size(sched.get(), g, sizes.data()); });
++                for (int b = 0; b < n_be; ++b) {
++                    if (sizes[b] > best[b]) {
++                        best[b]   = sizes[b];
++                        best_g[b] = g;
++                    }
++                }
++            }
++        }
++        ggml_cgraph * last_reserved = nullptr;
++        for (int b = 0; b < n_be; ++b) {
++            if (best_g[b] == nullptr || best_g[b] == last_reserved) {
++                continue;
++            }
++            bool ok = true;
++            with_pristine_graph(best_g[b], [&]() { ok = ggml_backend_sched_reserve(sched.get(), best_g[b]); });
++            if (!ok) {
++                ls->error_msg = "layer_major_pp: G28b scheduler pre-reserve failed (backend " + std::to_string(b) + ", " + std::to_string((unsigned long long) best[b]) + " B)";
++                ls->failed = true;
++                ls->tel_error(ls->error_msg.c_str());
++                ret = GGML_STATUS_ALLOC_FAILED;
++                return -2;
++            }
++            last_reserved = best_g[b];
++            LLAMA_LOG_INFO("%s: G28b: scheduler pre-reserved for the largest phase-0 graph (backend %d needs %.1f MiB)\n", __func__, b, best[b] / 1048576.0);
++        }
++        ggml_backend_sched_reset(sched.get());
++    }
++
+     auto should_exec = [&](int il) -> bool {
+         if (ls->exec_layers.empty()) return true;
+         for (int e : ls->exec_layers) if (e == il) return true;
+@@ -6476,11 +6833,12 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+     if (ls->pw_probe) {
+         const size_t slab_elt = ggml_type_size(ls->act_slab_dtype);
+         slab_base = ggml_backend_buffer_get_base(ls->buf_slab.get());
+-        slab_half = (size_t) ls->n_embd_io * (size_t) ls->pp_tokens * slab_elt;
+-        size_t off = 0;
+-        for (int c = 0; c < n_chunks; ++c) {
+-            slab_off_c[c] = off;
+-            off += (size_t) ls->chunks[c].n_tokens * (size_t) ls->n_embd_io * slab_elt;
++        // G28: one slab half holds one SEGMENT (slab_tokens tokens: the whole prompt without --pp-segment-tokens); the offsets restart at every segment boundary
++        slab_half = (size_t) ls->n_embd_io * (size_t) ls->slab_tokens * slab_elt;
++        slab_off_c = ls_segment_slab_offsets(ls->chunks.data(), ls->chunks.size(), seg_chunks, (int64_t) ls->n_embd_io, slab_elt);
++        if (slab_off_c.size() != (size_t) n_chunks) {
++            ret = GGML_STATUS_FAILED;
++            return -2;
+         }
+     }
+ 
+@@ -6552,9 +6910,42 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
          return true;
      };
  
@@ -1755,10 +1944,43 @@ index ed091c288..94b4f2421 100644
 +        }
 +    }
 +
++    // G28: one iteration over all chunks without --pp-segment-tokens (the historical order); with it, stages 1-4 run once per segment
++    for (int64_t seg = 0; seg < n_segs; ++seg) {
++    const int64_t seg_c0 = seg * seg_chunks;
++    const int64_t seg_c1 = std::min<int64_t>(n_chunks, seg_c0 + seg_chunks);
++    if (seg > 0) {
++        // the previous segment is complete for every layer: release its memory contexts and input snapshots, then apply this segment's chunks (the KV cells and the recurrent state
++        // continue where the previous segment left them, exactly as across chunks)
++        for (int64_t cp = seg_c0 - seg_chunks; cp < seg_c0; ++cp) {
++            chunk_mctx[cp].reset();
++            chunk_ubatch[cp] = nullptr;
++            std::vector<uint8_t>().swap(chunk_input_snap[cp]);
++        }
++        const int ar = apply_chunks(seg_c0, seg_c1);
++        if (ar != 0) {
++            return ar;
++        }
++    }
++    if (n_segs > 1) {
++        ls->tel_pp_segment(seg, n_segs, seg_c0, seg_c1);
++    }
++
      // 1. embed every chunk (writes slab A[c]); no slot work
      const int64_t t_led_embed0 = ggml_time_us();
-     for (int c = 0; c < n_chunks; ++c) {
-@@ -6584,8 +6846,22 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+-    for (int c = 0; c < n_chunks; ++c) {
++    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+         const int64_t t_p0 = ggml_time_us();
+         if (!prepare_chunk(c)) {
+             ret = GGML_STATUS_FAILED;
+@@ -6577,15 +6968,29 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+         }
+         ls->n_ubatches++;
+     }
+-    led_embed = (double) (ggml_time_us() - t_led_embed0);
++    led_embed += (double) (ggml_time_us() - t_led_embed0);
+ 
+     // 2. preload the first n_slots selected layers (overlap window)
+     const int64_t t_led_pre0 = ggml_time_us();
      {
          int preloaded = 0;
          int last_pre = -1;
@@ -1782,7 +2004,14 @@ index ed091c288..94b4f2421 100644
              bool copied = false;
              if (!ls->load_layer(il, copied)) {
                  ls->tel_error(ls->error_msg.c_str());
-@@ -6616,41 +6892,42 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+@@ -6610,52 +7015,53 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+             }
+         }
+     }
+-    led_preload = (double) (ggml_time_us() - t_led_pre0);
++    led_preload += (double) (ggml_time_us() - t_led_pre0);
+ 
+     // 3. layers on the outside, chunks on the inside (ascending chunk order)
      const int64_t t_led_sweep0 = ggml_time_us();
      for (int il = 0; il < ls->n_layer; ++il) {
          if (!should_exec(il)) continue;
@@ -1854,7 +2083,13 @@ index ed091c288..94b4f2421 100644
          const int64_t t_slot1 = ggml_time_us();
  
          // run every chunk through this layer before the next layer starts
-@@ -6709,11 +6986,17 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+         double layer_compute_us = 0.0, layer_setup_us = 0.0;
+-        for (int c = 0; c < n_chunks; ++c) {
++        for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+             const int64_t t_p0 = ggml_time_us();
+             if (!prepare_chunk(c)) {
+                 ret = GGML_STATUS_FAILED;
+@@ -6709,11 +7115,17 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
          // T-GPLR-39: the slot telemetry write inside the slot span, named so
          // `other` does not absorb it (per-layer, not ubatch-scaled).
          led_tel += slotreq_span;
@@ -1875,7 +2110,7 @@ index ed091c288..94b4f2421 100644
              if (ls->af) {
                  // T-GPLR-25 residue fix: single writer per copy. With the
                  // worker on, the just-freed slot's refill is enqueued (the
-@@ -6721,11 +7004,7 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+@@ -6721,11 +7133,7 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
                  // slot, which happened just above); the consumption-time
                  // load_layer remains the on-demand fallback when the worker
                  // refuses or the depth-1 queue was busy.
@@ -1888,9 +2123,27 @@ index ed091c288..94b4f2421 100644
              } else {
                  bool c2 = false;
                  if (!ls->load_layer(next, c2)) {
-@@ -6761,6 +7040,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+@@ -6737,11 +7145,11 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+         }
+         led_slot += (double) (ggml_time_us() - t_slot2);
      }
-     led_output = (double) (ggml_time_us() - t_led_out0);
+-    led_sweep = (double) (ggml_time_us() - t_led_sweep0);
++    led_sweep += (double) (ggml_time_us() - t_led_sweep0);
+ 
+     // 4. output graph for every chunk (final norm + LM head; no slot work)
+     const int64_t t_led_out0 = ggml_time_us();
+-    for (int c = 0; c < n_chunks; ++c) {
++    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
+         const int64_t t_p0 = ggml_time_us();
+         prepare_chunk(c);
+         const int64_t t_p1 = ggml_time_us();
+@@ -6759,8 +7167,13 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
+             return -2;
+         }
+     }
+-    led_output = (double) (ggml_time_us() - t_led_out0);
++    led_output += (double) (ggml_time_us() - t_led_out0);
++    }   // G28: end of the segment loop
  
 +    // G22: with paced copies or a CPU leg a request can still be queued or in flight here; the worker must be idle before the slots can be torn down
 +    if (ls->pp_copy_piece_bytes > 0 || ls->has_cpu_leg()) {
@@ -1899,7 +2152,23 @@ index ed091c288..94b4f2421 100644
      // drain the copy stream so no copies are pending when the pass ends
      ls->ls_stage_drain();
  
-@@ -7896,6 +8179,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
+@@ -7784,7 +8197,14 @@ void llama_layer_streaming::tel_route(int il, int64_t chunk, ggml_cgraph * g) {
+         n_union, (unsigned long long) hash, sampled.c_str(), (long long) ggml_time_us());
+ }
+ 
+-void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens) {
++void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg) {
++    if (seg >= 0) {
++        tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"seg\":%lld,\"t_us\":%lld}",
++            (unsigned long long) run_id, chunk_id, slab, off_bytes,
++            (size_t) n_tokens * n_embd_io * ggml_type_size(act_slab_dtype),
++            (long long) seg, (long long) ggml_time_us());
++        return;
++    }
+     tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"t_us\":%lld}",
+         (unsigned long long) run_id, chunk_id, slab, off_bytes,
+         (size_t) n_tokens * n_embd_io * ggml_type_size(act_slab_dtype),
+@@ -7896,6 +8316,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
          (long long) ggml_time_us());
  }
  
@@ -1923,7 +2192,7 @@ index ed091c288..94b4f2421 100644
  void llama_layer_streaming::tel_tg_tokens(const std::vector<int64_t> & ids) {
      if (tel_out == nullptr) {
          return;
-@@ -8018,6 +8318,7 @@ void llama_layer_streaming::reset_stats() {
+@@ -8018,6 +8455,7 @@ void llama_layer_streaming::reset_stats() {
  // layer). During PP the slot window banks every layer unchanged — the CPU
  // routing is phase-gated in slot_layer()/load_layer(), never a PP behavior.
  bool llama_layer_streaming::begin_tg_stock() {
@@ -1932,7 +2201,7 @@ index ed091c288..94b4f2421 100644
      size_t slab_bytes = 0;
      for (auto & slot : slots) {
 diff --git a/src/llama-layer-streaming.h b/src/llama-layer-streaming.h
-index f5304f17d..8beb6270b 100644
+index f5304f17d..dec13a025 100644
 --- a/src/llama-layer-streaming.h
 +++ b/src/llama-layer-streaming.h
 @@ -251,6 +251,10 @@ struct llama_layer_streaming_slot {
@@ -1981,6 +2250,15 @@ index f5304f17d..8beb6270b 100644
          // T-GPLR-16: partial handoff (NCMOE-style mixed placement). Decided
          // FIRST: layers below the migration split execute from their host-
          // mmap CPU tensors (attention/router/shared/norms of those layers
+@@ -1100,7 +1125,7 @@ struct LLAMA_API llama_layer_streaming {
+     // layer-major: record that a chunk's act pair was bound to a fixed slab
+     // offset (slab 0 = A, 1 = B); the host validator uses these to prove the
+     // per-chunk slices are non-aliasing
+-    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens);
++    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg = -1);   // G28: seg >= 0 adds the segment index of a segmented prefill
+     void tel_error(const char * msg);
+     // T-GPLR-04: explicit out-of-core capacity proof. One structured event
+     // after the runtime preflight with the full byte-class accounting; the
 @@ -1136,6 +1161,9 @@ struct LLAMA_API llama_layer_streaming {
      // event annotates the pick; it never perturbs it.
      void tel_tg_logits(int step, int64_t top1_id, float top1_logit, int64_t top2_id,
@@ -1991,7 +2269,7 @@ index f5304f17d..8beb6270b 100644
      // T-Q38HG-06: MTP draft/accept counters (drafted, accepted, acceptance rate)
      void tel_mtp(int64_t n_tokens, int64_t drafted, int64_t accepted);
  
-@@ -1879,6 +1907,16 @@ struct LLAMA_API llama_layer_streaming {
+@@ -1879,6 +1907,24 @@ struct LLAMA_API llama_layer_streaming {
      bool set_pp_copy_overlap(bool on);
      bool pp_copy_overlap = false;
  
@@ -2005,10 +2283,18 @@ index f5304f17d..8beb6270b 100644
 +    size_t pp_copy_piece_bytes = 0;
 +    int    pp_copy_window = 2;
 +
++    // G28: segmented layer-major prefill. pp_seg_tokens > 0 processes the chunk list in segments of that many tokens (a positive multiple of the chunk width): the activation slab holds ONE
++    // segment (slab_tokens tokens per half, set by init) instead of the whole prompt, and each segment streams the layer banks once more. 0 = off = the historical single sweep. Call before init().
++    // The arithmetic lives in llama-ls-segments.h (host-testable).
++    bool set_pp_segment_tokens(int64_t tokens);
++    int64_t pp_seg_tokens = 0;
++    int64_t slab_tokens   = 0;
++    void tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end);
++
      // T-GPLR-35 recon (diagnostics only, off by default): records stream/context
      // identity once per run plus, per staged bank, the copy's own GPU window and
      // its start offset against the compute stream's backlog at enqueue time.
-@@ -2090,7 +2128,16 @@ private:
+@@ -2090,7 +2136,16 @@ private:
                         llama_layer & bundle, int il, uint32_t gen, llama_layer_streaming_slot & slot,
                         char * pool_base, size_t pool_bytes, bool pool_valid,
                         char * staging, size_t * staged_out,
@@ -2026,7 +2312,7 @@ index f5304f17d..8beb6270b 100644
      // pick the next executed logical layer after il (empty exec_layers = il+1)
      int af_next_layer(int il) const;
      // T-GPLR-32 state (private): gate enabled + in-flight worker DMA counter.
-@@ -2574,4 +2621,18 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
+@@ -2574,4 +2629,18 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
  // tensor directly. Returns -1 when unavailable.
  LLAMA_API int64_t llama_layer_major_pp_first_token(llama_context * ctx);
  
@@ -3901,10 +4187,10 @@ index c50757539..718b3e4d4 100644
 +// bytes the slot cache of the one engine in this process holds now and its slot count (the zero slot makes the size (n_slot + 1) x one slot row). False when there is no engine.
 +bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 1e6babaa9..52b54d541 100644
+index 1e6babaa9..1eb723965 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -415,6 +415,11 @@ if (LLAMA_LAYER_STREAMING)
+@@ -415,6 +415,16 @@ if (LLAMA_LAYER_STREAMING)
      llama_build_and_test(test-layer-streaming-tg-view.cpp)
      target_compile_definitions(test-layer-streaming-tg-view PRIVATE LLAMA_LAYER_STREAMING)
  
@@ -3913,10 +4199,15 @@ index 1e6babaa9..52b54d541 100644
 +    llama_build_and_test(test-layer-streaming-cpu-leg.cpp)
 +    target_compile_definitions(test-layer-streaming-cpu-leg PRIVATE LLAMA_LAYER_STREAMING)
 +
++    # G28: host-only proof of the segmented layer-major prefill arithmetic (src/llama-ls-segments.h: chunks per segment, segment-relative slab offsets, slab size). Header-only, no libraries.
++    add_executable(test-layer-streaming-segments test-layer-streaming-segments.cpp)
++    add_test(NAME test-layer-streaming-segments COMMAND $<TARGET_FILE:test-layer-streaming-segments>)
++    set_property(TEST test-layer-streaming-segments PROPERTY LABELS main)
++
      # T-GPLR-61 step A: host-only proof of the `moe-row-split` POLICY AND SHAPE
      # (AC1) -- ls_classify_row / ls_evaluate_gate / ls_plan_split driven
      # directly, so the shipped partition and refusal contract is what is under
-@@ -426,6 +431,17 @@ if (LLAMA_LAYER_STREAMING)
+@@ -426,6 +436,17 @@ if (LLAMA_LAYER_STREAMING)
      # NOT prove the identity gate -- that is AC2, a separate GPU task.
      llama_build_and_test(test-layer-streaming-expert-split.cpp)
      target_compile_definitions(test-layer-streaming-expert-split PRIVATE LLAMA_LAYER_STREAMING)
@@ -3952,14 +4243,15 @@ index 8e62a6138..5aeb66970 100644
      test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
      test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
 diff --git a/tools/layer-streaming/main.cpp b/tools/layer-streaming/main.cpp
-index 16b384858..40fcc95fb 100644
+index 16b384858..c1ad388f8 100644
 --- a/tools/layer-streaming/main.cpp
 +++ b/tools/layer-streaming/main.cpp
-@@ -22,17 +22,161 @@
+@@ -22,17 +22,162 @@
  #include "llama-layer-streaming.h"
  #include "telemetry-json.h"
  #include "telemetry-pool.h"
 +#include "top2-exact.h"
++#include "doc-sampler.h"
  
  #include "ggml-backend.h"
 +#include "ggml-cpu.h"
@@ -4117,7 +4409,7 @@ index 16b384858..40fcc95fb 100644
  #include <map>
  #include <string>
  #include <unordered_map>
-@@ -57,6 +201,11 @@ static void usage(const char * prog) {
+@@ -57,6 +202,11 @@ static void usage(const char * prog) {
          "  --no-mmap              load the model into ordinary host memory\n"
          "  --model-env NAME       read the model path from environment variable NAME\n"
          "  --kv-cache S           f16 (default), q8, or q4 for both K and V\n"
@@ -4129,16 +4421,24 @@ index 16b384858..40fcc95fb 100644
          "  --kv-graph-pad N       KV graph-length granularity passed to llama_context_params.n_pad\n"
          "                         (default 0 = legacy: n_pad = n_ctx, which pins every attention view\n"
          "                         to the whole allocated cache). N>0 makes llama_kv_cache::get_n_kv()\n"
-@@ -118,7 +267,7 @@ static void usage(const char * prog) {
+@@ -118,10 +268,15 @@ static void usage(const char * prog) {
          "                         in full or fails loudly\n"
          "  --mtp                 T-Q38HG-06: MTP speculative draft head in handoff TG (loads blk.64, migrates it, greedy-exact verify)\n"
          "  --mtp-draft N         draft tokens per round (default 2)\n"
 -        "  --prompt TEXT         real prompt text (overrides synthetic ids; pads to ubatch multiple for --mtp)\n"
++        "  --pp-segment-tokens N G28: segmented layer-major prefill: process the prompt in segments of N tokens (a multiple of --ubatch, at least 4 x --ubatch); the activation slab\n"
++        "                        holds one segment (16 KiB per token in f32) instead of the whole prompt, each segment streams the layer banks once more; arithmetic unchanged (default 0 = off)\n"
 +        "  --prompt TEXT         real prompt text (overrides synthetic ids; LLAMA_MTP_PAD_PROMPT=1 pads it to a ubatch multiple for --mtp)\n"
          "  --rep-penalty F       greedy repeat-penalty factor (default 1 = off) applied identically\n"
          "                        at every greedy pick site (target, draft head, serial TG)\n"
          "  --rep-last-n N        repeat-penalty window (default 64)\n"
-@@ -148,6 +297,12 @@ static void usage(const char * prog) {
++        "  --tg-sampler MODE     G27: off (greedy, default) or doc = the sampler chain of the owner's llama-server (top-k 20, top-p 0.95,\n"
++        "                        min-p 0.05, temperature 1.0, seeded draw) in the serial TG loop; refused with --mtp\n"
++        "  --tg-seed N           G27: seed of the doc sampler (default 1)\n"
+         "  --prompt-env NAME     read the prompt from environment variable NAME\n"
+         "  --prompt-file PATH   T-GPLR-07: read the prompt text from PATH (conflicts loudly\n"
+         "                         with --prompt/--prompt-env; required for >32 KB prompts)\n"
+@@ -148,6 +303,12 @@ static void usage(const char * prog) {
          "                         backend's CUDA context, so bank transfers overlap layer compute\n"
          "                         (default 0 = off; N=1 requires the CUDA compute backend and refuses\n"
          "                         loudly instead of falling back to the serialized copy-stream path)\n"
@@ -4151,7 +4451,7 @@ index 16b384858..40fcc95fb 100644
          "  --pp-recon N         T-GPLR-35 diagnostics: stream/context identity once per run plus one\n"
          "                         per-bank sample of the staging copy's GPU window and its start offset\n"
          "                         against the compute stream's backlog (default 0 = off; adds no ordering)\n"
-@@ -168,6 +323,23 @@ static void usage(const char * prog) {
+@@ -168,6 +329,23 @@ static void usage(const char * prog) {
          "                        annotates the existing pick with its top-1/top-2 values; never\n"
          "                        perturbs sampling. Consumed by tools/check-gplr54-logits.py.\n"
          "  --pp-schedule S      PP schedule: batch-major (default) or layer-major (opt-in experiment)\n"
@@ -4175,7 +4475,7 @@ index 16b384858..40fcc95fb 100644
          "  --residency-tg-window W  T-GPLR-62 S2: narrow the row-set slot window to W experts\n"
          "                       (0 = full bank, default). W must cover the worst-case\n"
          "                       union; a wider union refuses with 'window_overflow'.\n"
-@@ -1436,6 +1608,23 @@ static int check_telemetry(const std::string & path) {
+@@ -1436,6 +1614,23 @@ static int check_telemetry(const std::string & path) {
          long long last_copy_layer = -1;
      };
      std::unordered_map<int, slot_state> slots;
@@ -4199,7 +4499,15 @@ index 16b384858..40fcc95fb 100644
  
      // layer-major (SDD section 13): per-layer ascending chunk order and
      // non-aliasing act-slab binds
-@@ -2023,6 +2212,19 @@ static int check_telemetry(const std::string & path) {
+@@ -1449,6 +1644,7 @@ static int check_telemetry(const std::string & path) {
+     int    lm_pp_n_chunks = -1;                  // -1 = absent
+     std::vector<std::pair<long long, long long>> lm_manifest; // (token_start, n_tokens)
+     std::unordered_map<long long, int> lm_act_binds;          // chunk -> binds seen (must end at 2)
++    long long lm_act_seg_cur = -1;                            // G28: segment of the act_bind events being read (absent seg field = no segmentation)
+ 
+     // per-phase summary data for the telemetry printout (tok/s, transfer,
+     // wait, compute, evictions, graph builds) after the invariant check
+@@ -2023,6 +2219,19 @@ static int check_telemetry(const std::string & path) {
              if (ho_mode_valid && handoff_active_expected && !build_allowance.handoff_ever) {
                  err("run_start declared handoff_mode on/auto-on but no handoff events followed");
              }
@@ -4219,7 +4527,7 @@ index 16b384858..40fcc95fb 100644
          } else if (event == "slot_request") {
              bool f_layer = false, f_slot = false;
              const long long layer = json::integer(line, "layer", &f_layer);
-@@ -2109,8 +2311,7 @@ static int check_telemetry(const std::string & path) {
+@@ -2109,8 +2318,7 @@ static int check_telemetry(const std::string & path) {
                  // deterministic policy: slot s serves layers s + k*n_slots in
                  // order; slots may own different counts when n_slots does not
                  // divide n_layer evenly.
@@ -4229,7 +4537,7 @@ index 16b384858..40fcc95fb 100644
                  if (layer != expect_layer) {
                      err("copy_submit layer violates deterministic slot policy");
                  }
-@@ -2149,7 +2350,7 @@ static int check_telemetry(const std::string & path) {
+@@ -2149,7 +2357,7 @@ static int check_telemetry(const std::string & path) {
                  // (one rowset_fetch per layer window) and emits NO
                  // copy_submit/copy_complete pair, so the copy-completed rule
                  // does not apply in row-set mode.
@@ -4238,7 +4546,22 @@ index 16b384858..40fcc95fb 100644
                      err("layer_compute before matching copy_complete");
                  }
                  // T-GPLR-13: TG row-set layer_compute carries the TG window
-@@ -2249,8 +2450,7 @@ static int check_telemetry(const std::string & path) {
+@@ -2194,6 +2402,14 @@ static int check_telemetry(const std::string & path) {
+                     err("act_bind slab out of range");
+                     continue;
+                 }
++                // G28: the slices of different prefill segments alias by design; the non-aliasing rule is judged per segment (the seg field is absent without --pp-segment-tokens)
++                bool f_seg = false;
++                const long long bseg = json::integer(line, "seg", &f_seg);
++                if (f_seg && bseg != lm_act_seg_cur) {
++                    lm_act_off_A.clear();
++                    lm_act_off_B.clear();
++                    lm_act_seg_cur = bseg;
++                }
+                 auto & offmap = (slab == 0) ? lm_act_off_A : lm_act_off_B;
+                 for (const auto & kv : offmap) {
+                     // [off, off+bytes) must not overlap an existing bind
+@@ -2249,8 +2465,7 @@ static int check_telemetry(const std::string & path) {
              // not divide evenly (the recorded 3-slot rung exposed this: the
              // old n_layer/n_slots form drifted after the first full wrap and
              // rejected 1,253 correct slot_evict records).
@@ -4248,7 +4571,7 @@ index 16b384858..40fcc95fb 100644
              if (layer != expect_layer) {
                  err("slot_evict layer is not the prior resident layer");
              }
-@@ -3231,6 +3431,10 @@ int main(int argc, char ** argv) {
+@@ -3231,6 +3446,10 @@ int main(int argc, char ** argv) {
      // is now measured from process entry instead of from backend init.
      ggml_time_init();
      llama_ls_tel_mark("proc_start", nullptr);
@@ -4259,7 +4582,7 @@ index 16b384858..40fcc95fb 100644
  
      std::string model_path;
      int n_slots = 2;                     // owner default 2026-09-15 (was 1): overlap-capable minimum
-@@ -3248,7 +3452,18 @@ int main(int argc, char ** argv) {
+@@ -3248,7 +3467,18 @@ int main(int argc, char ** argv) {
      // step 3 is in place, because on its own it would build the TG view before any KV
      // cell exists and silently under-read. See the usage text and the plan block.
      long long kv_graph_pad = 0;
@@ -4278,7 +4601,7 @@ index 16b384858..40fcc95fb 100644
      int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
      int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
      // T-GPLR-72: host-backend thread count. Default 16 = the value that was
-@@ -3264,6 +3479,11 @@ int main(int argc, char ** argv) {
+@@ -3264,6 +3494,11 @@ int main(int argc, char ** argv) {
      bool no_mmap = false;
      std::string pp_schedule = "layer-major"; // T-GPLR-12: layer-major + per-width graphs default
      bool layer_major_explicit = false; // T-GPLR-12: --pp-schedule actually passed
@@ -4290,7 +4613,7 @@ index 16b384858..40fcc95fb 100644
      bool pw_probe = true;            // T-GPLR-12: default within layer-major
      // T-GPLR-29/30 default profile v3 (owner decision 2026-09-16): the
      // measured optimum for PP wall on this program — pinned staging + the
-@@ -3329,6 +3549,7 @@ int main(int argc, char ** argv) {
+@@ -3329,6 +3564,7 @@ int main(int argc, char ** argv) {
      int         residency_tg_spec_null = 0;   // T-GPLR-58 A1: --residency-tg-spec-null <0|1> the count-matched null source
      bool mtp = false;                // T-Q38HG-06: MTP speculative decode in handoff TG
      int mtp_draft = 2;               // T-Q38HG-06: draft tokens per verify round
@@ -4298,7 +4621,7 @@ index 16b384858..40fcc95fb 100644
      std::string act_slab_dtype_str = "bf16"; // T-GPLR-12: bf16 default (f32 stays explicit)
      int pp_prefetch_ahead = 0;       // T-GPLR-08: one-layer-ahead PrefetchVirtualMemory (0 = off, default)
      int pp_async_feed = 1;           // T-GPLR-25: async-feed worker (default 1 since the
-@@ -3336,6 +3557,8 @@ int main(int argc, char ** argv) {
+@@ -3336,6 +3572,8 @@ int main(int argc, char ** argv) {
      bool pp_af_serialize = false;    // T-GPLR-32: one worker H2D in flight (default 0 = off)
      bool pp_submit_batch = false;    // T-GPLR-33: one H2D per bank (V1 span copy; default 0 = off)
      bool pp_copy_overlap = false;    // T-GPLR-35: staging DMAs on the compute context's aux stream (default 0 = off)
@@ -4307,7 +4630,18 @@ index 16b384858..40fcc95fb 100644
      bool pp_recon = false;           // T-GPLR-35 recon: stream identity + per-bank copy/compute timing (default 0 = off)
      bool pp_mctx_recon = false;      // T-GPLR-41 recon: pass-boundary memory-lifecycle events (default off)
      // T-GPLR-39 (owner decision 2026-09-20): the route DIAGNOSTIC defaults OFF.
-@@ -3406,10 +3629,33 @@ int main(int argc, char ** argv) {
+@@ -3358,7 +3596,10 @@ int main(int argc, char ** argv) {
+     std::string pp_pool_policy = "fixed";
+     double rep_penalty = 1.0;        // T-GPLR-06: greedy repeat penalty (1 = off)
+     int tg_logit_margin = 0;         // T-GPLR-54 A2: per-step logit readout (0 = off)
++    long long pp_segment_tokens = 0; // G28: --pp-segment-tokens: segmented layer-major prefill, segment size in tokens (0 = off = one sweep over the whole prompt)
+     int    rep_last_n = 64;          // T-GPLR-06: repeat-penalty window
++    std::string tg_sampler_str = "off"; // G27: off (greedy, default) | doc (top-k 20 -> top-p 0.95 -> min-p 0.05 -> temp 1.0 -> seeded draw) in the serial TG loop
++    long long   tg_seed = 1;            // G27: seed of the doc sampler
+     std::string prompt_text;         // real prompt text (overrides synthetic ids)
+     std::string prompt_file;         // T-GPLR-07: --prompt-file (file prompt source)
+     std::string tg_text_path;        // T-GPLR-07: --tg-text (generated-text file output)
+@@ -3406,10 +3647,33 @@ int main(int argc, char ** argv) {
              // T-GPLR-04: --ctx-size is honored in run mode as the explicit
              // context/KV capacity, independent of the PP token count.
              run_ctx_size = ctx_size;
@@ -4341,7 +4675,7 @@ index 16b384858..40fcc95fb 100644
          } else if (arg == "--residency-budget-mib") {
              residency_budget_mib = atoll(arg_value(argc, argv, i, "--residency-budget-mib").c_str());
          } else if (arg == "--reserve-mib") {
-@@ -3517,6 +3763,32 @@ int main(int argc, char ** argv) {
+@@ -3517,6 +3781,32 @@ int main(int argc, char ** argv) {
          } else if (arg == "--pp-schedule") {
              pp_schedule = arg_value(argc, argv, i, "--pp-schedule");
              layer_major_explicit = (pp_schedule == "layer-major");
@@ -4374,7 +4708,7 @@ index 16b384858..40fcc95fb 100644
          } else if (arg == "--residency") {
              residency = arg_value(argc, argv, i, "--residency");
          } else if (arg == "--probe-capability") {
-@@ -3709,6 +3981,8 @@ int main(int argc, char ** argv) {
+@@ -3709,12 +3999,20 @@ int main(int argc, char ** argv) {
              // path. Requires --handoff (-attention-only) and --tg-tokens.
              mtp = true;
              mtp_explicit = true;
@@ -4383,7 +4717,19 @@ index 16b384858..40fcc95fb 100644
          } else if (arg == "--mtp-draft") {
              mtp_draft = atoi(arg_value(argc, argv, i, "--mtp-draft").c_str());
          } else if (arg == "--rep-penalty") {
-@@ -3782,6 +4056,19 @@ int main(int argc, char ** argv) {
+             rep_penalty = atof(arg_value(argc, argv, i, "--rep-penalty").c_str());
+         } else if (arg == "--rep-last-n") {
+             rep_last_n = atoi(arg_value(argc, argv, i, "--rep-last-n").c_str());
++        } else if (arg == "--tg-sampler") {
++            tg_sampler_str = arg_value(argc, argv, i, "--tg-sampler");
++        } else if (arg == "--tg-seed") {
++            tg_seed = atoll(arg_value(argc, argv, i, "--tg-seed").c_str());
++        } else if (arg == "--pp-segment-tokens") {
++            pp_segment_tokens = atoll(arg_value(argc, argv, i, "--pp-segment-tokens").c_str());
+         } else if (arg == "--prompt") {
+             prompt_text = arg_value(argc, argv, i, "--prompt");
+         } else if (arg == "--prompt-env") {
+@@ -3782,6 +4080,19 @@ int main(int argc, char ** argv) {
                  return 2;
              }
              pp_copy_overlap = (v == 1);
@@ -4403,7 +4749,7 @@ index 16b384858..40fcc95fb 100644
          } else if (arg == "--pp-mctx-recon") {
              pp_mctx_recon = atoi(arg_value(argc, argv, i, "--pp-mctx-recon").c_str()) != 0;
          } else if (arg == "--route-telemetry") {
-@@ -3909,6 +4196,14 @@ int main(int argc, char ** argv) {
+@@ -3909,6 +4220,14 @@ int main(int argc, char ** argv) {
          fprintf(stderr, "error: --pp-tokens and --ubatch must be > 0\n");
          return 2;
      }
@@ -4418,7 +4764,7 @@ index 16b384858..40fcc95fb 100644
      if (pp_repeat < 1 || pp_repeat > 16) {
          fprintf(stderr, "error: --pp-repeat must be in 1..16\n");
          return 2;
-@@ -4034,6 +4329,10 @@ int main(int argc, char ** argv) {
+@@ -4034,6 +4353,10 @@ int main(int argc, char ** argv) {
          fprintf(stderr, "error: --pp-async-feed must be 0 (off) or 1 (one-layer-ahead worker feed; requires --layer-slots >= 2)\n");
          return 2;
      }
@@ -4429,7 +4775,72 @@ index 16b384858..40fcc95fb 100644
      if (pp_async_feed > 0 && n_slots < 2) {
          fprintf(stderr, "error: --pp-async-feed requires --layer-slots >= 2 (with one slot the reuse invariant forbids staging the next layer while the current one computes)\n");
          return 2;
-@@ -4492,7 +4791,27 @@ int main(int argc, char ** argv) {
+@@ -4117,11 +4440,53 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "error: --pw-probe requires --pp-schedule layer-major\n");
+         return 2;
+     }
++    // G28: segmented layer-major prefill
++    if (pp_segment_tokens != 0) {
++        if (pp_segment_tokens < 0 || schedule != LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
++            fprintf(stderr, "error: --pp-segment-tokens needs a positive size and --pp-schedule layer-major\n");
++            return 2;
++        }
++        if (!pw_probe) {
++            fprintf(stderr, "error: --pp-segment-tokens needs the per-width sets (do not pass --no-pw-probe): the segment-relative slab offsets are patched per launch\n");
++            return 2;
++        }
++        if (pp_segment_tokens % ubatch != 0 || pp_segment_tokens < 4LL * ubatch) {
++            fprintf(stderr, "error: --pp-segment-tokens %lld must be a multiple of --ubatch %d and at least 4 x --ubatch\n", pp_segment_tokens, ubatch);
++            return 2;
++        }
++        if (mtp || pp_copy_piece_mib > 0 || (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") || pp_stock_below > 0) {
++            fprintf(stderr, "error: --pp-segment-tokens is not validated with --mtp, paced copies (--pp-copy-piece-mib), the CPU leg (--pp-cpu-layers) or the stock prefill path (--pp-stock-below)\n");
++            return 2;
++        }
++        fprintf(stderr, "pp-segment: segments of %lld tokens (%lld chunks of %d): the activation slab holds one segment, each segment streams the layer banks once more\n",
++                pp_segment_tokens, pp_segment_tokens / ubatch, ubatch);
++    }
+ 
+     // T-Q38HG-06: MTP needs the draft head's weights resident. The exact
+     // policy check runs below, after auto resolution knows the final policy
+     // (T-GPLR-06: moe-expert-bank keeps the MTP package resident without
+     // any handoff migration).
++    if (tg_sampler_str != "off" && tg_sampler_str != "doc") {
++        fprintf(stderr, "error: --tg-sampler must be off or doc (got '%s')\n", tg_sampler_str.c_str());
++        return 2;
++    }
++    if (tg_sampler_str == "doc" && mtp) {
++        fprintf(stderr, "error: --tg-sampler doc is refused with --mtp (the MTP verify path is greedy-exact by construction)\n");
++        return 2;
++    }
++    if (tg_sampler_str == "doc" && tg_probe_nosample) {
++        fprintf(stderr, "error: --tg-sampler doc is refused with --tg-probe-nosample (the probe never reads the logits)\n");
++        return 2;
++    }
++    if (tg_sampler_str == "doc" && rep_penalty != 1.0) {
++        fprintf(stderr, "error: --tg-sampler doc is refused with --rep-penalty (the penalty belongs to the greedy pick; the sampled token would ignore it)\n");
++        return 2;
++    }
++    const bool tg_sampler_on = (tg_sampler_str == "doc");
++    std::mt19937_64 tg_rng((uint64_t) tg_seed);
++    if (tg_sampler_on) {
++        fprintf(stderr, "tg-sampler: doc (top-k 20, top-p 0.95, min-p 0.05, temperature 1.0), seed %lld: the generated tokens are SAMPLED, not greedy (token 0 is the prefill's greedy argmax when --tg-first-pp-token is on)\n", tg_seed);
++    }
+     if (mtp && mtp_draft < 1) {
+         fprintf(stderr, "error: --mtp-draft must be >= 1\n");
+         return 2;
+@@ -4180,6 +4545,10 @@ int main(int argc, char ** argv) {
+           "--residency off is incompatible with --pp-schedule layer-major (off is the normal batch-major llama.cpp path)" },
+         { mtp,
+           "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
++        { pp_segment_tokens != 0,
++          "--residency off is incompatible with --pp-segment-tokens (segmentation is a layer-major prefill mode)" },
++        { tg_sampler_str != "off",
++          "--residency off is incompatible with --tg-sampler (the sampler lives in the streaming runner's serial TG loop, not in the normal llama.cpp path)" },
+         // T-GPLR-12: only an explicit handoff request (--handoff/--handoff-mode
+         // on) refuses `off`; the auto default must degrade to auto-off with a
+         // notice instead (condition (a): auto enables handoff only for a
+@@ -4492,7 +4861,27 @@ int main(int argc, char ** argv) {
      mparams.load_mode = no_mmap ? LLAMA_LOAD_MODE_NONE : LLAMA_LOAD_MODE_AUTO;
  
      const char * blk_pattern = "blk\\.[0-9]+\\.*";
@@ -4458,7 +4869,7 @@ index 16b384858..40fcc95fb 100644
      llama_model_tensor_buft_override overrides[] = {
          { residency == "moe-expert-bank" ? exps_pattern : blk_pattern, ggml_backend_cpu_buffer_type() },
          { nullptr,     nullptr },
-@@ -4548,8 +4867,9 @@ int main(int argc, char ** argv) {
+@@ -4548,8 +4937,9 @@ int main(int argc, char ** argv) {
          } else {
              prompt_tokens.resize(n_tok);
          }
@@ -4470,7 +4881,7 @@ index 16b384858..40fcc95fb 100644
              const llama_token pad = llama_vocab_pad(vocab);
              while ((int) prompt_tokens.size() % ubatch != 0) {
                  prompt_tokens.push_back(pad);
-@@ -4595,7 +4915,10 @@ int main(int argc, char ** argv) {
+@@ -4595,7 +4985,10 @@ int main(int argc, char ** argv) {
      // T-Q38HG-06: the target emits dense per-position hidden rows (unmasked
      // nextn); with --mtp the row buffer must cover PP + TG positions, so the
      // batch reserve grows to the padded session length.
@@ -4482,7 +4893,7 @@ index 16b384858..40fcc95fb 100644
      cparams.n_ubatch     = ubatch;
      cparams.n_seq_max    = 1;
      // n_outputs_max caps the widest decode that requests logits rows: PP
-@@ -4606,12 +4929,21 @@ int main(int argc, char ** argv) {
+@@ -4606,12 +4999,21 @@ int main(int argc, char ** argv) {
      // cover that MTP draft width or output_reserve aborts at the first
      // verify round. Must remain nonzero in all cases for graph
      // reservation.
@@ -4505,7 +4916,7 @@ index 16b384858..40fcc95fb 100644
      // T-Q38HG-06: the target may roll back a partial draft acceptance, which
      // requires recurrent-state snapshots for the Gated DeltaNet layers (the
      // hybrid memory clamps to 0 when the arch lacks rollback support).
-@@ -4694,11 +5026,71 @@ int main(int argc, char ** argv) {
+@@ -4694,11 +5096,71 @@ int main(int argc, char ** argv) {
      llama_ls_vram_budget vram;
      ls_vram_budget_measure_start(vram, device, reserve_mib, residency_budget_mib);
  
@@ -4577,7 +4988,30 @@ index 16b384858..40fcc95fb 100644
  
      // ------------------------------------------------------------------
      // T-GPLR-05: forced `off` — the normal llama.cpp path inside the
-@@ -5427,6 +5819,19 @@ int main(int argc, char ** argv) {
+@@ -4723,8 +5185,10 @@ int main(int argc, char ** argv) {
+     const bool use_bf16_slab = (act_slab_dtype_str == "bf16");
+     const ggml_type act_slab_dtype = use_bf16_slab ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+     const size_t slab_elt = use_bf16_slab ? 2 : 4;
++    // G28: with --pp-segment-tokens the slab holds one segment
++    const int64_t slab_tokens_main = (pp_segment_tokens > 0 && pp_segment_tokens < (long long) pp_tokens) ? (int64_t) pp_segment_tokens : (int64_t) pp_tokens;
+     const size_t act_slab_bytes = (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR)
+-        ? (size_t) llama_model_n_embd_inp(model) * (size_t) pp_tokens * 2 * slab_elt
++        ? (size_t) llama_model_n_embd_inp(model) * (size_t) slab_tokens_main * 2 * slab_elt
+         : 0;
+ 
+     // layer-major preflight (SDD section 13): report the two-slab activation
+@@ -5093,6 +5557,10 @@ int main(int argc, char ** argv) {
+ 
+ 
+     llama_layer_streaming ls;
++    if (!ls.set_pp_segment_tokens(pp_segment_tokens)) {
++        fprintf(stderr, "error: %s\n", ls.error_msg.c_str());
++        return 2;
++    }
+     const bool use_implicit_causal_mask = schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR;
+     fprintf(stderr, "layer-major preflight: initializing streaming module\n");
+     if (!ls.init(*model, n_slots, device, tel_path.empty() ? nullptr : tel_path.c_str(), ubatch, n_ctx_total,
+@@ -5427,6 +5895,19 @@ int main(int argc, char ** argv) {
          ls.tel_run_refused("async_feed_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
          return 1;
      }
@@ -4597,7 +5031,7 @@ index 16b384858..40fcc95fb 100644
      // T-GPLR-30: configure the persistent pinned pool (after init — it needs
      // the per-layer package sizes — and after async-feed, since a failed pool
      // allocation must not leave a running worker behind). A failure aborts
-@@ -5484,6 +5889,36 @@ int main(int argc, char ** argv) {
+@@ -5484,6 +5965,36 @@ int main(int argc, char ** argv) {
          }
      }
      ls.exec_layers = boundary_layers;
@@ -4634,7 +5068,7 @@ index 16b384858..40fcc95fb 100644
  
      // T-GPLR-56 A3 arm `p1-early`: the earliest LEGAL registration site - after the
      // load, after ls.init and after exec_layers is assigned, before the prebuild.
-@@ -5581,7 +6016,7 @@ int main(int argc, char ** argv) {
+@@ -5581,7 +6092,7 @@ int main(int argc, char ** argv) {
          // T-GPLR-06 step 2: the per-round mirror fill decodes one row per
          // committed target cell (up to 1 + mtp_draft), so the draft ubatch
          // must hold a full round's fill.
@@ -4643,7 +5077,7 @@ index 16b384858..40fcc95fb 100644
          dparams.n_seq_max    = 1;
          dparams.n_outputs_max = 1;
          dparams.n_threads       = (int32_t) cpu_threads;
-@@ -5596,6 +6031,17 @@ int main(int argc, char ** argv) {
+@@ -5596,6 +6107,17 @@ int main(int argc, char ** argv) {
              return 1;
          }
          ctx_dft->set_layer_streaming(&ls);
@@ -4661,7 +5095,7 @@ index 16b384858..40fcc95fb 100644
          llama_set_embeddings_nextn(ctx, true, false);   // target: per-position hidden rows
          llama_set_embeddings_nextn(ctx_dft, true, true); // draft: chained head-internal rows
          fprintf(stderr, "MTP: draft head (blk.%d) enabled, n_embd_out %d, n_rs_seq %u\n",
-@@ -5651,7 +6097,7 @@ int main(int argc, char ** argv) {
+@@ -5651,7 +6173,7 @@ int main(int argc, char ** argv) {
              batch.pos[i]   = i;
              batch.n_seq_id[i] = 1;
              batch.seq_id[i][0] = 0;
@@ -4670,7 +5104,7 @@ index 16b384858..40fcc95fb 100644
          }
          batch.n_tokens = pp_tokens;
  
-@@ -5862,6 +6308,15 @@ int main(int argc, char ** argv) {
+@@ -5862,6 +6384,15 @@ int main(int argc, char ** argv) {
              // runs once after the final pass. Per-pass phase_summaries share
              // the prebuild's builds0 baseline, so graph_builds stays 0 unless
              // the timed region really constructs graphs (checker-enforced).
@@ -4686,7 +5120,7 @@ index 16b384858..40fcc95fb 100644
              for (int pp_pass_i = 0; pp_pass_i < pp_repeat && exit_status == 0; ++pp_pass_i) {
              if (pp_pass_i > 0) {
                  llama_memory_clear(llama_get_memory(ctx), true);
-@@ -5875,7 +6330,7 @@ int main(int argc, char ** argv) {
+@@ -5875,7 +6406,7 @@ int main(int argc, char ** argv) {
                  // keys/slab offsets; builds0 advances so per-pass phase
                  // summaries keep graph_builds = 0 (checker-clean). Refused
                  // under --mtp below.
@@ -4695,7 +5129,7 @@ index 16b384858..40fcc95fb 100644
                      // T-GPLR-47: pass-2+ prebuilds REPLACE each built set with a
                      // fresh-context rebuild (swap-in-slot) instead of resetting in
                      // place -- no ctx accumulation, pointers valid by construction.
-@@ -5923,7 +6378,7 @@ int main(int argc, char ** argv) {
+@@ -5923,7 +6454,7 @@ int main(int argc, char ** argv) {
                          ub.pos[i]     = off + i;
                          ub.n_seq_id[i] = 1;
                          ub.seq_id[i][0] = 0;
@@ -4704,7 +5138,7 @@ index 16b384858..40fcc95fb 100644
                      }
                      ub.n_tokens = n_tok;
                      ret = llama_decode(ctx, ub);
-@@ -5933,6 +6388,24 @@ int main(int argc, char ** argv) {
+@@ -5933,6 +6464,24 @@ int main(int argc, char ** argv) {
                      }
                      llama_batch_free(ub);
                  }
@@ -4729,7 +5163,7 @@ index 16b384858..40fcc95fb 100644
              } else if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
                  // layer-major PP (SDD section 13, T-Q38LM-02): drive the full
                  // prompt through the dedicated layer-major controller rather
-@@ -5988,6 +6461,16 @@ int main(int argc, char ** argv) {
+@@ -5988,6 +6537,16 @@ int main(int argc, char ** argv) {
      // run: `run_end.exit_status != 0` rejects the trace regardless, so no
      // verdict depends on the handoff rule for that shape.
      // ------------------------------------------------------------------
@@ -4746,7 +5180,7 @@ index 16b384858..40fcc95fb 100644
      if (exit_status == 0 && tg_tokens > 0) {
          const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
  
-@@ -6000,11 +6483,29 @@ int main(int argc, char ** argv) {
+@@ -6000,11 +6559,29 @@ int main(int argc, char ** argv) {
              ? (llama_token) (pp_tokens - 1)
              : prompt_tokens[pp_tokens - 1]; // last PP token; first generated comes from logits
  
@@ -4776,7 +5210,7 @@ index 16b384858..40fcc95fb 100644
          ls.phase = 1;
  
          // T-GPLR-71: arm the phase-scoped attention-view granularity. This is
-@@ -6098,7 +6599,8 @@ int main(int argc, char ** argv) {
+@@ -6098,7 +6675,8 @@ int main(int argc, char ** argv) {
          // filled by PP, so reset them so the TG phase_summary reports TG-only
          // transfer/wait/compute and ubatch counts (T-Q38LS-05)
          ls.reset_stats();
@@ -4786,7 +5220,7 @@ index 16b384858..40fcc95fb 100644
  
          // MTP acceptance counters (T-Q38HG-06) + batch-verify counters
          // (T-GPLR-06 step 2)
-@@ -6109,6 +6611,91 @@ int main(int argc, char ** argv) {
+@@ -6109,6 +6687,91 @@ int main(int argc, char ** argv) {
          int64_t mrounds_full    = 0;   // all drafts accepted
          int64_t mrounds_partial = 0;   // some draft rejected
          int64_t mrounds_rewind  = 0;   // rounds that rolled KV/RS back
@@ -4878,7 +5312,7 @@ index 16b384858..40fcc95fb 100644
  
          if (mtp && exit_status == 0) {
              // --- MTP draft/verify/accept loop (T-Q38HG-06) ---
-@@ -6131,6 +6718,7 @@ int main(int argc, char ** argv) {
+@@ -6131,6 +6794,7 @@ int main(int argc, char ** argv) {
              //    round. From here on every frontier decode is (cur at the
              //    frontier), the exact decode sequence of the non-MTP greedy
              //    path, so parity holds by construction.
@@ -4886,7 +5320,7 @@ index 16b384858..40fcc95fb 100644
              fprintf(stderr, "MTP: initial frontier decode (x[%d] at pos %d)\n", (int) cur, (int) pp_tokens); fflush(stderr);
              {
                  batch.token[0]   = cur;
-@@ -6237,27 +6825,49 @@ int main(int argc, char ** argv) {
+@@ -6237,27 +6901,49 @@ int main(int argc, char ** argv) {
                      draft_ring.accept(t);
                  }
  
@@ -4947,7 +5381,7 @@ index 16b384858..40fcc95fb 100644
                              // T-GPLR-06: penalized copy; the ring must see the
                              // chain built so far (prompt + generated + drafts)
                              // so the head drafts what the penalized target will
-@@ -6274,7 +6884,7 @@ int main(int argc, char ** argv) {
+@@ -6274,7 +6960,7 @@ int main(int argc, char ** argv) {
                          draft_ring.accept(bd);
                          // chained h row of the drafted token (draft head's
                          // own nextn row)
@@ -4956,7 +5390,7 @@ index 16b384858..40fcc95fb 100644
                          if (hd != nullptr) {
                              memcpy(pending_h.data(), hd, row_bytes);
                          }
-@@ -6290,6 +6900,7 @@ int main(int argc, char ** argv) {
+@@ -6290,6 +6976,7 @@ int main(int argc, char ** argv) {
                  if (exit_status != 0) {
                      break;
                  }
@@ -4964,7 +5398,7 @@ index 16b384858..40fcc95fb 100644
  
                  mtp_drafted += (int64_t) draft.size();
  
-@@ -6339,7 +6950,9 @@ int main(int argc, char ** argv) {
+@@ -6339,7 +7026,9 @@ int main(int argc, char ** argv) {
                      }
                  }
  
@@ -4974,7 +5408,7 @@ index 16b384858..40fcc95fb 100644
                  if (ret != 0) {
                      fprintf(stderr, "error: MTP batch verify decode failed with %d: %s\n", ret, ls.error_msg.c_str());
                      ls.failed = true;
-@@ -6349,6 +6962,9 @@ int main(int argc, char ** argv) {
+@@ -6349,6 +7038,9 @@ int main(int argc, char ** argv) {
  
                  for (int j = 0; j < rmax; ++j) {
                      const float * logits = llama_get_logits_ith(ctx, j);
@@ -4984,7 +5418,7 @@ index 16b384858..40fcc95fb 100644
                      if (logits == nullptr) {
                          fprintf(stderr, "error: no logits at MTP batch verify row %d\n", j);
                          ls.failed = true;
-@@ -6359,7 +6975,11 @@ int main(int argc, char ** argv) {
+@@ -6359,7 +7051,11 @@ int main(int argc, char ** argv) {
                      float best_val = logits[0];
                      float second_val = -INFINITY;
                      llama_token second_tok = 0;
@@ -4997,7 +5431,7 @@ index 16b384858..40fcc95fb 100644
                          // T-GPLR-06: penalized copy; row j's ring view is the
                          // true stream plus the draft chain prefix before row j
                          // (row 0 = the frontier decode sees the true ring).
-@@ -6386,6 +7006,8 @@ int main(int argc, char ** argv) {
+@@ -6386,6 +7082,8 @@ int main(int argc, char ** argv) {
                  if (exit_status != 0) {
                      break;
                  }
@@ -5006,7 +5440,7 @@ index 16b384858..40fcc95fb 100644
  
                  // A = committed rows: row 0 always commits (its input cur is
                  // the true stream); row j commits iff draft[j-1] was
-@@ -6423,12 +7045,14 @@ int main(int argc, char ** argv) {
+@@ -6423,12 +7121,14 @@ int main(int argc, char ** argv) {
                  // accumulation) are expected shape-numerics flip candidates;
                  // a flip at a large-margin row would instead indicate a
                  // state/wiring defect.
@@ -5026,7 +5460,7 @@ index 16b384858..40fcc95fb 100644
  
                  cur = gold[committed - 1];
                  const int n_acc = committed - 1;  // row 0 is the frontier, not a draft
-@@ -6482,9 +7106,10 @@ int main(int argc, char ** argv) {
+@@ -6482,9 +7182,10 @@ int main(int argc, char ** argv) {
                  // The LAST committed cell's mirror row is written by the
                  // next round's seed decode (cur, pending_h at push_pos-1),
   // exactly like the serial path's deferred fill.
@@ -5038,7 +5472,7 @@ index 16b384858..40fcc95fb 100644
                          fprintf(stderr, "error: draft KV trim before batch mirror fill failed at pos %lld\n",
                                  (long long) (pp_tokens + g0 - 1));
                          ls.failed = true;
-@@ -6519,21 +7144,29 @@ int main(int argc, char ** argv) {
+@@ -6519,21 +7220,29 @@ int main(int argc, char ** argv) {
                      break;
                  }
                  dbatch.n_tokens = n_rows;
@@ -5075,7 +5509,7 @@ index 16b384858..40fcc95fb 100644
                      llama_memory_t mem = llama_get_memory(ctx_dft);
                      const llama_pos rm_from = (llama_pos) (pp_tokens + generated.size());
                      if (!llama_memory_seq_rm(mem, 0, rm_from, -1)) {
-@@ -6542,20 +7175,57 @@ int main(int argc, char ** argv) {
+@@ -6542,20 +7251,57 @@ int main(int argc, char ** argv) {
                          exit_status = 1;
                      }
                  }
@@ -5137,7 +5571,7 @@ index 16b384858..40fcc95fb 100644
                  batch.token[0]   = cur;
                  batch.pos[0]     = pp_tokens + t;
                  batch.n_seq_id[0] = 1;
-@@ -6563,7 +7233,9 @@ int main(int argc, char ** argv) {
+@@ -6563,7 +7309,9 @@ int main(int argc, char ** argv) {
                  batch.logits[0]  = true;
                  batch.n_tokens   = 1;
  
@@ -5147,7 +5581,7 @@ index 16b384858..40fcc95fb 100644
                  if (ret != 0) {
                      fprintf(stderr, "error: TG decode step %d failed with %d: %s\n", t, ret, ls.error_msg.c_str());
                      ls.failed = true;
-@@ -6571,7 +7243,14 @@ int main(int argc, char ** argv) {
+@@ -6571,7 +7319,14 @@ int main(int argc, char ** argv) {
                      break;
                  }
  
@@ -5162,7 +5596,7 @@ index 16b384858..40fcc95fb 100644
                  if (logits == nullptr) {
                      fprintf(stderr, "error: no logits at TG step %d\n", t);
                      ls.failed = true;
-@@ -6583,7 +7262,11 @@ int main(int argc, char ** argv) {
+@@ -6583,7 +7338,11 @@ int main(int argc, char ** argv) {
                  float best_val = logits[0];
                  float second_val = -INFINITY;
                  llama_token second_tok = 0;
@@ -5175,8 +5609,20 @@ index 16b384858..40fcc95fb 100644
                      // T-GPLR-06: penalized copy of the serial TG pick
                      std::vector<float> plogits(logits, logits + n_vocab);
                      rep_ring.apply(plogits.data(), n_vocab, (float) rep_penalty);
-@@ -6607,6 +7290,17 @@ int main(int argc, char ** argv) {
+@@ -6605,8 +7364,29 @@ int main(int argc, char ** argv) {
+                 // integer compare here).
+                 ls.tel_tg_logits(t, (int64_t) best, best_val, (int64_t) second_tok, second_val);
                  cur = best;
++                if (tg_sampler_on) {
++                    // G27: the greedy pick above stays in the trace (margin, top-2); the token that is generated is the sampled one
++                    cur = (llama_token) ls_doc_sample(logits, n_vocab, ls_doc_sampler_params(), tg_rng);
++                    if (cur < 0) {
++                        fprintf(stderr, "error: --tg-sampler doc drew no token at TG step %d (an all-NaN logits row)\n", t);
++                        ls.failed = true;
++                        exit_status = 1;
++                        break;
++                    }
++                }
                  generated.push_back(cur);
                  rep_ring.accept(cur);
 +                host_dec_us   += t_h1 - t_h0;
@@ -5193,7 +5639,7 @@ index 16b384858..40fcc95fb 100644
              }
          }
  
-@@ -6794,6 +7488,7 @@ int main(int argc, char ** argv) {
+@@ -6794,6 +7574,7 @@ int main(int argc, char ** argv) {
          fprintf(stderr, "(boundary mode: skipping trace self-check; deterministic slot policy does not apply to a reduced layer subset)\n");
      }
  
@@ -5532,6 +5978,67 @@ index 000000000..7b5cc2b46
 +    dst_meta.alloc((size_t) pb * ggml_nrows(dst));
 +    ggml_cuda_fattn_gqa8_launch((const char *) Q->data, (int) Q->nb[2], (const char *) K->data, (int) K->nb[1], (int) K->nb[2],
 +        (const char *) V->data, (int) V->nb[1], (int) V->nb[2], (const half *) mask->data, (float *) dst->data, dst_tmp.ptr, dst_meta.ptr, N, nkv, pb, scale, ctx.stream());
++}
+diff --git a/src/llama-ls-segments.h b/src/llama-ls-segments.h
+new file mode 100644
+index 000000000..2b937d478
+--- /dev/null
++++ b/src/llama-ls-segments.h
+@@ -0,0 +1,55 @@
++// G28: host-pure arithmetic of the SEGMENTED layer-major prefill (no ggml, no CUDA, no model): which chunks form a segment, and where a chunk's activation slice sits inside its segment's slab half.
++//
++// The layer-major prefill keeps the inter-layer activations of the whole prompt in a GPU slab (2 halves x n_embd_io x prompt tokens x element size: 16 KiB per token in f32), which is
++// what breaks the owner's "16,000 MiB stay free" rule at long prompts. With --pp-segment-tokens S the chunk list is processed in segments of S tokens: for each segment the embed,
++// the sweep over all layers and the output run against a slab that holds ONE segment. Per layer the chunks are still visited in ascending order (segment k+1 after segment k), so the
++// arithmetic is the unsegmented one; the price is one more pass of the layer banks over PCIe per segment. Header-only so that the production code and the host test share the symbols.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Chunks per segment for segments of `seg_tokens` tokens over chunks of `chunk_width` tokens (the width of a full chunk = the ubatch):
++//   0   segmentation off (seg_tokens <= 0)
++//   -1  refused: the chunk width is not positive, or seg_tokens is not a positive multiple of it (the caller must refuse, never round)
++//   k   min(n_chunks, seg_tokens / chunk_width); k == n_chunks is a single segment, the historical sweep
++static inline int64_t ls_segment_chunks(int64_t seg_tokens, int64_t chunk_width, int64_t n_chunks) {
++    if (seg_tokens <= 0) {
++        return 0;
++    }
++    if (chunk_width <= 0 || seg_tokens % chunk_width != 0) {
++        return -1;
++    }
++    const int64_t k = seg_tokens / chunk_width;
++    if (k < 1) {
++        return -1;
++    }
++    return k < n_chunks ? k : n_chunks;
++}
++
++// the segment a chunk belongs to (0 without segmentation)
++static inline int64_t ls_segment_of(int64_t chunk, int64_t seg_chunks) {
++    return seg_chunks > 0 ? chunk / seg_chunks : 0;
++}
++
++// Byte offset of every chunk inside its segment's slab half: the cumulative size of the chunks before it IN THE SAME SEGMENT, restarting at 0 at every segment boundary.
++// seg_chunks <= 0 or >= n_chunks is one segment and gives the historical whole-prompt cumulative offsets.
++template <typename Chunk>
++static inline std::vector<size_t> ls_segment_slab_offsets(const Chunk * chunks, size_t n_chunks, int64_t seg_chunks, int64_t n_embd_io, size_t slab_elt) {
++    std::vector<size_t> off(n_chunks, 0);
++    size_t acc = 0;
++    for (size_t c = 0; c < n_chunks; ++c) {
++        if (seg_chunks > 0 && seg_chunks < (int64_t) n_chunks && (int64_t) c % seg_chunks == 0) {
++            acc = 0;
++        }
++        off[c] = acc;
++        acc += (size_t) chunks[c].n_tokens * (size_t) n_embd_io * slab_elt;
++    }
++    return off;
++}
++
++// tokens one slab half must hold: the segment size when it is smaller than the prompt, else the prompt
++static inline int64_t ls_slab_tokens(int64_t pp_tokens, int64_t seg_tokens) {
++    return (seg_tokens > 0 && seg_tokens < pp_tokens) ? seg_tokens : pp_tokens;
 +}
 diff --git a/src/llama-moe-lean.h b/src/llama-moe-lean.h
 new file mode 100644
@@ -6282,6 +6789,112 @@ index 000000000..1435e2d7d
 +    fprintf(stderr, "\n%s (%d failure%s)\n", failures == 0 ? "PASS" : "FAIL", failures, failures == 1 ? "" : "s");
 +    return failures == 0 ? 0 : 1;
 +}
+diff --git a/tests/test-layer-streaming-segments.cpp b/tests/test-layer-streaming-segments.cpp
+new file mode 100644
+index 000000000..d32c36e46
+--- /dev/null
++++ b/tests/test-layer-streaming-segments.cpp
+@@ -0,0 +1,100 @@
++// Host-only test (no CUDA, no model, no ggml) of the segmented layer-major prefill arithmetic (src/llama-ls-segments.h, G28).
++//
++// WHY THIS EXISTS. A wrong slab offset in the segmented prefill would make a chunk read or overwrite another chunk's activations: a plausible-looking wrong answer that no speed number shows.
++// The offsets are pure arithmetic, so they are proven here for the shapes that matter: the historical single sweep must be unchanged byte for byte; with segments the offsets restart at every
++// boundary; the tail chunk may be narrower; no two chunks of the SAME segment overlap; and every segment fits inside one slab half of ls_slab_tokens() tokens.
++//
++// Build:  g++ -O2 -std=c++17 -I../src test-layer-streaming-segments.cpp   (or cl /EHsc /std:c++17 /I..\src ...)
++#include "../src/llama-ls-segments.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++
++struct mock_chunk {
++    int64_t token_start;
++    int64_t n_tokens;
++};
++
++static int failures = 0;
++
++static void expect(bool cond, const char * what) {
++    if (cond) {
++        fprintf(stderr, "ok   %s\n", what);
++    } else {
++        fprintf(stderr, "FAIL %s\n", what);
++        failures++;
++    }
++}
++
++static std::vector<mock_chunk> layout(int64_t pp_tokens, int64_t ubatch) {
++    std::vector<mock_chunk> out;
++    for (int64_t s = 0; s < pp_tokens; s += ubatch) {
++        out.push_back({s, std::min<int64_t>(ubatch, pp_tokens - s)});
++    }
++    return out;
++}
++
++int main() {
++    fprintf(stderr, "== ls_segment_chunks ==\n");
++    expect(ls_segment_chunks(0, 2048, 100) == 0, "seg_tokens 0 = off");
++    expect(ls_segment_chunks(-5, 2048, 100) == 0, "negative seg_tokens = off");
++    expect(ls_segment_chunks(16384, 2048, 100) == 8, "16384 / 2048 = 8 chunks per segment");
++    expect(ls_segment_chunks(16384, 2048, 5) == 5, "a segment larger than the prompt is one segment of n_chunks");
++    expect(ls_segment_chunks(16384, 2048, 8) == 8, "exactly the prompt = one segment");
++    expect(ls_segment_chunks(1000, 2048, 100) == -1, "smaller than a chunk is refused");
++    expect(ls_segment_chunks(3000, 2048, 100) == -1, "not a multiple of the chunk width is refused");
++    expect(ls_segment_chunks(2048, 0, 100) == -1, "chunk width 0 is refused");
++
++    fprintf(stderr, "\n== single sweep (seg_chunks >= n_chunks or <= 0) = the historical cumulative offsets ==\n");
++    {
++        const auto ch = layout(5000, 2048);       // 2048, 2048, 904
++        const size_t e = 4 * 2048;                 // n_embd_io 2048 (bytes per token per half in f32 = 8192)
++        for (int64_t seg : {(int64_t) 0, (int64_t) 3, (int64_t) 100}) {
++            const auto off = ls_segment_slab_offsets(ch.data(), ch.size(), seg, 2048, 4);
++            expect(off.size() == 3 && off[0] == 0 && off[1] == 2048 * e && off[2] == 4096 * e, "cumulative offsets for a single sweep");
++        }
++    }
++
++    fprintf(stderr, "\n== segments: offsets restart, tail narrower, no overlap inside a segment, every segment fits one half ==\n");
++    for (int64_t pp : {(int64_t) 8192, (int64_t) 16385, (int64_t) 49997, (int64_t) 250000}) {
++        for (int64_t ub : {(int64_t) 512, (int64_t) 2048}) {
++            for (int64_t seg_tokens : {4 * ub, 8 * ub, 16384L / ub * ub}) {
++                if (seg_tokens < 4 * ub) { continue; }
++                const auto ch = layout(pp, ub);
++                const int64_t sc = ls_segment_chunks(seg_tokens, ub, (int64_t) ch.size());
++                const int64_t slab_tokens = ls_slab_tokens(pp, seg_tokens);
++                const size_t elt = 4, e = (size_t) 2048 * elt;
++                const auto off = ls_segment_slab_offsets(ch.data(), ch.size(), sc, 2048, elt);
++                bool ok = sc >= 1 && off.size() == ch.size();
++                size_t half = (size_t) slab_tokens * e;
++                for (size_t c = 0; ok && c < ch.size(); ++c) {
++                    const size_t bytes = (size_t) ch[c].n_tokens * e;
++                    if ((int64_t) c % sc == 0 && off[c] != 0) { ok = false; }                         // restarts at 0
++                    if (off[c] + bytes > half) { ok = false; }                                         // inside the half
++                    if ((int64_t) c % sc != 0 && off[c] != off[c - 1] + (size_t) ch[c - 1].n_tokens * e) { ok = false; }   // contiguous inside the segment
++                    if (ls_segment_of((int64_t) c, sc) != (int64_t) c / sc) { ok = false; }
++                }
++                char what[160];
++                snprintf(what, sizeof(what), "pp %lld ubatch %lld segment %lld tokens (%lld chunks): offsets valid, slab half %.1f MiB", (long long) pp, (long long) ub, (long long) seg_tokens, (long long) sc,
++                         (double) half / (1024.0 * 1024.0));
++                expect(ok, what);
++            }
++        }
++    }
++
++    fprintf(stderr, "\n== slab size ==\n");
++    expect(ls_slab_tokens(250000, 0) == 250000, "no segmentation: the whole prompt");
++    expect(ls_slab_tokens(250000, 16384) == 16384, "segmentation: one segment");
++    expect(ls_slab_tokens(10000, 16384) == 10000, "a segment larger than the prompt: the prompt");
++    {
++        // the f32 slab at 250k: 2 halves x 2048 x tokens x 4 B = 3,906 MiB unsegmented, 256 MiB with 16,384-token segments
++        const double full = 2.0 * 2048 * 250000 * 4 / (1024.0 * 1024.0), seg = 2.0 * 2048 * 16384 * 4 / (1024.0 * 1024.0);
++        char what[160];
++        snprintf(what, sizeof(what), "f32 slab at 250k tokens: %.0f MiB whole, %.0f MiB with 16,384-token segments", full, seg);
++        expect(full > 1900 && seg == 256.0, what);
++    }
++
++    fprintf(stderr, "\nsegments test: %s\n", failures == 0 ? "PASS" : "FAIL");
++    return failures == 0 ? 0 : 1;
++}
 diff --git a/tests/test-moe-lean-expert.cpp b/tests/test-moe-lean-expert.cpp
 new file mode 100644
 index 000000000..abf5d4c01
@@ -6994,6 +7607,258 @@ index 000000000..abf5d4c01
 +    std::printf("test-moe-lean-expert: %d checks, %d failures\n", n_checks, n_failures);
 +    ggml_backend_free(cpu);
 +    return n_failures == 0 ? 0 : 1;
++}
+diff --git a/tools/layer-streaming/doc-sampler.h b/tools/layer-streaming/doc-sampler.h
+new file mode 100644
+index 000000000..c84a8fa2b
+--- /dev/null
++++ b/tools/layer-streaming/doc-sampler.h
+@@ -0,0 +1,110 @@
++// G27: the sampler chain of the owner's llama-server document over ONE logits row, header-only, no dependencies beyond the standard library.
++//
++// The document's server printed its chain as `logits -> ... -> top-k -> ... -> top-p -> min-p -> ... -> temp-ext -> dist` with top_k = 20, top_p = 0.95, min_p = 0.05, temp = 1.0
++// (docs/llamacpp 8gb vram 262k base.md). This is the same chain with llama.cpp's own semantics (src/llama-sampler.cpp):
++//   top-k  : keep the K largest logits, sorted descending                                   (llama_sampler_top_k_impl)
++//   top-p  : softmax over the kept candidates; keep the shortest prefix whose cumulative probability reaches p (min_keep 1)   (llama_sampler_top_p_apply)
++//   min-p  : keep the prefix whose logit is >= max_logit + ln(min_p), i.e. p_i >= min_p * p_max (min_keep 1)                  (llama_sampler_min_p_apply)
++//   temp   : divide the kept logits by the temperature                                       (llama_sampler_temp_impl)
++//   dist   : softmax over the survivors and draw one with a seeded engine                    (llama_sampler_dist_apply; the engine here is std::mt19937_64 with a hand-written inverse-CDF
++//                                                                                              draw, so a seed is portable across standard libraries but does not reproduce llama.cpp's draw, only its distribution)
++// The top-K selection is ONE pass over the row with an insertion into a sorted array of K entries (K <= 64): about 250k comparisons for a 248k-token vocabulary, tens of microseconds
++// of scalar work per token once the array is warm, instead of the full partial sort over 248k candidates. NaN logits are skipped.
++// Used by the runner's serial TG loop under --tg-sampler doc. Greedy decoding (the default) never calls it.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <random>
++
++struct ls_doc_sampler_params {
++    int   top_k = 20;
++    float top_p = 0.95f;
++    float min_p = 0.05f;
++    float temp  = 1.0f;
++};
++
++// number of candidates left after top-k, top-p and min-p (the survivors the distribution is drawn from); fills `idx` / `logit` with them, sorted descending
++static inline int ls_doc_sampler_candidates(const float * x, int n, const ls_doc_sampler_params & P, int * idx, float * logit) {
++    const int K = (P.top_k > 0 && P.top_k < 64) ? (P.top_k < n ? P.top_k : n) : (n < 64 ? n : 64);
++    int m = 0;
++    for (int v = 0; v < n; ++v) {
++        const float f = x[v];
++        if (f != f) {
++            continue;                                   // NaN
++        }
++        if (m == K && !(f > logit[K - 1])) {
++            continue;                                   // not larger than the K-th: the common case after the first few hundred elements
++        }
++        int j = (m < K) ? m++ : K - 1;
++        while (j > 0 && logit[j - 1] < f) {
++            logit[j] = logit[j - 1];
++            idx[j]   = idx[j - 1];
++            --j;
++        }
++        logit[j] = f;
++        idx[j]   = v;
++    }
++    int keep = m;
++    if (keep > 1 && P.top_p < 1.0f) {
++        const float mx = logit[0];
++        float e[64];
++        float z = 0.0f;
++        for (int i = 0; i < keep; ++i) {
++            e[i] = std::exp(logit[i] - mx);
++            z += e[i];
++        }
++        float cum = 0.0f;
++        for (int i = 0; i < keep; ++i) {
++            cum += e[i] / z;
++            if (cum >= P.top_p) {
++                keep = i + 1;
++                break;
++            }
++        }
++    }
++    if (keep > 1 && P.min_p > 0.0f) {
++        const float min_logit = logit[0] + std::log(P.min_p);
++        int i = 1;
++        for (; i < keep; ++i) {
++            if (logit[i] < min_logit) {
++                break;
++            }
++        }
++        keep = i;
++    }
++    return keep;
++}
++
++// the token the chain draws from the row `x` (n logits); returns -1 for an empty row
++static inline int ls_doc_sample(const float * x, int n, const ls_doc_sampler_params & P, std::mt19937_64 & rng) {
++    int   idx[64];
++    float logit[64];
++    const int keep = ls_doc_sampler_candidates(x, n, P, idx, logit);
++    if (keep <= 0) {
++        return -1;
++    }
++    if (keep == 1) {
++        return idx[0];
++    }
++    const float t  = P.temp > 0.0f ? P.temp : 1.0f;
++    const float mx = logit[0] / t;
++    float p[64];
++    for (int i = 0; i < keep; ++i) {
++        p[i] = std::exp(logit[i] / t - mx);
++    }
++    // inverse-CDF draw with a hand-written uniform (std::discrete_distribution's mapping is implementation-defined, so a seed would not be portable across standard libraries)
++    float z = 0.0f;
++    for (int i = 0; i < keep; ++i) {
++        z += p[i];
++    }
++    const double u = (double) (rng() >> 11) * (1.0 / 9007199254740992.0) * (double) z;
++    double acc = 0.0;
++    for (int i = 0; i < keep; ++i) {
++        acc += (double) p[i];
++        if (u < acc) {
++            return idx[i];
++        }
++    }
++    return idx[keep - 1];
++}
+diff --git a/tools/layer-streaming/tests/doc-sampler-test.cpp b/tools/layer-streaming/tests/doc-sampler-test.cpp
+new file mode 100644
+index 000000000..7a7d0d04d
+--- /dev/null
++++ b/tools/layer-streaming/tests/doc-sampler-test.cpp
+@@ -0,0 +1,130 @@
++// Host-only test of ls_doc_sample / ls_doc_sampler_candidates (G27): exactness of the candidate set against a straightforward sort-everything reference of llama.cpp's chain
++// (top-k -> top-p -> min-p), the argmax special case, NaN handling, and the empirical distribution of the draw.
++// Build:  cl /EHsc /O2 /std:c++17 doc-sampler-test.cpp     (or: g++ -O2 -std=c++17 doc-sampler-test.cpp)
++#include "../doc-sampler.h"
++#include "../top2-exact.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <numeric>
++#include <random>
++#include <vector>
++
++// reference: sort ALL logits descending (stable: lower index first on ties), then the three truncations exactly as src/llama-sampler.cpp states them
++static std::vector<int> reference_candidates(const std::vector<float> & x, const ls_doc_sampler_params & P) {
++    std::vector<int> order(x.size());
++    std::iota(order.begin(), order.end(), 0);
++    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return x[a] > x[b]; });
++    size_t k = (size_t) P.top_k < order.size() ? (size_t) P.top_k : order.size();
++    order.resize(k);
++    // top-p
++    if (order.size() > 1 && P.top_p < 1.0f) {
++        const float mx = x[order[0]];
++        double z = 0.0;
++        for (int i : order) { z += std::exp((double) x[i] - mx); }
++        double cum = 0.0;
++        size_t keep = order.size();
++        for (size_t i = 0; i < order.size(); ++i) {
++            cum += std::exp((double) x[order[i]] - mx) / z;
++            if (cum >= (double) P.top_p) { keep = i + 1; break; }
++        }
++        order.resize(keep);
++    }
++    // min-p
++    if (order.size() > 1 && P.min_p > 0.0f) {
++        const double min_logit = (double) x[order[0]] + std::log((double) P.min_p);
++        size_t i = 1;
++        for (; i < order.size(); ++i) {
++            if ((double) x[order[i]] < min_logit) { break; }
++        }
++        order.resize(i);
++    }
++    return order;
++}
++
++int main() {
++    std::mt19937_64 rng(777);
++    ls_doc_sampler_params P;
++    long long rows = 0, bad = 0, boundary = 0;
++    for (int trial = 0; trial < 20000; ++trial) {
++        const int n = 1 + (int) (rng() % (trial % 11 == 0 ? 30 : 6000));
++        std::vector<float> x((size_t) n);
++        const int style = (int) (rng() % 4);
++        for (int i = 0; i < n; ++i) {
++            if (style == 0)      { x[(size_t) i] = (float) ((int) (rng() % 40) - 20) * 0.5f; }              // heavy ties
++            else if (style == 1) { x[(size_t) i] = (float) ((double) (rng() % 100000) / 5000.0 - 10.0); }   // spread
++            else if (style == 2) { x[(size_t) i] = -((float) (rng() % 1000) / 100.0f); }
++            else                 { x[(size_t) i] = (float) ((int) (rng() % 7)) * 3.0f; }
++        }
++        if (rng() % 3 == 0 && n > 1) { x[rng() % (uint64_t) n] += 12.0f; }   // a tall peak
++        int idx[64]; float lg[64];
++        const int keep = ls_doc_sampler_candidates(x.data(), n, P, idx, lg);
++        const std::vector<int> ref = reference_candidates(x, P);
++        ++rows;
++        bool same = (size_t) keep == ref.size();
++        for (int i = 0; same && i < keep; ++i) {
++            // equal logits may come out in any order, so compare the logit VALUES and the set of ties
++            if (lg[i] != x[(size_t) ref[(size_t) i]]) { same = false; }
++        }
++        if (!same) {
++            // a candidate set can legitimately differ only by a cumulative-probability value that sits within float rounding of p, or a min-p threshold within rounding
++            ++boundary;
++            if (++bad <= 5) { printf("MISMATCH n=%d style=%d keep=%d ref=%zu\n", n, style, keep, ref.size()); }
++        }
++    }
++    printf("candidate sets: %lld rows, %lld mismatches (float vs double rounding at the p / min-p boundaries are counted as mismatches too)\n", rows, bad);
++
++    // argmax special case: top_k = 1 is the greedy pick (lowest index among equal maxima, like ls_top2_scalar)
++    long long am_bad = 0;
++    ls_doc_sampler_params G; G.top_k = 1; G.top_p = 1.0f; G.min_p = 0.0f;
++    for (int trial = 0; trial < 20000; ++trial) {
++        const int n = 1 + (int) (rng() % 3000);
++        std::vector<float> x((size_t) n);
++        for (int i = 0; i < n; ++i) { x[(size_t) i] = (float) ((int) (rng() % 50)) * 0.25f; }
++        const ls_top2 t = ls_top2_scalar(x.data(), n);
++        const int s = ls_doc_sample(x.data(), n, G, rng);
++        if (s != t.best) { if (++am_bad <= 5) { printf("ARGMAX MISMATCH n=%d sampled %d greedy %d\n", n, s, t.best); } }
++    }
++    printf("top_k = 1: %lld mismatches against the greedy pick\n", am_bad);
++
++    // NaN rows: never selected
++    long long nan_bad = 0;
++    for (int trial = 0; trial < 5000; ++trial) {
++        const int n = 8 + (int) (rng() % 500);
++        std::vector<float> x((size_t) n);
++        for (int i = 0; i < n; ++i) { x[(size_t) i] = (float) ((double) (rng() % 1000) / 100.0); }
++        const int nanpos = (int) (rng() % (uint64_t) n);
++        x[(size_t) nanpos] = std::nanf("");
++        const int s = ls_doc_sample(x.data(), n, P, rng);
++        if (s == nanpos || s < 0) { ++nan_bad; }
++    }
++    printf("NaN rows: %lld bad draws\n", nan_bad);
++
++    // distribution: a fixed row, 400k draws, frequencies against the probabilities of the surviving candidates
++    std::vector<float> x(2000, -30.0f);
++    const float top[8] = {5.0f, 4.7f, 4.2f, 3.9f, 3.0f, 2.2f, 1.0f, 0.1f};
++    for (int i = 0; i < 8; ++i) { x[(size_t) (100 + 37 * i)] = top[i]; }
++    int idx[64]; float lg[64];
++    const int keep = ls_doc_sampler_candidates(x.data(), (int) x.size(), P, idx, lg);
++    std::vector<double> p((size_t) keep);
++    double z = 0.0;
++    for (int i = 0; i < keep; ++i) { p[(size_t) i] = std::exp((double) lg[i] - lg[0]); z += p[(size_t) i]; }
++    std::vector<long long> cnt((size_t) keep, 0);
++    const int N = 400000;
++    for (int d = 0; d < N; ++d) {
++        const int s = ls_doc_sample(x.data(), (int) x.size(), P, rng);
++        for (int i = 0; i < keep; ++i) { if (s == idx[i]) { ++cnt[(size_t) i]; break; } }
++    }
++    double worst = 0.0;
++    long long outside = N;
++    for (int i = 0; i < keep; ++i) {
++        outside -= cnt[(size_t) i];
++        const double f = (double) cnt[(size_t) i] / N, e = p[(size_t) i] / z;
++        worst = std::max(worst, std::fabs(f - e));
++        printf("  cand %d token %d p %.4f observed %.4f\n", i, idx[i], e, f);
++    }
++    printf("distribution: %d survivors, worst |observed - expected| = %.4f, draws outside the survivors %lld\n", keep, worst, outside);
++    const bool ok = bad == 0 && am_bad == 0 && nan_bad == 0 && worst < 0.004 && outside == 0 && keep >= 2;
++    printf("doc-sampler test: %s\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
 +}
 diff --git a/tools/layer-streaming/tests/top2-exact-test.cpp b/tools/layer-streaming/tests/top2-exact-test.cpp
 new file mode 100644

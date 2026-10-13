@@ -1,0 +1,15 @@
+{
+ "archive": "docs/plans/tg-beat-stock-8gb-262k-archive.md",
+ "archive_header_chars": 442,
+ "archive_header_lines": 4,
+ "archive_sha256": "5ca58116019c72089ec607ac6f7666b082d58749d3cc881d136d3f4da69ece0b",
+ "end_heading": "### G19 CONTRACT",
+ "index_chars": 10430,
+ "live": "docs/plans/tg-beat-stock-8gb-262k.md",
+ "live_sha256": "50c21a1103bbb6d900c74ea1a385786de0ab27b22d1e7ef879c80a911f278804",
+ "orig_char_end": 208705,
+ "orig_char_start": 11418,
+ "original_bytes": 502000,
+ "original_sha256": "d18665ee00c3fb0f9c6c76c1a97944f3c8080e4704e036b6228a0f2bd09c8fad",
+ "start_heading": "## Results log"
+}

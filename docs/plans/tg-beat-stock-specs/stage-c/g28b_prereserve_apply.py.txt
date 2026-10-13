@@ -1,0 +1,92 @@
+"""G28b (root-caused 2026-10-13 with GGML_LS_GRAPH_EXEC_MARKERS + a cudaPointerGetAttributes probe in ggml_cuda_cpy): a SEGMENTED layer-major prefill sweeps the same persistent graph sets more than once,
+and the second sweep crashed at the first layer-1 graph with `CUDA error: invalid argument` in ggml_cuda_cpy (cudaMemcpyAsync D2D, source `l_out-0`). Mechanism, measured:
+  * the scheduler's CUDA compute buffer is 397,410,432 B while the layer graphs run and GROWS to 516,950,016 B when the LAST graph (the output graph, `result_output`) first allocates;
+  * growing frees the old buffer and allocates a new one, and ggml_gallocr_init_tensor() only assigns an address to a tensor whose data is NULL -- the tensors of the already-executed persistent
+    graphs keep their old addresses (cudaPointerGetAttributes: type unregistered, i.e. freed memory);
+  * in a single sweep nothing runs after the output graph so it is harmless; a second sweep (segment 1, or --pp-repeat 2 without the per-pass rebuild) reads the stale pointers.
+Fix (opt-in, only with --pp-segment-tokens and more than one segment): before the first graph of the pass executes, reserve the scheduler for the LARGEST graph of every built phase-0 set (measured with
+ggml_backend_sched_reserve_size, the src pointers that split_graph rewires are snapshot and restored around every call, exactly like run_graph does), so the buffer is at its final size when the first
+persistent tensor gets its address and never changes afterwards. Default (flag absent) = untouched.
+Apply ONLY when no attested session is running or queued:  set G22_APPLY=1 (PATCH_DRY=1 first). Apply after g28_segments_apply."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+SP = r"C:\Users\<user>\AppData\Local\Temp\claude\C--Development-AI-qwen38GZI--claude-worktrees-attribution-handoff-doc-8ed1d1\0a80fa77-7086-4e1c-a6f9-e861ca8657c7\scratchpad"
+sys.path.insert(0, SP)
+from crlfpatch import patch
+
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+C = NEST + r"\src\llama-layer-streaming.cpp"
+
+patch(C, [
+    (r'''    if (ls->pp_copy_overlap && !ggml_backend_cuda_aux_stream_ok(backend_cuda)) {
+        ls->error_msg = "layer-major PP: copy-overlap requested but the compute backend's CUDA context has no auxiliary stream";
+        ret = GGML_STATUS_FAILED;
+        return -2;
+    }
+''', r'''    if (ls->pp_copy_overlap && !ggml_backend_cuda_aux_stream_ok(backend_cuda)) {
+        ls->error_msg = "layer-major PP: copy-overlap requested but the compute backend's CUDA context has no auxiliary stream";
+        ret = GGML_STATUS_FAILED;
+        return -2;
+    }
+
+    // G28b: reserve the scheduler's compute buffers for the LARGEST graph of every built phase-0 set BEFORE the first graph of this pass executes. The persistent graphs keep the tensor addresses they got
+    // at their first allocation (ggml_gallocr_init_tensor only assigns when data is NULL), so a compute buffer that grows LATER (the output graph, which holds the logits, is the largest and runs last) frees the
+    // old buffer under every graph that already ran. One sweep never notices; a second sweep (the next segment) reads freed memory ("invalid argument" in the first copy of layer 1). Only with segments.
+    if (ls->pp_seg_tokens > 0 && n_segs > 1) {
+        const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+        std::vector<size_t>        best(n_be, 0);
+        std::vector<ggml_cgraph *> best_g(n_be, nullptr);
+        std::vector<size_t>        sizes(n_be, 0);
+        // split_graph rewires node sources when it introduces cross-backend copies (the copies live in the scheduler's context, freed on the next reset): snapshot and restore, as run_graph does
+        auto with_pristine_graph = [&](ggml_cgraph * g, auto && fn) {
+            std::vector<ggml_tensor *> saved((size_t) g->n_nodes * GGML_MAX_SRC);
+            for (int k = 0; k < g->n_nodes; ++k) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) saved[(size_t) k * GGML_MAX_SRC + j] = g->nodes[k]->src[j];
+            }
+            fn();
+            for (int k = 0; k < g->n_nodes; ++k) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) g->nodes[k]->src[j] = saved[(size_t) k * GGML_MAX_SRC + j];
+            }
+        };
+        for (auto & s : ls->sets) {
+            if (!s.built || s.mode != 0) {
+                continue;
+            }
+            for (ggml_cgraph * g : s.graphs) {
+                if (g == nullptr) {
+                    continue;
+                }
+                std::fill(sizes.begin(), sizes.end(), (size_t) 0);
+                with_pristine_graph(g, [&]() { ggml_backend_sched_reserve_size(sched.get(), g, sizes.data()); });
+                for (int b = 0; b < n_be; ++b) {
+                    if (sizes[b] > best[b]) {
+                        best[b]   = sizes[b];
+                        best_g[b] = g;
+                    }
+                }
+            }
+        }
+        ggml_cgraph * last_reserved = nullptr;
+        for (int b = 0; b < n_be; ++b) {
+            if (best_g[b] == nullptr || best_g[b] == last_reserved) {
+                continue;
+            }
+            bool ok = true;
+            with_pristine_graph(best_g[b], [&]() { ok = ggml_backend_sched_reserve(sched.get(), best_g[b]); });
+            if (!ok) {
+                ls->error_msg = "layer_major_pp: G28b scheduler pre-reserve failed (backend " + std::to_string(b) + ", " + std::to_string((unsigned long long) best[b]) + " B)";
+                ls->failed = true;
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return -2;
+            }
+            last_reserved = best_g[b];
+            LLAMA_LOG_INFO("%s: G28b: scheduler pre-reserved for the largest phase-0 graph (backend %d needs %.1f MiB)\n", __func__, b, best[b] / 1048576.0);
+        }
+        ggml_backend_sched_reset(sched.get());
+    }
+'''),
+])

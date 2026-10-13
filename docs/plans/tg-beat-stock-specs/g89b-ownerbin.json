@@ -1,0 +1,88 @@
+{
+ "session": "g89b-ownerbin",
+ "exe_dir": "C:/Development/AI/llamacppCUDA",
+ "tg_tokens": 918,
+ "control": "OWN",
+ "qa": false,
+ "items": "N1,N2,N3,N4,K1",
+ "prompt": "build/llama-cuda/gplr07-qa-prompts/nat-B.txt",
+ "common": [
+  "--model",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "--prompt-file",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/nat-B.txt",
+  "--tg-tokens",
+  "512",
+  "--tg-logit-margin",
+  "512",
+  "--residency",
+  "moe-expert-bank",
+  "--allow-full-residency",
+  "--no-handoff",
+  "--tg-hybrid",
+  "--ctx-size",
+  "262144",
+  "--act-slab-dtype",
+  "bf16"
+ ],
+ "reps": 4,
+ "interleave": true,
+ "poll_ms": 50,
+ "counterbalance": true,
+ "arms": [
+  {
+   "name": "OWN",
+   "engine": "stock",
+   "flags": [
+    "-ncmoe",
+    "37",
+    "-t",
+    "16",
+    "--no-mmap"
+   ],
+   "env": {},
+   "why": "the OWNER'S llama-completion.exe (build 10892) with the STK flags (--no-mmap)"
+  },
+  {
+   "name": "OWNM",
+   "engine": "stock",
+   "flags": [
+    "-ncmoe",
+    "37",
+    "-t",
+    "16",
+    "-lm",
+    "mmap"
+   ],
+   "env": {},
+   "why": "the OWNER'S llama-completion.exe (build 10892), model mapped (the server's default load mode)"
+  }
+ ],
+ "stock_common": [
+  "-m",
+  "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf",
+  "-f",
+  "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/nat-B.txt",
+  "-ngl",
+  "99",
+  "-fa",
+  "on",
+  "-ctk",
+  "q8_0",
+  "-ctv",
+  "q8_0",
+  "-lm",
+  "none",
+  "-fit",
+  "off",
+  "-c",
+  "262000",
+  "-n",
+  "918",
+  "--ignore-eos",
+  "--temp",
+  "0",
+  "-no-cnv",
+  "--no-display-prompt"
+ ]
+}
