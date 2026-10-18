@@ -82,3 +82,7 @@ desktop.ini
 
 # G42: per-session server configs written by tools/server-config-gen.py (reproducible, hundreds of files)
 /tools/server-configs/
+
+# Local-only folders: experiment archives and prebuilt release binaries
+/archive/
+/releases/
