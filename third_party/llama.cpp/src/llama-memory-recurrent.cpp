@@ -848,7 +848,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
-            const llama_pos pos      = cell.pos;
+            const llama_pos pos      = state_pos_override >= 0 ? state_pos_override : cell.pos;   // G42
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
             io.write(&pos,      sizeof(pos));

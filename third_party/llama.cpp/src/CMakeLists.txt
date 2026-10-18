@@ -67,6 +67,11 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
 
+# G31: the C API a frontend uses for the hybrid MoE decode (stubs when LLAMA_LAYER_STREAMING is off)
+target_sources(llama PRIVATE llama-hybrid-api.cpp)
+# G32: the layer-major prefill of the server (stubs when LLAMA_LAYER_STREAMING is off)
+target_sources(llama PRIVATE llama-lm-prefill.cpp)
+
 # private research: experimental CUDA-only layer streaming (default OFF)
 if (LLAMA_LAYER_STREAMING)
     target_sources(llama PRIVATE

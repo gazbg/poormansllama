@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-hybrid.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -251,6 +252,10 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // G42 (--lm-prefill-fuse): the batch being decoded was sent whole; the checkpoints inside it (token index = the state after that many prompt tokens) are taken by the layer-major pass
+    std::vector<int64_t> fuse_at;            // still to create, ascending
+    int64_t              fuse_start = 0;     // token index of the batch's first token
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -871,6 +876,14 @@ private:
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
+    // G32: the previous iteration was a prompt turn (a big prompt chunk alone in its batch, see update_slots)
+    bool lm_last_prompt_turn = false;
+
+    // G42: the idle preparation of the layer-major pass
+    bool    lm_req_active = false;                 // a request was processed since the slots were last found idle
+    int32_t lm_hist       = 0;                     // bit i: the request i requests ago used the layer-major pass
+    int64_t lm_pass_seen  = 0;                     // passes counted so far
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -886,6 +899,7 @@ private:
         ctx_dft   = nullptr;
         model_dft = nullptr;
 
+        llama_hybrid_shutdown();
         llama_init.reset();
 
         ctx_tgt = nullptr;
@@ -939,6 +953,40 @@ private:
             });
         }
         return true;
+    }
+
+    // G31: size the hybrid MoE expert cache to the fit-target margin (between requests only)
+    void hybrid_size_cache(const char * why) {
+        if (!params_base.hybrid_moe || ctx_tgt == nullptr) {
+            return;
+        }
+        const int32_t keep_free_mib = (int32_t) (params_base.fit_params_target.empty() ? 1024 : params_base.fit_params_target[0] / (1024*1024));
+        int32_t before = 0, after = 0, free_mib = 0;
+        const int64_t t0 = ggml_time_us();
+        const int32_t max_slots = params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 256;
+        const int32_t min_slots = params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 8;
+        constexpr int32_t safety_mib = 160;    // as the runner's auto sizing
+        const char *  slack_env = getenv("LLAMA_HYBRID_SLACK_MIB");   // test knob: 0 forces frequent shrinks
+        const int32_t slack_mib = slack_env != nullptr ? std::max(0, atoi(slack_env)) : 128;    // free VRAM above the margin at the start: the first KV commits of a request then do not shrink the cache
+        if (!llama_hybrid_auto_size(ctx_tgt, keep_free_mib, safety_mib + slack_mib, min_slots, max_slots, &before, &after, &free_mib)) {
+            SRV_WRN("hybrid-moe: sizing of the expert cache failed (%s)\n", why);
+            return;
+        }
+        // every later commit of KV rows keeps the margin free by shrinking the cache (a fixed slot count never shrinks)
+        llama_hybrid_set_margin(ctx_tgt, keep_free_mib, safety_mib, slack_mib, min_slots);
+        if (params_base.hybrid_moe_seed > 0) {
+            llama_hybrid_set_seed(ctx_tgt, params_base.hybrid_moe_seed);
+        }
+        {
+            // the prefill window needs a cache that can shrink and grow: not with a fixed --hybrid-moe-slots
+            const int32_t big = std::min<int32_t>(params_base.hybrid_moe_prefill_ubatch, llama_n_batch(ctx_tgt));
+            if (params_base.hybrid_moe_slots <= 0 && big > (int32_t) llama_n_ubatch(ctx_tgt)) {
+                llama_hybrid_set_prefill(ctx_tgt, big, params_base.hybrid_moe_prefill_min, max_slots);
+                SRV_INF("hybrid-moe: prefill window: -ub %d from batches of %d tokens, -ub %d otherwise\n", big, params_base.hybrid_moe_prefill_min, (int) llama_n_ubatch(ctx_tgt));
+            }
+        }
+        SRV_INF("hybrid-moe: expert cache %d -> %d slots per layer (%s): free VRAM was %d MiB, margin %d MiB + %d MiB (+ %d MiB slack), %.1f ms\n",
+                before, after, why, free_mib, keep_free_mib, safety_mib, slack_mib, (ggml_time_us() - t0) / 1000.0);
     }
 
     // load the model and initialize llama_context
@@ -1090,6 +1138,96 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_available()) {
+                SRV_ERR("%s", "--hybrid-moe needs a build with LLAMA_LAYER_STREAMING (CUDA)\n");
+                return false;
+            }
+            // the expert banks stay on the host (the -cmoe override), the placement is explicit so the fit step is off.
+            // The argument parser pads the list with empty terminators: drop them, add the override, pad again.
+            auto & ov = params_base.tensor_buft_overrides;
+            while (!ov.empty() && ov.back().pattern == nullptr) {
+                ov.pop_back();
+            }
+            ov.push_back(llm_ffn_exps_cpu_override());
+            while (ov.size() < llama_max_tensor_buft_overrides()) {
+                ov.push_back({nullptr, nullptr});
+            }
+            params_base.fit_params = false;
+            if (params_base.n_parallel > 1 && !params_base.kv_unified && !params_base.kv_unified_set) {
+                params_base.kv_unified = true;   // the lazily committed KV cache needs a single stream
+                SRV_INF("hybrid-moe: unified KV cache for -np %d (use -no-kvu to keep one KV stream per slot)\n", params_base.n_parallel);
+            }
+            if (!params_base.n_ubatch_set && params_base.hybrid_moe_ubatch > 0) {
+                params_base.n_ubatch = params_base.hybrid_moe_ubatch;
+                params_base.n_batch  = std::max(params_base.n_batch, params_base.n_ubatch);
+                SRV_INF("hybrid-moe: physical batch size (-ub) %d, logical %d\n", params_base.n_ubatch, params_base.n_batch);
+            }
+            if (params_base.hybrid_moe_frozen) {
+                if (params_base.hybrid_moe_slots <= 0) {
+                    params_base.hybrid_moe_slots = 16;
+                }
+                // no promotions: the residency of the experts never changes after the start (the engine environment variable is the one the isolating tests used)
+#if defined(_WIN32)
+                _putenv_s("LLAMA_MOE_HYBRID_B", "0");
+#else
+                setenv("LLAMA_MOE_HYBRID_B", "0", 1);
+#endif
+                SRV_INF("hybrid-moe: frozen expert cache of %d slots per layer, no promotions (deterministic decode)\n", params_base.hybrid_moe_slots);
+            }
+            llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
+            SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
+        }
+
+        if (params_base.lm_prefill) {
+            if (!llama_hybrid_available()) {
+                SRV_ERR("%s", "--lm-prefill needs a build with LLAMA_LAYER_STREAMING (CUDA)\n");
+                return false;
+            }
+            if (!params_base.n_batch_set && params_base.n_batch < params_base.lm_prefill_batch) {
+                params_base.n_batch = params_base.lm_prefill_batch;
+                SRV_INF("lm-prefill: logical batch size (-b) %d (one layer-major pass per batch)\n", params_base.n_batch);
+            }
+            if (params_base.lm_prefill_canonical) {
+                if (params_base.n_ctx_checkpoints <= 0) {
+                    SRV_ERR("%s", "--lm-prefill-canonical needs context checkpoints (--ctx-checkpoints > 0)\n");
+                    return false;
+                }
+                if (params_base.lm_prefill_ubatch < 1 || params_base.n_batch % params_base.lm_prefill_ubatch != 0) {
+                    SRV_ERR("--lm-prefill-canonical needs -b (%d) to be a multiple of --lm-prefill-ubatch (%d)\n", params_base.n_batch, params_base.lm_prefill_ubatch);
+                    return false;
+                }
+                SRV_INF("lm-prefill: canonical chunks: context checkpoints only at multiples of %d tokens, a continuation resumes from one\n", params_base.lm_prefill_ubatch);
+            }
+            if (params_base.lm_prefill_fuse || params_base.lm_prefill_prearm != 0) {
+                // G42
+                if (params_base.n_parallel != 1) {
+                    SRV_ERR("--lm-prefill-fuse / --lm-prefill-prearm need -np 1 (they are for one conversation at a time; got -np %d)\n", params_base.n_parallel);
+                    return false;
+                }
+                if (has_spec) {
+                    SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding\n");
+                    return false;
+                }
+                if (params_base.lm_prefill_fuse_min < 1) {
+                    SRV_ERR("%s", "--lm-prefill-fuse-min must be at least 1\n");
+                    return false;
+                }
+                SRV_INF("lm-prefill: %s%s; prompts with >= %d tokens left go in one batch, checkpoints taken inside the pass; idle preparation of the pass: %s\n",
+                        params_base.lm_prefill_fuse ? "fused prompt batches" : "no fused batches", params_base.lm_prefill_canonical ? " (canonical chunks)" : "",
+                        params_base.lm_prefill_fuse_min, params_base.lm_prefill_prearm == 0 ? "off" : params_base.lm_prefill_prearm == 1 ? "always" : "auto");
+            }
+            // G32: the pass's flash attention takes the same (GQA-packed) kernel variant as the ordinary path, which makes it equal to the ordinary path at the same chunk shape; ggml-cuda reads this once at the first
+            // flash-attention call, i.e. during the model load below (FAFIX_CAUSAL_GQA=0 in the environment keeps the old variant)
+#if defined(_WIN32)
+            if (getenv("FAFIX_CAUSAL_GQA") == nullptr) {
+                _putenv_s("FAFIX_CAUSAL_GQA", "1");
+            }
+#else
+            setenv("FAFIX_CAUSAL_GQA", "1", 0);
+#endif
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1103,6 +1241,31 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (params_base.lm_prefill) {
+            // before the expert cache is sized: the slot window is allocated once here and freed at once, the cache then takes the rest
+            llama_lm_prefill_params lp = llama_lm_prefill_default_params();
+            lp.n_slots    = params_base.lm_prefill_slots;
+            lp.ubatch     = params_base.lm_prefill_ubatch;
+            lp.segment    = params_base.lm_prefill_segment;
+            lp.min_tokens = params_base.lm_prefill_min;
+            lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            char err[512] = { 0 };
+            if (!llama_lm_prefill_enable(ctx_tgt, &lp, err, sizeof(err))) {
+                SRV_ERR("--lm-prefill: %s\n", err);
+                return false;
+            }
+            SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\n",
+                    lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+        }
+
+        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_active()) {
+                SRV_ERR("%s", "--hybrid-moe: no hybrid engine in this process (is the model a supported MoE with its expert banks on the host?)\n");
+                return false;
+            }
+            hybrid_size_cache("start");
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1583,6 +1746,19 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+
+                if (params_base.lm_prefill && params_base.kv_unified && params_base.cache_idle_slots) {
+                    // G32: the other idle slots are saved to the host cache and cleared right after this task starts (unified KV); doing it now lets the prompt restored into `ret` land in an emptier cache,
+                    // as one contiguous block, which the layer-major pass can take
+                    for (auto & other : slots) {
+                        if (&other != ret && !other.is_processing()) {
+                            if (other.prompt_save(*prompt_cache)) {
+                                prompt_cache->update();
+                            }
+                            other.prompt_clear();
+                        }
+                    }
+                }
 
                 ret->prompt_save(*prompt_cache);
 
@@ -2239,7 +2415,7 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, std::vector<uint8_t> * blob = nullptr) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2277,8 +2453,24 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (blob != nullptr) {
+            cur.data_tgt = std::move(*blob);     // G42: the state was kept inside the layer-major pass
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (getenv("LLAMA_LM_LOG") != nullptr) {
+            uint64_t h = 0;
+            if (getenv("LLAMA_LM_HASH") != nullptr) {      // a byte loop over 63 MiB: ~100 ms, never in a timing run
+                h = 1469598103934665603ULL;
+                for (const uint8_t b : cur.data_tgt) {
+                    h ^= b;
+                    h *= 1099511628211ULL;
+                }
+            }
+            SRV_WRN("lm-fuse: checkpoint n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, %zu bytes, fnv %016llx, taken %s\n", cur.n_tokens, cur.pos_min, cur.pos_max, cur.data_tgt.size(),
+                    (unsigned long long) h, blob != nullptr ? "inside the pass" : "from the live state");
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2696,6 +2888,118 @@ private:
     };
 #endif
 
+    // G42: the slots just went idle after a request: prepare the layer-major pass of the next one (make room, allocate the window and the slab, copy the banks of the first layers)
+    void lm_idle_prepare() {
+        if (!lm_req_active) {
+            return;
+        }
+        lm_req_active = false;
+        if (params_base.lm_prefill_prearm == 0 || !params_base.lm_prefill) {
+            return;
+        }
+        const int64_t n_pass = llama_lm_prefill_n_pass(ctx_tgt);
+        lm_hist      = ((lm_hist << 1) | (n_pass > lm_pass_seen ? 1 : 0)) & 0xF;
+        lm_pass_seen = n_pass;
+        bool want = params_base.lm_prefill_prearm == 1;
+        if (!want) {
+            int c = 0;
+            for (int i = 0; i < 4; ++i) {
+                c += (lm_hist >> i) & 1;
+            }
+            want = c >= 3;       // an unused preparation costs ~0.4 s (the cache regrow), a used one saves ~0.26 s: it pays above ~60% hits
+        }
+        if (!want) {
+            return;
+        }
+        const int32_t hint = params_base.lm_prefill_segment;     // a full segment: the next batch is not known, and a slab that is too small costs a second acquisition
+        const int64_t t0 = ggml_time_us();
+        const bool ok = llama_lm_prefill_arm(ctx_tgt, -1, hint);
+        if (getenv("LLAMA_LM_LOG") != nullptr) {
+            SRV_WRN("lm-prefill: idle preparation for %d tokens (history %x): %s, %.0f ms\n", (int) hint, (unsigned) lm_hist, ok ? "armed" : "not armed", (ggml_time_us() - t0)/1000.0);
+        }
+    }
+
+    // G42: the slot whose batch owes checkpoints that the pass takes (np 1: the only slot)
+    server_slot * fuse_slot() {
+        for (auto & s : slots) {
+            if (!s.fuse_at.empty()) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    // G42, before llama_decode(batch_view at `off`): ask the pass for the state at the cuts inside the view; a cut at the view's first token (a retried view) is taken from the live state
+    void fuse_before_decode(int32_t off, int32_t n_view) {
+        server_slot * s = fuse_slot();
+        if (s == nullptr) {
+            return;
+        }
+        if (s->state == SLOT_STATE_GENERATING) {
+            s->fuse_at.clear();      // a batch that was abandoned (an error, a cancelled request): its checkpoints are not owed any more
+            return;
+        }
+        const int64_t v0 = s->fuse_start + off;
+        std::vector<int32_t> cuts;
+        for (auto it = s->fuse_at.begin(); it != s->fuse_at.end();) {
+            const int64_t rel = *it - v0;
+            if (rel > 0 && rel < n_view) {
+                cuts.push_back((int32_t) rel);
+                ++it;
+            } else if (rel == 0 && off > 0) {
+                create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - *it, (llama_pos) (*it - 1), (llama_pos) (*it - 1));
+                it = s->fuse_at.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        llama_lm_prefill_snap_request(ctx_tgt, cuts.data(), (int32_t) cuts.size());
+    }
+
+    // G42, after a successful llama_decode: the snapshots of the pass become checkpoints
+    void fuse_after_decode(int32_t off, int32_t n_view) {
+        server_slot * s = fuse_slot();
+        if (s == nullptr) {
+            return;
+        }
+        const int64_t v0 = s->fuse_start + off;
+        std::vector<int64_t> later;
+        int n_made = 0, n_lost = 0;
+        for (const int64_t at : s->fuse_at) {
+            const int64_t rel = at - v0;
+            if (rel >= n_view) {
+                later.push_back(at);
+                continue;
+            }
+            if (rel <= 0) {
+                continue;
+            }
+            int found = -1;
+            const int n_snap = llama_lm_prefill_snap_count(ctx_tgt);
+            for (int i = 0; i < n_snap; ++i) {
+                if (llama_lm_prefill_snap_cut(ctx_tgt, i) == (int32_t) rel) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found < 0) {
+                n_lost++;
+                continue;
+            }
+            std::vector<uint8_t> blob(llama_lm_prefill_snap_data(ctx_tgt, found, nullptr, 0));
+            if (blob.empty() || llama_lm_prefill_snap_data(ctx_tgt, found, blob.data(), blob.size()) != blob.size()) {
+                n_lost++;
+                continue;
+            }
+            create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - at, (llama_pos) (at - 1), (llama_pos) (at - 1), &blob);
+            n_made++;
+        }
+        s->fuse_at = later;
+        if (n_lost > 0) {
+            SRV_WRN("lm-fuse: the pass did not keep the state for %d of %d checkpoints of this batch (it took the ordinary path or failed to write them): they are not created\n", n_lost, n_made + n_lost);
+        }
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2726,9 +3030,12 @@ private:
 
                 metrics_flush_idle();
 
+                lm_idle_prepare();      // G42
+
                 return; // skip further processing
 
             } else {
+                lm_req_active = true;   // G42
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
@@ -2886,6 +3193,29 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // G32: with --lm-prefill, unified KV and several slots a big prompt chunk gets a batch of its own (the layer-major pass takes one sequence per batch); prompt turns and decode turns alternate
+        const bool lm_iso = params_base.lm_prefill && params_base.n_parallel > 1 && params_base.kv_unified && !spec;
+        const bool lm_canon = params_base.lm_prefill && params_base.lm_prefill_canonical;   // G41
+        server_slot * lm_big = nullptr;
+        bool lm_prompt_turn = false;
+        if (lm_iso) {
+            bool any_generating = false;
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    any_generating = true;
+                } else if (lm_big == nullptr && slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && slot.task &&
+                           // G41b: canonical chunks: a prompt batch never shares its batch with another sequence's tokens, whatever its size (the size decides which path computes it, and a hit must take the path a fresh run takes);
+                           // a slot that is about to start still counts the cached prefix that the checkpoint resume throws away
+                           (lm_canon || slot.task->n_tokens() - slot.prompt.n_tokens() >= params_base.lm_prefill_min)) {
+                    lm_big = &slot;
+                }
+            });
+            if (lm_big != nullptr) {
+                lm_prompt_turn = !(any_generating && lm_last_prompt_turn);
+            }
+            lm_last_prompt_turn = lm_prompt_turn;
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3001,10 +3331,12 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
+        // update the batch with the sampled/drafted tokens (a prompt turn leaves them for the next iteration)
+        if (!lm_prompt_turn) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3023,6 +3355,11 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // G32: a prompt turn carries the big prompt alone, a decode turn everything except it
+                if (lm_iso && lm_big != nullptr && (lm_prompt_turn ? &slot != lm_big : &slot == lm_big)) {
                     return;
                 }
 
@@ -3252,7 +3589,8 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // G41: canonical chunks: never keep the state that decode left behind, resume from the newest checkpoint (they sit on chunk boundaries) that precedes the common prefix, or from 0
+                                if (lm_canon || pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3272,7 +3610,11 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        const int64_t t_restore0 = ggml_time_us();
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (getenv("LLAMA_LM_LOG") != nullptr) {
+                                            SRV_WRN("lm-fuse: checkpoint of %" PRId64 " tokens restored in %.1f ms\n", it->n_tokens, (ggml_time_us() - t_restore0)/1000.0);
+                                        }
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
@@ -3378,6 +3720,8 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    const bool ckpt_ok = do_checkpoint;   // G41
+
                     bool has_mtmd = false;
 
                     // check if we should process the mtmd chunk
@@ -3426,6 +3770,69 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // G41: canonical chunks: the batch that ends the prompt is cut at the last multiple of the chunk size below N (N - 1 at most); the checkpoint taken there is the one a continuation resumes from
+                    const int canon_A = lm_canon ? (int) (((int64_t) slot.task->n_tokens() - 1) / params_base.lm_prefill_ubatch) * params_base.lm_prefill_ubatch : 0;
+
+                    // G42: --lm-prefill-fuse (np 1): the rest of the prompt goes in ONE batch, without the cuts that exist only to take checkpoints. The rules of the cuts and of the checkpoints are replayed on a
+                    // simulated checkpoint list; the checkpoints they would have produced are taken inside the pass (the library keeps the recurrent state at each token count asked for) and created after the decode.
+                    struct fuse_vb_t { int64_t start; int64_t end; bool want; };
+                    std::vector<fuse_vb_t> fuse_vbs;
+                    slot.fuse_at.clear();
+                    bool    fuse        = false;
+                    const int64_t fuse_first = slot.prompt.n_tokens();
+                    int64_t fuse_vstart = fuse_first;
+                    bool    sim_empty   = slot.prompt.checkpoints.empty();
+                    int64_t sim_back    = sim_empty ? -1 : slot.prompt.checkpoints.back().n_tokens;
+                    const llama_pos pos_min0 = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                    if (params_base.lm_prefill_fuse && !has_mtmd && !slot.prompt.tokens.has_mtmd && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                        batch.size() == 0) {
+                        const int64_t left = (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens();
+                        if (left >= params_base.lm_prefill_fuse_min) {
+                            const int64_t t_arm0 = ggml_time_us();
+                            fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
+                            if (getenv("LLAMA_LM_LOG") != nullptr) {
+                                SRV_WRN("lm-fuse: arm for %d tokens: %s, %.1f ms\n", (int) std::min<int64_t>(left, n_batch), fuse ? "armed" : "refused", (ggml_time_us() - t_arm0)/1000.0);
+                            }
+                        }
+                    }
+                    // the rule of the code after the loop, for a (virtual) batch [s, e) of the prompt: does a checkpoint exist at s?
+                    auto fuse_decide = [&](int64_t s, int64_t e, llama_pos pmin) -> bool {
+                        const int64_t N = slot.task->n_tokens();
+                        if (lm_canon) {
+                            bool have = false;
+                            for (const auto & c : slot.prompt.checkpoints) {
+                                if (c.n_tokens == s) {
+                                    have = true;
+                                    break;
+                                }
+                            }
+                            return ckpt_ok && canon_A > 0 && (int) s == canon_A && pmin >= 0 && !has_mtmd && !have;
+                        }
+                        const bool near_end = N < e + n_ubatch;
+                        bool d = ckpt_ok;
+                        if (e != N && !spans.is_user_start((int32_t) s) && !near_end) {
+                            d = false;
+                        }
+                        if (d && pmin < 0) {
+                            d = false;
+                        }
+                        d = d && !has_mtmd;
+                        return d && (sim_empty || s == last_user_pos || near_end || s > sim_back + params_base.checkpoint_min_step);
+                    };
+                    // a cut the legacy code would have made at token index `pos` (= the virtual batch [fuse_vstart, pos) ends here)
+                    auto fuse_cut = [&](int64_t pos) {
+                        if (!fuse || pos <= fuse_vstart) {
+                            return;
+                        }
+                        const bool want = fuse_decide(fuse_vstart, pos, fuse_vstart == fuse_first ? pos_min0 : (llama_pos) (fuse_vstart - 1));
+                        fuse_vbs.push_back({ fuse_vstart, pos, want });
+                        if (want) {
+                            sim_back  = fuse_vstart;
+                            sim_empty = false;
+                        }
+                        fuse_vstart = pos;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3453,12 +3860,16 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (!lm_canon && do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
+                            if (pos == last_user_pos || (fuse ? sim_empty : checkpoints.empty()) || pos > (fuse ? sim_back : checkpoints.back().n_tokens) + params_base.checkpoint_min_step) {
+                                if (fuse) {
+                                    fuse_cut(pos);
+                                } else {
+                                    break;
+                                }
                             }
                         }
 
@@ -3467,8 +3878,18 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                        if (lm_canon && canon_A > 0 && slot.prompt.n_tokens() == canon_A) {
+                            if (fuse) {
+                                fuse_cut(slot.prompt.n_tokens());
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if (!lm_canon && do_checkpoint) {
+                            // G32: --lm-prefill-ckpt-chunk makes the chunk before the last 4 tokens smaller than n_ubatch
+                            const int ckpt_chunk = (params_base.lm_prefill && params_base.lm_prefill_ckpt > 0) ? params_base.lm_prefill_ckpt : n_ubatch;
+                            const int checkpoint_offsets[] = {4 + ckpt_chunk, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -3479,8 +3900,30 @@ private:
                                 }
                             }
                             if (should_break) {
-                                break;
+                                if (fuse) {
+                                    fuse_cut(slot.prompt.n_tokens());
+                                } else {
+                                    break;
+                                }
                             }
+                        }
+                    }
+
+                    // G42: the last virtual batch ends where the real one does; the checkpoints that the pass has to take are known now
+                    if (fuse) {
+                        fuse_cut(slot.prompt.n_tokens());
+                        slot.fuse_start = fuse_first;
+                        for (size_t k = 1; k < fuse_vbs.size(); ++k) {
+                            if (fuse_vbs[k].want) {
+                                slot.fuse_at.push_back(fuse_vbs[k].start);
+                            }
+                        }
+                        if (getenv("LLAMA_LM_LOG") != nullptr) {
+                            std::string ws;
+                            for (const auto & vb : fuse_vbs) {
+                                ws += string_format(" [%" PRId64 ",%" PRId64 ")%s", vb.start, vb.end, vb.want ? "*" : "");
+                            }
+                            SRV_WRN("lm-fuse: %d tokens from %" PRId64 " in one batch; the cuts of the legacy flow (* = a checkpoint):%s\n", (int) (slot.prompt.n_tokens() - fuse_first), fuse_first, ws.c_str());
                         }
                     }
 
@@ -3534,6 +3977,22 @@ private:
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
+                    if (lm_canon) {
+                        // G41: a checkpoint exactly when this batch starts at the boundary (the state it saves is the one after the cut batch), none otherwise, none twice
+                        bool have = false;
+                        for (const auto & c : slot.prompt.checkpoints) {
+                            if (c.n_tokens == (int64_t) n_tokens_start) {
+                                have = true;
+                                break;
+                            }
+                        }
+                        do_checkpoint = ckpt_ok && canon_A > 0 && (int) n_tokens_start == canon_A && pos_min >= 0 && !has_mtmd && !have;
+                    }
+
+                    if (fuse && !fuse_vbs.empty()) {
+                        do_checkpoint = fuse_vbs.front().want;     // G42: the checkpoint at the start of the batch, from the live state; the others come out of the pass
+                    }
+
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
@@ -3544,6 +4003,13 @@ private:
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
+            });
+        }
+
+        // G32: a prompt turn whose big chunk could not add tokens must not leave the generating slots without their token
+        if (lm_prompt_turn && batch.size() == 0) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
             });
         }
     }
@@ -3584,12 +4050,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        fuse_before_decode(off, batch_view.n_tokens);    // G42
+        static const bool phase_log = getenv("LLAMA_SRV_PHASE_LOG") != nullptr;   // G42
+        const int64_t t_phase0 = phase_log ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (phase_log) {
+            SRV_WRN("phase: decode of %d tokens took %.1f ms (ret %d)\n", (int) batch_view.n_tokens, (ggml_time_us() - t_phase0)/1000.0, ret);
+        }
 
         if (ret != 0) {
             {
@@ -3642,6 +4114,7 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
+            fuse_after_decode(off, batch_view.n_tokens);     // G42
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]

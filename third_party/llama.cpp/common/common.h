@@ -561,6 +561,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool kv_unified_set    = false; // -kvu / -no-kvu was given (--hybrid-moe turns the unified KV on for -np > 1 unless it was)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -613,6 +614,32 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    // G31 (private fork, CUDA): hybrid MoE decode. The expert banks stay on the host, a VRAM expert cache sized to the fit-target margin serves most experts.
+    bool        hybrid_moe       = false;
+    int32_t     hybrid_moe_slots = -1;   // -1: size the cache to the --fit-target margin; N > 0: N slots per layer
+    bool        hybrid_moe_frozen = false; // fixed expert cache (--hybrid-moe-slots, default 16) and no promotions: the hybrid decode is deterministic
+    std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
+    int32_t     hybrid_moe_ubatch = 0;    // physical batch size (-ub) used with --hybrid-moe when -ub is not given, for the whole run (0 = keep the stock default; the prefill window below is the better way)
+    int32_t     hybrid_moe_prefill_ubatch = 2048; // physical batch size while a big prompt batch is processed (the expert cache gives the room back afterwards); 0 = off
+    int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window
+    int32_t     hybrid_moe_seed           = 16;   // tokens of the prompt's tail whose routing seeds the expert cache's popularity (0 = off)
+    bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
+    bool        n_batch_set      = false; // -b / LLAMA_ARG_BATCH was given
+
+    // G32 (private fork, CUDA): layer-major prefill. A prompt batch of >= lm_prefill_min tokens runs layer by layer: every expert bank is copied from the host once while all chunks of the batch go through the layer.
+    bool        lm_prefill         = false;
+    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
+    int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
+    int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
+    int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
+    bool        lm_prefill_bf16    = false;   // bf16 activation slab
+    int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
+    bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
+    int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule
+    bool        lm_prefill_fuse    = false;   // G42 (-np 1): the rest of a prompt goes in one batch, the context checkpoints inside it are taken by the layer-major pass
+    int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole
+    int32_t     lm_prefill_prearm  = 0;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

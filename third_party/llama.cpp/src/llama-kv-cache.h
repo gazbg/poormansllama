@@ -192,6 +192,34 @@ public:
     void     set_n_pad_view(uint32_t pad) { n_pad_view = pad; }
     uint32_t get_n_pad_view() const       { return n_pad_view; }
 
+    // n_kv of the worst-case graphs a scheduler reserve is sized from (init_full). The whole window, unless the TG view pad is armed: then the live rows plus 2,048 rows of headroom
+    // (a longer generation grows the compute buffers on demand, by a few MiB). Stock behaviour is unchanged when the view pad is never armed.
+    uint32_t get_n_kv_reserve() const;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: lazily committed KV (LLAMA_KV_LAZY). Commit the rows a ubatch is about to write (false: the driver refused, the caller must not write), or every row (whole-window graphs).
+    bool lazy_ensure(const slot_info & sinfo, llama_context * lctx);
+    bool lazy_commit_rows(uint32_t rows, llama_context * lctx);
+    bool is_lazy() const { return lazy_kv; }
+
+    // G32: where would the layer-major prefill put n_new tokens at position p0 of seq_id? The implicit causal mask of its flash attention addresses keys by cell relative to the sequence's first cell c0, so the
+    // sequence's cells must be exactly c0 + position (one sequence per cell, contiguous) with the n_new cells behind them empty. Returns c0 (for a fresh sequence: the start of the first run of n_new empty cells),
+    // or -1 when the layout does not allow a pass (the ordinary path then takes the batch).
+    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why = nullptr) const;   // why: the first violated condition, with cell numbers
+    // while >= 0, find_slot puts the next ubatch at exactly the cells [cell, cell + n) (and fails when one of them is occupied); the pass sets it before it applies each chunk and clears it afterwards
+    void    lm_force(int64_t cell) { lm_force_cell = cell; }
+    int64_t lm_force_cell = -1;
+    // sequence affinity (on after lm_prefill_enable): find_slot puts a ubatch of one sequence right behind that sequence's last cell when it is free, so that the batches of one prompt stay one contiguous block
+    void    lm_set_affinity(bool on) {
+        lm_affinity = on;
+        lm_tail_cell.assign(on ? LLAMA_MAX_SEQ : 0, -1);
+        lm_tail_pos .assign(on ? LLAMA_MAX_SEQ : 0, -1);
+    }
+    bool                 lm_affinity = false;
+    std::vector<int32_t> lm_tail_cell;   // per sequence: the cell of the last token placed
+    std::vector<int32_t> lm_tail_pos;    // and its position
+#endif
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -265,6 +293,12 @@ private:
 
     // T-GPLR-71: phase-scoped override of n_pad inside get_n_kv(); 0 = off
     uint32_t n_pad_view = 0;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: rows [0, lazy_rows) of the lazily committed cache tensors are committed
+    bool     lazy_kv   = false;
+    uint32_t lazy_rows = 0;
+#endif
 
     // SWA
     const uint32_t n_swa = 0;
@@ -428,7 +462,7 @@ private:
     llama_memory_status status;
 
     llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_context * lctx = nullptr;   // set by the update constructor only; a batch context has none (it used to be left uninitialised: G31i)
 
     //
     // update context

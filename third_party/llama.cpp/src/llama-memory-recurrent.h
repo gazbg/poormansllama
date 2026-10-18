@@ -70,6 +70,9 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // G42: >= 0 makes state_write record this position for the cell (a snapshot taken inside a layer-major pass is written as the state of an earlier position)
+    llama_pos state_pos_override = -1;
+
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 

@@ -22,17 +22,162 @@
 #include "llama-layer-streaming.h"
 #include "telemetry-json.h"
 #include "telemetry-pool.h"
+#include "top2-exact.h"
+#include "doc-sampler.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-cuda.h"
+#include "gguf.h"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+extern "C" {
+__declspec(dllimport) void * __stdcall LoadLibraryA(const char * name);
+__declspec(dllimport) void * __stdcall GetProcAddress(void * module, const char * name);
+}
+#endif
+
+// The device's memory use as nvidia-smi / NVML report it (the unit a VRAM cap is stated in). cudaMemGetInfo's total - free is a constant 1,080 MiB higher on this machine, so the two cannot be mixed.
+// NVML ships with the driver and is loaded at run time (nothing is linked). False when it is not available.
+static bool ls_nvml_used_bytes(int device, uint64_t * used) {
+#ifdef _WIN32
+    struct nvml_mem_t { unsigned long long total, free, used; };
+    typedef int (*fn_init_t)(void);
+    typedef int (*fn_handle_t)(unsigned int, void **);
+    typedef int (*fn_mem_t)(void *, nvml_mem_t *);
+    static void *       lib      = LoadLibraryA("nvml.dll");
+    if (lib == nullptr) {
+        return false;
+    }
+    static fn_init_t    p_init   = (fn_init_t)   GetProcAddress(lib, "nvmlInit_v2");
+    static fn_handle_t  p_handle = (fn_handle_t) GetProcAddress(lib, "nvmlDeviceGetHandleByIndex_v2");
+    static fn_mem_t     p_mem    = (fn_mem_t)    GetProcAddress(lib, "nvmlDeviceGetMemoryInfo");
+    if (p_init == nullptr || p_handle == nullptr || p_mem == nullptr) {
+        return false;
+    }
+    static const int    rc_init  = p_init();
+    if (rc_init != 0) {
+        return false;
+    }
+    void * h = nullptr;
+    if (p_handle((unsigned int) device, &h) != 0) {
+        return false;
+    }
+    nvml_mem_t m = {};
+    if (p_mem(h, &m) != 0) {
+        return false;
+    }
+    *used = (uint64_t) m.used;
+    return true;
+#else
+    (void) device;
+    (void) used;
+    return false;
+#endif
+}
+
+// LLAMA_TG_VRAM_TRACE=1: the device's memory use at a named point (measurement only)
+static void ls_vram_trace(int device, const char * what) {
+    if (getenv("LLAMA_TG_VRAM_TRACE") == nullptr) {
+        return;
+    }
+    size_t f = 0, t = 0;
+    ggml_backend_cuda_get_device_memory(device, &f, &t);
+    uint64_t nv = 0;
+    const bool have_nv = ls_nvml_used_bytes(device, &nv);
+    fprintf(stderr, "vram-trace: %-34s cudaMemGetInfo in use %.1f MiB, NVML in use %.1f MiB\n", what, (double) (t - f)/1048576.0, have_nv ? (double) nv/1048576.0 : -1.0);
+    fflush(stderr);
+}
+
+// LLAMA_TG_FREE_WATCH_MS=N: a thread samples the CUDA runtime's free device memory every N ms for the whole run and the report at the end gives the minimum. This is the owner's
+// definition of "8 GB" measured directly (llama-server --fit-target 16000: at least 16000 MiB must stay free). Measurement only.
+static std::atomic<bool>      g_free_watch_stop{false};
+static std::thread            g_free_watch_th;
+static std::atomic<long long> g_free_watch_min_free{-1};   // bytes
+static std::atomic<long long> g_free_watch_n{0};
+static double                 g_free_watch_t_min_ms = 0.0;
+// second minimum, over the decode phase only (set when the prefill buffers are released and the cache is resized): the prefill may use the free memory of a dedicated GPU
+static std::atomic<bool>      g_free_watch_tg{false};
+static std::atomic<long long> g_free_watch_tg_min_free{-1};
+static std::atomic<long long> g_free_watch_tg_n{0};
+static double                 g_free_watch_tg_t_min_ms = 0.0;
+static void ls_free_watch_mark_tg() {
+    g_free_watch_tg.store(true);
+}
+static void ls_free_watch_start(int device) {
+    const char * v = getenv("LLAMA_TG_FREE_WATCH_MS");
+    const int ms = v ? atoi(v) : 0;
+    if (ms <= 0) {
+        return;
+    }
+    g_free_watch_th = std::thread([device, ms]() {
+        const int64_t t0 = ggml_time_us();
+        while (!g_free_watch_stop.load(std::memory_order_relaxed)) {
+            size_t f = 0, t = 0;
+            ggml_backend_cuda_get_device_memory(device, &f, &t);
+            const long long cur = g_free_watch_min_free.load();
+            if (cur < 0 || (long long) f < cur) {
+                g_free_watch_min_free.store((long long) f);
+                g_free_watch_t_min_ms = (double) (ggml_time_us() - t0) / 1e3;
+            }
+            if (g_free_watch_tg.load(std::memory_order_relaxed)) {
+                const long long cur_tg = g_free_watch_tg_min_free.load();
+                if (cur_tg < 0 || (long long) f < cur_tg) {
+                    g_free_watch_tg_min_free.store((long long) f);
+                    g_free_watch_tg_t_min_ms = (double) (ggml_time_us() - t0) / 1e3;
+                }
+                g_free_watch_tg_n.fetch_add(1);
+            }
+            g_free_watch_n.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    });
+}
+static void ls_free_watch_report() {
+    if (!g_free_watch_th.joinable()) {
+        return;
+    }
+    g_free_watch_stop.store(true);
+    g_free_watch_th.join();
+    fprintf(stderr, "free-watch: minimum free device memory %.1f MiB at %.0f ms into the run, %lld samples (the owner's 8 GB definition needs >= 16000 MiB)\n",
+            (double) g_free_watch_min_free.load()/1048576.0, g_free_watch_t_min_ms, g_free_watch_n.load());
+    if (g_free_watch_tg_n.load() > 0) {
+        fprintf(stderr, "free-watch (decode phase, after the cache resize): minimum free device memory %.1f MiB at %.0f ms into the run, %lld samples\n",
+                (double) g_free_watch_tg_min_free.load()/1048576.0, g_free_watch_tg_t_min_ms, g_free_watch_tg_n.load());
+    }
+    fflush(stderr);
+}
+
+// defined in ggml/src/ggml-cuda/ggml-cuda.cu (opt-in lazily committed KV buffer, --kv-lazy)
+extern "C" {
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int ggml_backend_cuda_keepalive(int device, int on);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+bool ggml_backend_cuda_buft_is_lazy_capable(int device);
+}
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <thread>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -57,6 +202,11 @@ static void usage(const char * prog) {
         "  --no-mmap              load the model into ordinary host memory\n"
         "  --model-env NAME       read the model path from environment variable NAME\n"
         "  --kv-cache S           f16 (default), q8, or q4 for both K and V\n"
+        "  --kv-lazy              reserve the CUDA KV cache as address space and commit only the rows this run\n"
+        "                         uses (prompt + generated tokens + 1024), so an unused 262,144-token window costs no\n"
+        "                         VRAM. Needs --kv-graph-pad N>0 (attention must not read the whole cache) and CUDA\n"
+        "                         virtual memory management. The freed VRAM is spent by the caller, e.g. a bigger\n"
+        "                         --tg-hybrid-slots; a run that outgrows its committed rows fails loudly.\n"
         "  --kv-graph-pad N       KV graph-length granularity passed to llama_context_params.n_pad\n"
         "                         (default 0 = legacy: n_pad = n_ctx, which pins every attention view\n"
         "                         to the whole allocated cache). N>0 makes llama_kv_cache::get_n_kv()\n"
@@ -118,10 +268,21 @@ static void usage(const char * prog) {
         "                         in full or fails loudly\n"
         "  --mtp                 T-Q38HG-06: MTP speculative draft head in handoff TG (loads blk.64, migrates it, greedy-exact verify)\n"
         "  --mtp-draft N         draft tokens per round (default 2)\n"
-        "  --prompt TEXT         real prompt text (overrides synthetic ids; pads to ubatch multiple for --mtp)\n"
+        "  --mtp-catchup N       G30: rows per draft-head catch-up decode after a layer-major / stock-path prefill (default 512)\n"
+        "  --mtp-mirror-tail N   G30: mirror only the last N prompt positions into the draft head (default 0 = every position)\n"
+        "  --mtp-draft-vocab N   G30: the draft head draws only from the token ids [0, N) (rounded up to a multiple of 256; its lm head reads N / n_vocab of the bytes); default 0 = all\n"
+        "  --mtp-draft-p-min P   G30: stop extending the draft chain when the head's top token has a probability below P (llama.cpp's draft p_min; the token is dropped); default 0 = off\n"
+        "  --mtp-draft-late      G30: the draft head's routed experts load on the host and its context stays lean until the layer-major prefill has finished and its buffers are released; then the experts\n"
+        "                        move to the GPU, the draft KV is committed and the catch-up runs (restores the whole-run VRAM bars; needs --pp-schedule layer-major, --kv-lazy, --tg-hybrid --tg-release-compute)\n"
+        "  --pp-segment-tokens N G28: segmented layer-major prefill: process the prompt in segments of N tokens (a multiple of --ubatch, at least 4 x --ubatch); the activation slab\n"
+        "                        holds one segment (16 KiB per token in f32) instead of the whole prompt, each segment streams the layer banks once more; arithmetic unchanged (default 0 = off)\n"
+        "  --prompt TEXT         real prompt text (overrides synthetic ids; LLAMA_MTP_PAD_PROMPT=1 pads it to a ubatch multiple for --mtp)\n"
         "  --rep-penalty F       greedy repeat-penalty factor (default 1 = off) applied identically\n"
         "                        at every greedy pick site (target, draft head, serial TG)\n"
         "  --rep-last-n N        repeat-penalty window (default 64)\n"
+        "  --tg-sampler MODE     G27: off (greedy, default) or doc = the sampler chain of the owner's llama-server (top-k 20, top-p 0.95,\n"
+        "                        min-p 0.05, temperature 1.0, seeded draw) in the serial TG loop; refused with --mtp\n"
+        "  --tg-seed N           G27: seed of the doc sampler (default 1)\n"
         "  --prompt-env NAME     read the prompt from environment variable NAME\n"
         "  --prompt-file PATH   T-GPLR-07: read the prompt text from PATH (conflicts loudly\n"
         "                         with --prompt/--prompt-env; required for >32 KB prompts)\n"
@@ -148,6 +309,12 @@ static void usage(const char * prog) {
         "                         backend's CUDA context, so bank transfers overlap layer compute\n"
         "                         (default 0 = off; N=1 requires the CUDA compute backend and refuses\n"
         "                         loudly instead of falling back to the serialized copy-stream path)\n"
+        "  --pp-copy-piece-mib N G22 stage B: paced bank copies. The feed worker issues each 144 MiB member in pieces of\n"
+        "                         N MiB and keeps at most --pp-copy-window pieces in flight, so a small host-to-device copy\n"
+        "                         of the compute stream (an attention layer's inputs, the result of a CPU-leg layer) waits\n"
+        "                         for a few pieces instead of the whole bank. Costs ~2.5%% of the copy rate at 16 MiB x 2.\n"
+        "                         Default 0 = off; needs --pp-async-feed 1 and --pp-schedule layer-major\n"
+        "  --pp-copy-window N    G22 stage B: pieces in flight with --pp-copy-piece-mib (default 2)\n"
         "  --pp-recon N         T-GPLR-35 diagnostics: stream/context identity once per run plus one\n"
         "                         per-bank sample of the staging copy's GPU window and its start offset\n"
         "                         against the compute stream's backlog (default 0 = off; adds no ordering)\n"
@@ -168,6 +335,23 @@ static void usage(const char * prog) {
         "                        annotates the existing pick with its top-1/top-2 values; never\n"
         "                        perturbs sampling. Consumed by tools/check-gplr54-logits.py.\n"
         "  --pp-schedule S      PP schedule: batch-major (default) or layer-major (opt-in experiment)\n"
+        "  --pp-cpu-layers L    G22: layer-major prefill only. Comma list of logical layers (or 'all') whose routed-expert FFN\n"
+        "                       runs on the CPU from the host banks instead of streaming the bank to a slot; the attention,\n"
+        "                       router and shared expert stay on the GPU. The copy engine loads the banks of the other layers\n"
+        "                       while the CPU computes. Disables the scheduler's op offload. Refused with --mtp.\n"
+        "  --pp-stock-below N   G22 stage A: a prompt of fewer than N tokens is NOT prefilled layer by layer; it is decoded through the\n"
+        "                       stock graph path (the path the hybrid decode uses: experts in host memory, attention on the GPU), as\n"
+        "                       llama-completion does. The layer-major prefill streams all 40 expert banks (a floor of ~1.3 s); the stock\n"
+        "                       path copies only the experts a ubatch uses, or computes them on the CPU. Needs --tg-hybrid; refused with\n"
+        "                       --mtp. Default 0 = off\n"
+        "  --gpu-keepalive N    G23: run a one-block spin kernel on a private stream for the whole run (default 0 = off). After ~10 s of GPU\n"
+        "                       utilisation under ~10%% the PCIe link of the laptop GPU falls from Gen4 to Gen1 (a bank copy 8x slower) and needs\n"
+        "                       ~0.25 s of traffic to climb back; a busy GPU keeps it up. Costs the GPU's idle power. See tools/pcie-state-bench\n"
+        "  --pp-threadpool N    G22: attach an explicit persistent CPU threadpool (workers poll, power throttling off, one pool for generation and batch,\n"
+        "                       --cpu-threads threads) for the prefill, as the stock tools do, and detach it before the generation. Without it the CPU\n"
+        "                       matmuls of the prefill (--pp-stock-below, --pp-cpu-layers) run on OpenMP regions. Default 0 = off\n"
+        "  --pp-stock-offload N G22 stage A: scheduler op offload on the stock prompt path (default 1 = stock behaviour: a batch of 32 or\n"
+        "                       more tokens copies the experts it uses to the GPU; 0 = the experts stay on the CPU, which is faster below ~200 tokens)\n"
         "  --residency-tg-window W  T-GPLR-62 S2: narrow the row-set slot window to W experts\n"
         "                       (0 = full bank, default). W must cover the worst-case\n"
         "                       union; a wider union refuses with 'window_overflow'.\n"
@@ -1436,6 +1620,23 @@ static int check_telemetry(const std::string & path) {
         long long last_copy_layer = -1;
     };
     std::unordered_map<int, slot_state> slots;
+    // G22: layers whose routed experts run on the CPU in the layer-major prefill (event pp_cpu_layers): they stream no bank, so they have no copy events
+    std::unordered_set<int> cpu_leg_layers;
+    // the layer that slot `slot` serves at generation `gen` (generations wrap every pass): slot + ((gen-1) mod per_slot) * n_slots; a CPU-leg layer streams no bank, so it is
+    // skipped and the slot cycles through its streamed layers only
+    auto served_layer = [&](long long slot, long long gen) -> long long {
+        if (cpu_leg_layers.empty()) {
+            const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
+            return slot + ((gen - 1) % per_slot) * n_slots;
+        }
+        std::vector<long long> served;
+        for (long long l = slot; l < n_layer; l += n_slots) {
+            if (!cpu_leg_layers.count((int) l)) {
+                served.push_back(l);
+            }
+        }
+        return served.empty() ? -1 : served[(size_t) ((gen - 1) % (long long) served.size())];
+    };
 
     // layer-major (SDD section 13): per-layer ascending chunk order and
     // non-aliasing act-slab binds
@@ -1449,6 +1650,7 @@ static int check_telemetry(const std::string & path) {
     int    lm_pp_n_chunks = -1;                  // -1 = absent
     std::vector<std::pair<long long, long long>> lm_manifest; // (token_start, n_tokens)
     std::unordered_map<long long, int> lm_act_binds;          // chunk -> binds seen (must end at 2)
+    long long lm_act_seg_cur = -1;                            // G28: segment of the act_bind events being read (absent seg field = no segmentation)
 
     // per-phase summary data for the telemetry printout (tok/s, transfer,
     // wait, compute, evictions, graph builds) after the invariant check
@@ -2023,6 +2225,19 @@ static int check_telemetry(const std::string & path) {
             if (ho_mode_valid && handoff_active_expected && !build_allowance.handoff_ever) {
                 err("run_start declared handoff_mode on/auto-on but no handoff events followed");
             }
+        } else if (event == "pp_cpu_layers") {
+            const std::string lst = json::value(line, "layers");
+            size_t pos = 0;
+            while (pos < lst.size()) {
+                size_t end = lst.find(',', pos);
+                if (end == std::string::npos) {
+                    end = lst.size();
+                }
+                if (end > pos) {
+                    cpu_leg_layers.insert(atoi(lst.substr(pos, end - pos).c_str()));
+                }
+                pos = end + 1;
+            }
         } else if (event == "slot_request") {
             bool f_layer = false, f_slot = false;
             const long long layer = json::integer(line, "layer", &f_layer);
@@ -2109,8 +2324,7 @@ static int check_telemetry(const std::string & path) {
                 // deterministic policy: slot s serves layers s + k*n_slots in
                 // order; slots may own different counts when n_slots does not
                 // divide n_layer evenly.
-                const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
-                const long long expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+                const long long expect_layer = served_layer(slot, gen);
                 if (layer != expect_layer) {
                     err("copy_submit layer violates deterministic slot policy");
                 }
@@ -2149,7 +2363,7 @@ static int check_telemetry(const std::string & path) {
                 // (one rowset_fetch per layer window) and emits NO
                 // copy_submit/copy_complete pair, so the copy-completed rule
                 // does not apply in row-set mode.
-                if (!rowset_mode && st.last_copy_layer != layer) {
+                if (!rowset_mode && st.last_copy_layer != layer && !cpu_leg_layers.count((int) layer)) {
                     err("layer_compute before matching copy_complete");
                 }
                 // T-GPLR-13: TG row-set layer_compute carries the TG window
@@ -2193,6 +2407,14 @@ static int check_telemetry(const std::string & path) {
                 if (slab != 0 && slab != 1) {
                     err("act_bind slab out of range");
                     continue;
+                }
+                // G28: the slices of different prefill segments alias by design; the non-aliasing rule is judged per segment (the seg field is absent without --pp-segment-tokens)
+                bool f_seg = false;
+                const long long bseg = json::integer(line, "seg", &f_seg);
+                if (f_seg && bseg != lm_act_seg_cur) {
+                    lm_act_off_A.clear();
+                    lm_act_off_B.clear();
+                    lm_act_seg_cur = bseg;
                 }
                 auto & offmap = (slab == 0) ? lm_act_off_A : lm_act_off_B;
                 for (const auto & kv : offmap) {
@@ -2249,8 +2471,7 @@ static int check_telemetry(const std::string & path) {
             // not divide evenly (the recorded 3-slot rung exposed this: the
             // old n_layer/n_slots form drifted after the first full wrap and
             // rejected 1,253 correct slot_evict records).
-            const long long per_slot = (n_layer - 1 - slot) / n_slots + 1;
-            const long long expect_layer = slot + ((gen - 1) % per_slot) * n_slots;
+            const long long expect_layer = served_layer(slot, gen);
             if (layer != expect_layer) {
                 err("slot_evict layer is not the prior resident layer");
             }
@@ -3231,6 +3452,10 @@ int main(int argc, char ** argv) {
     // is now measured from process entry instead of from backend init.
     ggml_time_init();
     llama_ls_tel_mark("proc_start", nullptr);
+    // what other processes (the desktop compositor, other apps) already hold on the device, read before this process touches CUDA. NVML's used = that + this process; the nvidia-smi
+    // poller every peak in this file is quoted in counts this process only, so --tg-vram-cap-mib (a cap in the poller's unit) subtracts it.
+    uint64_t nvml_baseline_bytes = 0;
+    (void) ls_nvml_used_bytes(0, &nvml_baseline_bytes);
 
     std::string model_path;
     int n_slots = 2;                     // owner default 2026-09-15 (was 1): overlap-capable minimum
@@ -3248,7 +3473,18 @@ int main(int argc, char ** argv) {
     // step 3 is in place, because on its own it would build the TG view before any KV
     // cell exists and silently under-read. See the usage text and the plan block.
     long long kv_graph_pad = 0;
+    bool kv_lazy = false; // --kv-lazy: commit the KV cache rows on demand instead of the whole window
+    bool tg_fast_sample = false; // --tg-fast-sample: the serial TG greedy pick scans the logits row in place with an exact vectorised top-2 (no 1 MB copy); identical picks
+    bool tg_probe_nosample = false; // --tg-probe-nosample (MEASUREMENT PROBE, the text it produces is meaningless): the serial TG loop feeds the same token every step and never reads the logits, so the
+                                    // time per step is the decode with NO logits copy, NO host top-2, NO per-step print and NO sampling: an upper bound for what moving the argmax onto the GPU could save
+    bool tg_first_pp = false; // --tg-first-pp-token: generated token 0 = argmax of the PP logits (stock semantics), not a re-decode of the last prompt token
     bool tg_hybrid = false; // --tg-hybrid: after PP, decode through the stock graph path (AER hybrid engine, env LLAMA_MOE_HYBRID)
+    int  tg_hybrid_slots = 0; // --tg-hybrid-slots N: after PP released its weight slots, resize the hybrid VRAM cache to N slots per layer; -1 = auto
+    long long tg_vram_cap_mib    = 8192; // --tg-vram-cap-mib: the whole-device VRAM the decode phase may use when --tg-hybrid-slots is auto
+    long long tg_vram_safety_mib = 160;  // --tg-vram-safety-mib: held back from the cap for allocator slack and graph capture
+    long long tg_vram_keep_free_mib = 0; // --tg-vram-keep-free-mib: with auto and --tg-vram-cap-mib 0, this much device memory must stay free in the CUDA runtime's view (llama.cpp's --fit-target)
+    long long tg_vram_reserved_mib = 0;  // --tg-vram-reserved-mib: what cudaMemGetInfo counts above nvidia-smi (1080 on the dev machine); only used when NVML cannot be loaded
+    bool tg_release_compute = false; // --tg-release-compute: before decode, re-reserve the scheduler compute buffers for single-token decode
     int pp_span_pace_ahead = 1;      // T-GPLR-56 A3: groups issued ahead of the layer being staged
     int pp_register_site = 0;        // T-GPLR-56 A3 arm control: 0 = post-prebuild (today), 1 = early (before the prebuild)
     // T-GPLR-72: host-backend thread count. Default 16 = the value that was
@@ -3264,6 +3500,11 @@ int main(int argc, char ** argv) {
     bool no_mmap = false;
     std::string pp_schedule = "layer-major"; // T-GPLR-12: layer-major + per-width graphs default
     bool layer_major_explicit = false; // T-GPLR-12: --pp-schedule actually passed
+    std::string pp_cpu_layers_arg;     // G22: --pp-cpu-layers (comma list, "all" or "none")
+    int  pp_stock_below = 0;           // G22 stage A: a prompt shorter than N tokens runs through the stock graph path instead of the layer-major prefill (0 = off)
+    int  pp_stock_offload = 1;         // G22 stage A: scheduler op offload on that path (1 = stock default: the experts a batch uses are copied to the GPU; 0 = they stay on the CPU)
+    int  pp_threadpool = 0;            // G22: an explicit persistent CPU threadpool for the prefill (as the stock tools attach), detached before the generation (0 = off)
+    int  gpu_keepalive = 0;            // G23: a spin kernel on one SM for the whole run, so that the PCIe link stays at Gen4 while the GPU would idle (0 = off)
     bool pw_probe = true;            // T-GPLR-12: default within layer-major
     // T-GPLR-29/30 default profile v3 (owner decision 2026-09-16): the
     // measured optimum for PP wall on this program — pinned staging + the
@@ -3329,6 +3570,12 @@ int main(int argc, char ** argv) {
     int         residency_tg_spec_null = 0;   // T-GPLR-58 A1: --residency-tg-spec-null <0|1> the count-matched null source
     bool mtp = false;                // T-Q38HG-06: MTP speculative decode in handoff TG
     int mtp_draft = 2;               // T-Q38HG-06: draft tokens per verify round
+    int mtp_catchup = 512;           // G30: --mtp-catchup N: rows per draft-head catch-up decode after a layer-major prefill (the draft context's n_ubatch is raised to it)
+    int mtp_mirror_tail = 0;         // G30: --mtp-mirror-tail N: mirror only the last N prompt positions into the draft head (0 = every position)
+    int mtp_draft_vocab = 0;         // G30: --mtp-draft-vocab N: the draft head draws only from the token ids [0, N) (0 = all)
+    double mtp_draft_pmin = 0.0;     // G30: --mtp-draft-p-min P: the draft chain stops when the top token's probability is below P (0 = off)
+    bool mtp_draft_late = false;     // G30: --mtp-draft-late: the draft head's experts and context come up after the layer-major prefill (keeps the prefill's VRAM headroom)
+    bool mtp_experts_gpu = false;    // --mtp-draft-experts-gpu: the MTP layer's routed experts stay on the GPU (the loader override would put them on the host with the rest)
     std::string act_slab_dtype_str = "bf16"; // T-GPLR-12: bf16 default (f32 stays explicit)
     int pp_prefetch_ahead = 0;       // T-GPLR-08: one-layer-ahead PrefetchVirtualMemory (0 = off, default)
     int pp_async_feed = 1;           // T-GPLR-25: async-feed worker (default 1 since the
@@ -3336,6 +3583,8 @@ int main(int argc, char ** argv) {
     bool pp_af_serialize = false;    // T-GPLR-32: one worker H2D in flight (default 0 = off)
     bool pp_submit_batch = false;    // T-GPLR-33: one H2D per bank (V1 span copy; default 0 = off)
     bool pp_copy_overlap = false;    // T-GPLR-35: staging DMAs on the compute context's aux stream (default 0 = off)
+    int  pp_copy_piece_mib = 0;      // G22 stage B: paced bank copies, piece size in MiB (0 = off)
+    int  pp_copy_window = 2;         // G22 stage B: pieces in flight
     bool pp_recon = false;           // T-GPLR-35 recon: stream identity + per-bank copy/compute timing (default 0 = off)
     bool pp_mctx_recon = false;      // T-GPLR-41 recon: pass-boundary memory-lifecycle events (default off)
     // T-GPLR-39 (owner decision 2026-09-20): the route DIAGNOSTIC defaults OFF.
@@ -3358,7 +3607,10 @@ int main(int argc, char ** argv) {
     std::string pp_pool_policy = "fixed";
     double rep_penalty = 1.0;        // T-GPLR-06: greedy repeat penalty (1 = off)
     int tg_logit_margin = 0;         // T-GPLR-54 A2: per-step logit readout (0 = off)
+    long long pp_segment_tokens = 0; // G28: --pp-segment-tokens: segmented layer-major prefill, segment size in tokens (0 = off = one sweep over the whole prompt)
     int    rep_last_n = 64;          // T-GPLR-06: repeat-penalty window
+    std::string tg_sampler_str = "off"; // G27: off (greedy, default) | doc (top-k 20 -> top-p 0.95 -> min-p 0.05 -> temp 1.0 -> seeded draw) in the serial TG loop
+    long long   tg_seed = 1;            // G27: seed of the doc sampler
     std::string prompt_text;         // real prompt text (overrides synthetic ids)
     std::string prompt_file;         // T-GPLR-07: --prompt-file (file prompt source)
     std::string tg_text_path;        // T-GPLR-07: --tg-text (generated-text file output)
@@ -3406,10 +3658,33 @@ int main(int argc, char ** argv) {
             // T-GPLR-04: --ctx-size is honored in run mode as the explicit
             // context/KV capacity, independent of the PP token count.
             run_ctx_size = ctx_size;
+        } else if (arg == "--tg-first-pp-token") {
+            tg_first_pp = true;
         } else if (arg == "--tg-hybrid") {
             tg_hybrid = true;
+        } else if (arg == "--tg-hybrid-slots") {
+            {
+                const std::string v = arg_value(argc, argv, i, "--tg-hybrid-slots");
+                tg_hybrid_slots = (v == "auto") ? -1 : atoi(v.c_str());
+            }
+        } else if (arg == "--tg-vram-cap-mib") {
+            tg_vram_cap_mib = atoll(arg_value(argc, argv, i, "--tg-vram-cap-mib").c_str());
+        } else if (arg == "--tg-vram-keep-free-mib") {
+            tg_vram_keep_free_mib = atoll(arg_value(argc, argv, i, "--tg-vram-keep-free-mib").c_str());
+        } else if (arg == "--tg-vram-safety-mib") {
+            tg_vram_safety_mib = atoll(arg_value(argc, argv, i, "--tg-vram-safety-mib").c_str());
+        } else if (arg == "--tg-vram-reserved-mib") {
+            tg_vram_reserved_mib = atoll(arg_value(argc, argv, i, "--tg-vram-reserved-mib").c_str());
+        } else if (arg == "--tg-release-compute") {
+            tg_release_compute = true;
         } else if (arg == "--kv-graph-pad") {
             kv_graph_pad = atoll(arg_value(argc, argv, i, "--kv-graph-pad").c_str());
+        } else if (arg == "--kv-lazy") {
+            kv_lazy = true;
+        } else if (arg == "--tg-fast-sample") {
+            tg_fast_sample = true;
+        } else if (arg == "--tg-probe-nosample") {
+            tg_probe_nosample = true;
         } else if (arg == "--residency-budget-mib") {
             residency_budget_mib = atoll(arg_value(argc, argv, i, "--residency-budget-mib").c_str());
         } else if (arg == "--reserve-mib") {
@@ -3517,6 +3792,32 @@ int main(int argc, char ** argv) {
         } else if (arg == "--pp-schedule") {
             pp_schedule = arg_value(argc, argv, i, "--pp-schedule");
             layer_major_explicit = (pp_schedule == "layer-major");
+        } else if (arg == "--pp-cpu-layers") {
+            pp_cpu_layers_arg = arg_value(argc, argv, i, "--pp-cpu-layers");
+        } else if (arg == "--pp-stock-below") {
+            pp_stock_below = atoi(arg_value(argc, argv, i, "--pp-stock-below").c_str());
+            if (pp_stock_below < 0) {
+                fprintf(stderr, "error: --pp-stock-below must be >= 0\n");
+                return 2;
+            }
+        } else if (arg == "--gpu-keepalive") {
+            gpu_keepalive = atoi(arg_value(argc, argv, i, "--gpu-keepalive").c_str());
+            if (gpu_keepalive != 0 && gpu_keepalive != 1) {
+                fprintf(stderr, "error: --gpu-keepalive must be 0 or 1\n");
+                return 2;
+            }
+        } else if (arg == "--pp-threadpool") {
+            pp_threadpool = atoi(arg_value(argc, argv, i, "--pp-threadpool").c_str());
+            if (pp_threadpool != 0 && pp_threadpool != 1) {
+                fprintf(stderr, "error: --pp-threadpool must be 0 or 1\n");
+                return 2;
+            }
+        } else if (arg == "--pp-stock-offload") {
+            pp_stock_offload = atoi(arg_value(argc, argv, i, "--pp-stock-offload").c_str());
+            if (pp_stock_offload != 0 && pp_stock_offload != 1) {
+                fprintf(stderr, "error: --pp-stock-offload must be 0 or 1\n");
+                return 2;
+            }
         } else if (arg == "--residency") {
             residency = arg_value(argc, argv, i, "--residency");
         } else if (arg == "--probe-capability") {
@@ -3709,12 +4010,30 @@ int main(int argc, char ** argv) {
             // path. Requires --handoff (-attention-only) and --tg-tokens.
             mtp = true;
             mtp_explicit = true;
+        } else if (arg == "--mtp-draft-experts-gpu") {
+            mtp_experts_gpu = true;
         } else if (arg == "--mtp-draft") {
             mtp_draft = atoi(arg_value(argc, argv, i, "--mtp-draft").c_str());
+        } else if (arg == "--mtp-catchup") {
+            mtp_catchup = atoi(arg_value(argc, argv, i, "--mtp-catchup").c_str());
+        } else if (arg == "--mtp-mirror-tail") {
+            mtp_mirror_tail = atoi(arg_value(argc, argv, i, "--mtp-mirror-tail").c_str());
+        } else if (arg == "--mtp-draft-vocab") {
+            mtp_draft_vocab = atoi(arg_value(argc, argv, i, "--mtp-draft-vocab").c_str());
+        } else if (arg == "--mtp-draft-p-min") {
+            mtp_draft_pmin = atof(arg_value(argc, argv, i, "--mtp-draft-p-min").c_str());
+        } else if (arg == "--mtp-draft-late") {
+            mtp_draft_late = true;
         } else if (arg == "--rep-penalty") {
             rep_penalty = atof(arg_value(argc, argv, i, "--rep-penalty").c_str());
         } else if (arg == "--rep-last-n") {
             rep_last_n = atoi(arg_value(argc, argv, i, "--rep-last-n").c_str());
+        } else if (arg == "--tg-sampler") {
+            tg_sampler_str = arg_value(argc, argv, i, "--tg-sampler");
+        } else if (arg == "--tg-seed") {
+            tg_seed = atoll(arg_value(argc, argv, i, "--tg-seed").c_str());
+        } else if (arg == "--pp-segment-tokens") {
+            pp_segment_tokens = atoll(arg_value(argc, argv, i, "--pp-segment-tokens").c_str());
         } else if (arg == "--prompt") {
             prompt_text = arg_value(argc, argv, i, "--prompt");
         } else if (arg == "--prompt-env") {
@@ -3782,6 +4101,19 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             pp_copy_overlap = (v == 1);
+        } else if (arg == "--pp-copy-piece-mib") {
+            // G22 stage B: paced bank copies (pieces of N MiB, at most --pp-copy-window in flight); 0 = off (default)
+            pp_copy_piece_mib = atoi(arg_value(argc, argv, i, "--pp-copy-piece-mib").c_str());
+            if (pp_copy_piece_mib < 0 || pp_copy_piece_mib > 144) {
+                fprintf(stderr, "error: --pp-copy-piece-mib must be 0 (off) or 1..144\n");
+                return 2;
+            }
+        } else if (arg == "--pp-copy-window") {
+            pp_copy_window = atoi(arg_value(argc, argv, i, "--pp-copy-window").c_str());
+            if (pp_copy_window < 1 || pp_copy_window > 16) {
+                fprintf(stderr, "error: --pp-copy-window must be 1..16\n");
+                return 2;
+            }
         } else if (arg == "--pp-mctx-recon") {
             pp_mctx_recon = atoi(arg_value(argc, argv, i, "--pp-mctx-recon").c_str()) != 0;
         } else if (arg == "--route-telemetry") {
@@ -3909,6 +4241,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: --pp-tokens and --ubatch must be > 0\n");
         return 2;
     }
+    if (kv_lazy && kv_graph_pad <= 0) {
+        fprintf(stderr, "error: --kv-lazy needs --kv-graph-pad N>0: without it every attention view spans the whole cache and would read rows that are never committed\n");
+        return 2;
+    }
+    if (tg_hybrid_slots < 0 && (!tg_hybrid || (tg_vram_cap_mib != 0 && tg_vram_cap_mib <= tg_vram_safety_mib))) {
+        fprintf(stderr, "error: --tg-hybrid-slots auto needs --tg-hybrid and --tg-vram-cap-mib 0 (fit to the free memory) or above --tg-vram-safety-mib\n");
+        return 2;
+    }
     if (pp_repeat < 1 || pp_repeat > 16) {
         fprintf(stderr, "error: --pp-repeat must be in 1..16\n");
         return 2;
@@ -4034,6 +4374,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: --pp-async-feed must be 0 (off) or 1 (one-layer-ahead worker feed; requires --layer-slots >= 2)\n");
         return 2;
     }
+    if (pp_stock_below > 0 && !tg_hybrid) {
+        fprintf(stderr, "error: --pp-stock-below needs --tg-hybrid (the stock graph path is the hybrid decode path)\n");
+        return 2;
+    }
     if (pp_async_feed > 0 && n_slots < 2) {
         fprintf(stderr, "error: --pp-async-feed requires --layer-slots >= 2 (with one slot the reuse invariant forbids staging the next layer while the current one computes)\n");
         return 2;
@@ -4117,11 +4461,53 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: --pw-probe requires --pp-schedule layer-major\n");
         return 2;
     }
+    // G28: segmented layer-major prefill
+    if (pp_segment_tokens != 0) {
+        if (pp_segment_tokens < 0 || schedule != LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+            fprintf(stderr, "error: --pp-segment-tokens needs a positive size and --pp-schedule layer-major\n");
+            return 2;
+        }
+        if (!pw_probe) {
+            fprintf(stderr, "error: --pp-segment-tokens needs the per-width sets (do not pass --no-pw-probe): the segment-relative slab offsets are patched per launch\n");
+            return 2;
+        }
+        if (pp_segment_tokens % ubatch != 0 || pp_segment_tokens < 4LL * ubatch) {
+            fprintf(stderr, "error: --pp-segment-tokens %lld must be a multiple of --ubatch %d and at least 4 x --ubatch\n", pp_segment_tokens, ubatch);
+            return 2;
+        }
+        if (pp_copy_piece_mib > 0 || (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") || pp_stock_below > 0) {
+            fprintf(stderr, "error: --pp-segment-tokens is not validated with paced copies (--pp-copy-piece-mib), the CPU leg (--pp-cpu-layers) or the stock prefill path (--pp-stock-below)\n");
+            return 2;
+        }
+        fprintf(stderr, "pp-segment: segments of %lld tokens (%lld chunks of %d): the activation slab holds one segment, each segment streams the layer banks once more\n",
+                pp_segment_tokens, pp_segment_tokens / ubatch, ubatch);
+    }
 
     // T-Q38HG-06: MTP needs the draft head's weights resident. The exact
     // policy check runs below, after auto resolution knows the final policy
     // (T-GPLR-06: moe-expert-bank keeps the MTP package resident without
     // any handoff migration).
+    if (tg_sampler_str != "off" && tg_sampler_str != "doc") {
+        fprintf(stderr, "error: --tg-sampler must be off or doc (got '%s')\n", tg_sampler_str.c_str());
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && mtp) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --mtp (the MTP verify path is greedy-exact by construction)\n");
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && tg_probe_nosample) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --tg-probe-nosample (the probe never reads the logits)\n");
+        return 2;
+    }
+    if (tg_sampler_str == "doc" && rep_penalty != 1.0) {
+        fprintf(stderr, "error: --tg-sampler doc is refused with --rep-penalty (the penalty belongs to the greedy pick; the sampled token would ignore it)\n");
+        return 2;
+    }
+    const bool tg_sampler_on = (tg_sampler_str == "doc");
+    std::mt19937_64 tg_rng((uint64_t) tg_seed);
+    if (tg_sampler_on) {
+        fprintf(stderr, "tg-sampler: doc (top-k 20, top-p 0.95, min-p 0.05, temperature 1.0), seed %lld: the generated tokens are SAMPLED, not greedy (token 0 is the prefill's greedy argmax when --tg-first-pp-token is on)\n", tg_seed);
+    }
     if (mtp && mtp_draft < 1) {
         fprintf(stderr, "error: --mtp-draft must be >= 1\n");
         return 2;
@@ -4140,11 +4526,28 @@ int main(int argc, char ** argv) {
                 mtp_draft, 1 + mtp_draft);
         return 2;
     }
-    // T-Q38HG-06: the MTP prompt catch-up mirrors each PP ubatch into the
-    // draft context, so the runner drives PP itself (batch-major ubatches).
-    // The layer-major controller has no per-ubatch hook; reject the combo.
-    if (mtp && schedule != LLAMA_PP_SCHEDULE_BATCH_MAJOR) {
-        fprintf(stderr, "error: --mtp requires --pp-schedule batch-major\n");
+    // T-Q38HG-06: the MTP prompt catch-up mirrors each PP ubatch into the draft context (batch-major ubatches and the stock graph path).
+    // G30: the layer-major controller has no per-ubatch hook, but its output stage copies every chunk's post-norm hidden rows (t_h_nextn) to the host, and the runner runs the same
+    // catch-up after the sweep. The MTP loop's positions follow the harness convention (the last prompt token is decoded again at position P), so a layer-major MTP run takes no
+    // --tg-first-pp-token (D99).
+    if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && tg_first_pp) {
+        fprintf(stderr, "error: --mtp with --pp-schedule layer-major keeps the MTP loop's first-token convention: drop --tg-first-pp-token (use --pp-no-logits)\n");
+        return 2;
+    }
+    if (mtp && (mtp_catchup < 1 || mtp_mirror_tail < 0)) {
+        fprintf(stderr, "error: --mtp-catchup must be >= 1 and --mtp-mirror-tail >= 0\n");
+        return 2;
+    }
+    if (mtp_draft_vocab < 0 || (mtp_draft_vocab > 0 && !mtp)) {
+        fprintf(stderr, "error: --mtp-draft-vocab needs --mtp and a value >= 0\n");
+        return 2;
+    }
+    if (mtp_draft_pmin < 0.0 || mtp_draft_pmin >= 1.0 || (mtp_draft_pmin > 0.0 && (!mtp || !tg_fast_sample || (rep_penalty != 1.0 && rep_last_n != 0)))) {
+        fprintf(stderr, "error: --mtp-draft-p-min needs --mtp, --tg-fast-sample, no repetition penalty and a value in [0, 1)\n");
+        return 2;
+    }
+    if (mtp_draft_late && (!mtp || schedule != LLAMA_PP_SCHEDULE_LAYER_MAJOR || !kv_lazy || !tg_hybrid || !tg_release_compute || residency != "moe-expert-bank")) {
+        fprintf(stderr, "error: --mtp-draft-late needs --mtp, --pp-schedule layer-major, --kv-lazy, --tg-hybrid, --tg-release-compute and --residency moe-expert-bank\n");
         return 2;
     }
     if (mtp && prompt_text.empty() && pp_tokens % ubatch != 0) {
@@ -4180,6 +4583,10 @@ int main(int argc, char ** argv) {
           "--residency off is incompatible with --pp-schedule layer-major (off is the normal batch-major llama.cpp path)" },
         { mtp,
           "--residency off is incompatible with --mtp (MTP speculative decode requires the streaming module)" },
+        { pp_segment_tokens != 0,
+          "--residency off is incompatible with --pp-segment-tokens (segmentation is a layer-major prefill mode)" },
+        { tg_sampler_str != "off",
+          "--residency off is incompatible with --tg-sampler (the sampler lives in the streaming runner's serial TG loop, not in the normal llama.cpp path)" },
         // T-GPLR-12: only an explicit handoff request (--handoff/--handoff-mode
         // on) refuses `off`; the auto default must degrade to auto-off with a
         // notice instead (condition (a): auto enables handoff only for a
@@ -4492,7 +4899,30 @@ int main(int argc, char ** argv) {
     mparams.load_mode = no_mmap ? LLAMA_LOAD_MODE_NONE : LLAMA_LOAD_MODE_AUTO;
 
     const char * blk_pattern = "blk\\.[0-9]+\\.*";
-    const char * exps_pattern = "blk\\.[0-9]+\\.ffn_(gate|up|down|gate_up)_exps\\.weight";
+    // G12 R1: with the MTP draft head, its layer (index block_count - nextn_predict_layers) can keep its routed experts on the GPU: on the host the draft graph splits CPU / CUDA / CPU /
+    // CUDA (123 host tensors in the load log instead of 120) and costs ~1.2 ms more per round
+    std::string exps_pattern_str = "blk\\.[0-9]+\\.ffn_(gate|up|down|gate_up)_exps\\.weight";
+    if (mtp && mtp_draft_late) {
+        fprintf(stderr, "MTP: the draft layer's routed experts load on the host and move to the GPU after the prefill (--mtp-draft-late)\n");
+    }
+    if (mtp && mtp_experts_gpu && !mtp_draft_late && residency == "moe-expert-bank") {
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context * gg = gguf_init_from_file(model_path.c_str(), gp);
+        int64_t kb = gg ? gguf_find_key(gg, (model_arch + ".block_count").c_str()) : -1;
+        int64_t kn = gg ? gguf_find_key(gg, (model_arch + ".nextn_predict_layers").c_str()) : -1;
+        if (kb >= 0 && kn >= 0) {
+            const int mtp_layer = (int) gguf_get_val_u32(gg, kb) - (int) gguf_get_val_u32(gg, kn);
+            exps_pattern_str = "blk\\.(?!" + std::to_string(mtp_layer) + "\\.)[0-9]+\\.ffn_(gate|up|down|gate_up)_exps\\.weight";
+            fprintf(stderr, "MTP: the draft layer blk.%d keeps its routed experts on the GPU (--mtp-draft-experts-gpu)\n", mtp_layer);
+        } else {
+            fprintf(stderr, "error: --mtp-draft-experts-gpu: cannot read %s.block_count / nextn_predict_layers from the model\n", model_arch.c_str());
+            return 2;
+        }
+        if (gg) {
+            gguf_free(gg);
+        }
+    }
+    const char * exps_pattern = exps_pattern_str.c_str();
     llama_model_tensor_buft_override overrides[] = {
         { residency == "moe-expert-bank" ? exps_pattern : blk_pattern, ggml_backend_cpu_buffer_type() },
         { nullptr,     nullptr },
@@ -4548,8 +4978,9 @@ int main(int argc, char ** argv) {
         } else {
             prompt_tokens.resize(n_tok);
         }
-        // For MTP, pad to next ubatch multiple (mirror requires exact ubatches)
-        if (mtp) {
+        // Old MTP behavior, A/B only: the pad tokens stay in the context and broke the needle answer at 100k tokens
+        const char * mtp_pad_env = getenv("LLAMA_MTP_PAD_PROMPT");
+        if (mtp && mtp_pad_env != nullptr && atoi(mtp_pad_env) != 0) {
             const llama_token pad = llama_vocab_pad(vocab);
             while ((int) prompt_tokens.size() % ubatch != 0) {
                 prompt_tokens.push_back(pad);
@@ -4595,7 +5026,10 @@ int main(int argc, char ** argv) {
     // T-Q38HG-06: the target emits dense per-position hidden rows (unmasked
     // nextn); with --mtp the row buffer must cover PP + TG positions, so the
     // batch reserve grows to the padded session length.
-    cparams.n_batch      = mtp ? n_ctx_total : pp_tokens;
+    // G12: the rows are read by index inside one decode (a PP ubatch, or a verify step of 1 + drafts rows), never by session position, so the largest single batch is enough. n_ctx_total made
+    // this buffer n_embd * n_ctx floats (2 GiB at ctx 262,144), and its first growth (a 1-row frontier decode, then a 2-row verify) reallocated and cleared it INSIDE the TG timer: ~1 s, the
+    // "host time grows with the context" that the g25 ctx sweep measured.
+    cparams.n_batch      = mtp ? (uint32_t) std::max<int64_t>((int64_t) pp_tokens, (int64_t) ubatch + (int64_t) mtp_draft + 2) : pp_tokens;
     cparams.n_ubatch     = ubatch;
     cparams.n_seq_max    = 1;
     // n_outputs_max caps the widest decode that requests logits rows: PP
@@ -4606,12 +5040,21 @@ int main(int argc, char ** argv) {
     // cover that MTP draft width or output_reserve aborts at the first
     // verify round. Must remain nonzero in all cases for graph
     // reservation.
-    cparams.n_outputs_max = pp_no_logits
+    cparams.n_outputs_max = (pp_no_logits || tg_first_pp)
         ? (mtp ? (uint32_t) (1 + mtp_draft) : 1)
         : (uint32_t) pp_tokens;
     // T-GPLR-72: was hardcoded 16/16; now a flag whose default is that same 16.
     cparams.n_threads       = (int32_t) cpu_threads;
     cparams.n_threads_batch = (int32_t) cpu_threads;
+    // G22: the CPU leg of the layer-major prefill must run on the CPU; the scheduler would otherwise copy the experts of a batch of 32 or more
+    // tokens to the GPU through the same link the prefill is trying to keep for the streamed banks
+    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        cparams.op_offload = false;
+    }
+    // G22 stage A: the stock prompt path keeps the experts on the CPU when asked (the scheduler decides per context, so this is fixed by the requested prompt length)
+    if (pp_stock_below > 0 && pp_tokens < pp_stock_below && pp_stock_offload == 0) {
+        cparams.op_offload = false;
+    }
     // T-Q38HG-06: the target may roll back a partial draft acceptance, which
     // requires recurrent-state snapshots for the Gated DeltaNet layers (the
     // hybrid memory clamps to 0 when the arch lacks rollback support).
@@ -4694,10 +5137,70 @@ int main(int argc, char ** argv) {
     llama_ls_vram_budget vram;
     ls_vram_budget_measure_start(vram, device, reserve_mib, residency_budget_mib);
 
+    if (kv_lazy) {
+        if (!ggml_backend_cuda_buft_is_lazy_capable(device)) {
+            fprintf(stderr, "error: --kv-lazy needs CUDA virtual memory management, which device %d does not report\n", device);
+            return 2;
+        }
+#ifdef _WIN32
+        _putenv_s("LLAMA_KV_LAZY", "1");
+#else
+        setenv("LLAMA_KV_LAZY", "1", 1);
+#endif
+    }
     llama_context * ctx = llama_new_context_with_model(model, cparams);
     if (ctx == nullptr) {
         fprintf(stderr, "error: failed to create context (is VRAM sufficient?)\n");
         return 1;
+    }
+    ls_free_watch_start(device);
+    // G23: the keep-alive kernel (see --gpu-keepalive); stopped by the guard on every way out of main()
+    struct ls_keepalive_guard {
+        bool on = false;
+        ~ls_keepalive_guard() {
+            if (on) {
+                ggml_backend_cuda_keepalive(0, 0);
+            }
+        }
+    } keepalive_guard;
+    if (gpu_keepalive != 0) {
+        ggml_backend_cuda_keepalive(device, 1);
+        keepalive_guard.on = true;
+        fprintf(stderr, "gpu-keepalive: a spin kernel keeps the GPU busy for the whole run\n");
+    }
+    // G22: the explicit CPU threadpool of the prefill (see --pp-threadpool); freed before the generation starts
+    ggml_threadpool_t pp_tp = nullptr;
+    void (*pp_tp_free)(ggml_threadpool_t) = nullptr;
+    if (pp_threadpool != 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_reg_t cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+        auto * tp_new  = cpu_reg ? (decltype(ggml_threadpool_new) *)  ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new")  : nullptr;
+        pp_tp_free     = cpu_reg ? (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free") : nullptr;
+        if (tp_new != nullptr && pp_tp_free != nullptr) {
+            struct ggml_threadpool_params tpp;
+            ggml_threadpool_params_init(&tpp, cpu_threads);
+            tpp.prio = GGML_SCHED_PRIO_NORMAL;
+            tpp.poll = 50;
+            pp_tp = tp_new(&tpp);
+        }
+        if (pp_tp == nullptr) {
+            fprintf(stderr, "error: --pp-threadpool: the CPU backend does not offer a threadpool\n");
+            return 1;
+        }
+        llama_attach_threadpool(ctx, pp_tp, nullptr);
+        fprintf(stderr, "pp-threadpool: explicit CPU threadpool of %d threads attached for the prefill\n", cpu_threads);
+    }
+    if (kv_lazy) {
+        // every row the run can touch: prompt + generated tokens, plus a margin that covers the attention kernels' 256-row tiles and the pad granularity
+        const int64_t kv_rows = std::min<int64_t>((int64_t) n_ctx_total, (int64_t) pp_tokens + (int64_t) tg_tokens + 1024);
+        const int64_t kv_bytes = ggml_backend_cuda_lazy_commit_rows(kv_rows);
+        if (kv_bytes < 0) {
+            fprintf(stderr, "error: --kv-lazy: the driver could not commit %lld KV rows (out of device memory)\n", (long long) kv_rows);
+            return 1;
+        }
+        fprintf(stderr, "kv-lazy: committed %.1f MiB of KV cache (%lld of %d rows) instead of the whole window\n",
+                (double) kv_bytes / 1048576.0, (long long) kv_rows, n_ctx_total);
+        fflush(stderr);
     }
 
     // ------------------------------------------------------------------
@@ -4723,8 +5226,10 @@ int main(int argc, char ** argv) {
     const bool use_bf16_slab = (act_slab_dtype_str == "bf16");
     const ggml_type act_slab_dtype = use_bf16_slab ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     const size_t slab_elt = use_bf16_slab ? 2 : 4;
+    // G28: with --pp-segment-tokens the slab holds one segment
+    const int64_t slab_tokens_main = (pp_segment_tokens > 0 && pp_segment_tokens < (long long) pp_tokens) ? (int64_t) pp_segment_tokens : (int64_t) pp_tokens;
     const size_t act_slab_bytes = (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR)
-        ? (size_t) llama_model_n_embd_inp(model) * (size_t) pp_tokens * 2 * slab_elt
+        ? (size_t) llama_model_n_embd_inp(model) * (size_t) slab_tokens_main * 2 * slab_elt
         : 0;
 
     // layer-major preflight (SDD section 13): report the two-slab activation
@@ -5093,6 +5598,10 @@ int main(int argc, char ** argv) {
 
 
     llama_layer_streaming ls;
+    if (!ls.set_pp_segment_tokens(pp_segment_tokens)) {
+        fprintf(stderr, "error: %s\n", ls.error_msg.c_str());
+        return 2;
+    }
     const bool use_implicit_causal_mask = schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR;
     fprintf(stderr, "layer-major preflight: initializing streaming module\n");
     if (!ls.init(*model, n_slots, device, tel_path.empty() ? nullptr : tel_path.c_str(), ubatch, n_ctx_total,
@@ -5427,6 +5936,19 @@ int main(int argc, char ** argv) {
         ls.tel_run_refused("async_feed_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
         return 1;
     }
+    // G22 stage B: paced bank copies (only the feed worker paces, so the worker must exist)
+    if (pp_copy_piece_mib > 0) {
+        if (pp_async_feed <= 0 || pp_schedule != "layer-major") {
+            fprintf(stderr, "error: --pp-copy-piece-mib needs --pp-async-feed 1 and --pp-schedule layer-major\n");
+            ls.tel_run_refused("copy_pacing_configure", "needs --pp-async-feed 1 and --pp-schedule layer-major", 1, 0, 0, "none");
+            return 2;
+        }
+        if (!ls.set_pp_copy_pacing(((size_t) pp_copy_piece_mib) << 20, pp_copy_window)) {
+            fprintf(stderr, "error: copy-pacing configure failed: %s\n", ls.error_msg.c_str());
+            ls.tel_run_refused("copy_pacing_configure", ls.error_msg.c_str(), 1, 0, 0, "none");
+            return 1;
+        }
+    }
     // T-GPLR-30: configure the persistent pinned pool (after init — it needs
     // the per-layer package sizes — and after async-feed, since a failed pool
     // allocation must not leave a running worker behind). A failure aborts
@@ -5484,6 +6006,36 @@ int main(int argc, char ** argv) {
         }
     }
     ls.exec_layers = boundary_layers;
+    if (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") {
+        if (pp_schedule != "layer-major") {
+            fprintf(stderr, "error: --pp-cpu-layers needs --pp-schedule layer-major\n");
+            return 2;
+        }
+        std::vector<int> cpu_list;
+        if (pp_cpu_layers_arg == "all") {
+            for (int il = 0; il < ls.n_layer; ++il) {
+                cpu_list.push_back(il);
+            }
+        } else {
+            size_t pos = 0;
+            while (pos < pp_cpu_layers_arg.size()) {
+                size_t end = pp_cpu_layers_arg.find(',', pos);
+                if (end == std::string::npos) {
+                    end = pp_cpu_layers_arg.size();
+                }
+                const std::string tok = pp_cpu_layers_arg.substr(pos, end - pos);
+                if (!tok.empty()) {
+                    cpu_list.push_back(atoi(tok.c_str()));
+                }
+                pos = end + 1;
+            }
+        }
+        if (!ls.set_pp_cpu_layers(cpu_list)) {
+            fprintf(stderr, "error: --pp-cpu-layers: %s\n", ls.error_msg.c_str());
+            return 2;
+        }
+        fprintf(stderr, "pp-cpu-layers: %zu of %d layers run their routed experts on the CPU in the layer-major prefill (op offload off)\n", cpu_list.size(), ls.n_layer);
+    }
 
     // T-GPLR-56 A3 arm `p1-early`: the earliest LEGAL registration site - after the
     // load, after ls.init and after exec_layers is assigned, before the prebuild.
@@ -5574,14 +6126,116 @@ int main(int argc, char ** argv) {
     const int n_embd_out = (int) llama_model_n_embd_out(model);
     const size_t row_bytes = (size_t) n_embd_out * sizeof(float);
     llama_context * ctx_dft = nullptr;
+    // G30 (--mtp-draft-late): state and bring-up of the draft head after the layer-major prefill (see stage-c/g30h_draft_late_apply.py.txt)
+    bool                mtp_compute_released = false;     // the target's prefill-sized scheduler buffers were already released by the bring-up (tg_transition then skips its own release)
+    int64_t             mtp_pp_excl_us       = 0;         // time of that release: it is transition work B0 also does outside its PP wall
+    uint64_t            mtp_builds_excl      = 0;         // persistent-graph builds that release made (B0 runs it after begin_tg_stock(), where it builds nothing): not graph construction in the timed region
+    ggml_backend_buffer_t mtp_head_buf       = nullptr;   // the device buffer that now holds the draft head's routed experts
+    ggml_backend_buffer_t mtp_head_stage     = nullptr;   // page-locked host copy of those experts, made at start-up (outside the timed prefill)
+    std::vector<const void *> mtp_head_src;                // per tensor of the head's expert set: where its bytes can be read from (the staging copy, or the mapping)
+    auto mtp_late_bringup = [&]() -> bool {
+        const int64_t t_l0 = ggml_time_us();
+        if (tg_hybrid && tg_release_compute && !mtp_compute_released) {
+            const int64_t t_rc0 = ggml_time_us();
+            const uint64_t gen_rc0 = ls.build_generation;
+            const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
+            if (freed < 0) {
+                fprintf(stderr, "error: --mtp-draft-late: the scheduler re-reserve failed\n");
+                ls.failed = true;
+                return false;
+            }
+            mtp_builds_excl += ls.build_generation - gen_rc0;
+            mtp_compute_released = true;
+            mtp_pp_excl_us += ggml_time_us() - t_rc0;
+            fprintf(stderr, "tg-hybrid: scheduler compute buffers re-reserved for decode, %.1f MiB released in %.1f ms (early, for --mtp-draft-late; not part of the PP wall)\n",
+                    (double) freed / 1048576.0, (double) (ggml_time_us() - t_rc0) / 1e3);
+        }
+        ls_vram_trace(device, "late draft: before the migration");
+        const int64_t t_m0 = ggml_time_us();
+        llama_layer & hl = model->layers[n_layer];
+        ggml_tensor * moving[4] = { hl.ffn_gate_exps, hl.ffn_up_exps, hl.ffn_down_exps, hl.ffn_gate_up_exps };
+        ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+        size_t total = 0;
+        for (ggml_tensor * t : moving) {
+            if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                total += GGML_PAD(ggml_nbytes(t), align);
+            }
+        }
+        if (total > 0) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+            if (buf == nullptr) {
+                fprintf(stderr, "error: --mtp-draft-late: cannot allocate %.1f MiB on the device for the draft head's experts\n", (double) total / 1048576.0);
+                ls.failed = true;
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_tallocr ta = ggml_tallocr_new(buf);
+            for (ggml_tensor * t : moving) {
+                if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                const void * src = t->data;
+                for (size_t k = 0; k < 4; ++k) {
+                    if (moving[k] == t && k < mtp_head_src.size() && mtp_head_src[k] != nullptr) {
+                        src = mtp_head_src[k];
+                    }
+                }
+                const size_t nb  = ggml_nbytes(t);
+                t->data   = nullptr;
+                t->buffer = nullptr;
+                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "error: --mtp-draft-late: cannot place %s in the device buffer\n", t->name);
+                    ls.failed = true;
+                    return false;
+                }
+                ggml_backend_tensor_set(t, src, 0, nb);
+            }
+            mtp_head_buf = buf;
+        }
+        fprintf(stderr, "MTP: draft head experts moved to the GPU: %.1f MiB in %.1f ms (%s)\n", (double) total / 1048576.0, (ggml_time_us() - t_m0) / 1000.0,
+                mtp_head_stage != nullptr ? "from the page-locked staging copy" : "from the mapping");
+        if (mtp_head_stage != nullptr) {
+            ggml_backend_buffer_free(mtp_head_stage);
+            mtp_head_stage = nullptr;
+            mtp_head_src.clear();
+        }
+        ls_vram_trace(device, "late draft: after the migration");
+        // the draft KV (reserved lazily at creation): commit the rows this run can use
+        const int64_t kv_rows_d  = std::min<int64_t>((int64_t) n_ctx_total, (int64_t) pp_tokens + (int64_t) tg_tokens + 1024);
+        const int64_t kv_bytes_d = ggml_backend_cuda_lazy_commit_rows(kv_rows_d);
+        if (kv_bytes_d < 0) {
+            fprintf(stderr, "error: --mtp-draft-late: the driver could not commit the draft context's %lld KV rows\n", (long long) kv_rows_d);
+            ls.failed = true;
+            return false;
+        }
+        fprintf(stderr, "kv-lazy: draft context committed, lazily committed KV now %.1f MiB in total\n", (double) kv_bytes_d / 1048576.0);
+        // the draft context decodes the catch-up in up to --mtp-catchup rows: re-reserve at that width (against the device-resident experts); the rounds' width is restored after the catch-up
+        const int64_t t_r0 = ggml_time_us();
+        (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch)));
+        fprintf(stderr, "MTP: draft context re-reserved at %d rows in %.1f ms; late bring-up %.1f ms in total\n", std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch)),
+                (ggml_time_us() - t_r0) / 1000.0, (ggml_time_us() - t_l0) / 1000.0);
+        ls_vram_trace(device, "late draft: ready for the catch-up");
+        return true;
+    };
     if (mtp) {
+        if (mtp_draft_vocab > 0) {
+            // G30: the draft graph reads LLAMA_MTP_DRAFT_VOCAB_N when it is built (inside llama_init_from_model below)
+            char dv[32];
+            snprintf(dv, sizeof(dv), "%d", ((mtp_draft_vocab + 255) / 256) * 256);
+#ifdef _WIN32
+            _putenv_s("LLAMA_MTP_DRAFT_VOCAB_N", dv);
+#else
+            setenv("LLAMA_MTP_DRAFT_VOCAB_N", dv, 1);
+#endif
+        }
         llama_context_params dparams = llama_context_default_params();
         dparams.n_ctx        = n_ctx_total;
         dparams.n_batch      = n_ctx_total;
         // T-GPLR-06 step 2: the per-round mirror fill decodes one row per
         // committed target cell (up to 1 + mtp_draft), so the draft ubatch
         // must hold a full round's fill.
-        dparams.n_ubatch     = 1 + mtp_draft;
+        dparams.n_ubatch     = mtp_draft_late ? (uint32_t) (2 + mtp_draft) : (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch));   // G30: a prompt catch-up decode takes up to --mtp-catchup rows in one launch (it was 2 + draft, i.e. 3 rows per launch). G12: the next round's seed decode also carries the committed mirror rows (up to 1 + mtp_draft) in one batch
         dparams.n_seq_max    = 1;
         dparams.n_outputs_max = 1;
         dparams.n_threads       = (int32_t) cpu_threads;
@@ -5596,10 +6250,84 @@ int main(int argc, char ** argv) {
             return 1;
         }
         ctx_dft->set_layer_streaming(&ls);
+        if (kv_lazy && !mtp_draft_late) {
+            // the draft context's KV cache was reserved lazily too (LLAMA_KV_LAZY is still set) after the target's rows were committed: commit again, which only maps the new buffer
+            const int64_t kv_rows_d  = std::min<int64_t>((int64_t) n_ctx_total, (int64_t) pp_tokens + (int64_t) tg_tokens + 1024);
+            const int64_t kv_bytes_d = ggml_backend_cuda_lazy_commit_rows(kv_rows_d);
+            if (kv_bytes_d < 0) {
+                fprintf(stderr, "error: --kv-lazy: the driver could not commit the draft context's %lld KV rows\n", (long long) kv_rows_d);
+                return 1;
+            }
+            fprintf(stderr, "kv-lazy: draft context committed, lazily committed KV now %.1f MiB in total\n", (double) kv_bytes_d / 1048576.0);
+            fflush(stderr);
+        }
+        if (mtp_draft_late) {
+            // G30: stage the head's host experts in page-locked memory now (start-up work, not part of the timed prefill)
+            const int64_t t_s0 = ggml_time_us();
+            llama_layer & hl0 = model->layers[n_layer];
+            ggml_tensor * stage_ts[4] = { hl0.ffn_gate_exps, hl0.ffn_up_exps, hl0.ffn_down_exps, hl0.ffn_gate_up_exps };
+            size_t stage_total = 0;
+            for (ggml_tensor * t : stage_ts) {
+                if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                    stage_total += GGML_PAD(ggml_nbytes(t), 4096);
+                }
+            }
+            if (stage_total > 0) {
+                mtp_head_stage = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), stage_total);
+                if (mtp_head_stage != nullptr) {
+                    char * base = (char *) ggml_backend_buffer_get_base(mtp_head_stage);
+                    size_t off = 0;
+                    mtp_head_src.assign(4, nullptr);
+                    for (size_t k = 0; k < 4; ++k) {
+                        ggml_tensor * t = stage_ts[k];
+                        if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                            memcpy(base + off, t->data, ggml_nbytes(t));
+                            mtp_head_src[k] = base + off;
+                            off += GGML_PAD(ggml_nbytes(t), 4096);
+                        }
+                    }
+                }
+                fprintf(stderr, "MTP: draft head experts staged in page-locked memory: %.1f MiB in %.1f ms (%s)\n", (double) stage_total / 1048576.0, (ggml_time_us() - t_s0) / 1000.0,
+                        mtp_head_stage != nullptr ? "ok" : "page-locked allocation failed, the migration will read the mapping");
+            }
+        }
         llama_set_embeddings_nextn(ctx, true, false);   // target: per-position hidden rows
         llama_set_embeddings_nextn(ctx_dft, true, true); // draft: chained head-internal rows
         fprintf(stderr, "MTP: draft head (blk.%d) enabled, n_embd_out %d, n_rs_seq %u\n",
                 n_layer, n_embd_out, (unsigned) cparams.n_rs_seq);
+        {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill
+            const int64_t t_w0 = ggml_time_us();
+            const int n_w = mtp_draft_late ? std::max(1, std::min(std::min(mtp_catchup, ubatch), 128)) : std::max(1, std::min(mtp_catchup, ubatch));
+            if (mtp_draft_late) {
+                // the lean context: commit the KV rows this decode touches and widen the context to the catch-up width (both undone below)
+                if (ggml_backend_cuda_lazy_commit_rows(n_w) < 0) {
+                    fprintf(stderr, "error: --mtp-draft-late: the driver could not commit %d draft KV rows for the warm-up\n", n_w);
+                    return 1;
+                }
+                (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) std::max(2 + mtp_draft, n_w));
+            }
+            llama_batch wb = llama_batch_init(n_w, n_embd_out, 1);
+            wb.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) n_w);
+            if (wb.token != nullptr) {
+                for (int i = 0; i < n_w; ++i) {
+                    wb.token[i]      = 0;
+                    wb.pos[i]        = i;
+                    wb.n_seq_id[i]   = 1;
+                    wb.seq_id[i][0]  = 0;
+                    wb.logits[i]     = false;
+                }
+                memset(wb.embd, 0, (size_t) n_w * row_bytes);
+                wb.n_tokens = n_w;
+                const int wrc = llama_decode(ctx_dft, wb);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                fprintf(stderr, "MTP: draft context warm-up (%d rows, rc %d) in %.1f ms\n", n_w, wrc, (ggml_time_us() - t_w0) / 1000.0);
+            }
+            llama_batch_free(wb);
+            if (mtp_draft_late) {
+                (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) (2 + mtp_draft));
+            }
+        }
     }
 
     // T-Q38HG-06: shared MTP catch-up batch (ubatch capacity: prompt mirrors,
@@ -5651,7 +6379,7 @@ int main(int argc, char ** argv) {
             batch.pos[i]   = i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = !pp_no_logits;
+            batch.logits[i] = !pp_no_logits || (tg_first_pp && i == pp_tokens - 1);
         }
         batch.n_tokens = pp_tokens;
 
@@ -5799,6 +6527,11 @@ int main(int argc, char ** argv) {
             // row (x_1, h_0) has no h_0 at all and pairs with zeros. After
             // the final ubatch, the deferred row (x_P, h_{P-1}) is completed
             // by the first draft round's seed at pos P.
+            // G30: when set, slot i of a mirror call is the captured row mtp_hrows + i * n_embd_out (the layer-major prefill's catch-up); otherwise the target context's per-call nextn slot i (the per-ubatch loops)
+            const float * mtp_hrows = nullptr;
+            auto mirror_h = [&](int i) -> const float * {
+                return mtp_hrows != nullptr ? mtp_hrows + (size_t) i * (size_t) n_embd_out : llama_get_embeddings_nextn_ith(ctx, i);
+            };
             auto mtp_mirror = [&](const llama_batch & ub, int off, int n_tok) -> int {
                 int n_rows = 0;
                 if (mtail_off >= 0) {
@@ -5820,7 +6553,7 @@ int main(int argc, char ** argv) {
                     dbatch.n_seq_id[n_rows] = 1;
                     dbatch.seq_id[n_rows][0] = 0;
                     dbatch.logits[n_rows]   = false;
-                    const float * h = llama_get_embeddings_nextn_ith(ctx, i);
+                    const float * h = mirror_h(i);
                     if (h == nullptr) {
                         fprintf(stderr, "error: no target nextn row at PP mirror slot %d\n", i);
                         return -1;
@@ -5830,7 +6563,7 @@ int main(int argc, char ** argv) {
                 }
                 if (n_rows == 0) {
                     // stash the deferred h (n_tok == 1 ubatch: only the tail)
-                    const float * h_last = llama_get_embeddings_nextn_ith(ctx, n_tok - 1);
+                    const float * h_last = mirror_h(n_tok - 1);
                     if (h_last != nullptr) {
                         memcpy(mtail_h.data(), h_last, row_bytes);
                     }
@@ -5845,7 +6578,7 @@ int main(int argc, char ** argv) {
                 }
                 // stash the deferred h (the LAST row of this call = slot
                 // n_tok-1; the next ubatch's bridge pairs with it)
-                const float * h_last = llama_get_embeddings_nextn_ith(ctx, n_tok - 1);
+                const float * h_last = mirror_h(n_tok - 1);
                 if (h_last == nullptr) {
                     fprintf(stderr, "error: no target nextn row at PP mirror slot %d\n", n_tok - 1);
                     return -1;
@@ -5855,6 +6588,7 @@ int main(int argc, char ** argv) {
                 return 0;
             };
 
+            // (G30: the lambda above is the T-Q38HG-06 mirror with its row source made switchable)
             // T-GPLR-28: in-process PP repeat. Passes 1..N-1 clear KV (so
             // positions restart at 0) and reset the per-layer stats; the slot
             // window is deliberately NOT reset — banks left resident from the
@@ -5862,6 +6596,15 @@ int main(int argc, char ** argv) {
             // runs once after the final pass. Per-pass phase_summaries share
             // the prebuild's builds0 baseline, so graph_builds stays 0 unless
             // the timed region really constructs graphs (checker-enforced).
+            // G22 stage A: a short prompt goes through the stock graph path. The prefill slots and the activation slab are released and the decode
+            // runs on the stock graph path from here on (exactly what the TG phase does after the layer-major prefill), so the prompt is decoded by
+            // llama_decode in ubatches of --ubatch tokens: experts a ubatch uses are copied to the GPU (op offload) or computed on the CPU (--pp-stock-offload 0).
+            const bool stock_prefill = pp_stock_below > 0 && pp_tokens < pp_stock_below && tg_hybrid;   // G30: also with --mtp (the per-ubatch mirror loop below)
+            bool stock_prefill_armed = false;
+            if (stock_prefill) {
+                fprintf(stderr, "pp-stock: %d prompt tokens < %d, prefill through the stock graph path (op offload %s, ubatch %d)\n",
+                        pp_tokens, pp_stock_below, pp_stock_offload ? "on" : "off", ubatch);
+            }
             for (int pp_pass_i = 0; pp_pass_i < pp_repeat && exit_status == 0; ++pp_pass_i) {
             if (pp_pass_i > 0) {
                 llama_memory_clear(llama_get_memory(ctx), true);
@@ -5875,7 +6618,7 @@ int main(int argc, char ** argv) {
                 // keys/slab offsets; builds0 advances so per-pass phase
                 // summaries keep graph_builds = 0 (checker-clean). Refused
                 // under --mtp below.
-                if (pp_prebuild_per_pass == 1) {
+                if (pp_prebuild_per_pass == 1 && !stock_prefill) {
                     // T-GPLR-47: pass-2+ prebuilds REPLACE each built set with a
                     // fresh-context rebuild (swap-in-slot) instead of resetting in
                     // place -- no ctx accumulation, pointers valid by construction.
@@ -5912,10 +6655,83 @@ int main(int argc, char ** argv) {
             }
             const int64_t t0 = ggml_time_us();
             int ret = 0;
-            if (mtp) {
+            if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && !stock_prefill) {
+                // G30: layer-major sweep with the capture of every chunk's post-norm hidden rows, then the draft head's catch-up from the captured rows (same pairs as the per-ubatch mirror)
+                std::vector<float> h_rows;
+                bool cap_ok = true;
+                try {
+                    h_rows.resize((size_t) pp_tokens * (size_t) n_embd_out);
+                } catch (const std::exception &) {
+                    fprintf(stderr, "error: MTP catch-up: cannot allocate %.1f MiB for the hidden rows of %d prompt tokens\n", (double) pp_tokens * (double) row_bytes / 1048576.0, pp_tokens);
+                    cap_ok = false;
+                }
+                if (cap_ok) {
+                    ls.pp_nextn_dst    = h_rows.data();
+                    ls.pp_nextn_cap    = pp_tokens;
+                    ls.pp_nextn_n_embd = n_embd_out;
+                    ls.pp_nextn_n      = 0;
+                }
+                ggml_status st = GGML_STATUS_SUCCESS;
+                ret = cap_ok ? llama_layer_major_pp(ctx, batch, st) : 1;
+                ls.pp_nextn_dst = nullptr;
+                if (st != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "error: layer-major PP failed: %s\n", ls.error_msg.c_str());
+                    ls.failed = true;
+                }
+                if (ret == 0 && !ls.failed && ctx_dft != nullptr) {
+                    if (ls.pp_nextn_n != pp_tokens) {
+                        fprintf(stderr, "error: MTP catch-up: the layer-major prefill captured %lld of %d hidden rows\n", (long long) ls.pp_nextn_n, pp_tokens);
+                        ret = 1;
+                    } else {
+                        if (mtp_draft_late && !mtp_late_bringup()) {
+                            ret = 1;
+                        }
+                        const int64_t t_cu0 = ggml_time_us();
+                        const int step = std::max(1, std::min(mtp_catchup, ubatch));
+                        const int tail0 = (mtp_mirror_tail > 0 && mtp_mirror_tail < pp_tokens) ? pp_tokens - mtp_mirror_tail : 0;
+                        int n_calls = 0;
+                        for (int off = tail0; off < pp_tokens && ret == 0; off += step) {
+                            const int n_tok = std::min(step, pp_tokens - off);
+                            llama_batch ub = llama_batch_init(n_tok, 0, 1);
+                            for (int i = 0; i < n_tok; ++i) {
+                                ub.token[i]   = batch.token[off + i];
+                                ub.pos[i]     = off + i;
+                                ub.n_seq_id[i] = 1;
+                                ub.seq_id[i][0] = 0;
+                                ub.logits[i]   = false;
+                            }
+                            ub.n_tokens = n_tok;
+                            mtp_hrows = h_rows.data() + (size_t) off * (size_t) n_embd_out;
+                            const int64_t t_call0 = ggml_time_us();
+                            ret = mtp_mirror(ub, off, n_tok);
+                            if (mtp_draft_late && n_calls < 3) {
+                                fprintf(stderr, "MTP: catch-up call %d (%d rows) %.1f ms\n", n_calls, n_tok, (ggml_time_us() - t_call0) / 1000.0);
+                            }
+                            mtp_hrows = nullptr;
+                            llama_batch_free(ub);
+                            n_calls++;
+                        }
+                        fprintf(stderr, "MTP: draft-head catch-up over %d prompt positions (%d calls of up to %d rows) in %.1f ms\n",
+                                pp_tokens - tail0, n_calls, step, (ggml_time_us() - t_cu0) / 1000.0);
+                    }
+                }
+            } else if (mtp) {
+                // G30: the stock graph path (--pp-stock-below) with MTP: arm it exactly like the plain stock branch below, then the per-ubatch loop mirrors every ubatch as before
+                if (stock_prefill && !stock_prefill_armed) {
+                    if (!ls.begin_tg_stock()) {
+                        fprintf(stderr, "error: pp-stock: release failed: %s\n", ls.error_msg.c_str());
+                        ls.failed = true;
+                    }
+                    ls.phase = 1;
+                    if (kv_graph_pad > 0 && ctx != nullptr && !ctx->set_attn_view_pad((uint32_t) kv_graph_pad)) {
+                        fprintf(stderr, "error: pp-stock: --kv-graph-pad %lld is not supported by this memory type\n", kv_graph_pad);
+                        ls.failed = true;
+                    }
+                    stock_prefill_armed = true;
+                }
                 // per-ubatch prompt decodes so the draft head can mirror each
                 // row (T-Q38HG-06).
-                for (int off = 0; off < pp_tokens && exit_status == 0; off += ubatch) {
+                for (int off = 0; off < pp_tokens && exit_status == 0 && !ls.failed; off += ubatch) {
                     const int n_tok = std::min(ubatch, pp_tokens - off);
                     llama_batch ub = llama_batch_init(n_tok, 0, 1);
                     for (int i = 0; i < n_tok; ++i) {
@@ -5923,7 +6739,7 @@ int main(int argc, char ** argv) {
                         ub.pos[i]     = off + i;
                         ub.n_seq_id[i] = 1;
                         ub.seq_id[i][0] = 0;
-                        ub.logits[i]   = !pp_no_logits;
+                        ub.logits[i]   = !pp_no_logits || (tg_first_pp && off + i == pp_tokens - 1);
                     }
                     ub.n_tokens = n_tok;
                     ret = llama_decode(ctx, ub);
@@ -5933,6 +6749,24 @@ int main(int argc, char ** argv) {
                     }
                     llama_batch_free(ub);
                 }
+            } else if (stock_prefill) {
+                if (!stock_prefill_armed) {
+                    if (!ls.begin_tg_stock()) {
+                        fprintf(stderr, "error: pp-stock: release failed: %s\n", ls.error_msg.c_str());
+                        ls.failed = true;
+                    }
+                    ls.phase = 1;
+                    if (kv_graph_pad > 0 && ctx != nullptr && !ctx->set_attn_view_pad((uint32_t) kv_graph_pad)) {
+                        fprintf(stderr, "error: pp-stock: --kv-graph-pad %lld is not supported by this memory type\n", kv_graph_pad);
+                        ls.failed = true;
+                    }
+                    stock_prefill_armed = true;
+                }
+                // the context reserves a single output row (--tg-first-pp-token / --pp-no-logits): only the last prompt position asks for logits
+                for (int i = 0; i < pp_tokens; ++i) {
+                    batch.logits[i] = (i == pp_tokens - 1);
+                }
+                ret = ls.failed ? 1 : llama_decode(ctx, batch);
             } else if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
                 // layer-major PP (SDD section 13, T-Q38LM-02): drive the full
                 // prompt through the dedicated layer-major controller rather
@@ -5947,14 +6781,14 @@ int main(int argc, char ** argv) {
                 ret = llama_decode(ctx, batch);
             }
 
-            const int64_t t1 = ggml_time_us();
+            const int64_t t1 = ggml_time_us() - mtp_pp_excl_us;
 
             if (ret != 0) {
                 fprintf(stderr, "error: PP decode failed with %d: %s\n", ret, ls.error_msg.c_str());
                 ls.failed = true;
                 exit_status = 1;
             } else {
-                ls.tel_phase_summary("pp", pp_tokens, t1 - t0, builds0, graph_prep_us);
+                ls.tel_phase_summary("pp", pp_tokens, t1 - t0, builds0 + mtp_builds_excl, graph_prep_us);
                 fprintf(stderr, "PP: %d tokens in %.1f ms (%.2f tok/s)  [transfer+wait+compute per layer in telemetry]",
                     pp_tokens, (t1 - t0) / 1000.0, pp_tokens * 1e6 / (double) (t1 - t0));
                 if (pw_probe) {
@@ -5988,6 +6822,16 @@ int main(int argc, char ** argv) {
     // run: `run_end.exit_status != 0` rejects the trace regardless, so no
     // verdict depends on the handoff rule for that shape.
     // ------------------------------------------------------------------
+    if (keepalive_guard.on) {
+        ggml_backend_cuda_keepalive(0, 0);
+        keepalive_guard.on = false;
+    }
+    if (pp_tp != nullptr) {
+        // the polling workers would compete with the lean host team of the decode
+        llama_detach_threadpool(ctx);
+        pp_tp_free(pp_tp);
+        pp_tp = nullptr;
+    }
     if (exit_status == 0 && tg_tokens > 0) {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
@@ -6000,11 +6844,29 @@ int main(int argc, char ** argv) {
             ? (llama_token) (pp_tokens - 1)
             : prompt_tokens[pp_tokens - 1]; // last PP token; first generated comes from logits
 
+        ls_vram_trace(device, "before begin_tg_stock");
         if (tg_hybrid && !ls.begin_tg_stock()) {
             fprintf(stderr, "error: --tg-hybrid release failed: %s\n", ls.error_msg.c_str());
             ls.failed = true;
             exit_status = 1;
         }
+        // Opt-in: prefill's weight slots are gone now, so give that VRAM to the decode cache. With --tg-release-compute the scheduler
+        // buffers must be released first (they are still needed until the prefill logits were read), so that case resizes later.
+        // LLAMA_TG_RESIZE_LATE=1 forces the late position without the release (an A/B switch for the ordering, no other use).
+        const bool resize_late = tg_release_compute || tg_hybrid_slots < 0 || getenv("LLAMA_TG_RESIZE_LATE") != nullptr;
+        if (tg_hybrid && tg_hybrid_slots > 0 && !resize_late && exit_status == 0) {
+            const int64_t t_rs0 = ggml_time_us();
+            if (!llama_moe_hybrid_resize(tg_hybrid_slots)) {
+                fprintf(stderr, "error: --tg-hybrid-slots %d: no hybrid engine to resize (is LLAMA_MOE_HYBRID set?) or invalid slot count\n",
+                        tg_hybrid_slots);
+                ls.failed = true;
+                exit_status = 1;
+            } else {
+                fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms\n", tg_hybrid_slots,
+                        (double) (ggml_time_us() - t_rs0) / 1e3);
+            }
+        }
+        ls_vram_trace(device, "after begin_tg_stock");
         ls.phase = 1;
 
         // T-GPLR-71: arm the phase-scoped attention-view granularity. This is
@@ -6098,7 +6960,8 @@ int main(int argc, char ** argv) {
         // filled by PP, so reset them so the TG phase_summary reports TG-only
         // transfer/wait/compute and ubatch counts (T-Q38LS-05)
         ls.reset_stats();
-        const int64_t t0 = ggml_time_us();
+        int64_t t0 = ggml_time_us();
+        int64_t host_dec_us = 0, host_fetch_us = 0, host_samp_us = 0, host_steps = 0; // measurement only: llama_decode, the logits fetch (the GPU wait), the runner's own sampling
 
         // MTP acceptance counters (T-Q38HG-06) + batch-verify counters
         // (T-GPLR-06 step 2)
@@ -6109,8 +6972,105 @@ int main(int argc, char ** argv) {
         int64_t mrounds_full    = 0;   // all drafts accepted
         int64_t mrounds_partial = 0;   // some draft rejected
         int64_t mrounds_rewind  = 0;   // rounds that rolled KV/RS back
+        int64_t mt_draft_us = 0, mt_verify_us = 0, mt_fetch_us = 0, mt_samp_us = 0, mt_mirror_us = 0, mt_rounds_t = 0;   // host time per stage of the MTP rounds (measurement only)
+        int64_t mt_dd_dec_us = 0, mt_dd_get_us = 0, mt_dd_scan_us = 0;   // G30: the draft stage split into the decode call, the logits fetch (GPU wait + D2H) and the scan
+        int draft_vocab_n = 0;   // G30: LLAMA_MTP_DRAFT_VOCAB_N, measurement of a pruned draft vocabulary (0 = all)
+        int64_t mt_pmin_checked = 0, mt_pmin_cut = 0, mt_pmin_us = 0;   // G30: --mtp-draft-p-min: draft steps checked, chains stopped, host time of the check
+        if (const char * e_dv = getenv("LLAMA_MTP_DRAFT_VOCAB_N")) {
+            draft_vocab_n = atoi(e_dv);
+        }
+        // G12: the mirror fill of a round is not decoded on its own any more: its rows wait in dbatch (pending_mirror_rows of them) and ride in the SAME ctx_dft decode as the next
+        // round's seed row (the seed attends to them inside the batch), which saves one launch + synchronisation per round. LLAMA_MTP_FUSE=0 restores the separate decode.
+        int pending_mirror_rows = 0;
+        llama_pos pending_mirror_trim = 0;
+        const bool mtp_fuse = getenv("LLAMA_MTP_FUSE") == nullptr || atoi(getenv("LLAMA_MTP_FUSE")) != 0;
+        const bool mtp_round_log = getenv("LLAMA_MTP_ROUND_LOG") != nullptr && atoi(getenv("LLAMA_MTP_ROUND_LOG")) != 0;   // the per-round prints (rows + margins)
+
+        // PP -> TG transition work shared by the plain and the MTP decode loops: release the prefill-sized scheduler buffers, resize the hybrid cache,
+        // restart the TG timer. (Moved verbatim into this lambda; the plain loop calls it where the block used to be.)
+        auto tg_transition = [&]() {
+            // Opt-in: the prefill logits have been read, so give decode the VRAM prefill needed. Order matters for the peak: release the
+            // scheduler's worst-case compute buffers first, then grow the hybrid cache (which frees the old cache before it allocates).
+            if (tg_hybrid && tg_release_compute && exit_status == 0 && !mtp_compute_released) {
+                const int64_t t_rc0 = ggml_time_us();
+                const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
+                if (freed < 0) {
+                    fprintf(stderr, "error: --tg-release-compute: scheduler re-reserve failed\n");
+                    ls.failed = true;
+                    exit_status = 1;
+                } else {
+                    fprintf(stderr, "tg-hybrid: scheduler compute buffers re-reserved for decode, %.1f MiB released in %.1f ms\n",
+                            (double) freed / 1048576.0, (double) (ggml_time_us() - t_rc0) / 1e3);
+                }
+            }
+            ls_vram_trace(device, "after the compute-buffer release");
+            if (tg_hybrid && tg_hybrid_slots != 0 && resize_late && exit_status == 0) {
+                const int64_t t_rs0 = ggml_time_us();
+                int slots = tg_hybrid_slots;
+                if (slots < 0) {
+                    // auto: the largest cache whose whole-device total stays under the cap. The device total already holds the old cache, which the resize frees first.
+                    int64_t cache_bytes = 0;
+                    int     cur_slots   = 0;
+                    size_t  free_now = 0, total_now = 0;
+                    if (!llama_moe_hybrid_cache_info(&cache_bytes, &cur_slots) || cur_slots < 1) {
+                        fprintf(stderr, "error: --tg-hybrid-slots auto: no hybrid engine (is LLAMA_MOE_HYBRID set?)\n");
+                        ls.failed = true;
+                        exit_status = 1;
+                    } else {
+                        // the cap is stated in nvidia-smi units: NVML if it can be loaded, else cudaMemGetInfo minus --tg-vram-reserved-mib
+                        const int64_t MiB = 1048576;
+                        uint64_t      nv_used = 0;
+                        int64_t       used_now = 0;
+                        const char *  src = "NVML";
+                        if (ls_nvml_used_bytes(device, &nv_used)) {
+                            used_now = (int64_t) nv_used - (int64_t) nvml_baseline_bytes;
+                        } else {
+                            ggml_backend_cuda_get_device_memory(device, &free_now, &total_now);
+                            used_now = (int64_t) total_now - (int64_t) free_now - tg_vram_reserved_mib*MiB;
+                            src      = "cudaMemGetInfo";
+                        }
+                        const int64_t row_bytes = cache_bytes / (cur_slots + 1);
+                        int64_t       room      = tg_vram_cap_mib*MiB - (used_now - cache_bytes) - tg_vram_safety_mib*MiB;
+                        if (tg_vram_cap_mib == 0) {
+                            // --tg-vram-cap-mib 0: no cap of our own, fit to what the allocator will still give (the CUDA runtime's own free memory, the unit cudaMalloc obeys;
+                            // the old cache is freed first, so it counts as available). This is how a physical card, or the owner's llama.cpp --fit-target, bounds a run.
+                            ggml_backend_cuda_get_device_memory(device, &free_now, &total_now);
+                            room     = (int64_t) free_now + cache_bytes - tg_vram_keep_free_mib*MiB - tg_vram_safety_mib*MiB;
+                            src      = "cudaMemGetInfo free";
+                            used_now = (int64_t) total_now - (int64_t) free_now;
+                        }
+                        slots = (int) std::min<int64_t>(256, std::max<int64_t>(cur_slots, room / row_bytes - 1));
+                        fprintf(stderr, "tg-hybrid: auto slots: device in use by this process %.1f MiB per %s minus the start-up baseline of %.1f MiB (cache %.1f MiB at %d slots, one slot row %.2f MiB), cap %lld MiB, safety %lld MiB -> %d slots\n",
+                                (double) used_now/MiB, src, (double) nvml_baseline_bytes/MiB, (double) cache_bytes/MiB, cur_slots, (double) row_bytes/MiB, tg_vram_cap_mib, tg_vram_safety_mib, slots);
+                    }
+                }
+                const int64_t t_rs1 = ggml_time_us();
+                if (exit_status == 0 && !llama_moe_hybrid_resize(slots)) {
+                    fprintf(stderr, "error: --tg-hybrid-slots %d: no hybrid engine to resize (is LLAMA_MOE_HYBRID set?) or invalid slot count\n",
+                            slots);
+                    ls.failed = true;
+                    exit_status = 1;
+                } else if (exit_status == 0) {
+                    fprintf(stderr, "tg-hybrid: cache resized to %d slots per layer in %.1f ms (%.1f ms including the auto sizing)\n", slots,
+                            (double) (ggml_time_us() - t_rs1) / 1e3, (double) (ggml_time_us() - t_rs0) / 1e3);
+                    ls_vram_trace(device, "after the cache resize");
+                }
+            }
+            if (resize_late && exit_status == 0) {
+                // the release and the resize above are PP->TG transition work, not decode: the TG timer starts here, as it does when that work
+                // runs at the early position (before t0). Their cost is printed on their own lines.
+                t0 = ggml_time_us();
+            }
+            ls_free_watch_mark_tg();
+        };
 
         if (mtp && exit_status == 0) {
+            // G30: the prompt catch-up needed up to --mtp-catchup rows per draft decode; the rounds decode at most 2 + draft rows. Give the difference of the draft context's compute buffer back (before
+            // tg_transition() below sizes the hybrid cache from the free memory).
+            if (ctx_dft != nullptr && std::min(mtp_catchup, ubatch) > 2 + mtp_draft) {
+                const int64_t freed_d = llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) (2 + mtp_draft));
+                fprintf(stderr, "MTP: draft context compute buffers re-reserved for the rounds (%d rows), %.1f MiB released\n", 2 + mtp_draft, (double) freed_d / 1048576.0);
+            }
             // --- MTP draft/verify/accept loop (T-Q38HG-06) ---
             // The target context keeps the authoritative greedy state. The
             // draft head consumes (token, h_nextn row of the previous target
@@ -6131,6 +7091,7 @@ int main(int argc, char ** argv) {
             //    round. From here on every frontier decode is (cur at the
             //    frontier), the exact decode sequence of the non-MTP greedy
             //    path, so parity holds by construction.
+            tg_transition();
             fprintf(stderr, "MTP: initial frontier decode (x[%d] at pos %d)\n", (int) cur, (int) pp_tokens); fflush(stderr);
             {
                 batch.token[0]   = cur;
@@ -6237,27 +7198,74 @@ int main(int argc, char ** argv) {
                     draft_ring.accept(t);
                 }
 
+                const int64_t tm_d0 = ggml_time_us();
+                bool pmin_stop = false;   // G30: the last draft step was not confident enough: the chain ends
                 for (int d = 0; d < mtp_draft && (int) generated.size() + (int) draft.size() < tg_tokens; ++d) {
                     // the chain rows sit at the frontier cell and follow:
                     // the seed row is (x_{v-1}, h_{v-1}) at v, its
                     // prediction is the draft candidate for x_v
                     const llama_pos dpos = (llama_pos) (pp_tokens + (int) generated.size() - 1 + (int) draft.size());
-                    llama_batch db = llama_batch_init(1, n_embd_out, 1);
-                    db.token = (llama_token *) malloc(sizeof(llama_token));
-                    db.token[0]  = td;
-                    memcpy(db.embd, pending_h.data(), row_bytes);
-                    db.pos[0]      = dpos;
-                    db.n_seq_id[0] = 1;
-                    db.seq_id[0][0] = 0;
-                    db.logits[0]  = true;
-                    db.n_tokens = 1;
+                    const int n_pre = (d == 0) ? pending_mirror_rows : 0;   // fused: the previous round's mirror rows go first, the seed row last
+                    llama_batch db = llama_batch_init(n_pre + 1, n_embd_out, 1);
+                    db.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) (n_pre + 1));
+                    if (n_pre > 0) {
+                        llama_memory_t mem_d0 = llama_get_memory(ctx_dft);
+                        if (!llama_memory_seq_rm(mem_d0, 0, pending_mirror_trim, -1)) {
+                            fprintf(stderr, "error: draft KV trim before the fused mirror + seed decode failed at pos %lld\n", (long long) pending_mirror_trim);
+                            ls.failed = true;
+                            exit_status = 1;
+                        }
+                        for (int i = 0; i < n_pre; ++i) {
+                            db.token[i]     = dbatch.token[i];
+                            db.pos[i]       = dbatch.pos[i];
+                            db.n_seq_id[i]  = 1;
+                            db.seq_id[i][0] = 0;
+                            db.logits[i]    = false;
+                            memcpy(db.embd + (size_t) i * n_embd_out, dbatch.embd + (size_t) i * n_embd_out, row_bytes);
+                        }
+                        pending_mirror_rows = 0;
+                    }
+                    db.token[n_pre]  = td;
+                    memcpy(db.embd + (size_t) n_pre * n_embd_out, pending_h.data(), row_bytes);
+                    db.pos[n_pre]      = dpos;
+                    db.n_seq_id[n_pre] = 1;
+                    db.seq_id[n_pre][0] = 0;
+                    db.logits[n_pre]  = true;
+                    db.n_tokens = n_pre + 1;
 
+                    const int64_t tm_dd0 = ggml_time_us();
                     const int drc = llama_decode(ctx_dft, db);
+                    const int64_t tm_dd1 = ggml_time_us();
+                    mt_dd_dec_us += tm_dd1 - tm_dd0;
                     if (drc == 0) {
-                        const float * dlogits = llama_get_logits_ith(ctx_dft, 0);
+                        const float * dlogits = llama_get_logits_ith(ctx_dft, n_pre);   // outputs are indexed by batch row: the seed row is the last of the fused batch
+                        const int64_t tm_dd2 = ggml_time_us();
+                        mt_dd_get_us += tm_dd2 - tm_dd1;
                         llama_token bd = 0;
                         float bdv = dlogits[0];
-                        {
+                        bool pmin_keep = true;
+                        if (tg_fast_sample && (rep_penalty == 1.0 || rep_last_n == 0) && n_vocab >= 64) {
+                            // no penalty to apply: the exact vectorised scan over the output row in place (same pick as the scalar loop below)
+                            const int scan_n_d = draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab;
+                            const ls_top2 r2d = ls_top2_exact(dlogits, scan_n_d);
+                            bd  = (llama_token) r2d.best;
+                            bdv = r2d.best_val;
+                            if (mtp_draft_pmin > 0.0) {
+                                // the top token's probability among its candidates: 1 / sum(exp(l - l_max)); terms below -20 are zero in float
+                                const int64_t tm_pm0 = ggml_time_us();
+                                float ssum = 0.0f;
+                                for (int i = 0; i < scan_n_d; ++i) {
+                                    const float dd = dlogits[i] - bdv;
+                                    if (dd > -20.0f) {
+                                        ssum += expf(dd);
+                                    }
+                                }
+                                pmin_keep = (1.0f / ssum) >= (float) mtp_draft_pmin;
+                                mt_pmin_checked++;
+                                mt_pmin_cut += pmin_keep ? 0 : 1;
+                                mt_pmin_us += ggml_time_us() - tm_pm0;
+                            }
+                        } else {
                             // T-GPLR-06: penalized copy; the ring must see the
                             // chain built so far (prompt + generated + drafts)
                             // so the head drafts what the penalized target will
@@ -6265,19 +7273,24 @@ int main(int argc, char ** argv) {
                             std::vector<float> plogits(dlogits, dlogits + n_vocab);
                             draft_ring.apply(plogits.data(), n_vocab, (float) rep_penalty);
                             bdv = plogits[0];  // penalized seed
-                            for (int v = 1; v < n_vocab; ++v) {
+                            for (int v = 1; v < (draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab); ++v) {
                                 if (plogits[v] > bdv) { bdv = plogits[v]; bd = v; }
                             }
                         }
-                        draft.push_back(bd);
-                        td = bd;
-                        draft_ring.accept(bd);
-                        // chained h row of the drafted token (draft head's
-                        // own nextn row)
-                        const float * hd = llama_get_embeddings_nextn_ith(ctx_dft, 0);
-                        if (hd != nullptr) {
-                            memcpy(pending_h.data(), hd, row_bytes);
+                        if (pmin_keep) {
+                            draft.push_back(bd);
+                            td = bd;
+                            draft_ring.accept(bd);
+                            // chained h row of the drafted token (draft head's
+                            // own nextn row)
+                            const float * hd = llama_get_embeddings_nextn_ith(ctx_dft, n_pre);
+                            if (hd != nullptr) {
+                                memcpy(pending_h.data(), hd, row_bytes);
+                            }
+                        } else {
+                            pmin_stop = true;
                         }
+                        mt_dd_scan_us += ggml_time_us() - tm_dd2;
                     }
                     llama_batch_free(db); // frees token + embd + pos...
                     if (drc != 0) {
@@ -6286,10 +7299,14 @@ int main(int argc, char ** argv) {
                         exit_status = 1;
                         break;
                     }
+                    if (pmin_stop) {
+                        break;
+                    }
                 }
                 if (exit_status != 0) {
                     break;
                 }
+                mt_draft_us += ggml_time_us() - tm_d0;
 
                 mtp_drafted += (int64_t) draft.size();
 
@@ -6339,7 +7356,9 @@ int main(int argc, char ** argv) {
                     }
                 }
 
+                const int64_t tm_v0 = ggml_time_us();
                 const int ret = llama_decode(ctx, batch);
+                const int64_t tm_v1 = ggml_time_us();
                 if (ret != 0) {
                     fprintf(stderr, "error: MTP batch verify decode failed with %d: %s\n", ret, ls.error_msg.c_str());
                     ls.failed = true;
@@ -6349,6 +7368,9 @@ int main(int argc, char ** argv) {
 
                 for (int j = 0; j < rmax; ++j) {
                     const float * logits = llama_get_logits_ith(ctx, j);
+                    if (j == 0) {
+                        mt_fetch_us += ggml_time_us() - tm_v1;   // the logits fetch of row 0 is where the GPU wait lands
+                    }
                     if (logits == nullptr) {
                         fprintf(stderr, "error: no logits at MTP batch verify row %d\n", j);
                         ls.failed = true;
@@ -6359,7 +7381,11 @@ int main(int argc, char ** argv) {
                     float best_val = logits[0];
                     float second_val = -INFINITY;
                     llama_token second_tok = 0;
-                    {
+                    if (tg_fast_sample && (rep_penalty == 1.0 || rep_last_n == 0) && n_vocab >= 64) {
+                        // no penalty to apply: the exact vectorised top-2 over the output row in place (same picks as the scalar loop below)
+                        const ls_top2 r2 = ls_top2_exact(logits, n_vocab);
+                        best = (llama_token) r2.best; best_val = r2.best_val; second_tok = (llama_token) r2.second; second_val = r2.second_val;
+                    } else {
                         // T-GPLR-06: penalized copy; row j's ring view is the
                         // true stream plus the draft chain prefix before row j
                         // (row 0 = the frontier decode sees the true ring).
@@ -6386,6 +7412,8 @@ int main(int argc, char ** argv) {
                 if (exit_status != 0) {
                     break;
                 }
+                mt_verify_us += tm_v1 - tm_v0;
+                mt_samp_us   += ggml_time_us() - tm_v1;   // includes the row-0 fetch above
 
                 // A = committed rows: row 0 always commits (its input cur is
                 // the true stream); row j commits iff draft[j-1] was
@@ -6423,12 +7451,14 @@ int main(int argc, char ** argv) {
                 // accumulation) are expected shape-numerics flip candidates;
                 // a flip at a large-margin row would instead indicate a
                 // state/wiring defect.
-                fprintf(stderr, "MTP: round %d rows:", mround - 1);
-                for (int j = 0; j < rmax; ++j) {
-                    fprintf(stderr, " %d(%.4f|%d)", (int) gold[j], (double) margins[j], (int) seconds[j]);
+                if (mtp_round_log) {
+                    fprintf(stderr, "MTP: round %d rows:", mround - 1);
+                    for (int j = 0; j < rmax; ++j) {
+                        fprintf(stderr, " %d(%.4f|%d)", (int) gold[j], (double) margins[j], (int) seconds[j]);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
                 }
-                fprintf(stderr, "\n");
-                fflush(stderr);
 
                 cur = gold[committed - 1];
                 const int n_acc = committed - 1;  // row 0 is the frontier, not a draft
@@ -6482,9 +7512,10 @@ int main(int argc, char ** argv) {
                 // The LAST committed cell's mirror row is written by the
                 // next round's seed decode (cur, pending_h at push_pos-1),
  // exactly like the serial path's deferred fill.
+                const int64_t tm_m0 = ggml_time_us();
                 {
                     llama_memory_t mem_d = llama_get_memory(ctx_dft);
-                    if (!llama_memory_seq_rm(mem_d, 0, (llama_pos) (pp_tokens + g0 - 1), -1)) {
+                    if (!mtp_fuse && !llama_memory_seq_rm(mem_d, 0, (llama_pos) (pp_tokens + g0 - 1), -1)) {
                         fprintf(stderr, "error: draft KV trim before batch mirror fill failed at pos %lld\n",
                                 (long long) (pp_tokens + g0 - 1));
                         ls.failed = true;
@@ -6519,21 +7550,29 @@ int main(int argc, char ** argv) {
                     break;
                 }
                 dbatch.n_tokens = n_rows;
-                    const int mrc = llama_decode(ctx_dft, dbatch);
-                    if (mrc != 0) {
-                        fprintf(stderr, "error: MTP batch mirror fill failed (%d)\n", mrc);
-                        ls.failed = true;
-                        exit_status = 1;
-                        break;
+                    if (mtp_fuse && (int) generated.size() < tg_tokens) {
+                        // the rows stay in dbatch for the next round's seed decode (the trim position is where the separate decode would have trimmed)
+                        pending_mirror_rows = n_rows;
+                        pending_mirror_trim = (llama_pos) (pp_tokens + g0 - 1);
+                    } else if (!mtp_fuse) {
+                        const int mrc = llama_decode(ctx_dft, dbatch);
+                        if (mrc != 0) {
+                            fprintf(stderr, "error: MTP batch mirror fill failed (%d)\n", mrc);
+                            ls.failed = true;
+                            exit_status = 1;
+                            break;
+                        }
                     }
                 }
+                mt_mirror_us += ggml_time_us() - tm_m0;
+                mt_rounds_t++;
 
                 // 3. Re-arm the draft chain for the next round: the head's
                 //    KV beyond the frontier was written with hypothetical
                 //    draft rows, so trim it back; the next round's first
                 //    draft then starts from the accepted cur/pending_h pair
                 //    at the fresh frontier.
-                if (exit_status == 0 && (int) generated.size() < tg_tokens) {
+                if (!mtp_fuse && exit_status == 0 && (int) generated.size() < tg_tokens) {
                     llama_memory_t mem = llama_get_memory(ctx_dft);
                     const llama_pos rm_from = (llama_pos) (pp_tokens + generated.size());
                     if (!llama_memory_seq_rm(mem, 0, rm_from, -1)) {
@@ -6542,20 +7581,63 @@ int main(int argc, char ** argv) {
                         exit_status = 1;
                     }
                 }
-                fprintf(stderr, "MTP: round %d: drafted %d, accepted %d, gen %d, next pos %d\n",
-                        (int) (mround - 1), (int) draft.size(), n_acc, (int) generated.size(),
-                        (int) (pp_tokens + generated.size())); fflush(stderr);
+                if (mtp_round_log) {
+                    fprintf(stderr, "MTP: round %d: drafted %d, accepted %d, gen %d, next pos %d\n",
+                            (int) (mround - 1), (int) draft.size(), n_acc, (int) generated.size(),
+                            (int) (pp_tokens + generated.size())); fflush(stderr);
+                }
             }
             if (exit_status == 0 && (int) generated.size() < tg_tokens) {
                 fprintf(stderr, "error: MTP round guard exhausted at gen %d (no progress?)\n", (int) generated.size());
                 ls.failed = true;
                 exit_status = 1;
             }
+            if (mt_rounds_t > 0) {
+                fprintf(stderr, "MTP host timing over %lld rounds, us per round: draft stage %.1f, verify llama_decode (host side, up to the launch) %.1f, verify fetch + sampling %.1f of which the row-0 logits fetch (the GPU wait) %.1f, "
+                                "mirror fill %.1f\n", (long long) mt_rounds_t, (double) mt_draft_us / mt_rounds_t, (double) mt_verify_us / mt_rounds_t,
+                        (double) mt_samp_us / mt_rounds_t, (double) mt_fetch_us / mt_rounds_t, (double) mt_mirror_us / mt_rounds_t);
+                fprintf(stderr, "MTP draft stage split, us per round: decode call (graph build + launch) %.1f, logits fetch (GPU wait + D2H) %.1f, scan + hidden-row copy %.1f (draft vocab %d)\n",
+                        (double) mt_dd_dec_us / mt_rounds_t, (double) mt_dd_get_us / mt_rounds_t, (double) mt_dd_scan_us / mt_rounds_t, draft_vocab_n > 0 ? draft_vocab_n : n_vocab);
+                if (ctx_dft != nullptr) {
+                    const llama_perf_context_data pd = llama_perf_context(ctx_dft);
+                    fprintf(stderr, "MTP draft context: graphs reused %d, evaluated tokens %d, decoded prompt tokens %d, over %lld rounds\n", pd.n_reused, pd.n_eval, pd.n_p_eval, (long long) mt_rounds_t);
+                }
+            }
         } else {
             // --- standard greedy TG (unchanged) ---
             // exit_status guard: a failed TG setup (e.g. row-set activation)
             // must not keep decoding (T-GPLR-13 probe evidence).
-            for (int t = 0; t < tg_tokens && exit_status == 0; ++t) {
+            int tg_steps = tg_tokens;
+            if (tg_first_pp && exit_status == 0) {
+                const int64_t pp_first_tok = llama_layer_major_pp_first_token(ctx);
+                if (pp_first_tok < 0) {
+                    fprintf(stderr, "error: --tg-first-pp-token needs the PP logits (drop --pp-no-logits)\n");
+                    ls.failed = true;
+                    exit_status = 1;
+                } else if (tg_tokens > 0) {
+                    cur = (llama_token) pp_first_tok;
+                    generated.push_back(cur);
+                    rep_ring.accept(cur);
+                    tg_steps = tg_tokens - 1;
+                }
+            }
+            // Opt-in (--tg-logit-margin): top-8 of P(.|prompt) at the last prompt
+            // position, for a logit-level comparison against another engine.
+            if (tg_logit_margin > 0 && exit_status == 0) {
+                int64_t pp_top_ids[8];
+                float   pp_top_vals[8];
+                const int n_top = llama_layer_major_pp_topk(ctx, 8, pp_top_ids, pp_top_vals);
+                if (n_top > 0) {
+                    ls.tel_pp_last_logits(n_top, pp_top_ids, pp_top_vals);
+                    for (int i = 0; i < n_top; ++i) {
+                        fprintf(stderr, "PP: last-position top%d id %lld logit %.6f\n",
+                                i + 1, (long long) pp_top_ids[i], (double) pp_top_vals[i]);
+                    }
+                    fflush(stderr);
+                }
+            }
+            tg_transition();
+            for (int t = 0; t < tg_steps && exit_status == 0; ++t) {
                 batch.token[0]   = cur;
                 batch.pos[0]     = pp_tokens + t;
                 batch.n_seq_id[0] = 1;
@@ -6563,7 +7645,9 @@ int main(int argc, char ** argv) {
                 batch.logits[0]  = true;
                 batch.n_tokens   = 1;
 
+                const int64_t t_h0 = ggml_time_us();
                 const int ret = llama_decode(ctx, batch);
+                const int64_t t_h1 = ggml_time_us();
                 if (ret != 0) {
                     fprintf(stderr, "error: TG decode step %d failed with %d: %s\n", t, ret, ls.error_msg.c_str());
                     ls.failed = true;
@@ -6571,7 +7655,14 @@ int main(int argc, char ** argv) {
                     break;
                 }
 
+                if (tg_probe_nosample) {
+                    host_dec_us += t_h1 - t_h0;
+                    host_steps++;
+                    generated.push_back(cur);
+                    continue;
+                }
                 const float * logits = llama_get_logits_ith(ctx, 0);
+                const int64_t t_h2 = ggml_time_us();
                 if (logits == nullptr) {
                     fprintf(stderr, "error: no logits at TG step %d\n", t);
                     ls.failed = true;
@@ -6583,7 +7674,11 @@ int main(int argc, char ** argv) {
                 float best_val = logits[0];
                 float second_val = -INFINITY;
                 llama_token second_tok = 0;
-                {
+                if (tg_fast_sample && (rep_penalty == 1.0 || rep_last_n == 0) && n_vocab >= 64) {
+                    // no penalty to apply: scan the output row in place (identical picks, tests/top2-exact: 302,200 rows, 0 mismatches)
+                    const ls_top2 r2 = ls_top2_exact(logits, n_vocab);
+                    best = (llama_token) r2.best; best_val = r2.best_val; second_tok = (llama_token) r2.second; second_val = r2.second_val;
+                } else {
                     // T-GPLR-06: penalized copy of the serial TG pick
                     std::vector<float> plogits(logits, logits + n_vocab);
                     rep_ring.apply(plogits.data(), n_vocab, (float) rep_penalty);
@@ -6605,8 +7700,29 @@ int main(int argc, char ** argv) {
                 // integer compare here).
                 ls.tel_tg_logits(t, (int64_t) best, best_val, (int64_t) second_tok, second_val);
                 cur = best;
+                if (tg_sampler_on) {
+                    // G27: the greedy pick above stays in the trace (margin, top-2); the token that is generated is the sampled one
+                    cur = (llama_token) ls_doc_sample(logits, n_vocab, ls_doc_sampler_params(), tg_rng);
+                    if (cur < 0) {
+                        fprintf(stderr, "error: --tg-sampler doc drew no token at TG step %d (an all-NaN logits row)\n", t);
+                        ls.failed = true;
+                        exit_status = 1;
+                        break;
+                    }
+                }
                 generated.push_back(cur);
                 rep_ring.accept(cur);
+                host_dec_us   += t_h1 - t_h0;
+                host_fetch_us += t_h2 - t_h1;
+                host_samp_us  += ggml_time_us() - t_h2;
+                host_steps++;
+            }
+            if (tg_probe_nosample) {
+                llama_synchronize(ctx);     // the last step was never waited for
+            }
+            if (host_steps > 0) {
+                fprintf(stderr, "tg host timing over %lld steps: llama_decode (host side, up to the graph launch) %.1f us/step, logits fetch (the GPU wait) %.1f us/step, runner copy + penalty + top-2 scan + telemetry %.1f us/step\n",
+                        (long long) host_steps, (double) host_dec_us/host_steps, (double) host_fetch_us/host_steps, (double) host_samp_us/host_steps);
             }
         }
 
@@ -6620,6 +7736,10 @@ int main(int argc, char ** argv) {
         if (ctx_dft) {
             llama_free(ctx_dft);
             ctx_dft = nullptr;
+        }
+        if (mtp_head_buf != nullptr) {
+            ggml_backend_buffer_free(mtp_head_buf);
+            mtp_head_buf = nullptr;
         }
 
         // T-Q38HG-02: tear down the handoff buffer after TG completes
@@ -6638,7 +7758,7 @@ int main(int argc, char ** argv) {
         if (exit_status == 0) {
             // the TG graph set was prebuilt before the PP timer, so the phase
             // baseline is the build_generation captured at prebuild completion
-            ls.tel_phase_summary("tg", tg_tokens, t1 - t0, builds0, graph_prep_us);
+            ls.tel_phase_summary("tg", tg_tokens, t1 - t0, builds0 + mtp_builds_excl, graph_prep_us);
             if (mtp) {
                 ls.tel_mtp((int64_t) generated.size(), mtp_drafted, mtp_accepted);
             }
@@ -6672,6 +7792,9 @@ int main(int argc, char ** argv) {
                     mtp_drafted > 0 ? (double) mtp_accepted / (double) mtp_drafted : 0.0);
             }
             if (mtp && mrounds_batch > 0) {
+                fprintf(stderr, "MTP depth: --mtp-draft %d, p-min %.2f: %.3f drafted tokens per round, %.3f tokens committed per round; p-min checks %lld, chains stopped %lld, %.1f us per round\n", mtp_draft, mtp_draft_pmin,
+                    (double) mtp_drafted / (double) mrounds_batch, (double) (mtp_accepted + mrounds_batch) / (double) mrounds_batch, (long long) mt_pmin_checked, (long long) mt_pmin_cut,
+                    (double) mt_pmin_us / (double) mrounds_batch);
                 fprintf(stderr, "MTP batch verify: rounds %lld, full-accept %lld, partial-accept %lld (avg accepted/round %.2f), rollback rounds %lld\n",
                     (long long) mrounds_batch, (long long) mrounds_full, (long long) mrounds_partial,
                     (double) mtp_accepted / (double) mrounds_batch, (long long) mrounds_rewind);
@@ -6794,6 +7917,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "(boundary mode: skipping trace self-check; deterministic slot policy does not apply to a reduced layer subset)\n");
     }
 
+    ls_free_watch_report();
     ctx->set_layer_streaming(nullptr);
     llama_free(ctx);
     llama_model_free(model);

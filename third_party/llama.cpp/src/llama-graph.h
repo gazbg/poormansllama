@@ -739,6 +739,26 @@ class llm_graph_result;
 // the default path
 struct llama_layer_streaming;
 
+// G32: one piece of a layer-major prefill pass, built per launch by llama-lm-prefill.cpp (nullptr in every other path).
+//   kind 0: embed the ubatch's tokens into act_out
+//   kind 1: decoder layer il: act_in -> act_out, with the weights of `layer` (the routed experts are the slot's device bank)
+//   kind 2: head: row act_in (one row) -> final norm -> logits
+// act_in / act_out are device addresses inside the pass's slab (act_buf); the flash attention of kind 1 uses the implicit causal mask:
+// the ubatch's first query is position q_pos_base, keys [kv_cell0, kv_cell0 + n_kv_valid) are live (the sequence's cells are kv_cell0 + position).
+struct llm_graph_lm {
+    int                  kind            = 0;
+    int                  il              = -1;
+    const llama_layer *  layer           = nullptr;
+    ggml_backend_buffer_t act_buf        = nullptr;
+    ggml_type            act_type        = GGML_TYPE_F32;
+    void *               act_in          = nullptr;
+    void *               act_out         = nullptr;
+    bool                 implicit_causal = true;
+    int32_t              q_pos_base      = 0;
+    int32_t              n_kv_valid      = 0;
+    int32_t              kv_cell0        = 0;     // cell of position 0 of the sequence
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -783,6 +803,9 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // G32: when set, the graph is ONE piece of a layer-major prefill pass (see llm_graph_lm). The LAST member, so the positional initialisers of llm_graph_params stay valid.
+    const llm_graph_lm * lm = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -962,6 +985,7 @@ struct llm_graph_context {
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
     const llama_layer_streaming * layer_streaming;
+    const llm_graph_lm *          lm;
 
     const int64_t n_embd;
     const int64_t n_layer;

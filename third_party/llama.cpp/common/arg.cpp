@@ -1659,14 +1659,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {
-            params.n_batch = value;
+            params.n_batch     = value;
+            params.n_batch_set = true;
         }
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
         string_format("physical maximum batch size (default: %d)", params.n_ubatch),
         [](common_params & params, int value) {
-            params.n_ubatch = value;
+            params.n_ubatch     = value;
+            params.n_ubatch_set = true;
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
@@ -1711,11 +1713,170 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--hybrid-moe"},
+        "hybrid MoE decode (private fork, CUDA): the expert banks stay on the host and a VRAM expert cache, sized so that the --fit-target margin stays free, serves most experts; "
+        "also sets the engine environment variables you did not set, turns --fit off, takes -ub 2048 unless -ub is given and, for -np > 1, the unified KV cache unless -kvu/-no-kvu is given",
+        [](common_params & params) {
+            params.hybrid_moe = true;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-slots"}, "N",
+        "expert-cache slots per layer for --hybrid-moe (default: -1 = size the cache to the --fit-target margin)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_slots = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-frozen"},
+        "deterministic hybrid decode: a fixed expert cache of --hybrid-moe-slots slots (default 16 here) and no promotions, so which experts run on the GPU never changes and identical requests give identical output "
+        "(a cache-hit continuation equals a fresh one); the decode is slower than with the dynamic cache",
+        [](common_params & params) {
+            params.hybrid_moe_frozen = true;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_FROZEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-ubatch"}, "N",
+        "physical batch size used with --hybrid-moe for the whole run when -ub is not given (default: 0 = keep the stock default 512; the prefill window of --hybrid-moe-prefill-ubatch is the better way: it does not cost expert-cache slots while decoding)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-prefill-ubatch"}, "N",
+        "physical batch size while a big prompt batch is processed with --hybrid-moe (default: 2048; 0 = off). The stock-path prefill copies each expert bank once per ubatch, so 2048 is ~3x faster than 512; the expert cache shrinks for the duration and grows back afterwards",
+        [](common_params & params, int value) {
+            params.hybrid_moe_prefill_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_PREFILL_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-prefill-min"}, "N",
+        "smallest batch, in tokens, that opens the --hybrid-moe prefill window (default: 1024)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_prefill_min = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-seed"}, "N",
+        "with --hybrid-moe: the routing of the last N tokens of a prompt seeds the expert cache's popularity statistics before the first token is generated (default: 16; 0 = off)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_seed = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_SEED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill"},
+        "layer-major prefill (private fork, CUDA, Qwen3.5/3.6 MoE): a prompt batch of --lm-prefill-min tokens or more runs layer by layer, every routed-expert bank is copied from the host ONCE into a VRAM slot window while "
+        "all chunks of the batch go through the layer (the ordinary path copies all banks once per ubatch). Works with --hybrid-moe (hybrid decode) and without it (stock decode of the placement given by -ncmoe/-cmoe/the fit step: the layers whose experts are on the host stream, the others compute in place). "
+        "Takes -b 16384 unless -b is given",
+        [](common_params & params) {
+            params.lm_prefill = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-min"}, "N",
+        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024)",
+        [](common_params & params, int value) {
+            params.lm_prefill_min = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-ubatch"}, "N",
+        "tokens per chunk of the --lm-prefill pass (default: 2048)",
+        [](common_params & params, int value) {
+            params.lm_prefill_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-segment"}, "N",
+        "tokens per activation-slab segment of the --lm-prefill pass, a multiple of --lm-prefill-ubatch (default: 16384); a longer batch repeats the layer sweep per segment",
+        [](common_params & params, int value) {
+            params.lm_prefill_segment = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_SEGMENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-slots"}, "N",
+        "layer slots in the --lm-prefill VRAM window (default: 2: the next bank is copied while the current layer computes)",
+        [](common_params & params, int value) {
+            params.lm_prefill_slots = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-bf16"},
+        "keep the activations of the --lm-prefill pass in bf16 (half the slab, not validated against f32)",
+        [](common_params & params) {
+            params.lm_prefill_bf16 = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_BF16").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-batch"}, "N",
+        "logical batch size (-b) used with --lm-prefill when -b is not given (default: 16384)",
+        [](common_params & params, int value) {
+            params.lm_prefill_batch = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_BATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-ckpt-chunk"}, "N",
+        "with --lm-prefill: the last N + 4 tokens of a prompt are processed separately so that a context checkpoint exists N + 4 tokens before the end (default: 0 = -ub, the stock rule: 4 + ubatch). A chunk of fewer than 32 tokens "
+        "(for example 24) is computed on the CPU and costs ~0.3 s; a chunk of 512 tokens copies every expert bank (~1.3 s). The price is the depth of the rollback that the checkpoint covers: a request that diverges earlier than N + 4 tokens from the "
+        "end of the previous prompt resumes from the next older checkpoint",
+        [](common_params & params, int value) {
+            params.lm_prefill_ckpt = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_CKPT_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-canonical"},
+        "with --lm-prefill: make a cache hit equal a fresh run bit for bit (with stock decode or --hybrid-moe-frozen). Context checkpoints exist only at multiples of --lm-prefill-ubatch (no 4 + ubatch tail, no user-message checkpoints) "
+        "and a continuation always resumes from the newest one before the common prefix of the old and the new prompt (never from the state that decode left behind), so that the tokens after it are prefilled in the same chunks as in a "
+        "fresh run. The price: a repeat or a follow-up prefills up to one chunk more than its new tokens (about 1 s) instead of 4 tokens. Needs -b to be a multiple of --lm-prefill-ubatch and context checkpoints",
+        [](common_params & params) {
+            params.lm_prefill_canonical = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_CANONICAL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-fuse"},
+        "with --lm-prefill and -np 1: send the rest of a prompt in ONE batch (one layer-major pass) instead of cutting it where context checkpoints are taken (before the last user message, 4 + ubatch and 4 tokens before the end): "
+        "the pass keeps the recurrent state at those token counts and the server stores it as the checkpoints. Saves the second and third expert-bank streams of every request (~1.3 s each). A prompt with fewer than --lm-prefill-fuse-min tokens left is not sent whole",
+        [](common_params & params) {
+            params.lm_prefill_fuse = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-fuse-min"}, "N",
+        "fewest prompt tokens left (after the cache hit) that --lm-prefill-fuse sends whole (default: 700)",
+        [](common_params & params, int value) {
+            params.lm_prefill_fuse_min = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-prearm"}, "MODE",
+        "with --lm-prefill and -np 1: when the slots go idle after a request, prepare the layer-major pass of the next one (make room, allocate the slot window and the slab, copy the banks of the first layers). "
+        "MODE: off (default), always, auto (when at least 3 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode, a used one saves ~0.26 s",
+        [](common_params & params, const std::string & value) {
+            if (value == "off" || value == "0") {
+                params.lm_prefill_prearm = 0;
+            } else if (value == "always" || value == "1") {
+                params.lm_prefill_prearm = 1;
+            } else if (value == "auto" || value == "2") {
+                params.lm_prefill_prearm = 2;
+            } else {
+                throw std::invalid_argument("invalid value for --lm-prefill-prearm (off, always or auto)");
+            }
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PREARM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",
+        "expert frequency table (n_layer x n_expert counts, whitespace separated) that fills the --hybrid-moe cache at start (default: uniform prior)",
+        [](common_params & params, const std::string & value) {
+            params.hybrid_moe_freq = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_FREQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
         [](common_params & params, bool value) {
-            params.kv_unified = value;
+            params.kv_unified     = value;
+            params.kv_unified_set = true;
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(

@@ -10,6 +10,18 @@
 #include "llama-memory-hybrid.h"
 #ifdef LLAMA_LAYER_STREAMING
 #include "llama-layer-streaming.h"
+// defined in ggml/src/ggml-cuda/ggml-cuda.cu (not in ggml-cuda.h: every CUDA translation unit includes that header)
+#include "ggml-cuda.h"
+extern "C" {
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+bool ggml_backend_cuda_input_batch_begin(void * compute_stream);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+void ggml_backend_cuda_input_batch_end(void);
+}
 #include "llama-moe-hybrid.h"
 #endif
 #include "llama-mmap.h"
@@ -494,6 +506,8 @@ llama_context::~llama_context() {
     synchronize();
 
 #ifdef LLAMA_LAYER_STREAMING
+    // G42: a pass that is armed (prepared in the idle time) gives its resources back while the backends exist
+    lm_release_if_live();
     // T-Q36-AER: stop the hybrid MoE engine while its backend still exists
     for (auto * backend : backend_ptrs) {
         llama_moe_hybrid_release(backend);
@@ -1423,6 +1437,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+#ifdef LLAMA_LAYER_STREAMING
+    // opt-in (LLAMA_CUDA_INPUT_BATCH=1; 2 = with diagnostics): the small host->device input uploads of this decode -- made by set_inputs and by the
+    // scheduler's split-input copies inside graph_compute -- skip their per-tensor synchronize; the CUDA graph compute waits for them by event
+    static const bool input_batch = getenv("LLAMA_CUDA_INPUT_BATCH") != nullptr;
+    bool batched = false;
+    if (input_batch) {
+        for (auto & b : backends) {
+            if (ggml_backend_is_cuda(b.get())) {
+                batched = ggml_backend_cuda_input_batch_begin(ggml_backend_cuda_stream_handle(b.get(), 0)); // the compute stream the graph runs on
+                break;
+            }
+        }
+    }
+#endif
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1434,6 +1462,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+#ifdef LLAMA_LAYER_STREAMING
+    if (batched) {
+        ggml_backend_cuda_input_batch_end();
+    }
+#endif
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2045,10 +2078,35 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// LLAMA_DECODE_PROFILE=1: host time of the phases of decode(), averaged per call and printed at process exit, one line per context type (0 = the target, 1 = the MTP draft head).
+// Measurement only; found with it (2026-10-11): the verify decode of an MTP run spent 38 ns per context cell on the host.
+struct ls_decode_prof_t {
+    double  t[2][8] = {};
+    int64_t n[2]    = {};
+    bool    on      = getenv("LLAMA_DECODE_PROFILE") != nullptr && atoi(getenv("LLAMA_DECODE_PROFILE")) != 0;
+    ~ls_decode_prof_t() {
+        for (int k = 0; k < 2 && on; ++k) {
+            if (n[k] > 0) {
+                fprintf(stderr, "decode profile (%s, %lld calls), avg us: batch init %.1f, memory update %.1f, memory init_batch %.1f, output reserve %.1f, process_ubatch %.1f, outputs + rest %.1f, total %.1f\n",
+                        k == 0 ? "target" : "draft head", (long long) n[k], t[k][0]/n[k], t[k][1]/n[k], t[k][2]/n[k], t[k][3]/n[k], t[k][4]/n[k], t[k][5]/n[k], t[k][6]/n[k]);
+            }
+        }
+    }
+};
+static ls_decode_prof_t g_ls_decode_prof;
+
+#ifdef LLAMA_LAYER_STREAMING
+// G31o: called at the start of every decode with the batch size; llama-hybrid-api.cpp registers it (the hybrid prefill window)
+void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
+extern bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
+#endif
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+    const int64_t tp0 = ggml_time_us();
+    int64_t tp1 = tp0, tp2 = tp0, tp3 = tp0, tp4 = tp0, tp5 = 0;
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2059,6 +2117,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G32: a batch that the layer-major prefill takes gets its resources first (so the hybrid prefill window does not open for it, and a refusal falls back to the window); they go back when decode() returns
+    llama_lm_plan lm_plan;
+    struct lm_scope_t {
+        llama_context * c;
+        bool            on;
+        explicit lm_scope_t(llama_context * c_) : c(c_), on(false) {}
+        ~lm_scope_t() { if (on) { c->lm_release(); } }
+    } lm_scope(this);
+    if (lm_state != nullptr) {
+        lm_scope.on = lm_decode_begin(batch_inp, lm_plan);
+    }
+    llama_lm_prefill_pending = lm_plan.ok;
+    if (llama_hybrid_decode_hook != nullptr) {
+        llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+    }
+    llama_lm_prefill_pending = false;
+#endif
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2109,6 +2186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    tp1 = ggml_time_us();
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -2145,6 +2223,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+    tp2 = ggml_time_us();
+
+#ifdef LLAMA_LAYER_STREAMING
+    if (lm_plan.ok) {
+        const int lm_ret = lm_run(lm_plan, n_outputs_all);
+        if (lm_ret != 1) {
+            return lm_ret;   // 0: the batch is done (the pass's resources go back with lm_scope); < 0: failed
+        }
+        // nothing was changed: give the pass's resources back and take the ordinary path (the hybrid prefill window opens for it now, as it would have without the pass)
+        lm_release();
+        lm_scope.on = false;
+        llama_lm_prefill_pending = false;
+        if (llama_hybrid_decode_hook != nullptr) {
+            llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+        }
+    }
+#endif
 
     llama_memory_context_ptr mctx;
 
@@ -2190,12 +2285,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         break;
     }
+    tp3 = ggml_time_us();
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    tp4 = ggml_time_us();
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2226,7 +2323,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        const int64_t tq0 = ggml_time_us();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        tp5 += ggml_time_us() - tq0;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2434,6 +2533,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (g_ls_decode_prof.on) {
+        const int k = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+        const int64_t te = ggml_time_us();
+        g_ls_decode_prof.n[k]++;
+        g_ls_decode_prof.t[k][0] += (double) (tp1 - tp0);
+        g_ls_decode_prof.t[k][1] += (double) (tp2 - tp1);
+        g_ls_decode_prof.t[k][2] += (double) (tp3 - tp2);
+        g_ls_decode_prof.t[k][3] += (double) (tp4 - tp3);
+        g_ls_decode_prof.t[k][4] += (double) tp5;
+        g_ls_decode_prof.t[k][5] += (double) ((te - tp4) - tp5);
+        g_ls_decode_prof.t[k][6] += (double) (te - tp0);
+    }
 
     return 0;
 }

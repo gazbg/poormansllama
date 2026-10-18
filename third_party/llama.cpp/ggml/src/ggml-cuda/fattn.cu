@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-gqa8.cuh"
 #include "fattn.cuh"
 
 // FAFIX experiment toggle (opt-in, default off): FAFIX_CAUSAL_GQA=1 lets the mask-free causal-window FA op
@@ -585,7 +586,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            if (ggml_cuda_fattn_gqa8_applies(dst)) {
+                ggml_cuda_flash_attn_ext_gqa8(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            }
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

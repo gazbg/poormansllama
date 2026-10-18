@@ -2648,14 +2648,15 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // experimental MoE hybrid decode (CUDA only, single token):
-    // publish: selected [n_used, 1] I32, weights [1, n_used, 1] F32, cur [n_embd, 1] F32,
+    // experimental MoE hybrid decode (CUDA only, 1 .. GGML_MOE_HYBRID_MAX_WIDTH tokens: one decode step, or an MTP verify step of the frontier plus its drafts):
+    // publish: selected [n_used, T] I32, weights [1, n_used, T] F32, cur [n_embd, T] F32,
     //          map [n_layer*n_expert] I32 (map[il*n_expert + e] = cache slot of expert e, n_slot = not cached),
-    //          state I32 device request counter
-    //          -> I32 [16]: [0..n_used) cache slot per selected expert (misses -> zero slot n_slot),
-    //             [8] miss count, [9] request sequence; misses are posted to the host mailbox and the
-    //             selected ids are written to trace[il*8 ..]; mailbox and trace must be device-visible host memory
-    // wait_add: cur [n_embd, 1] F32 -> cur + host result of the misses published in pub
+    //          state I32 device request counters (state[t] belongs to token t)
+    //          -> I32 [16, T]: per token t, [0..n_used) cache slot per selected expert (misses -> zero slot n_slot),
+    //             [8] miss count, [9] request sequence; the misses of token t are posted to its own host mailbox (mailbox + t*mailbox_stride bytes)
+    //             and its selected ids are written to trace[t*trace_stride + il*8 ..]; mailbox and trace must be device-visible host memory
+    // wait_add: cur [n_embd, T] F32 -> cur + host result of the misses published in pub, token by token
+#define GGML_MOE_HYBRID_MAX_WIDTH 4
     GGML_API struct ggml_tensor * ggml_moe_hybrid_publish(
             struct ggml_context * ctx,
             struct ggml_tensor  * selected,
@@ -2667,7 +2668,9 @@ extern "C" {
             int32_t               n_expert,
             int32_t               n_slot,
             void                * mailbox,
-            void                * trace);
+            int32_t               mailbox_stride,
+            void                * trace,
+            int32_t               trace_stride);
 
     GGML_API struct ggml_tensor * ggml_moe_hybrid_wait_add(
             struct ggml_context * ctx,

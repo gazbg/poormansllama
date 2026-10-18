@@ -14,6 +14,9 @@
 
 const llama_layer & llama_model_qwen35moe::graph::layer(int il) const {
 #ifdef LLAMA_LAYER_STREAMING
+    if (lm != nullptr && lm->layer != nullptr) {
+        return *lm->layer;
+    }
     if (ls != nullptr) {
         return ls->slot_layer(il);
     }
@@ -183,6 +186,10 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ls = const_cast<llama_layer_streaming *>(params.layer_streaming);
     if (ls != nullptr) {
         build_streaming_graphs();
+        return;
+    }
+    if (params.lm != nullptr) {
+        build_lm_graph();
         return;
     }
 #endif
@@ -957,7 +964,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     ggml_tensor * moe_pub = nullptr;
 #ifdef LLAMA_LAYER_STREAMING
     // opt-in hybrid decode (env LLAMA_MOE_HYBRID): GPU slot cache plus a host pool for the misses; nullptr means the stock path
-    if (ls == nullptr && selected_experts_in == nullptr && moe_weights_in == nullptr && routed_rows == 0) {
+    if (ls == nullptr && lm == nullptr && selected_experts_in == nullptr && moe_weights_in == nullptr && routed_rows == 0) {
         moe_out = llama_moe_hybrid_build_ffn(*this, model, il, cur, &moe_pub);
     }
 #endif
@@ -1024,6 +1031,97 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
     return cur;
 }
+
+// G32: ONE piece of a layer-major prefill pass, built per launch (llama-lm-prefill.cpp), see llm_graph_lm. The pieces hand the hidden state to each other through the pass's slab; every
+// INPUT tensor of the piece is pulled into the graph at the end, because a piece of one layer type never reads the inputs of the other type (an unallocated input would crash set_inputs).
+#ifdef LLAMA_LAYER_STREAMING
+void llama_model_qwen35moe::graph::build_lm_graph() {
+    GGML_ASSERT(lm != nullptr);
+
+    const int64_t n_embd_io = hparams.n_embd_inp();
+    const bool    slab_bf16 = (lm->act_type == GGML_TYPE_BF16);
+
+    auto act = [&](void * addr, int64_t rows) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx0, lm->act_type, n_embd_io, rows);
+        ggml_set_name(t, "lm_act");
+        ggml_backend_tensor_alloc(lm->act_buf, t, addr);
+        return t;
+    };
+
+    ggml_tensor * cur;
+
+    if (lm->kind == 0) {
+        cur = build_inp_embd(model.tok_embd);
+        cb(cur, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else if (lm->kind == 1) {
+        const int il = lm->il;
+
+        int sections[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+        auto * inp = build_inp_mem_hybrid();
+
+        ggml_tensor * inp_pos = build_inp_pos();
+
+        ggml_tensor * inpSA = act(lm->act_in, n_tokens);
+        if (slab_bf16) {
+            inpSA = ggml_cast(ctx0, inpSA, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(inpSA, layer(il).attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        if (hparams.is_recr(il)) {
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else {
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+        }
+
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "attn_residual", il);
+
+        ggml_tensor * ffn_residual = cur;
+
+        ggml_tensor * attn_post_norm = build_norm(cur, layer(il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(attn_post_norm, "attn_post_norm", il);
+
+        cur = build_layer_ffn(attn_post_norm, il);
+        cb(cur, "ffn_out", il);
+
+        cur = ggml_add(ctx0, cur, ffn_residual);
+        cb(cur, "post_moe", il);
+
+        cur = build_cvec(cur, il);
+        cb(cur, "l_out", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else {
+        cur = act(lm->act_in, 1);
+        if (slab_bf16) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+}
+#endif // LLAMA_LAYER_STREAMING
 
 // T-GPLR-82 S2: the HOST expert sub-op.
 //
@@ -1355,7 +1453,17 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // G30: LLAMA_MTP_DRAFT_VOCAB_N = N > 0 draws the draft only from the token ids [0, N). The first N rows of the head are a contiguous prefix of the weight, so a 2-D view of them costs nothing and the
+    // lm head reads N / n_vocab of the bytes; the draft pick only has to be a good guess (the verify keeps the output exact). The logits are padded back to the full row so the logits layout is unchanged.
+    static const int64_t g30_draft_vocab_n = []() { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB_N"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    const int64_t g30_head_rows = head_w->ne[1];
+    if (g30_draft_vocab_n > 0 && g30_draft_vocab_n < g30_head_rows) {
+        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], g30_draft_vocab_n, head_w->nb[1], 0);
+        cur = build_lora_mm(head_sub, cur, head_s);
+        cur = ggml_pad(ctx0, cur, (int) (g30_head_rows - g30_draft_vocab_n), 0, 0, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

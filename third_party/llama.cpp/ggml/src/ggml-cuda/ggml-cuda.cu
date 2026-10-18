@@ -84,6 +84,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -534,6 +535,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
+extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void);
+
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
@@ -651,6 +654,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            if (getenv("LLAMA_CUDA_POOL_LOG") != nullptr) {
+                fprintf(stderr, "cuda pool[%d]: grew by %.2f MiB to %.2f MiB for a %zu B request (main thread has launched %lld nodes)\n", device,
+                        reserve_size/1048576.0, pool_size/1048576.0, size, (long long) ggml_backend_cuda_dbg_nodes_launched());
+            }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -722,10 +729,151 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// A device buffer whose address range is reserved up front and whose physical memory is committed on demand, one VMM granule at a time (LLAMA_KV_LAZY, used for the
+// KV cache only). Reading or writing an uncommitted page is an illegal address and fails loudly; the owner commits every row it will touch before the graph that touches it.
+struct ggml_cuda_lazy_buffer {
+    int         device          = 0;
+    int         physical_device = 0;
+    CUdeviceptr base            = 0;
+    size_t      size            = 0;   // reserved bytes, a multiple of the granularity
+    size_t      gran            = 0;
+    size_t      n_mapped        = 0;
+    std::vector<uint8_t>       mapped;  // one state per granule: 0 nothing mapped, 1 a committed read-write granule, 2 an alias of the shared zero granule (read-only)
+    std::vector<ggml_tensor *> tensors; // the cache tensors registered by init_tensor
+    size_t      n_alias         = 0;
+
+    // Map every granule of the reserved range to ONE shared zeroed physical granule, read-only (G12-6). A kernel that reads the reserved but uncommitted window then reads
+    // zeros instead of faulting: batch-major prefill attends over the whole pinned window (nothing narrows its views outside the layer-major controller) and crashed with an
+    // illegal memory access on the first uncommitted page. A stray WRITE into the window still faults, and commit() swaps an alias for a real granule. Costs one granule.
+    bool alias_all() {
+        ggml_cuda_set_device(device);
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical_device;
+        CUmemGenericAllocationHandle zero;
+        if (cuMemCreate(&zero, gran, &prop, 0) != CUDA_SUCCESS) {
+            return false;
+        }
+        // zero the shared granule once through a temporary read-write mapping at granule 0
+        CUmemAccessDesc rw = {};
+        rw.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        rw.location.id   = physical_device;
+        rw.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemMap(base, gran, 0, zero, 0) != CUDA_SUCCESS) {
+            cuMemRelease(zero);
+            return false;
+        }
+        if (cuMemSetAccess(base, gran, &rw, 1) != CUDA_SUCCESS) {
+            cuMemUnmap(base, gran);
+            cuMemRelease(zero);
+            return false;
+        }
+        CUDA_CHECK(cudaMemset((void *) base, 0, gran));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        size_t n_ok = 1;
+        for (size_t g = 1; g < mapped.size(); ++g) {
+            if (cuMemMap(base + g*gran, gran, 0, zero, 0) != CUDA_SUCCESS) {
+                break;
+            }
+            ++n_ok;
+        }
+        cuMemRelease(zero); // the mappings keep the allocation alive
+        bool ok = n_ok == mapped.size();
+        if (ok) {
+            CUmemAccessDesc ro = rw;
+            ro.flags = CU_MEM_ACCESS_FLAGS_PROT_READ;
+            if (cuMemSetAccess(base, size, &ro, 1) != CUDA_SUCCESS) {
+                // one call over many mappings was refused: set the access granule by granule
+                for (size_t g = 0; g < mapped.size() && ok; ++g) {
+                    ok = cuMemSetAccess(base + g*gran, gran, &ro, 1) == CUDA_SUCCESS;
+                }
+            }
+        }
+        if (!ok) {
+            for (size_t g = 0; g < n_ok; ++g) {
+                cuMemUnmap(base + g*gran, gran);
+            }
+            return false;
+        }
+        for (size_t g = 0; g < mapped.size(); ++g) {
+            mapped[g] = 2;
+        }
+        n_alias = mapped.size();
+        return true;
+    }
+
+    // map, enable access to and zero every unmapped granule overlapping [off, off + bytes); false when the driver refuses (out of memory)
+    bool commit(size_t off, size_t bytes) {
+        if (bytes == 0) {
+            return true;
+        }
+        const size_t g0 = off / gran;
+        const size_t g1 = std::min((off + bytes + gran - 1) / gran, mapped.size());
+        ggml_cuda_set_device(device);
+        for (size_t g = g0; g < g1; ++g) {
+            if (mapped[g] == 1) {
+                continue;
+            }
+            if (mapped[g] == 2) {
+                // replace the read-only alias of the zero granule by a real one
+                if (cuMemUnmap(base + g*gran, gran) != CUDA_SUCCESS) {
+                    return false;
+                }
+                mapped[g] = 0;
+                n_alias--;
+            }
+            CUmemAllocationProp prop = {};
+            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id   = physical_device;
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, gran, &prop, 0) != CUDA_SUCCESS) {
+                return false;
+            }
+            const CUdeviceptr at = base + g*gran;
+            if (cuMemMap(at, gran, 0, handle, 0) != CUDA_SUCCESS) {
+                cuMemRelease(handle);
+                return false;
+            }
+            cuMemRelease(handle); // the mapping keeps the allocation alive
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id   = physical_device;
+            access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            if (cuMemSetAccess(at, gran, &access, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(at, gran);
+                return false;
+            }
+            // the cache relies on zeroed padding rows (a NaN there would survive the attention mask)
+            CUDA_CHECK(cudaMemset((void *) at, 0, gran));
+            mapped[g] = 1;
+            n_mapped++;
+        }
+        return true;
+    }
+
+    ~ggml_cuda_lazy_buffer() {
+        ggml_cuda_set_device(device);
+        for (size_t g = 0; g < mapped.size(); ++g) {
+            if (mapped[g]) {
+                cuMemUnmap(base + g*gran, gran);
+            }
+        }
+        if (base != 0) {
+            cuMemAddressFree(base, size);
+        }
+    }
+};
+
+static std::vector<ggml_cuda_lazy_buffer *> g_cuda_lazy_buffers;
+static bool                                 g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_cuda_lazy_buffer * lazy = nullptr; // non-null: dev_ptr is a reserved range committed on demand
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -733,7 +881,12 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (lazy != nullptr) {
+            g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
+            delete lazy;
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -759,6 +912,13 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
+    if (ctx->lazy != nullptr) {
+        // a lazily committed buffer holds the cache tensors; their padding must be empty because an uncommitted page cannot be written
+        GGML_ASSERT(ggml_backend_buft_get_alloc_size(buffer->buft, tensor) == ggml_nbytes(tensor));
+        ctx->lazy->tensors.push_back(tensor);
+        return GGML_STATUS_SUCCESS;
+    }
+
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
@@ -772,7 +932,10 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_cuda_input_batch_settle();
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_cuda_input_batch_settle();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -780,15 +943,268 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Opt-in input batching v4 (LLAMA_CUDA_INPUT_BATCH, see llama_context::process_ubatch): while a batch is open, small host->device tensor uploads are copied into
+// pinned memory and RECORDED, not issued. ggml_backend_cuda_graph_compute issues them back to back on the compute stream right before the graph's own work
+// (stream order alone orders them before every kernel: no event, no cross-stream dependency). v2 put the copies on the per-thread stream behind an event and the
+// dependent graph launch then cost ~200 us more host time; v3 queued each copy on the compute stream as it came, and the scheduler's per-input synchronize of that
+// stream then waited ~45 us for every one of them. The staging area is reused only after an event recorded behind the copies has fired.
+static constexpr size_t GGML_CUDA_INPUT_STAGE_BYTES = 8u << 20;
+static constexpr size_t GGML_CUDA_INPUT_STAGE_MAX_COPY = 1u << 20;
+static constexpr size_t GGML_CUDA_INPUT_MAX_PENDING = 64;
+struct ggml_cuda_input_copy {
+    char *       dst;
+    const char * src;
+    size_t       size;
+};
+static bool         g_cuda_input_batch_open = false;
+static bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
+static bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
+static char *       g_cuda_input_stage      = nullptr;
+static size_t       g_cuda_input_stage_used = 0;
+static bool         g_cuda_input_failed     = false;
+static cudaStream_t g_cuda_input_stream     = nullptr;
+static cudaEvent_t  g_cuda_input_event      = nullptr;
+static ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
+static size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
+static size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
+static size_t       g_cuda_input_n_direct   = 0;
+
+// diagnostics for the hybrid engine's watchdog (read through the exported getters below): how far the main thread got launching this graph's nodes,
+// whether it is inside a graph compute, and which promotion copy the engine thread is submitting
+static std::atomic<int64_t> g_dbg_nodes_launched{0};
+static std::atomic<int>     g_dbg_in_compute{0};
+static std::atomic<int>     g_dbg_aux_idx{0};
+
+extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void) { return g_dbg_nodes_launched.load(std::memory_order_relaxed); }
+extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_in_compute(void)     { return g_dbg_in_compute.load(std::memory_order_relaxed); }
+extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_aux_idx(void)        { return g_dbg_aux_idx.load(std::memory_order_relaxed); }
+
+// test knob (LLAMA_CUDA_GRAPH_RESET_EVERY=N): force a CUDA graph warmup reset on every N-th replay, so the direct (not captured) launch path that follows a
+// KV-view pad boundary is exercised often instead of once per 256 tokens
+static bool ggml_cuda_dbg_force_graph_reset() {
+    static const int every = [] {
+        const char * v = getenv("LLAMA_CUDA_GRAPH_RESET_EVERY");
+        return v != nullptr ? atoi(v) : 0;
+    }();
+    static int calls = 0;
+    return every > 0 && (++calls % every) == 0;
+}
+
+// test knob (LLAMA_CUDA_DEBUG_FREE_AT_NODE=K): the direct launch path of a decode graph (>= 800 nodes) allocates and frees 4 MiB just before node K. cudaFree
+// synchronizes the device and takes the driver lock, like the pool growth the first KV-pad boundary needs
+static int ggml_cuda_dbg_free_at() {
+    static const int at = [] {
+        const char * v = getenv("LLAMA_CUDA_DEBUG_FREE_AT_NODE");
+        return v != nullptr ? atoi(v) : -1;
+    }();
+    return at;
+}
+
+// the next device buffer allocation is reserved lazily (set by the KV cache constructor around its allocation, reset right after)
+extern "C" __declspec(dllexport) void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
+    g_cuda_lazy_next = on;
+}
+
+// commit the first `rows` rows of every cache tensor held by a lazily committed buffer (the rows beyond stay uncommitted and must never be touched).
+// Returns the physical bytes committed in total, or -1 when the driver ran out of memory (the caller fails loudly).
+extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
+    int64_t total = 0;
+    for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        for (ggml_tensor * t : lz->tensors) {
+            const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
+            const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                if (!lz->commit(off + (size_t) s*t->nb[2], (size_t) r*t->nb[1])) {
+                    return -1;
+                }
+            }
+        }
+        total += (int64_t) (lz->n_mapped*lz->gran);
+    }
+    return total;
+}
+
+// G31: the physical bytes that committing the first `rows` rows of every lazily committed cache tensor would still map (an uncommitted or aliased granule counts once)
+extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
+    int64_t total = 0;
+    for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        std::vector<uint8_t> seen(lz->mapped.size(), 0);
+        for (ggml_tensor * t : lz->tensors) {
+            const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
+            const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                const size_t o = off + (size_t) s*t->nb[2];
+                const size_t b = (size_t) r*t->nb[1];
+                if (b == 0) {
+                    continue;
+                }
+                const size_t g0 = o / lz->gran;
+                const size_t g1 = std::min((o + b + lz->gran - 1) / lz->gran, lz->mapped.size());
+                for (size_t g = g0; g < g1; ++g) {
+                    if (lz->mapped[g] != 1 && !seen[g]) {
+                        seen[g] = 1;
+                        total += (int64_t) lz->gran;
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
+extern "C" __declspec(dllexport) bool ggml_backend_cuda_buft_is_lazy_capable(int device) {
+    return device >= 0 && device < ggml_cuda_info().device_count && ggml_cuda_info().devices[device].vmm;
+}
+
+// G23 (ledger row 63): keep the GPU, and with it the PCIe link, out of its idle state. On the laptop GPU the link falls from Gen4 to Gen1 after ~10 s of GPU utilisation under ~10% (a 32 MiB host-to-device copy
+// 2.33 -> 18.3 ms) and needs ~0.25 s of traffic to climb back; a one-block spin kernel (100% utilisation, one SM) keeps it up (tools/pcie-state-bench). The kernel spins ~4 ms of maximum-clock cycles per launch.
+static __global__ void ggml_cuda_keepalive_spin(long long cycles) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) {
+    }
+}
+
+static std::thread       g_cuda_keepalive_thread;
+static std::atomic<bool> g_cuda_keepalive_stop{false};
+
+extern "C" __declspec(dllexport) int ggml_backend_cuda_keepalive(int device, int on) {
+    if (on) {
+        if (g_cuda_keepalive_thread.joinable()) {
+            return 1;
+        }
+        g_cuda_keepalive_stop.store(false);
+        g_cuda_keepalive_thread = std::thread([device] {
+            cudaSetDevice(device);
+            cudaStream_t s = nullptr;
+            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+            int clock_khz = 0;
+            cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+            const long long cycles = (long long) std::max(clock_khz, 1000000) * 4;
+            while (!g_cuda_keepalive_stop.load()) {
+                ggml_cuda_keepalive_spin<<<1, 32, 0, s>>>(cycles);
+                cudaStreamSynchronize(s);
+            }
+            cudaStreamDestroy(s);
+        });
+        return 1;
+    }
+    if (g_cuda_keepalive_thread.joinable()) {
+        g_cuda_keepalive_stop.store(true);
+        g_cuda_keepalive_thread.join();
+    }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
+    if (g_cuda_input_batch_open || compute_stream == nullptr) {
+        return false; // no nesting
+    }
+    if (!g_cuda_input_failed && (g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr)) {
+        if (g_cuda_input_stage == nullptr && cudaMallocHost((void **) &g_cuda_input_stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_cuda_input_stage = nullptr;
+        }
+        if (g_cuda_input_event == nullptr && cudaEventCreateWithFlags(&g_cuda_input_event, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_cuda_input_event = nullptr;
+        }
+        g_cuda_input_failed = g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr;
+    }
+    if (g_cuda_input_failed) {
+        return false; // the caller then runs the original per-tensor path
+    }
+    if (g_cuda_input_in_flight) {
+        // the previous batch's copies were ordered before a compute that has long finished; this only makes reuse of the staging area safe
+        CUDA_CHECK(cudaEventSynchronize(g_cuda_input_event));
+        g_cuda_input_in_flight = false;
+    }
+    g_cuda_input_stage_used = 0;
+    g_cuda_input_n_pending  = 0;
+    g_cuda_input_dirty      = false;
+    g_cuda_input_stream     = (cudaStream_t) compute_stream;
+    g_cuda_input_batch_open = true;
+    return true;
+}
+
+// issue the recorded uploads back to back on `stream`, then an event behind them that guards reuse of the staging area
+static void ggml_cuda_input_batch_flush(cudaStream_t stream) {
+    if (g_cuda_input_n_pending == 0) {
+        return;
+    }
+    for (size_t i = 0; i < g_cuda_input_n_pending; ++i) {
+        const ggml_cuda_input_copy & c = g_cuda_input_pending[i];
+        CUDA_CHECK(cudaMemcpyAsync(c.dst, c.src, c.size, cudaMemcpyHostToDevice, stream));
+    }
+    g_cuda_input_n_pending = 0;
+    CUDA_CHECK(cudaEventRecord(g_cuda_input_event, stream)); // fires once the staged copies are done
+    g_cuda_input_in_flight = true;
+    g_cuda_input_dirty     = true;
+}
+
+// anything that reads or writes device memory outside the compute stream's order (a readback, a device copy, a direct upload) must see the recorded uploads first
+static void ggml_cuda_input_batch_settle() {
+    if (!g_cuda_input_batch_open) {
+        return;
+    }
+    ggml_cuda_input_batch_flush(g_cuda_input_stream);
+    if (g_cuda_input_dirty) {
+        CUDA_CHECK(cudaStreamSynchronize(g_cuda_input_stream));
+        g_cuda_input_dirty = false;
+    }
+}
+
+// start of every CUDA graph compute: the recorded uploads go out right before the graph's own work, on the stream the graph runs on
+static void ggml_cuda_input_batch_before_compute(cudaStream_t stream) {
+    if (g_cuda_input_batch_open && g_cuda_input_n_pending > 0) {
+        if (stream == g_cuda_input_stream) {
+            ggml_cuda_input_batch_flush(stream);
+        } else {
+            ggml_cuda_input_batch_settle();
+        }
+    }
+}
+
+extern "C" __declspec(dllexport) void ggml_backend_cuda_input_batch_end(void) {
+    if (!g_cuda_input_batch_open) {
+        return;
+    }
+    ggml_cuda_input_batch_flush(g_cuda_input_stream); // normally empty: the graph compute issued them
+    g_cuda_input_dirty      = false;
+    g_cuda_input_batch_open = false;
+    static const bool dbg = getenv("LLAMA_CUDA_INPUT_BATCH") != nullptr && getenv("LLAMA_CUDA_INPUT_BATCH")[0] == '2';
+    static int printed = 0;
+    if (dbg && printed < 6) {
+        fprintf(stderr, "ggml_cuda_input_batch: closed, %zu uploads staged, %zu direct, %zu bytes staged\n",
+                g_cuda_input_n_staged, g_cuda_input_n_direct, g_cuda_input_stage_used);
+        printed++;
+    }
+    g_cuda_input_n_staged = g_cuda_input_n_direct = 0;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (g_cuda_input_batch_open) {
+        if (size > 0 && size <= GGML_CUDA_INPUT_STAGE_MAX_COPY && g_cuda_input_n_pending < GGML_CUDA_INPUT_MAX_PENDING) {
+            const size_t at = (g_cuda_input_stage_used + 255) & ~(size_t) 255;
+            if (at + size <= GGML_CUDA_INPUT_STAGE_BYTES) {
+                memcpy(g_cuda_input_stage + at, data, size); // the caller may reuse its memory as soon as this returns
+                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_stage + at, size };
+                g_cuda_input_stage_used = at + size;
+                g_cuda_input_n_staged++;
+                return;
+            }
+        }
+        ggml_cuda_input_batch_settle(); // program order: the uploads recorded so far land before this direct one
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    g_cuda_input_n_direct++;
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_cuda_input_batch_settle();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -798,6 +1214,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_cuda_input_batch_settle();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -808,6 +1225,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_cuda_input_batch_settle();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -817,6 +1235,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_input_batch_settle();
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -842,9 +1261,21 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_cuda_input_batch_settle();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->lazy != nullptr) {
+        // only the committed granules exist
+        ggml_cuda_lazy_buffer * lz = ctx->lazy;
+        for (size_t g = 0; g < lz->mapped.size(); ++g) {
+            if (lz->mapped[g] == 1) {
+                CUDA_CHECK(cudaMemsetAsync((void *) (lz->base + g*lz->gran), value, lz->gran, cudaStreamPerThread));
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -883,6 +1314,37 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+    if (g_cuda_lazy_next) {
+        // LLAMA_KV_LAZY: reserve the range, commit nothing (see ggml_backend_cuda_lazy_commit_rows)
+        if (!ggml_cuda_info().devices[buft_ctx->device].vmm) {
+            GGML_LOG_ERROR("%s: LLAMA_KV_LAZY needs CUDA virtual memory management, which device %d does not report\n", __func__, buft_ctx->device);
+            return nullptr;
+        }
+        ggml_cuda_lazy_buffer * lz = new ggml_cuda_lazy_buffer();
+        lz->device          = buft_ctx->device;
+        lz->physical_device = ggml_cuda_get_physical_device(buft_ctx->device);
+        lz->gran            = ggml_cuda_info().devices[buft_ctx->device].vmm_granularity;
+        lz->size            = lz->gran * ((size + lz->gran - 1) / lz->gran);
+        if (cuMemAddressReserve(&lz->base, lz->size, 0, 0, 0) != CUDA_SUCCESS) {
+            GGML_LOG_ERROR("%s: reserving %.2f MiB of address space failed\n", __func__, lz->size / 1024.0 / 1024.0);
+            lz->base = 0;
+            delete lz;
+            return nullptr;
+        }
+        lz->mapped.assign(lz->size / lz->gran, 0);
+        if (const char * al = getenv("LLAMA_KV_LAZY_ALIAS"); al == nullptr || atoi(al) != 0) {
+            if (!lz->alias_all()) {
+                GGML_LOG_WARN("%s: could not alias the reserved range to a zero granule; reads of uncommitted rows will fault\n", __func__);
+            }
+        }
+        ggml_backend_cuda_buffer_context * lctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) lz->base);
+        lctx->lazy = lz;
+        g_cuda_lazy_buffers.push_back(lz);
+        GGML_LOG_INFO("%s: reserved %.2f MiB of address space for a lazily committed buffer on device %d (granule %.1f MiB)\n", __func__,
+                      size / 1024.0 / 1024.0, buft_ctx->device, lz->gran / 1024.0 / 1024.0);
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, lctx, size);
+    }
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -2987,8 +3449,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
     bool is_ok = true;
     // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
-        return true;
+    if (is_topk_moe && (ggml_nrows(cgraph->nodes[node_idx]) == 1 || (ggml_nrows(cgraph->nodes[node_idx]) <= 4 && ggml_cuda_topk_moe_small_rows()))) {
+        return true;   // G30: 2-4 rows share one block, the kernel waits at a barrier between its reads and its writes (topk-moe.cu)
     }
 
     for (int i = 0; i < out_count; ++i) {
@@ -4018,6 +4480,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    int  dbg_eval_nodes = 0; // nodes launched by this evaluation (LLAMA_CUDA_DEBUG_FREE_AT_NODE)
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4185,6 +4648,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                g_dbg_nodes_launched.fetch_add(1, std::memory_order_relaxed);
+                if (!use_cuda_graph && cgraph->n_nodes >= 800 && ggml_cuda_dbg_free_at() >= 0 && dbg_eval_nodes++ == ggml_cuda_dbg_free_at()) {
+                    void * dbg_p = nullptr;
+                    if (cudaMalloc(&dbg_p, 4u << 20) == cudaSuccess) {
+                        CUDA_CHECK(cudaFree(dbg_p));
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -4255,6 +4727,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_input_batch_before_compute(cuda_ctx->stream());
+    g_dbg_in_compute.store(1, std::memory_order_relaxed);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4282,7 +4756,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
+                if (properties_changed || ggml_cuda_dbg_force_graph_reset()) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
@@ -4307,6 +4781,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+    g_dbg_in_compute.store(0, std::memory_order_relaxed);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4805,12 +5280,15 @@ bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
     }();
     if (copy_mode == 2) {
         for (size_t i = 0; i < count; ++i) {
+            g_dbg_aux_idx.store((int) i + 1, std::memory_order_relaxed);
             const cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream);
             if (e != cudaSuccess) {
+                g_dbg_aux_idx.store(0, std::memory_order_relaxed);
                 (void) cudaGetLastError();
                 return false;
             }
         }
+        g_dbg_aux_idx.store(0, std::memory_order_relaxed);
         return true;
     }
     // same attribute shape as ggml_backend_cuda_copy_batch_async; the hybrid
@@ -4868,6 +5346,22 @@ bool ggml_backend_cuda_register_host_range(const void * ptr, size_t nbytes, char
         err[0] = '\0';
     }
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    {
+        // G32q: a range whose first and last byte are page-locked host memory already (the hybrid engine pinned it) is reported exactly as the driver reports it -- "already mapped" -- without asking
+        // the driver to register it a second time, which would only return that error (and make every sanitizer run count it)
+        cudaPointerAttributes a0, a1;
+        const bool pin0 = cudaPointerGetAttributes(&a0, ptr) == cudaSuccess && a0.type == cudaMemoryTypeHost;
+        const bool pin1 = pin0 && nbytes > 0 && cudaPointerGetAttributes(&a1, (const char *) ptr + (nbytes - 1)) == cudaSuccess && a1.type == cudaMemoryTypeHost;
+        (void) cudaGetLastError();
+        if (pin0 && pin1) {
+            if (err != nullptr && err_len > 0) {
+                snprintf(err, err_len, "part or all of the requested memory range is already mapped");
+            }
+            return false;
+        }
+    }
+#endif
     cudaError_t e = cudaHostRegister(const_cast<void *>(ptr), nbytes,
                                      cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (e != cudaSuccess) {

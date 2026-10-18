@@ -452,6 +452,10 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
     }
 }
 
+void ggml_cpu_swiglu_f32(int n, float * y, const float * gate, const float * up) {
+    ggml_vec_swiglu_f32(n, y, gate, up);
+}
+
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
     int i = 0;
     ggml_float sum = 0;

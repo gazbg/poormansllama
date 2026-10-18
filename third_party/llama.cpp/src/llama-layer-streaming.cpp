@@ -21,6 +21,8 @@
 #ifdef LLAMA_LAYER_STREAMING
 
 #include "llama-layer-streaming.h"
+#include "llama-moe-hybrid.h"
+#include "llama-ls-segments.h"
 #include "llama-expert-split-policy.h"
 
 #include <chrono>
@@ -1477,11 +1479,13 @@ struct llama_layer_streaming::af_worker {
     std::thread             thread;
     std::mutex              mtx;
     std::condition_variable cv;
+    std::condition_variable cv_stage;   // G22 stage B: a paced stage finished issuing (slot.stage_il cleared)
     std::deque<int>         queue;      // logical layers to stage
     // slots the main thread has released (consumer done) and the worker may
     // fill; index = slot id, value = true when free
     std::vector<uint8_t>    free_slot;
     bool                    stop = false;
+    bool                    busy = false;   // G22: a popped request is being processed
     llama_layer_streaming * owner = nullptr;
 
     // stats (guarded by mtx)
@@ -1500,8 +1504,16 @@ struct llama_layer_streaming::af_worker {
                 if (stop && queue.empty()) {
                     return;
                 }
-                il = queue.front();
-                queue.pop_front();
+                if (owner->pp_copy_piece_bytes > 0 || owner->has_cpu_leg()) {
+                    // G22: serve the bank that is needed first
+                    auto it = std::min_element(queue.begin(), queue.end());
+                    il = *it;
+                    queue.erase(it);
+                } else {
+                    il = queue.front();
+                    queue.pop_front();
+                }
+                busy = true;
             }
             const int64_t t0 = ggml_time_us();
             const bool ok = owner->af_submit_copy(il);
@@ -1516,7 +1528,9 @@ struct llama_layer_streaming::af_worker {
                 } else {
                     n_err++;
                 }
+                busy = false;
             }
+            cv_stage.notify_all();
         }
     }
 };
@@ -1526,15 +1540,45 @@ void llama_layer_streaming::af_worker_deleter::operator()(af_worker * w) const {
 }
 
 int llama_layer_streaming::af_next_layer(int il) const {
-    if (exec_layers.empty()) {
-        return il + 1 < n_layer ? il + 1 : -1;
-    }
-    for (size_t i = 0; i < exec_layers.size(); ++i) {
-        if (exec_layers[i] == il) {
-            return i + 1 < exec_layers.size() ? exec_layers[i + 1] : -1;
+    auto step = [&](int from) -> int {
+        if (exec_layers.empty()) {
+            return from + 1 < n_layer ? from + 1 : -1;
         }
+        for (size_t i = 0; i < exec_layers.size(); ++i) {
+            if (exec_layers[i] == from) {
+                return i + 1 < exec_layers.size() ? exec_layers[i + 1] : -1;
+            }
+        }
+        return -1;
+    };
+    int nxt = step(il);
+    while (nxt >= 0 && is_cpu_leg(nxt)) {   // G22: a CPU-leg layer streams nothing, the feed skips it
+        nxt = step(nxt);
     }
-    return -1;
+    return nxt;
+}
+
+bool llama_layer_streaming::set_pp_cpu_layers(const std::vector<int> & layers) {
+    pp_cpu_leg.assign((size_t) n_layer, 0);
+    for (int il : layers) {
+        if (il < 0 || il >= n_layer) {
+            error_msg = "set_pp_cpu_layers: layer " + std::to_string(il) + " out of range [0, " + std::to_string(n_layer) + ")";
+            pp_cpu_leg.clear();
+            return false;
+        }
+        pp_cpu_leg[(size_t) il] = 1;
+    }
+    if (tel_out != nullptr) {
+        std::string lst;
+        for (int il = 0; il < n_layer; ++il) {
+            if (pp_cpu_leg[(size_t) il] != 0) {
+                lst += (lst.empty() ? "" : ",") + std::to_string(il);
+            }
+        }
+        tel_write(tel_out, "{\"event\":\"pp_cpu_layers\",\"run_id\":%llu,\"layers\":\"%s\",\"t_us\":%lld}",
+            (unsigned long long) run_id, lst.c_str(), (long long) ggml_time_us());
+    }
+    return true;
 }
 
 // T-GPLR-37: direct mmap-sourced staging helpers. The registered span is the
@@ -2020,7 +2064,7 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
                                           llama_layer_streaming_slot & slot,
                                           char * pool_base, size_t pool_bytes, bool pool_valid,
                                           char * staging, size_t * staged_out,
-                                          int * submit_batch_out) {
+                                          int * submit_batch_out, bool paced) {
     // T-GPLR-56 A3: paced registration is issued HERE, before a single copy for
     // this layer is enqueued, so the group covering a bounded distance ahead of
     // the sweep is locked (and its deferred commit started) while this layer's
@@ -2065,17 +2109,42 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
     // backend's context, so every staging/compute ordering wait is
     // intra-context. A missing compute backend with the flag on is a loud
     // failure — never a silent fallback to the serialized path.
-    auto submit = [&](ggml_tensor * dst_t, const void * src_p, size_t bytes) -> bool {
+    // G22 stage B: one H2D of `len` bytes at byte offset `off` of the member (off == 0 and len == bytes is the historical single command)
+    auto issue_range = [&](ggml_tensor * dst_t, const void * src_p, size_t off, size_t len) -> bool {
         if (pp_copy_overlap) {
             if (backend_compute == nullptr) {
                 error_msg = "copy-overlap is on but the CUDA compute backend is unresolved; "
                             "refusing to fall back to the copy-stream staging path";
                 return false;
             }
-            ggml_backend_cuda_memcpy_1d_aux(backend_compute, (char *) dst_t->data, src_p, bytes);
+            ggml_backend_cuda_memcpy_1d_aux(backend_compute, (char *) dst_t->data + off, (const char *) src_p + off, len);
             return true;
         }
-        ggml_backend_tensor_set_async(backend, dst_t, src_p, 0, bytes);
+        ggml_backend_tensor_set_async(backend, dst_t, (const char *) src_p + off, off, len);
+        return true;
+    };
+    uint32_t pace_issued  = 0;      // pieces issued for this bank (the ring index counts across the members)
+    double   pace_wait_us = 0.0;    // host time spent waiting for the event of piece i - window
+    const bool pace_on = paced && pp_copy_piece_bytes > 0 && !pace_ev.empty();
+    auto submit = [&](ggml_tensor * dst_t, const void * src_p, size_t bytes) -> bool {
+        if (!pace_on || bytes <= pp_copy_piece_bytes) {
+            return issue_range(dst_t, src_p, 0, bytes);
+        }
+        const uint32_t win = (uint32_t) pace_ev.size();
+        for (size_t off = 0; off < bytes; off += pp_copy_piece_bytes) {
+            const size_t len = std::min(pp_copy_piece_bytes, bytes - off);
+            if (pace_issued >= win) {
+                // at most `win` pieces in flight: wait for the piece issued `win` pieces ago
+                const int64_t tw0 = ggml_time_us();
+                ggml_backend_event_synchronize((ggml_backend_event_t) pace_ev[pace_issued % win]);
+                pace_wait_us += (double) (ggml_time_us() - tw0);
+            }
+            if (!issue_range(dst_t, src_p, off, len)) {
+                return false;
+            }
+            ls_stage_record(pace_ev[pace_issued % win]);
+            pace_issued++;
+        }
         return true;
     };
 
@@ -2144,6 +2213,10 @@ bool llama_layer_streaming::stage_members(ggml_backend_t backend,
     }
     recon_end_bank();
     *staged_out = staging_off;
+    if (pace_on) {
+        paced_pieces_last  = pace_issued;
+        paced_wait_us_last = pace_wait_us;
+    }
     if (submit_batch_out != nullptr) {
         *submit_batch_out = submit_batch_path;
     }
@@ -2164,6 +2237,13 @@ bool llama_layer_streaming::af_submit_copy(int il) {
     // thread's load_layer/wait_slot_ready/record_consumer_done)
     std::unique_lock<std::mutex> lk(af->mtx);
     llama_layer_streaming_slot & slot = slots[s];
+
+    // G22: a layer the slot already holds (staged earlier in this pass, consumed or not) needs no second copy. A stale duplicate request used to be caught only
+    // while the slot was still claimed (free_slot == 0); once the layer was consumed it was staged over itself. With paced copies (a worker busy for a whole bank)
+    // that happened late enough to run into the slot teardown after the prefill (CUDA "invalid argument"). Gated so that the historical path is untouched.
+    if (slot.logical_layer == il && slot.generation > 0) {   // G29: unconditional (was gated to the paced / CPU-leg modes; see the note at the top of this edit script)
+        return true;
+    }
 
     // the slot must have been released by the main thread (consumer done).
     // A slot that already holds THIS logical layer resident (preload or a
@@ -2245,9 +2325,22 @@ bool llama_layer_streaming::af_submit_copy(int il) {
     char * staging = slot.buf_staging ? (char *) ggml_backend_buffer_get_base(slot.buf_staging.get()) : nullptr;
     size_t staging_off = 0;
     int sb_path_af = 0; // T-GPLR-33: the taken submission path (0/1/2)
+    // G22 stage B: a paced bank blocks this thread for the length of the DMA (it waits for the event of piece i-window), so the shared mutex is
+    // released around it. The slot is marked as being staged: load_layer / wait_slot_ready of this slot wait on cv_stage (a second stager, the main
+    // thread's on-demand path, would write the same bank). Everything else the paced section touches is private to this thread.
+    const bool paced = pp_copy_piece_bytes > 0 && !pace_ev.empty();
+    if (paced) {
+        slot.stage_il = il;
+        lk.unlock();
+    }
     const bool staged_ok = stage_members(backend_copy, pkg, slot.layers.at(il), il, gen, slot,
                                          pool_base, pool_bytes, pool_valid, staging, &staging_off,
-                                         &sb_path_af);
+                                         &sb_path_af, paced);
+    if (paced) {
+        lk.lock();
+        slot.stage_il = -1;
+        af->cv_stage.notify_all();
+    }
     pp_pool_release(il, pool_base, staging_off, staged_ok);
     if (!staged_ok) {
         return false;
@@ -2374,6 +2467,88 @@ bool llama_layer_streaming::set_pp_copy_overlap(bool on) {
     // run that asked for overlap but cannot get it fails loudly.
     pp_copy_overlap = on;
     return true;
+}
+
+// G22 stage B: paced bank copies (see the header). The pacing events live on the copy device, so this needs init(); the async-feed worker is the only
+// issuer, so the ring needs no lock. A queue depth of 2 lets one request wait while the worker is busy with a whole bank.
+bool llama_layer_streaming::set_pp_copy_pacing(size_t piece_bytes, int window) {
+    if (piece_bytes == 0) {
+        pp_copy_piece_bytes = 0;
+        return true;
+    }
+    if (piece_bytes < ((size_t) 1 << 20) || window < 1 || window > 16) {
+        error_msg = "set_pp_copy_pacing: the piece must be at least 1 MiB and the window 1..16";
+        return false;
+    }
+    if (backend_copy == nullptr) {
+        error_msg = "set_pp_copy_pacing: the copy backend is not initialised (call after init)";
+        return false;
+    }
+    if (!pace_ev.empty()) {
+        error_msg = "set_pp_copy_pacing: already configured";
+        return false;
+    }
+    ggml_backend_dev_t dev_copy = ggml_backend_get_device(backend_copy);
+    for (int i = 0; i < window; ++i) {
+        ggml_backend_event_t ev = ggml_backend_event_new(dev_copy);
+        if (ev == nullptr) {
+            for (void * e : pace_ev) {
+                ggml_backend_event_free((ggml_backend_event_t) e);
+            }
+            pace_ev.clear();
+            error_msg = "set_pp_copy_pacing: event creation failed";
+            return false;
+        }
+        pace_ev.push_back((void *) ev);
+    }
+    pp_copy_piece_bytes = piece_bytes;
+    pp_copy_window      = window;
+    if (af != nullptr) {
+        std::lock_guard<std::mutex> lk(af->mtx);
+        af_depth = std::max(af_depth, 2);
+    }
+    tel_write(tel_out, "{\"event\":\"pp_copy_pacing\",\"run_id\":%llu,\"piece_bytes\":%zu,\"window\":%d,\"t_us\":%lld}",
+        (unsigned long long) run_id, piece_bytes, window, (long long) ggml_time_us());
+    return true;
+}
+
+void llama_layer_streaming::af_wait_idle() {
+    if (!af) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(af->mtx);
+    af->cv_stage.wait(lk, [this] { return af->queue.empty() && !af->busy; });
+}
+
+void llama_layer_streaming::af_push(int il) {
+    if (!af) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(af->mtx);
+    const bool exact = pp_copy_piece_bytes > 0 || has_cpu_leg();
+    if (!exact && af->queue.size() >= (size_t) af_depth) {
+        return;
+    }
+    if (exact && std::find(af->queue.begin(), af->queue.end(), il) != af->queue.end()) {
+        return;   // a layer that is already queued is not queued twice; the queue is not bounded in these modes (a request is a distinct bank)
+    }
+    af->queue.push_back(il);
+    af->cv.notify_one();
+}
+
+// G28: segmented layer-major prefill (see the header). Before init(): the slab is sized from it.
+bool llama_layer_streaming::set_pp_segment_tokens(int64_t tokens) {
+    if (tokens < 0) {
+        error_msg = "set_pp_segment_tokens: negative size";
+        return false;
+    }
+    pp_seg_tokens = tokens;
+    return true;
+}
+
+void llama_layer_streaming::tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end) {
+    tel_write(tel_out, "{\"event\":\"pp_segment\",\"run_id\":%llu,\"seg\":%lld,\"n_segs\":%lld,\"chunk_begin\":%lld,\"chunk_end\":%lld,\"t_us\":%lld}",
+        (unsigned long long) run_id, (long long) seg, (long long) n_segs, (long long) chunk_begin, (long long) chunk_end, (long long) ggml_time_us());
 }
 
 bool llama_layer_streaming::set_pp_recon(bool on) {
@@ -2916,6 +3091,11 @@ void llama_layer_streaming::tel_async_feed_init(int depth, int n_slots_) {
 }
 
 void llama_layer_streaming::tel_async_feed_submit(int il, int slot, uint32_t generation) {
+    if (pp_copy_piece_bytes > 0) {
+        tel_write(tel_out, "{\"event\":\"async_feed_submit\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,\"generation\":%u,\"phase\":%d,\"pieces\":%u,\"pace_wait_us\":%.1f,\"t_us\":%lld}",
+            (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation, phase, paced_pieces_last, paced_wait_us_last, (long long) ggml_time_us());
+        return;
+    }
     tel_write(tel_out, "{\"event\":\"async_feed_submit\",\"run_id\":%llu,\"ubatch\":%llu,\"layer\":%d,\"slot\":%d,\"generation\":%u,\"phase\":%d,\"t_us\":%lld}",
         (unsigned long long) run_id, (unsigned long long) n_ubatches, il, slot, generation, phase, (long long) ggml_time_us());
 }
@@ -3121,6 +3301,10 @@ llama_layer_streaming::~llama_layer_streaming() {
             slot.ev_af_gate = nullptr;
         }
     }
+    for (void * e : pace_ev) {
+        ggml_backend_event_free((ggml_backend_event_t) e);
+    }
+    pace_ev.clear();
     if (ctx_handoff != nullptr) {
         ggml_free(ctx_handoff);
         ctx_handoff = nullptr;
@@ -3473,7 +3657,9 @@ bool llama_layer_streaming::init(const llama_model & model, int n_slots_, int de
     // use buf_act).
     if (schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
         const size_t slab_elt = ggml_type_size(act_slab_dtype);
-        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) pp_tokens * slab_elt;
+        // G28: with --pp-segment-tokens one slab half holds ONE segment, not the whole prompt
+        slab_tokens = ls_slab_tokens(pp_tokens, pp_seg_tokens);
+        const size_t slab_half_bytes = (size_t) n_embd_io * (size_t) slab_tokens * slab_elt;
         buf_slab.reset(ggml_backend_buft_alloc_buffer(buft_cuda, 2 * slab_half_bytes));
         if (!buf_slab) {
             error_msg = "failed to allocate layer-major activation slabs (" +
@@ -3678,7 +3864,10 @@ static bool slab_slice(llama_layer_streaming & ls, ggml_context * ctx, int which
         return false;
     }
     const size_t slice_bytes = region.bytes;
-    const size_t half_bytes  = region.half;
+    // G28: with segments one slab half holds ONE segment (slab_tokens tokens), not the whole prompt that region.half sums; without them the two are the same number
+    const size_t half_bytes  = (ls.pp_seg_tokens > 0 && ls.slab_tokens > 0)
+        ? (size_t) ls.slab_tokens * (size_t) ls.n_embd_io * ggml_type_size(ls.act_slab_dtype)
+        : region.half;
     if (off + slice_bytes > half_bytes) {
         ls.error_msg = "layer-major activation slab " + std::string(which ? "B" : "A") + " exhausted (" +
                        std::to_string(off + slice_bytes) + ">" + std::to_string(half_bytes) + ")";
@@ -3829,11 +4018,14 @@ llama_layer_streaming::graph_set * llama_layer_streaming::begin_set(int mode, in
                     tel_act_bind(chunk_id, 1, off_B, n_tokens);
                 } else if (chunk_id == 0) {
                     const size_t slab_elt = ggml_type_size(act_slab_dtype);
-                    size_t off_walk = 0;
+                    // G28: without --pp-segment-tokens seg_chunks_walk is <= 0 and these are the historical cumulative offsets (one segment); with it the offsets restart at every segment
+                    // boundary (the slices of different segments alias by design) and every bind carries its segment index so the checker judges aliasing per segment
+                    const int64_t seg_chunks_walk = ls_segment_chunks(pp_seg_tokens, chunks.empty() ? 0 : chunks[0].n_tokens, (int64_t) chunks.size());
+                    const std::vector<size_t> walk_off = ls_segment_slab_offsets(chunks.data(), chunks.size(), seg_chunks_walk, (int64_t) n_embd_io, slab_elt);
                     for (size_t c = 0; c < chunks.size(); ++c) {
-                        tel_act_bind((int32_t) c, 0, off_walk, chunks[c].n_tokens);
-                        tel_act_bind((int32_t) c, 1, off_walk, chunks[c].n_tokens);
-                        off_walk += (size_t) chunks[c].n_tokens * (size_t) n_embd_io * slab_elt;
+                        const int64_t seg_of = seg_chunks_walk > 0 ? ls_segment_of((int64_t) c, seg_chunks_walk) : -1;
+                        tel_act_bind((int32_t) c, 0, walk_off[c], chunks[c].n_tokens, seg_of);
+                        tel_act_bind((int32_t) c, 1, walk_off[c], chunks[c].n_tokens, seg_of);
                     }
                 }
             }
@@ -4030,6 +4222,10 @@ bool llama_layer_streaming::load_layer(int il, bool & copied) {
     } af_guard{af_lk, this};
 
     llama_layer_streaming_slot & slot = slots[il % n_slots];
+    // G22 stage B: the worker may be issuing a paced bank into this very slot with the mutex released; staging it a second time would write the bank twice
+    while (af && slot.stage_il != -1) {
+        af->cv_stage.wait(af_lk);
+    }
 
     // T-GPLR-16: partial handoff — identical no-copy handling to the full
     // handoff branch below. Migrating banks (il >= partial_from) are
@@ -4234,6 +4430,10 @@ bool llama_layer_streaming::wait_slot_ready(int il, double & wait_us, double & h
     }
 
     llama_layer_streaming_slot & slot = slots[il % n_slots];
+    // G22 stage B: bookkeeping of a paced bank is published when its last piece is issued
+    while (af && slot.stage_il != -1) {
+        af->cv_stage.wait(af_lk);
+    }
 
     if (slot.logical_layer != il) {
         error_msg = "wait_slot_ready: slot " + std::to_string(il % n_slots) +
@@ -4535,6 +4735,26 @@ int64_t llama_layer_major_pp_first_token(llama_context * ctx) {
     return ctx->layer_major_pp_first_token();
 }
 
+int llama_layer_major_pp_topk(llama_context * ctx, int k, int64_t * ids, float * vals) {
+    return ctx->layer_major_pp_topk(k, ids, vals);
+}
+
+bool llama_moe_hybrid_resize(int n_slot) {
+    return llama_moe_hybrid_resize_impl(n_slot);
+}
+
+bool llama_moe_hybrid_cache_info(int64_t * cache_bytes, int * n_slot) {
+    return llama_moe_hybrid_cache_info_impl(cache_bytes, n_slot);
+}
+
+int64_t llama_layer_streaming_reserve_decode(llama_context * ctx) {
+    return ctx->reserve_for_decode();
+}
+
+int64_t llama_layer_streaming_reserve_ubatch(llama_context * ctx, uint32_t n_ubatch) {
+    return ctx->reserve_ubatch(n_ubatch);
+}
+
 // T-GPLR-03: argmax of the last output row of the PP logits. The layer-major
 // controller exposes the last chunk's result tensors on gf_res_prev but never
 // fills the context's host logits buffer (it bypasses decode()), so read the
@@ -4563,6 +4783,100 @@ int64_t llama_context::layer_major_pp_first_token() {
         }
     }
     return best;
+}
+
+// Opt-in diagnostics: the same last-row read as layer_major_pp_first_token, but
+// returning the top-k (id, logit) pairs so two engines can be compared at the
+// logit level instead of by first-token identity. Read-only.
+int llama_context::layer_major_pp_topk(int k, int64_t * ids, float * vals) {
+    if (gf_res_prev == nullptr || k <= 0 || ids == nullptr || vals == nullptr) {
+        return -1;
+    }
+    ggml_tensor * t = gf_res_prev->get_logits();
+    if (t == nullptr || t->data == nullptr || t->ne[0] <= 0 || t->ne[1] <= 0) {
+        return -1;
+    }
+    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+    if (backend_res == nullptr) {
+        return -1;
+    }
+    const int64_t n_vocab = t->ne[0];
+    const int64_t n_out   = t->ne[1];
+    std::vector<float> row((size_t) n_vocab);
+    ggml_backend_tensor_get(t, row.data(), (size_t) (n_out - 1) * t->nb[1], (size_t) n_vocab * sizeof(float));
+    const int kk = (int) std::min<int64_t>((int64_t) k, n_vocab);
+    std::vector<int64_t> idx((size_t) n_vocab);
+    for (int64_t v = 0; v < n_vocab; ++v) {
+        idx[(size_t) v] = v;
+    }
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&row](int64_t a, int64_t b) {
+        return row[(size_t) a] > row[(size_t) b];
+    });
+    for (int i = 0; i < kk; ++i) {
+        ids[i]  = idx[(size_t) i];
+        vals[i] = row[(size_t) idx[(size_t) i]];
+    }
+    return kk;
+}
+
+// Opt-in (--tg-release-compute), see llama-context.h. Everything prefill put in the scheduler's compute buffers is dead once the
+// last prefill logits have been read, and a single-token decode needs a small fraction of it, so the worst-case reserve is redone
+// for n_ubatch = 1. The old scheduler, and with it the old compute buffers, is freed by the reset inside sched_reserve().
+int64_t llama_context::reserve_for_decode() {
+    if (!sched) {
+        return -1;
+    }
+    synchronize();
+    auto total = [this]() {
+        size_t s = 0;
+        for (ggml_backend_t b : backend_ptrs) {
+            s += ggml_backend_sched_get_buffer_size(sched.get(), b);
+        }
+        return s;
+    };
+    const size_t before = total();
+    // the widest decode step is an MTP verify step, the frontier plus n_rs_seq drafts; the recurrent memory splits with n_keep_tail = n_rs_seq + 1 and asserts n_ubatch > n_keep_tail,
+    // so the ubatch must be one larger than that step (n_rs_seq is 0 without --mtp: 1 as before)
+    cparams.n_ubatch   = cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 1;
+    sched_need_reserve = true;
+    sched_reserve();
+    return (int64_t) before - (int64_t) total();
+}
+
+// G31: see llama-context.h
+void llama_context::set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data) {
+    cparams.cb_eval           = cb;
+    cparams.cb_eval_user_data = user_data;
+    if (sched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb, user_data);
+    }
+}
+
+void llama_context::drop_graph_reuse() {
+    synchronize();
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+// G30: reserve_for_decode with an explicit ubatch, for the MTP draft context: its prompt catch-up decodes up to 512 rows (a 296 MiB compute buffer), its rounds at most 2 + draft rows.
+int64_t llama_context::reserve_ubatch(uint32_t n_ubatch_new) {
+    if (!sched || n_ubatch_new < 1) {
+        return -1;
+    }
+    synchronize();
+    auto total = [this]() {
+        size_t s = 0;
+        for (ggml_backend_t b : backend_ptrs) {
+            s += ggml_backend_sched_get_buffer_size(sched.get(), b);
+        }
+        return s;
+    };
+    const size_t before = total();
+    cparams.n_ubatch   = n_ubatch_new;
+    sched_need_reserve = true;
+    sched_reserve();
+    return (int64_t) before - (int64_t) total();
 }
 
 // One owner for the structured failure shape (error_msg -> failed -> error
@@ -6172,6 +6486,21 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     const bool    output_all = cparams.embeddings;
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
     const int64_t n_chunks = ls->n_chunks;
+    // G28: chunks per segment. Without --pp-segment-tokens (the default) this is n_chunks: ONE segment, the historical order. With it the stages below (embed, preload, sweep over all layers,
+    // output) run per segment against a slab that holds one segment; per layer the chunks are still visited in ascending order, so the arithmetic is unchanged.
+    int64_t seg_chunks = n_chunks;
+    if (ls->pp_seg_tokens > 0 && n_chunks > 1) {
+        const int64_t sc = ls_segment_chunks(ls->pp_seg_tokens, ls->chunks.empty() ? 0 : ls->chunks[0].n_tokens, n_chunks);
+        if (sc < 1 || !ls->pw_probe) {
+            ls->error_msg = "layer_major_pp: --pp-segment-tokens " + std::to_string((long long) ls->pp_seg_tokens) +
+                            " is not a positive multiple of the chunk width, or the per-width sets (pw_probe) are off";
+            ls->failed = true;
+            ret = GGML_STATUS_FAILED;
+            return -2;
+        }
+        seg_chunks = sc;
+    }
+    const int64_t n_segs = seg_chunks > 0 ? (n_chunks + seg_chunks - 1) / seg_chunks : 1;   // seg_chunks == 0 only for an empty chunk list, which the guard below refuses
     // T-GPLR-41: identify which --pp-repeat pass this controller invocation is
     // (1-based). Monotonic across the process: the runner invokes layer_major_pp
     // exactly once per prefill pass, so the counter equals the pass number.
@@ -6194,7 +6523,10 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     std::vector<const llama_ubatch *>     chunk_ubatch(n_chunks);
     std::vector<llama_layer_streaming::graph_set *> sets(n_chunks);
     std::vector<std::vector<uint8_t>> chunk_input_snap(n_chunks); // T-Q38PW-00 probe snapshots
-    for (int64_t c = 0; c < n_chunks; ++c) {
+    // G28: the apply loop is a lambda over a chunk range. The historical call right after it applies the chunks of the first segment (all chunks without --pp-segment-tokens), at the same
+    // place and in the same order as before; later segments are applied when they start.
+    auto apply_chunks = [&](int64_t c_begin, int64_t c_end) -> int {
+    for (int64_t c = c_begin; c < c_end; ++c) {
         // T-Q38CTX-01: build the chunk from its immutable descriptor (real
         // width + token_start) so the final tail chunk is a real 1..ubatch
         // token chunk, never a padded one.
@@ -6377,6 +6709,14 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
             }
         }
     }
+    return 0;
+    };
+    {
+        const int ar = apply_chunks(0, std::min<int64_t>(n_chunks, seg_chunks));
+        if (ar != 0) {
+            return ar;
+        }
+    }
 
     // locate the CUDA compute backend (for copy-event ordering)
     ggml_backend_t backend_cuda = nullptr;
@@ -6402,6 +6742,63 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         ls->error_msg = "layer-major PP: copy-overlap requested but the compute backend's CUDA context has no auxiliary stream";
         ret = GGML_STATUS_FAILED;
         return -2;
+    }
+
+    // G28b: reserve the scheduler's compute buffers for the LARGEST graph of every built phase-0 set BEFORE the first graph of this pass executes. The persistent graphs keep the tensor addresses they got
+    // at their first allocation (ggml_gallocr_init_tensor only assigns when data is NULL), so a compute buffer that grows LATER (the output graph, which holds the logits, is the largest and runs last) frees the
+    // old buffer under every graph that already ran. One sweep never notices; a second sweep (the next segment) reads freed memory ("invalid argument" in the first copy of layer 1). Only with segments.
+    if (ls->pp_seg_tokens > 0 && n_segs > 1) {
+        const int n_be = ggml_backend_sched_get_n_backends(sched.get());
+        std::vector<size_t>        best(n_be, 0);
+        std::vector<ggml_cgraph *> best_g(n_be, nullptr);
+        std::vector<size_t>        sizes(n_be, 0);
+        // split_graph rewires node sources when it introduces cross-backend copies (the copies live in the scheduler's context, freed on the next reset): snapshot and restore, as run_graph does
+        auto with_pristine_graph = [&](ggml_cgraph * g, auto && fn) {
+            std::vector<ggml_tensor *> saved((size_t) g->n_nodes * GGML_MAX_SRC);
+            for (int k = 0; k < g->n_nodes; ++k) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) saved[(size_t) k * GGML_MAX_SRC + j] = g->nodes[k]->src[j];
+            }
+            fn();
+            for (int k = 0; k < g->n_nodes; ++k) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) g->nodes[k]->src[j] = saved[(size_t) k * GGML_MAX_SRC + j];
+            }
+        };
+        for (auto & s : ls->sets) {
+            if (!s.built || s.mode != 0) {
+                continue;
+            }
+            for (ggml_cgraph * g : s.graphs) {
+                if (g == nullptr) {
+                    continue;
+                }
+                std::fill(sizes.begin(), sizes.end(), (size_t) 0);
+                with_pristine_graph(g, [&]() { ggml_backend_sched_reserve_size(sched.get(), g, sizes.data()); });
+                for (int b = 0; b < n_be; ++b) {
+                    if (sizes[b] > best[b]) {
+                        best[b]   = sizes[b];
+                        best_g[b] = g;
+                    }
+                }
+            }
+        }
+        ggml_cgraph * last_reserved = nullptr;
+        for (int b = 0; b < n_be; ++b) {
+            if (best_g[b] == nullptr || best_g[b] == last_reserved) {
+                continue;
+            }
+            bool ok = true;
+            with_pristine_graph(best_g[b], [&]() { ok = ggml_backend_sched_reserve(sched.get(), best_g[b]); });
+            if (!ok) {
+                ls->error_msg = "layer_major_pp: G28b scheduler pre-reserve failed (backend " + std::to_string(b) + ", " + std::to_string((unsigned long long) best[b]) + " B)";
+                ls->failed = true;
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return -2;
+            }
+            last_reserved = best_g[b];
+            LLAMA_LOG_INFO("%s: G28b: scheduler pre-reserved for the largest phase-0 graph (backend %d needs %.1f MiB)\n", __func__, b, best[b] / 1048576.0);
+        }
+        ggml_backend_sched_reset(sched.get());
     }
 
     auto should_exec = [&](int il) -> bool {
@@ -6476,11 +6873,12 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     if (ls->pw_probe) {
         const size_t slab_elt = ggml_type_size(ls->act_slab_dtype);
         slab_base = ggml_backend_buffer_get_base(ls->buf_slab.get());
-        slab_half = (size_t) ls->n_embd_io * (size_t) ls->pp_tokens * slab_elt;
-        size_t off = 0;
-        for (int c = 0; c < n_chunks; ++c) {
-            slab_off_c[c] = off;
-            off += (size_t) ls->chunks[c].n_tokens * (size_t) ls->n_embd_io * slab_elt;
+        // G28: one slab half holds one SEGMENT (slab_tokens tokens: the whole prompt without --pp-segment-tokens); the offsets restart at every segment boundary
+        slab_half = (size_t) ls->n_embd_io * (size_t) ls->slab_tokens * slab_elt;
+        slab_off_c = ls_segment_slab_offsets(ls->chunks.data(), ls->chunks.size(), seg_chunks, (int64_t) ls->n_embd_io, slab_elt);
+        if (slab_off_c.size() != (size_t) n_chunks) {
+            ret = GGML_STATUS_FAILED;
+            return -2;
         }
     }
 
@@ -6552,9 +6950,42 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         return true;
     };
 
+    // G22: the controller calls the scheduler directly, so the CPU backend would keep its default thread count; a CPU-leg layer needs the batch count
+    if (ls->has_cpu_leg()) {
+        for (const auto & fn : set_n_threads_fns) {
+            fn.second(fn.first, (int) cparams.n_threads_batch);
+        }
+        if (ls->af) {
+            // several copies are requested ahead while the CPU computes (the feed queue is 1-deep by default and drops a request that finds it full)
+            std::lock_guard<std::mutex> lk(ls->af->mtx);
+            ls->af_depth = std::max<int>(ls->af_depth, ls->n_slots);
+        }
+    }
+
+    // G28: one iteration over all chunks without --pp-segment-tokens (the historical order); with it, stages 1-4 run once per segment
+    for (int64_t seg = 0; seg < n_segs; ++seg) {
+    const int64_t seg_c0 = seg * seg_chunks;
+    const int64_t seg_c1 = std::min<int64_t>(n_chunks, seg_c0 + seg_chunks);
+    if (seg > 0) {
+        // the previous segment is complete for every layer: release its memory contexts and input snapshots, then apply this segment's chunks (the KV cells and the recurrent state
+        // continue where the previous segment left them, exactly as across chunks)
+        for (int64_t cp = seg_c0 - seg_chunks; cp < seg_c0; ++cp) {
+            chunk_mctx[cp].reset();
+            chunk_ubatch[cp] = nullptr;
+            std::vector<uint8_t>().swap(chunk_input_snap[cp]);
+        }
+        const int ar = apply_chunks(seg_c0, seg_c1);
+        if (ar != 0) {
+            return ar;
+        }
+    }
+    if (n_segs > 1) {
+        ls->tel_pp_segment(seg, n_segs, seg_c0, seg_c1);
+    }
+
     // 1. embed every chunk (writes slab A[c]); no slot work
     const int64_t t_led_embed0 = ggml_time_us();
-    for (int c = 0; c < n_chunks; ++c) {
+    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
         const int64_t t_p0 = ggml_time_us();
         if (!prepare_chunk(c)) {
             ret = GGML_STATUS_FAILED;
@@ -6577,15 +7008,29 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         }
         ls->n_ubatches++;
     }
-    led_embed = (double) (ggml_time_us() - t_led_embed0);
+    led_embed += (double) (ggml_time_us() - t_led_embed0);
 
     // 2. preload the first n_slots selected layers (overlap window)
     const int64_t t_led_pre0 = ggml_time_us();
     {
         int preloaded = 0;
         int last_pre = -1;
+        // G22: with CPU-leg layers two streamed layers can share a slot; preload the first streamed layer of each slot only
+        std::vector<uint8_t> slot_taken((size_t) ls->n_slots, 0);
         for (int il = 0; il < ls->n_layer && preloaded < ls->n_slots; ++il) {
-            if (!should_exec(il)) continue;
+            if (!should_exec(il) || ls->is_cpu_leg(il)) continue;
+            if (slot_taken[(size_t) (il % ls->n_slots)]) continue;
+            slot_taken[(size_t) (il % ls->n_slots)] = 1;
+            if (ls->pp_copy_piece_bytes > 0 && ls->has_cpu_leg() && ls->af) {
+                // G22: the preload banks go through the PACED feed worker: S unpaced banks queued by the main thread block the small copies of the first CPU-leg layers
+                // (build g43: layer 0 took 177 ms instead of 56)
+                std::lock_guard<std::mutex> lk(ls->af->mtx);
+                ls->af->queue.push_back(il);
+                ls->af->cv.notify_one();
+                last_pre = il;
+                preloaded++;
+                continue;
+            }
             bool copied = false;
             if (!ls->load_layer(il, copied)) {
                 ls->tel_error(ls->error_msg.c_str());
@@ -6610,52 +7055,53 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
             }
         }
     }
-    led_preload = (double) (ggml_time_us() - t_led_pre0);
+    led_preload += (double) (ggml_time_us() - t_led_pre0);
 
     // 3. layers on the outside, chunks on the inside (ascending chunk order)
     const int64_t t_led_sweep0 = ggml_time_us();
     for (int il = 0; il < ls->n_layer; ++il) {
         if (!should_exec(il)) continue;
+        const bool cpu_il = ls->is_cpu_leg(il);   // G22: no slot, no copy, no consumer event
 
         const int64_t t_slot0 = ggml_time_us();
-        const size_t req_bytes = ls->package_bytes(il);
-        const int64_t t_slotreq0 = ggml_time_us();
-        ls->tel_slot_request(il, ls->phase, req_bytes);
-        const double slotreq_span = (double) (ggml_time_us() - t_slotreq0);
-
-        bool copied = false;
-        if (!ls->load_layer(il, copied)) {
-            ls->tel_error(ls->error_msg.c_str());
-            ret = GGML_STATUS_FAILED;
-            return -2;
-        }
+        double slotreq_span = 0.0;
         double wait_us = 0.0, host_submit_us = 0.0, ready_latency_us = 0.0;
-        if (!ls->wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
-            ls->tel_error(ls->error_msg.c_str());
-            ret = GGML_STATUS_FAILED;
-            return -2;
-        }
-        // T-GPLR-25: with the async-feed worker on, the NEXT executed layer's
-        // copy is enqueued as soon as this layer's copy has been consumed —
-        // the worker submits it into the just-released next slot while every
-        // chunk of this layer computes. enqueue is a no-op when off.
-        {
-            const int nxt = ls->af_next_layer(il);
-            if (nxt >= 0 && ls->af) {
-                std::lock_guard<std::mutex> lk(ls->af->mtx);
-                if (ls->af->queue.size() < (size_t) ls->af_depth) {
-                    ls->af->queue.push_back(nxt);
-                    ls->af->cv.notify_one();
+        bool ready_at_consumption = true;
+        if (!cpu_il) {
+            const size_t req_bytes = ls->package_bytes(il);
+            const int64_t t_slotreq0 = ggml_time_us();
+            ls->tel_slot_request(il, ls->phase, req_bytes);
+            slotreq_span = (double) (ggml_time_us() - t_slotreq0);
+
+            bool copied = false;
+            if (!ls->load_layer(il, copied)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            if (!ls->wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            // T-GPLR-25: with the async-feed worker on, the NEXT executed layer's
+            // copy is enqueued as soon as this layer's copy has been consumed —
+            // the worker submits it into the just-released next slot while every
+            // chunk of this layer computes. enqueue is a no-op when off.
+            {
+                const int nxt = ls->af_next_layer(il);
+                if (nxt >= 0 && ls->af) {
+                    ls->af_push(nxt);
                 }
             }
+            ready_at_consumption = (wait_us < 100.0);
+            ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls->slots[il % ls->n_slots].ev_copy_ready);
         }
-        const bool ready_at_consumption = (wait_us < 100.0);
-        ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls->slots[il % ls->n_slots].ev_copy_ready);
         const int64_t t_slot1 = ggml_time_us();
 
         // run every chunk through this layer before the next layer starts
         double layer_compute_us = 0.0, layer_setup_us = 0.0;
-        for (int c = 0; c < n_chunks; ++c) {
+        for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
             const int64_t t_p0 = ggml_time_us();
             if (!prepare_chunk(c)) {
                 ret = GGML_STATUS_FAILED;
@@ -6709,11 +7155,17 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         // T-GPLR-39: the slot telemetry write inside the slot span, named so
         // `other` does not absorb it (per-layer, not ubatch-scaled).
         led_tel += slotreq_span;
-        ls->record_consumer_done(il, backend_cuda);
+        if (!cpu_il) {
+            ls->record_consumer_done(il, backend_cuda);
+        }
         ls->add_layer_stats(il, host_submit_us + ready_latency_us, wait_us, layer_compute_us, layer_setup_us,
                             layer_compute_us + layer_setup_us, ready_at_consumption);
-        const int next = il + ls->n_slots;
-        if (next < ls->n_layer && should_exec(next)) {
+        // G22: the successor in this slot is the next STREAMED layer of the same slot (a CPU-leg layer holds no slot)
+        int next = il + ls->n_slots;
+        while (next < ls->n_layer && ls->is_cpu_leg(next)) {
+            next += ls->n_slots;
+        }
+        if (!cpu_il && next < ls->n_layer && should_exec(next)) {
             if (ls->af) {
                 // T-GPLR-25 residue fix: single writer per copy. With the
                 // worker on, the just-freed slot's refill is enqueued (the
@@ -6721,11 +7173,7 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
                 // slot, which happened just above); the consumption-time
                 // load_layer remains the on-demand fallback when the worker
                 // refuses or the depth-1 queue was busy.
-                std::lock_guard<std::mutex> afd_lk(ls->af->mtx);
-                if (ls->af->queue.size() < (size_t) ls->af_depth) {
-                    ls->af->queue.push_back(next);
-                    ls->af->cv.notify_one();
-                }
+                ls->af_push(next);
             } else {
                 bool c2 = false;
                 if (!ls->load_layer(next, c2)) {
@@ -6737,11 +7185,11 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         }
         led_slot += (double) (ggml_time_us() - t_slot2);
     }
-    led_sweep = (double) (ggml_time_us() - t_led_sweep0);
+    led_sweep += (double) (ggml_time_us() - t_led_sweep0);
 
     // 4. output graph for every chunk (final norm + LM head; no slot work)
     const int64_t t_led_out0 = ggml_time_us();
-    for (int c = 0; c < n_chunks; ++c) {
+    for (int c = (int) seg_c0; c < (int) seg_c1; ++c) {
         const int64_t t_p0 = ggml_time_us();
         prepare_chunk(c);
         const int64_t t_p1 = ggml_time_us();
@@ -6758,9 +7206,30 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
             ret = st;
             return -2;
         }
+        if (ls->pp_nextn_dst != nullptr) {
+            // G30: the chunk's post-norm hidden rows for the MTP draft head (valid until the next graph is allocated; run_graph has synchronized)
+            ggml_tensor * hn = sets[c]->res->t_h_nextn;
+            const int64_t n_c  = ls->chunks[c].n_tokens;
+            const int64_t t0_c = ls->chunks[c].token_start;
+            if (hn == nullptr || hn->type != GGML_TYPE_F32 || hn->ne[0] != ls->pp_nextn_n_embd || hn->ne[1] != n_c || t0_c + n_c > ls->pp_nextn_cap) {
+                ls->error_msg = "layer_major_pp: the MTP hidden-row capture does not match the output graph (chunk " + std::to_string(c) + ", rows " +
+                                (hn ? std::to_string((long long) hn->ne[1]) : std::string("none")) + ", expected " + std::to_string((long long) n_c) + ")";
+                ls->failed = true;
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            ggml_backend_tensor_get(hn, ls->pp_nextn_dst + (size_t) t0_c * (size_t) ls->pp_nextn_n_embd, 0, ggml_nbytes(hn));
+            ls->pp_nextn_n = std::max<int64_t>(ls->pp_nextn_n, t0_c + n_c);
+        }
     }
-    led_output = (double) (ggml_time_us() - t_led_out0);
+    led_output += (double) (ggml_time_us() - t_led_out0);
+    }   // G28: end of the segment loop
 
+    // G22: with paced copies or a CPU leg a request can still be queued or in flight here; the worker must be idle before the slots can be torn down
+    if (ls->pp_copy_piece_bytes > 0 || ls->has_cpu_leg()) {
+        ls->af_wait_idle();
+    }
     // drain the copy stream so no copies are pending when the pass ends
     ls->ls_stage_drain();
 
@@ -7784,7 +8253,14 @@ void llama_layer_streaming::tel_route(int il, int64_t chunk, ggml_cgraph * g) {
         n_union, (unsigned long long) hash, sampled.c_str(), (long long) ggml_time_us());
 }
 
-void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens) {
+void llama_layer_streaming::tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg) {
+    if (seg >= 0) {
+        tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"seg\":%lld,\"t_us\":%lld}",
+            (unsigned long long) run_id, chunk_id, slab, off_bytes,
+            (size_t) n_tokens * n_embd_io * ggml_type_size(act_slab_dtype),
+            (long long) seg, (long long) ggml_time_us());
+        return;
+    }
     tel_write(tel_out, "{\"event\":\"act_bind\",\"run_id\":%llu,\"chunk\":%d,\"slab\":%d,\"off_bytes\":%zu,\"n_bytes\":%zu,\"t_us\":%lld}",
         (unsigned long long) run_id, chunk_id, slab, off_bytes,
         (size_t) n_tokens * n_embd_io * ggml_type_size(act_slab_dtype),
@@ -7894,6 +8370,23 @@ void llama_layer_streaming::tel_tg_logits(int step, int64_t top1_id, float top1_
         (unsigned long long) run_id, step, (long long) top1_id, (double) top1_logit,
         (long long) top2_id, (double) top2_logit, (double) (top1_logit - top2_logit),
         (long long) ggml_time_us());
+}
+
+// Opt-in (tg_logit_margin > 0): the top-n (id, logit) of the last prompt position,
+// one line per run. Read-only annotation; a default run's trace is unchanged.
+void llama_layer_streaming::tel_pp_last_logits(int n, const int64_t * ids, const float * vals) {
+    if (tel_out == nullptr || tg_logit_margin <= 0 || n <= 0) {
+        return;
+    }
+    std::string out = "{\"event\":\"pp_last_logits\",\"run_id\":" + std::to_string(run_id) + ",\"top\":[";
+    char buf[96];
+    for (int i = 0; i < n; ++i) {
+        snprintf(buf, sizeof(buf), "%s{\"id\":%lld,\"logit\":%.6f}", i > 0 ? "," : "",
+                 (long long) ids[i], (double) vals[i]);
+        out += buf;
+    }
+    out += "]}";
+    tel_write(tel_out, out.c_str());
 }
 
 void llama_layer_streaming::tel_tg_tokens(const std::vector<int64_t> & ids) {
@@ -8018,6 +8511,7 @@ void llama_layer_streaming::reset_stats() {
 // layer). During PP the slot window banks every layer unchanged — the CPU
 // routing is phase-gated in slot_layer()/load_layer(), never a PP behavior.
 bool llama_layer_streaming::begin_tg_stock() {
+    af_wait_idle();   // G22: a worker request still queued or in flight would write into a slot buffer that is released below
     size_t slot_bytes = 0;
     size_t slab_bytes = 0;
     for (auto & slot : slots) {
@@ -8035,6 +8529,81 @@ bool llama_layer_streaming::begin_tg_stock() {
     tg_stock = true;
     LLAMA_LOG_INFO("%s: released %zu slot bytes and %zu slab bytes; decode runs on the stock graph path\n", __func__, slot_bytes, slab_bytes);
     return true;
+}
+
+bool llama_layer_streaming::lm_alloc_slots() {
+    ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
+    for (int s = 0; s < n_slots; ++s) {
+        auto & slot = slots[s];
+        if (slot.buf) {
+            continue;
+        }
+        size_t slot_bytes_max = 0;
+        for (const auto & kv : slot.layer_bytes) {
+            if (!is_cpu_leg(kv.first)) {
+                slot_bytes_max = std::max(slot_bytes_max, kv.second);
+            }
+        }
+        if (slot_bytes_max == 0) {
+            continue;   // every layer of this slot has its experts on the device: nothing to hold
+        }
+        slot.buf.reset(ggml_backend_buft_alloc_buffer(buft_cuda, slot_bytes_max + 4096));
+        if (!slot.buf) {
+            error_msg = "lm_alloc_slots: failed to allocate slot buffer " + std::to_string(s) + " (" + std::to_string(slot_bytes_max + 4096) + " bytes)";
+            return false;
+        }
+        char * buf_base = (char *) ggml_backend_buffer_get_base(slot.buf.get());
+        for (auto & kv : slot.layers) {
+            const int il = kv.first;
+            if (is_cpu_leg(il)) {
+                continue;
+            }
+            std::vector<ggml_tensor *> tensors;
+            for (const auto & m : pkg_cache.at(il).members) {
+                ggml_tensor * t = ls_dst(kv.second, m);
+                if (t != nullptr) {
+                    tensors.push_back(t);
+                }
+            }
+            size_t off = 0;
+            if (!alloc_tensors(slot.buf.get(), buft_cuda, tensors, off)) {
+                error_msg = "lm_alloc_slots: failed to bind the tensors of layer " + std::to_string(il);
+                return false;
+            }
+            auto sp = slot.bank_span.find(il);
+            if (sp != slot.bank_span.end() && sp->second != nullptr) {
+                ggml_backend_tensor_alloc(slot.buf.get(), sp->second, buf_base);
+            }
+        }
+    }
+    return true;
+}
+
+void llama_layer_streaming::lm_release_slots() {
+    af_wait_idle();
+    ls_stage_drain();
+    for (auto & slot : slots) {
+        slot.buf.reset();
+        slot.buf_staging.reset();
+        ls_unregister_slot_source(slot);
+        if (slot.ctx_meta != nullptr) {
+            for (ggml_tensor * t = ggml_get_first_tensor(slot.ctx_meta); t != nullptr; t = ggml_get_next_tensor(slot.ctx_meta, t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+        }
+        slot.logical_layer          = -1;
+        slot.consumer_pending       = false;
+        slot.t_copy_submit_us       = 0;
+        slot.t_copy_enqueue_done_us = 0;
+        slot.af_submitted           = false;
+        slot.stage_il               = -1;
+    }
+    if (af) {
+        std::lock_guard<std::mutex> lk(af->mtx);
+        std::fill(af->free_slot.begin(), af->free_slot.end(), (uint8_t) 1);
+        af->queue.clear();
+    }
 }
 
 bool llama_layer_streaming::begin_handoff_partial(int partial_from_) {

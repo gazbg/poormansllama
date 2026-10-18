@@ -1441,6 +1441,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cparams          (params.cparams),
     ubatch           (params.ubatch),
     layer_streaming  (params.layer_streaming),
+    lm               (params.lm),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
@@ -1489,6 +1490,13 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 
 bool llm_graph_context::use_implicit_causal_mask() const {
 #ifdef LLAMA_LAYER_STREAMING
+    if (lm != nullptr) {
+        // G32: the layer-major pass builds its pieces per launch; the window is part of the piece
+        return lm->implicit_causal &&
+            cparams.causal_attn && cparams.flash_attn &&
+            hparams.swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+            ubatch.n_seqs_unq == 1 && ubatch.equal_seqs();
+    }
     return layer_streaming != nullptr &&
         layer_streaming->use_implicit_causal_mask &&
         layer_streaming->adapter != nullptr &&
@@ -2660,6 +2668,32 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         if (use_implicit_causal_mask()) {
 #ifdef LLAMA_LAYER_STREAMING
+            if (lm != nullptr) {
+                // G32: the K/V views are as wide as the chunk's memory context made them (padded to 256); the kernel iterates the view, so cut it to the live keys, as layer_major_pp's per-chunk patch does
+                GGML_ASSERT((int64_t) lm->kv_cell0 + lm->n_kv_valid <= cur->src[1]->ne[1]);
+                ggml_flash_attn_ext_set_causal(cur, lm->q_pos_base, lm->n_kv_valid);
+                {
+                    // the key range is the 256-padded one the ordinary path's view has for the same chunk (g32p, default since g32r); LLAMA_LM_FA_EXACT=0: exactly the live keys
+                    static const bool fa_exact = !(getenv("LLAMA_LM_FA_EXACT") != nullptr && getenv("LLAMA_LM_FA_EXACT")[0] == '0');
+                    int64_t n_view = lm->n_kv_valid;
+                    if (fa_exact) {
+                        n_view = std::min<int64_t>(GGML_PAD((int64_t) lm->n_kv_valid, 256), cur->src[1]->ne[1] - lm->kv_cell0);
+                    }
+                    cur->src[1]->ne[1] = n_view;
+                    cur->src[2]->ne[1] = n_view;
+                }
+                if (lm->kv_cell0 != 0) {
+                    // the sequence's cells start at kv_cell0 (a second slot of a unified cache): the K and V views start there, so key index == position as the implicit causal mask assumes
+                    for (ggml_tensor * t : { cur->src[1], cur->src[2] }) {
+                        GGML_ASSERT(t->view_src != nullptr);
+                        const size_t off = (size_t) lm->kv_cell0 * t->nb[1];
+                        t->view_offs += off;
+                        if (t->data != nullptr) {
+                            t->data = (char *) t->data + off;
+                        }
+                    }
+                }
+            } else {
             // T-Q38CTX-01: the causal window comes from the immutable chunk
             // descriptor (cumulative token offset), not the uniform
             // chunk_id * n_tokens assumption, so a 1..ubatch tail chunk sees
@@ -2667,6 +2701,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const llama_ls_chunk & ck = layer_streaming->chunks[layer_streaming->cur_chunk_id];
             ggml_flash_attn_ext_set_causal(cur, (int32_t) ck.token_start,
                                            (int32_t) (ck.token_start + ck.n_tokens));
+            }
 #endif
         }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

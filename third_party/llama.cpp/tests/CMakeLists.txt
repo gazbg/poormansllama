@@ -415,6 +415,16 @@ if (LLAMA_LAYER_STREAMING)
     llama_build_and_test(test-layer-streaming-tg-view.cpp)
     target_compile_definitions(test-layer-streaming-tg-view PRIVATE LLAMA_LAYER_STREAMING)
 
+    # G22 stage C: host-only proof of the CPU-leg routing of the layer-major prefill (slot_layer() reads the host layer of a CPU-leg layer in phase 0
+    # only, the async feed skips such layers and offers the next STREAMED layer). No CUDA, no model load.
+    llama_build_and_test(test-layer-streaming-cpu-leg.cpp)
+    target_compile_definitions(test-layer-streaming-cpu-leg PRIVATE LLAMA_LAYER_STREAMING)
+
+    # G28: host-only proof of the segmented layer-major prefill arithmetic (src/llama-ls-segments.h: chunks per segment, segment-relative slab offsets, slab size). Header-only, no libraries.
+    add_executable(test-layer-streaming-segments test-layer-streaming-segments.cpp)
+    add_test(NAME test-layer-streaming-segments COMMAND $<TARGET_FILE:test-layer-streaming-segments>)
+    set_property(TEST test-layer-streaming-segments PROPERTY LABELS main)
+
     # T-GPLR-61 step A: host-only proof of the `moe-row-split` POLICY AND SHAPE
     # (AC1) -- ls_classify_row / ls_evaluate_gate / ls_plan_split driven
     # directly, so the shipped partition and refusal contract is what is under
@@ -426,6 +436,17 @@ if (LLAMA_LAYER_STREAMING)
     # NOT prove the identity gate -- that is AC2, a separate GPU task.
     llama_build_and_test(test-layer-streaming-expert-split.cpp)
     target_compile_definitions(test-layer-streaming-expert-split PRIVATE LLAMA_LAYER_STREAMING)
+
+    # G14: host-only BITWISE equivalence of the lean host expert leg of the
+    # hybrid MoE decode (src/llama-moe-lean.h) against the ggml graph it
+    # replaces, over the quantization types a model may use, every miss count,
+    # several thread counts and random requests. No CUDA, no model load.
+    # `test-moe-lean-expert --bench` times the two paths (not a check).
+    # It needs only ggml and the CPU backend (not libllama), so it builds in seconds.
+    add_executable(test-moe-lean-expert test-moe-lean-expert.cpp)
+    target_link_libraries(test-moe-lean-expert PRIVATE ggml)
+    add_test(NAME test-moe-lean-expert COMMAND $<TARGET_FILE:test-moe-lean-expert>)
+    set_property(TEST test-moe-lean-expert PROPERTY LABELS main)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

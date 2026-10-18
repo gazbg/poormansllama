@@ -123,6 +123,9 @@ extern "C" {
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
 
+    // y[i] = silu(gate[i]) * up[i], the routine the SWIGLU graph op runs on one row (the hybrid MoE host leg calls it outside a graph)
+    GGML_BACKEND_API void ggml_cpu_swiglu_f32(int n, float * y, const float * gate, const float * up);
+
     GGML_BACKEND_API void ggml_cpu_init(void);
 
     //

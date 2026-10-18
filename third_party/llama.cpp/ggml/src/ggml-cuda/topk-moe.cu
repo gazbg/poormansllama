@@ -11,6 +11,7 @@ struct topk_moe_config {
     bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
+    bool sync_rows;   // G30: 2-4 rows share one block: wait for every row's reads before the first write (see ggml_cuda_topk_moe_small_rows)
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -173,6 +174,11 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         output_weights[i] = 0.f;
+    }
+
+    if (config.sync_rows) {
+        // G30: all reads of the logits (and the bias) of this row are done; the rows of this launch share one block, so after the barrier no row can still be reading what another row writes below
+        __syncthreads();
     }
 
     ggml_cuda_pdl_lc();
@@ -343,6 +349,12 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     }
 }
 
+// G30: LLAMA_CUDA_TOPK_MOE_SMALL=1 lets the fused router run for 2-4 rows even where the output may alias the logits (see the barrier in the kernel)
+bool ggml_cuda_topk_moe_small_rows() {
+    static const bool on = []() { const char * e = getenv("LLAMA_CUDA_TOPK_MOE_SMALL"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             logits,
                            ggml_tensor *                   weights,
@@ -381,6 +393,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+    config.sync_rows         = n_rows > 1 && n_rows <= 4 && ggml_cuda_topk_moe_small_rows();
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,

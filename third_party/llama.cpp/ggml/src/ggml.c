@@ -6496,8 +6496,8 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 }
 
 // ggml_moe_hybrid_publish / ggml_moe_hybrid_wait_add
-// publish op_params (int32): [0] il, [1] n_slot, [2] n_expert, [4..5] mailbox pointer, [6..7] trace pointer
-// wait_add reads the mailbox pointer from its pub source
+// publish op_params (int32): [0] il, [1] n_slot, [2] n_expert, [3] trace stride (int32 per token), [4..5] mailbox pointer, [6..7] trace pointer, [8] mailbox stride (bytes per token)
+// wait_add reads the mailbox pointer and stride from its pub source
 
 struct ggml_tensor * ggml_moe_hybrid_publish(
         struct ggml_context * ctx,
@@ -6510,18 +6510,21 @@ struct ggml_tensor * ggml_moe_hybrid_publish(
         int32_t               n_expert,
         int32_t               n_slot,
         void                * mailbox,
-        void                * trace) {
-    GGML_ASSERT(selected->type == GGML_TYPE_I32 && selected->ne[1] == 1 && selected->ne[0] <= 8);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_nelements(weights) == selected->ne[0]);
-    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && ggml_nelements(cur) == cur->ne[0]);
+        int32_t               mailbox_stride,
+        void                * trace,
+        int32_t               trace_stride) {
+    const int64_t n_tok = selected->ne[1];
+    GGML_ASSERT(selected->type == GGML_TYPE_I32 && n_tok >= 1 && n_tok <= GGML_MOE_HYBRID_MAX_WIDTH && selected->ne[0] <= 8);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_nelements(weights) == selected->ne[0]*n_tok);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && cur->ne[1] == n_tok && ggml_nelements(cur) == cur->ne[0]*n_tok);
     GGML_ASSERT(map->type == GGML_TYPE_I32 && ggml_is_contiguous(map));
     GGML_ASSERT(n_expert > 0 && ggml_nelements(map) % n_expert == 0 && il < ggml_nelements(map) / n_expert);
-    GGML_ASSERT(state->type == GGML_TYPE_I32);
-    GGML_ASSERT(mailbox != NULL && trace != NULL && il >= 0 && n_slot > 0);
+    GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_nelements(state) >= n_tok);
+    GGML_ASSERT(mailbox != NULL && trace != NULL && il >= 0 && n_slot > 0 && mailbox_stride > 0 && trace_stride > 0);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 16, n_tok);
 
-    int32_t params[8] = { il, n_slot, n_expert, 0, 0, 0, 0, 0 };
+    int32_t params[16] = { il, n_slot, n_expert, trace_stride, 0, 0, 0, 0, mailbox_stride, 0, 0, 0, 0, 0, 0, 0 };
     const uint64_t mb = (uint64_t) (uintptr_t) mailbox;
     const uint64_t tr = (uint64_t) (uintptr_t) trace;
     memcpy(params + 4, &mb, sizeof(mb));
@@ -6543,8 +6546,8 @@ struct ggml_tensor * ggml_moe_hybrid_wait_add(
         struct ggml_tensor  * cur,
         struct ggml_tensor  * pub,
         struct ggml_tensor  * state) {
-    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && ggml_nelements(cur) == cur->ne[0]);
-    GGML_ASSERT(pub->op == GGML_OP_MOE_HYBRID_PUBLISH && pub->src[2]->ne[0] == cur->ne[0]);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && ggml_nelements(cur) == cur->ne[0]*cur->ne[1]);
+    GGML_ASSERT(pub->op == GGML_OP_MOE_HYBRID_PUBLISH && pub->src[2]->ne[0] == cur->ne[0] && pub->src[2]->ne[1] == cur->ne[1]);
     GGML_ASSERT(state->type == GGML_TYPE_I32);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);

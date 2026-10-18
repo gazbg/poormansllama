@@ -19,6 +19,26 @@ class llama_batch_allocr;
 
 #ifdef LLAMA_LAYER_STREAMING
 struct llama_layer_streaming;
+
+// G32: the server's layer-major prefill (llama-lm-prefill.cpp)
+struct llama_lm_prefill_params;
+struct llama_lm_state;
+struct llama_lm_state_deleter { void operator()(llama_lm_state * s) const; };
+
+// what decode() decided about a batch: taken by the layer-major pass or not
+struct llama_lm_plan {
+    bool                 ok          = false;
+    llama_seq_id         seq         = 0;
+    llama_pos            p0          = 0;     // position of the batch's first token
+    int64_t              c0          = 0;     // KV cell of position 0 of the sequence (the pass addresses keys relative to it)
+    int32_t              n           = 0;
+    bool                 want_logits = false; // the last token's logits are wanted
+    std::vector<int32_t> widths;              // chunk widths, in order
+    std::vector<int32_t> snap_cuts;           // G42: token counts at which the recurrent state is kept (each one is a chunk boundary)
+    std::vector<int32_t> snap_chunk;          // G42: the chunk that ends at each of them
+    const char *         why         = nullptr; // when !ok: the reason (a static string)
+    std::string          why_detail;                // when !ok because of the KV layout: which cell broke it
+};
 #endif
 
 class llama_io_read_i;
@@ -291,6 +311,49 @@ public:
     // bypasses decode(), so the host logits buffer is never populated; this
     // reads the exposed result tensor directly. Returns -1 when unavailable.
     int64_t layer_major_pp_first_token();
+
+    // Opt-in diagnostics (--tg-logit-margin): top-k of the last PP output row,
+    // the distribution P(.|prompt) a normal-path sampler reads for its first
+    // token. Writes up to k (id, logit) pairs, best first. Returns the number
+    // written, or -1 when unavailable.
+    int layer_major_pp_topk(int k, int64_t * ids, float * vals);
+
+    // Opt-in (--tg-release-compute): after prefill, release the scheduler's worst-case compute buffers (sized for the prefill
+    // ubatch) and reserve again for single-token decode only. The caller must already have read whatever it needs from the
+    // prefill graph results, and must not decode more than one token per ubatch afterwards. Returns the bytes released (sum
+    // over backends), or -1 on failure.
+    int64_t reserve_for_decode();
+
+    // G30: the same with an explicit ubatch (the MTP draft context after its prompt catch-up decodes at most 2 + draft rows). Returns the bytes released, or -1.
+    int64_t reserve_ubatch(uint32_t n_ubatch_new);
+
+    // G31: forget the cached decode graph (it points at tensors that a hybrid cache resize freed); the next decode builds a new one
+    void drop_graph_reuse();
+
+    // G31s: install (or, with nullptr, remove) an evaluation callback for the next decodes; the scheduler's current one is replaced at once
+    void set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data);
+
+    // G32: layer-major prefill of one sequence's batch (llama-lm-prefill.cpp)
+    bool lm_prefill_enable(const llama_lm_prefill_params & p, std::string & err);
+    void lm_prefill_disable();
+    bool lm_prefill_is_enabled() const { return lm_state != nullptr; }
+    llama_lm_plan lm_make_plan(const llama_batch & b) const;
+    void lm_note(const llama_batch & b, const llama_lm_plan & pl) const;   // LLAMA_LM_LOG=1: why a big enough batch was not taken
+    bool lm_acquire(const llama_lm_plan & pl);   // false: nothing is held, the batch takes the ordinary path
+    void lm_release();
+    int  lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all);   // 0 done, 1 nothing changed (ordinary path), < 0 failed
+    bool lm_acquire_n(int64_t n_tokens, int32_t wmax);               // G42: the resources for a batch of n_tokens whose widest chunk is wmax
+    bool lm_stage_first();                                           // G42: copy the banks of the first streamed layers into the slot window
+    bool lm_decode_begin(const llama_batch & b, llama_lm_plan & plan);   // G42: what decode() does about the pass: plan, acquire (true: the resources are held for this decode), or give an armed pass back
+    void lm_release_if_live();                                       // G42: the destructor's release of an armed pass
+    bool lm_prearm(llama_seq_id seq, int64_t n_tokens);              // G42: see llama_lm_prefill_arm
+    void lm_disarm();
+    void lm_snap_request(const int32_t * cuts, int32_t n_cuts);
+    int32_t lm_snap_count() const;
+    int32_t lm_snap_cut(int32_t i) const;
+    size_t  lm_snap_data(int32_t i, uint8_t * dst, size_t size) const;
+    int64_t lm_n_pass() const;
+    bool    lm_is_armed() const;
 #endif
 
     // reserve a graph with a dummy ubatch of the specified size
@@ -416,6 +479,9 @@ private:
 #ifdef LLAMA_LAYER_STREAMING
     // experimental layer-streaming module (owned by the caller)
     llama_layer_streaming * layer_streaming = nullptr;
+
+    // G32: the server's layer-major prefill; declared last so it is destroyed before the backends and the memory it works on
+    std::unique_ptr<llama_lm_state, llama_lm_state_deleter> lm_state;
 #endif
 
     // host buffer for the model output (logits and embeddings)

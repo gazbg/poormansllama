@@ -5,6 +5,25 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#ifdef LLAMA_LAYER_STREAMING
+// defined in ggml/src/ggml-cuda/ggml-cuda.cu (opt-in lazily committed KV buffer, env LLAMA_KV_LAZY)
+#include "ggml-cuda.h"
+extern "C" {
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+void ggml_backend_cuda_lazy_set_next_alloc(bool on);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows);
+}
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -280,7 +299,26 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
+#ifdef LLAMA_LAYER_STREAMING
+            // opt-in (runner flag --kv-lazy sets LLAMA_KV_LAZY): reserve the CUDA KV buffer, let the runner commit the rows the run uses
+            bool kv_lazy = false;
+            // G31: the commit works on whole cell rows of one stream: not with several streams or the transposed V layout
+            if (getenv("LLAMA_KV_LAZY") != nullptr && n_stream == 1 && !v_trans) {
+                for (int i_dev = 0; i_dev < ggml_backend_cuda_get_device_count(); ++i_dev) {
+                    kv_lazy = kv_lazy || buft == ggml_backend_cuda_buffer_type(i_dev);
+                }
+            }
+            if (kv_lazy) {
+                ggml_backend_cuda_lazy_set_next_alloc(true);
+            }
+#endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+#ifdef LLAMA_LAYER_STREAMING
+            if (kv_lazy) {
+                ggml_backend_cuda_lazy_set_next_alloc(false);
+                lazy_kv = true;
+            }
+#endif
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -818,6 +856,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     bool updated = false;
 
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: the shift graph rewrites the whole window
+    if (do_shift && !lazy_commit_rows(get_size(), lctx)) {
+        return false;
+    }
+#endif
+
     auto * sched = lctx->get_sched();
 
     if (!sc_info.empty()) {
@@ -890,6 +935,40 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     return updated;
 }
+
+#ifdef LLAMA_LAYER_STREAMING
+// G32: the gap that a layer-major-friendly placement leaves in front of and behind a fresh sequence
+static uint32_t lm_gap(uint32_t size, uint32_t n_seq_max) {
+    return std::min<uint32_t>(size / 8u, std::max<uint32_t>(16384u, size / (4u * std::max<uint32_t>(1u, n_seq_max))));
+}
+
+// G32: where a FRESH sequence of n_new tokens goes: the first run of empty cells that leaves a gap of H cells in front of it (room for the left neighbour to grow into) and H empty cells behind it;
+// else the first run that fits. -1: none.
+static int64_t lm_fresh_place(const llama_kv_cells & cells, uint32_t size, uint32_t n_new, uint32_t H) {
+    int64_t  first_fit = -1;
+    uint32_t s = 0;
+    while (s < size) {
+        if (!cells.is_empty(s)) {
+            ++s;
+            continue;
+        }
+        uint32_t e = s;
+        while (e < size && cells.is_empty(e)) {
+            ++e;
+        }
+        const uint32_t len  = e - s;           // [s, e) is a maximal run of empty cells
+        const uint32_t lead = s == 0 ? 0u : H;
+        if (first_fit < 0 && len >= n_new) {
+            first_fit = s;
+        }
+        if ((uint64_t) len >= (uint64_t) lead + n_new + H) {
+            return (int64_t) (s + lead);
+        }
+        s = e;
+    }
+    return first_fit;
+}
+#endif
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
@@ -993,6 +1072,116 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         res.idxs[s].reserve(n_tokens);
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+#ifdef LLAMA_LAYER_STREAMING
+        if (lm_force_cell >= 0) {
+            // G32: a layer-major pass fixes where its chunk goes (cell == c0 + position); anything else is a failure, never a silent placement elsewhere
+            if (n_stream != 1 || (uint64_t) lm_force_cell + n_tokens > cells.size()) {
+                return { };
+            }
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                if (!cells.is_empty((uint32_t) lm_force_cell + i)) {
+                    return { };
+                }
+                res.idxs[s].push_back((uint32_t) lm_force_cell + i);
+            }
+            continue;
+        }
+        if (lm_affinity && n_stream == 1 && n_tokens > 0) {
+            // G32: every token goes right behind the last cell of its own sequence when those cells are free (the remembered tails are validated against the cells); anything else gets the stock placement
+            struct run_t { llama_seq_id seq; uint32_t first; uint32_t n; llama_pos next_pos; };
+            std::vector<run_t> runs;
+            bool ok = true;
+            for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+                if (ubatch.n_seq_id[i] != 1) {
+                    ok = false;
+                    break;
+                }
+                const llama_seq_id sid = ubatch.seq_id[i][0];
+                if (sid < 0 || (size_t) sid >= lm_tail_cell.size()) {
+                    ok = false;
+                    break;
+                }
+                run_t * r = nullptr;
+                for (auto & x : runs) {
+                    if (x.seq == sid) {
+                        r = &x;
+                        break;
+                    }
+                }
+                if (r == nullptr) {
+                    int32_t tc = lm_tail_cell[sid];
+                    const bool tail_ok = tc >= 0 && lm_tail_pos[sid] == (int32_t) ubatch.pos[i] - 1 && !cells.is_empty((uint32_t) tc) && cells.seq_count((uint32_t) tc) == 1 &&
+                                         cells.seq_get((uint32_t) tc) == sid && cells.pos_get((uint32_t) tc) == ubatch.pos[i] - 1;
+                    if (!tail_ok) {
+                        // after a rollback (seq_rm) or a restore the remembered tail is gone: the cell that holds position pos - 1 of this sequence is the tail
+                        tc = -1;
+                        if (ubatch.pos[i] > 0) {
+                            for (uint32_t c = 0; c < cells.size(); ++c) {
+                                if (!cells.is_empty(c) && cells.pos_get(c) == ubatch.pos[i] - 1 && cells.seq_count(c) == 1 && cells.seq_get(c) == sid) {
+                                    tc = (int32_t) c;
+                                    break;
+                                }
+                            }
+                        }
+                        if (tc < 0) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    runs.push_back({ sid, (uint32_t) tc + 1, 0u, ubatch.pos[i] });
+                    r = &runs.back();
+                }
+                if (ubatch.pos[i] != r->next_pos) {
+                    ok = false;
+                    break;
+                }
+                r->n++;
+                r->next_pos++;
+            }
+            for (size_t a = 0; a < runs.size() && ok; ++a) {
+                // each run [first, first + n) must be in bounds, empty and disjoint from the runs before it
+                if ((uint64_t) runs[a].first + runs[a].n > cells.size()) {
+                    ok = false;
+                    break;
+                }
+                for (uint32_t k = 0; k < runs[a].n; ++k) {
+                    if (!cells.is_empty(runs[a].first + k)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                for (size_t b = 0; b < a && ok; ++b) {
+                    if (runs[a].first < runs[b].first + runs[b].n && runs[b].first < runs[a].first + runs[a].n) {
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) {
+                std::vector<uint32_t> taken(runs.size(), 0u);
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const llama_seq_id sid = ubatch.seq_id[i][0];
+                    for (size_t a = 0; a < runs.size(); ++a) {
+                        if (runs[a].seq == sid) {
+                            res.idxs[s].push_back(runs[a].first + taken[a]++);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        if (lm_affinity && n_stream == 1 && ubatch.n_seqs_unq == 1 && n_tokens > 0 && ubatch.pos[0] == 0 && cells.get_used() > 0) {
+            // G32: a fresh sequence next to other sequences: leave gaps (the same placement as lm_block's)
+            const int64_t c = lm_fresh_place(cells, cells.size(), n_tokens, lm_gap(cells.size(), n_seq_max));
+            if (c >= 0) {
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    res.idxs[s].push_back((uint32_t) c + i);
+                }
+                continue;
+            }
+        }
+#endif
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
@@ -1137,6 +1326,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+#ifdef LLAMA_LAYER_STREAMING
+            if (lm_affinity && ubatch.n_seq_id[i] == 1 && (size_t) ubatch.seq_id[i][0] < lm_tail_cell.size()) {
+                lm_tail_cell[ubatch.seq_id[i][0]] = (int32_t) idx;
+                lm_tail_pos [ubatch.seq_id[i][0]] = (int32_t) ubatch.pos[i];
+            }
+#endif
         }
     }
 
@@ -1238,6 +1434,123 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+#ifdef LLAMA_LAYER_STREAMING
+// G31: called with the bytes a commit is about to map (llama-hybrid-api.cpp registers it: the VRAM expert cache makes room)
+void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes) = nullptr;
+
+bool llama_kv_cache::lazy_commit_rows(uint32_t rows, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }
+    // G31r: only the server (llama_hybrid_prepare_env) commits on demand; the runner commits its prompt's rows itself
+    static const bool on_demand = getenv("LLAMA_KV_LAZY_ONDEMAND") != nullptr;
+    if (!on_demand) {
+        return true;
+    }
+    rows = std::min<uint32_t>(rows, get_size());
+    if (rows <= lazy_rows) {
+        return true;
+    }
+    const uint32_t target = std::min<uint32_t>(get_size(), ((rows + 1024u + 4095u) / 4096u) * 4096u);   // steps of 4096 rows plus headroom
+    const int64_t cost = ggml_backend_cuda_lazy_commit_cost(target);
+    if (cost > 0 && llama_kv_lazy_pressure_cb != nullptr) {
+        llama_kv_lazy_pressure_cb(lctx, cost);
+    }
+    const int64_t total = ggml_backend_cuda_lazy_commit_rows(target);
+    if (total < 0) {
+        LLAMA_LOG_ERROR("%s: the driver could not commit KV rows [0, %u) (%.1f MiB more): out of device memory\n", __func__, target, (double) cost/1048576.0);
+        return false;
+    }
+    LLAMA_LOG_DEBUG("%s: KV rows [0, %u) committed (+%.1f MiB, %.1f MiB committed in total)\n", __func__, target, (double) cost/1048576.0, (double) total/1048576.0);
+    lazy_rows = target;
+    return true;
+}
+
+int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why) const {
+    auto no = [&](const std::string & s) -> int64_t {
+        if (why != nullptr) {
+            *why = s;
+        }
+        return -1;
+    };
+    if (other || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0 || n_new == 0) {
+        return no("unsupported cache (shared cells, several streams, sliding window or a bad sequence id)");
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t size  = cells.size();
+    const uint32_t n_old = (uint32_t) p0;
+    if ((uint64_t) n_old + n_new > size) {
+        return no("the batch does not fit the cache (" + std::to_string(n_old) + " + " + std::to_string(n_new) + " > " + std::to_string(size) + ")");
+    }
+    auto who = [&](uint32_t c) -> std::string {
+        if (cells.is_empty(c)) {
+            return "empty";
+        }
+        if (cells.seq_count(c) != 1) {
+            return "shared by " + std::to_string(cells.seq_count(c)) + " sequences";
+        }
+        return "seq " + std::to_string(cells.seq_get(c)) + " pos " + std::to_string(cells.pos_get(c));
+    };
+
+    uint32_t c0 = 0;
+    if (n_old == 0) {
+        // a fresh sequence: the same placement as the ordinary path's (gaps in front of and behind it, else the first run that fits)
+        const int64_t c = lm_fresh_place(cells, size, n_new, lm_gap(size, n_seq_max));
+        return c >= 0 ? c : no("no run of " + std::to_string(n_new) + " empty cells for a fresh sequence (" + std::to_string(cells.get_used()) + " of " + std::to_string(size) + " cells used)");
+    }
+
+    // the cell of position 0 of the sequence
+    bool found = false;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (!cells.is_empty(i) && cells.pos_get(i) == 0 && cells.seq_count(i) == 1 && cells.seq_get(i) == seq_id) {
+            c0    = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return no("no cell holds position 0 of sequence " + std::to_string(seq_id));
+    }
+    if ((uint64_t) c0 + n_old + n_new > size) {
+        return no("the block at cell " + std::to_string(c0) + " leaves no room for " + std::to_string(n_new) + " more cells before the end of the cache");
+    }
+    for (uint32_t i = 0; i < n_old; ++i) {
+        const uint32_t c = c0 + i;
+        if (cells.is_empty(c) || cells.seq_count(c) != 1 || cells.seq_get(c) != seq_id || cells.pos_get(c) != (llama_pos) i) {
+            return no("the block starting at cell " + std::to_string(c0) + " breaks at cell " + std::to_string(c) + " (" + who(c) + ", expected seq " + std::to_string(seq_id) + " pos " + std::to_string(i) + ")");
+        }
+    }
+    for (uint32_t i = 0; i < n_new; ++i) {
+        if (!cells.is_empty(c0 + n_old + i)) {
+            return no("the room behind the block (cells " + std::to_string(c0 + n_old) + " ..) is taken at cell " + std::to_string(c0 + n_old + i) + " (" + who(c0 + n_old + i) + ")");
+        }
+    }
+    return (int64_t) c0;
+}
+
+bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }
+    uint32_t need = 0;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            need = std::max(need, (uint32_t) sinfo.idxs[s][ii] + 1u);
+        }
+    }
+    return lazy_commit_rows(need, lctx);
+}
+#endif
+
+uint32_t llama_kv_cache::get_n_kv_reserve() const {
+    const auto & cells = v_cells[seq_to_stream[0]];
+
+    if (n_pad_view == 0) {
+        return cells.size();
+    }
+    return std::min<uint32_t>(cells.size(), std::max<uint32_t>(GGML_PAD(cells.used_max_p1() + 2048u, n_pad_view), 256u));
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2281,6 +2594,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+#ifdef LLAMA_LAYER_STREAMING
+        if (!lazy_ensure(sinfo, nullptr)) {
+            return false;
+        }
+#endif
         apply_ubatch(sinfo, ubatch);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
@@ -2523,7 +2841,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv = kv->get_n_kv_reserve();
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2576,6 +2894,12 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: commit the rows this ubatch writes before it is applied
+    if (!kv->lazy_ensure(sinfos[i_cur], lctx)) {
+        return false;
+    }
+#endif
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 

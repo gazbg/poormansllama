@@ -1455,6 +1455,15 @@ UseGgmlGemm2:;
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
+// Opt-in software prefetch (dst->op_params[0] = bytes ahead, 0 = off): the hybrid MoE engine streams a few MiB of weights per
+// call from DRAM, and the hardware prefetcher restarts at every 4 KiB page. Nothing else sets the hint.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#define GGML_CPU_MMID_PF(p) _mm_prefetch((const char *) (p), _MM_HINT_T0)
+#else
+#define GGML_CPU_MMID_PF(p) ((void) (p))
+#endif
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1474,7 +1483,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const int32_t pf_bytes) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1485,6 +1495,17 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
+
+    // rows ahead to prefetch (0 = off) and the cache lines per row
+    const int64_t pf_rows = pf_bytes > 0 ? ((int64_t) pf_bytes + (int64_t) nb01 - 1) / (int64_t) nb01 : 0;
+    if (pf_rows > 0) {
+        // the first window of this chunk
+        for (int64_t r = ir0_start; r < ir0_start + pf_rows && r < ir0_end; ++r) {
+            for (size_t o = 0; o < nb01; o += 64) {
+                GGML_CPU_MMID_PF(src0_cur + (size_t) r*nb01 + o);
+            }
+        }
+    }
 
     float tmp[16];
 
@@ -1514,6 +1535,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                    if (pf_rows > 0 && ir1 == ir1_start && ir0 + pf_rows < ir0_end) {
+                        const char * pp = src0_cur + (size_t) (ir0 + pf_rows)*nb01;
+                        for (size_t o = 0; o < nb01; o += 64) {
+                            GGML_CPU_MMID_PF(pp + o);
+                        }
+                    }
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
@@ -1560,6 +1587,8 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    const int32_t pf_bytes = ((const int32_t *) dst->op_params)[0]; // opt-in prefetch hint, 0 for every graph but the hybrid host leg
 
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
@@ -1694,7 +1723,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, pf_bytes
             );
 
             if (nth >= nchunk0 * nchunk1) {

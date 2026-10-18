@@ -251,6 +251,10 @@ struct llama_layer_streaming_slot {
     // a copy the worker did not submit (the main-thread lookahead path sets
     // this never; its copies are reported by copy_submit/copy_complete only).
     bool af_submitted = false;
+
+    // G22 stage B: the logical layer the async-feed worker is issuing into this slot with af->mtx RELEASED (paced copies block the worker for the
+    // length of the DMA); -1 = none. load_layer / wait_slot_ready of this slot wait on af->cv_stage until it is -1 again.
+    int32_t stage_il = -1;
 };
 
 // LLAMA_API: exported so the experimental runner can link the module from
@@ -651,6 +655,23 @@ struct LLAMA_API llama_layer_streaming {
     // one-layer boundary proof. KV/state of skipped layers is untouched.
     std::vector<int> exec_layers;
 
+    // G22: layers whose routed-expert FFN runs on the CPU in the layer-major prefill (empty = none). Such a layer has no slot, no copy and no consumer
+    // event; its graphs are built against the model's own host layer tensors, so the scheduler places the expert matmuls on the CPU backend while the
+    // attention, router and shared expert stay on the GPU. Set by the runner before the prebuild (--pp-cpu-layers); only phase 0 reads it.
+    std::vector<uint8_t> pp_cpu_leg;
+    bool is_cpu_leg(int il) const { return il >= 0 && il < (int) pp_cpu_leg.size() && pp_cpu_leg[il] != 0; }
+    bool has_cpu_leg() const {
+        for (uint8_t v : pp_cpu_leg) {
+            if (v != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool set_pp_cpu_layers(const std::vector<int> & layers);
+    // the next layer after il that the async feed streams (CPU-leg layers are skipped; -1 = none); public so that a host test can drive the feed order
+    int next_streamed_layer(int il) const { return af_next_layer(il); }
+
     // execution phase tag for telemetry (0 = PP, 1 = TG); set by the runner
     // (read from the executor thread; the prefetch worker snapshots it at
     // enqueue time, a benign race for a telemetry tag)
@@ -893,6 +914,10 @@ struct LLAMA_API llama_layer_streaming {
     // During handoff, returns the handoff-layers bundle (full resident copy of
     // all 64 packages) instead of the slot bundle.
     const llama_layer & slot_layer(int il) const {
+        // G22: a CPU-leg layer of the layer-major prefill reads its experts from the host banks (no slot, no copy)
+        if (phase == 0 && !handoff_active && il < n_layer && is_cpu_leg(il)) {
+            return *host_layers[il];
+        }
         // T-GPLR-16: partial handoff (NCMOE-style mixed placement). Decided
         // FIRST: layers below the migration split execute from their host-
         // mmap CPU tensors (attention/router/shared/norms of those layers
@@ -1100,7 +1125,7 @@ struct LLAMA_API llama_layer_streaming {
     // layer-major: record that a chunk's act pair was bound to a fixed slab
     // offset (slab 0 = A, 1 = B); the host validator uses these to prove the
     // per-chunk slices are non-aliasing
-    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens);
+    void tel_act_bind(int32_t chunk_id, int slab, size_t off_bytes, int64_t n_tokens, int64_t seg = -1);   // G28: seg >= 0 adds the segment index of a segmented prefill
     void tel_error(const char * msg);
     // T-GPLR-04: explicit out-of-core capacity proof. One structured event
     // after the runtime preflight with the full byte-class accounting; the
@@ -1136,6 +1161,9 @@ struct LLAMA_API llama_layer_streaming {
     // event annotates the pick; it never perturbs it.
     void tel_tg_logits(int step, int64_t top1_id, float top1_logit, int64_t top2_id,
                        float top2_logit);
+    // Same gate (tg_logit_margin > 0): one `pp_last_logits` line with the top-n
+    // (id, logit) of the last prompt position, read-only.
+    void tel_pp_last_logits(int n, const int64_t * ids, const float * vals);
     // T-Q38HG-06: MTP draft/accept counters (drafted, accepted, acceptance rate)
     void tel_mtp(int64_t n_tokens, int64_t drafted, int64_t accepted);
 
@@ -1324,6 +1352,10 @@ struct LLAMA_API llama_layer_streaming {
     bool tg_stock = false;
     // frees the PP slot window and activation slabs, then routes decode through the stock graph path; call once after PP
     bool begin_tg_stock();
+    // G32 (the server's layer-major prefill): the slot window exists only while a pass runs. lm_release_slots waits for the feed and the copy stream and frees the device buffers (the tensor objects of
+    // the bundles stay); lm_alloc_slots allocates them again and binds every bundle tensor.
+    bool lm_alloc_slots();
+    void lm_release_slots();
     // T-GPLR-61 S3: per slot, per expert: copies ISSUED but never observed
     // complete on the host (a skipped wait leaves them outstanding). An
     // outstanding row classifies PENDING -- it may compute on the host leg,
@@ -1879,6 +1911,31 @@ struct LLAMA_API llama_layer_streaming {
     bool set_pp_copy_overlap(bool on);
     bool pp_copy_overlap = false;
 
+    // G22 stage B: paced bank copies. A bank is one 144 MiB command per member, and a small host-to-device copy that the compute stream issues while
+    // a bank is in flight waits for ALL of it (31.5 ms measured: tools/ce-hol-bench, nsys g54-nsys-pp). With piece_bytes > 0 the async-feed worker
+    // issues each member in pieces and keeps at most `window` pieces in flight (before piece i it waits for the event of piece i-window), so a small
+    // copy waits for about `window` pieces instead. Costs ~30 us of host round trip per piece (ce-hol-bench: 2.5% of the bank time at 16 MiB x 2).
+    // piece_bytes == 0 = off = the historical path, byte for byte. Call after init(); only the async-feed worker paces (the main thread's preload
+    // and on-demand staging stay unpaced). The worker releases af->mtx while it issues a paced bank (slot.stage_il guards the slot).
+    bool set_pp_copy_pacing(size_t piece_bytes, int window);
+    size_t pp_copy_piece_bytes = 0;
+    int    pp_copy_window = 2;
+
+    // G28: segmented layer-major prefill. pp_seg_tokens > 0 processes the chunk list in segments of that many tokens (a positive multiple of the chunk width): the activation slab holds ONE
+    // segment (slab_tokens tokens per half, set by init) instead of the whole prompt, and each segment streams the layer banks once more. 0 = off = the historical single sweep. Call before init().
+    // The arithmetic lives in llama-ls-segments.h (host-testable).
+    bool set_pp_segment_tokens(int64_t tokens);
+    int64_t pp_seg_tokens = 0;
+    int64_t slab_tokens   = 0;
+
+    // G30: capture of the post-norm hidden rows (the output graph's t_h_nextn, [n_embd, n_tokens] f32) of every chunk of the layer-major prefill into a host buffer, for the MTP draft head's catch-up.
+    // pp_nextn_dst == nullptr = off (the default). The buffer holds pp_nextn_cap tokens of pp_nextn_n_embd floats in token order; pp_nextn_n is the number of tokens captured so far.
+    float *  pp_nextn_dst    = nullptr;
+    int64_t  pp_nextn_cap    = 0;
+    int64_t  pp_nextn_n_embd = 0;
+    int64_t  pp_nextn_n      = 0;
+    void tel_pp_segment(int64_t seg, int64_t n_segs, int64_t chunk_begin, int64_t chunk_end);
+
     // T-GPLR-35 recon (diagnostics only, off by default): records stream/context
     // identity once per run plus, per staged bank, the copy's own GPU window and
     // its start offset against the compute stream's backlog at enqueue time.
@@ -2090,7 +2147,16 @@ private:
                        llama_layer & bundle, int il, uint32_t gen, llama_layer_streaming_slot & slot,
                        char * pool_base, size_t pool_bytes, bool pool_valid,
                        char * staging, size_t * staged_out,
-                       int * submit_batch_out = nullptr);
+                       int * submit_batch_out = nullptr,
+                       bool paced = false);
+    // G22 stage B state: the pacing event ring (owned by the worker thread, the only issuer) and the last bank's counters for telemetry
+    std::vector<void *> pace_ev;
+    uint32_t paced_pieces_last  = 0;
+    double   paced_wait_us_last = 0.0;
+    // G22: queue a layer for the feed worker (the historical rule; with paced copies or a CPU leg a layer that is already queued is not queued twice)
+    void af_push(int il);
+    // G22: wait until the feed worker has nothing queued and nothing in flight (before the slots are torn down or reused for another purpose)
+    void af_wait_idle();
     // pick the next executed logical layer after il (empty exec_layers = il+1)
     int af_next_layer(int il) const;
     // T-GPLR-32 state (private): gate enabled + in-flight worker DMA counter.
@@ -2573,5 +2639,22 @@ LLAMA_API int llama_layer_major_pp(llama_context * ctx, const llama_batch & batc
 // so the host logits buffer is never populated; this reads the exposed result
 // tensor directly. Returns -1 when unavailable.
 LLAMA_API int64_t llama_layer_major_pp_first_token(llama_context * ctx);
+
+// Opt-in diagnostics: top-k (id, logit) of the last PP output row, best first.
+// Returns the number of entries written, or -1 when unavailable.
+LLAMA_API int llama_layer_major_pp_topk(llama_context * ctx, int k, int64_t * ids, float * vals);
+
+// Opt-in (--tg-hybrid-slots): resize the hybrid MoE engine's VRAM cache after prefill released its weight slots.
+// Between decodes only. Returns false (nothing changed) when there is no hybrid engine or the slot count is invalid.
+LLAMA_API bool llama_moe_hybrid_resize(int n_slot);
+
+// the hybrid slot cache's current size in bytes and slot count (--tg-hybrid-slots auto); false when there is no engine
+LLAMA_API bool llama_moe_hybrid_cache_info(int64_t * cache_bytes, int * n_slot);
+
+// Opt-in (--tg-release-compute): see llama_context::reserve_for_decode. Returns bytes released, or -1.
+LLAMA_API int64_t llama_layer_streaming_reserve_decode(llama_context * ctx);
+
+// G30: see llama_context::reserve_ubatch. Returns the bytes released, or -1.
+LLAMA_API int64_t llama_layer_streaming_reserve_ubatch(llama_context * ctx, uint32_t n_ubatch);
 
 #endif // LLAMA_LAYER_STREAMING
