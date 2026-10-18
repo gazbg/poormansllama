@@ -1,0 +1,28 @@
+{
+  "report": "q38ls-layer-streaming-profile",
+  "validated": true,
+  "events": 2,
+  "environment": {
+    "model": "",
+    "arch": "",
+    "n_layer": 0,
+    "n_slots": 0,
+    "device": -1,
+    "total_vram_bytes": -1,
+    "free_vram_at_start_bytes": -1,
+    "slot_vram_bytes": -1,
+    "peak_vram_bytes": 0,
+    "notes": "cold source state is best-effort: layer packages live in the host mmap and the Windows file cache is uncontrolled, so the H2D source may be warm; this is recorded as uncontrolled, not a guaranteed cold condition"
+  },
+  "caveats": {
+    "source_cache": "best-effort cold (uncontrolled Windows file cache)",
+    "baseline": "no speedup baseline was run; these are raw absolute measurements only",
+    "claims": "no quality, equivalence, or speedup claim is made"
+  },
+  "phases": {
+  },
+  "generated_tokens": {
+    "n": 2,
+    "ids_reported": -1
+  }
+}

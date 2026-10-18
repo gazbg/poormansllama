@@ -1,0 +1,10 @@
+{"event":"run_start","run_id":9000001,"n_slots":1,"n_layer":1,"schedule":"layer-major","telemetry_chunk_stride":10}
+{"event":"copy_submit","run_id":9000001,"layer":0,"slot":0,"generation":1,"phase":0}
+{"event":"copy_complete","run_id":9000001,"layer":0,"slot":0,"generation":1,"phase":0}
+{"event":"layer_compute","run_id":9000001,"layer":0,"slot":0,"generation":1,"chunk":0,"phase":0}
+{"event":"layer_compute","run_id":9000001,"layer":0,"slot":0,"generation":1,"chunk":10,"phase":0}
+{"event":"layer_compute","run_id":9000001,"layer":0,"slot":0,"generation":1,"chunk":20,"phase":0}
+{"event":"layer_compute","run_id":9000001,"layer":0,"slot":0,"generation":1,"chunk":30,"phase":0}
+{"event":"layer_compute","run_id":9000001,"layer":0,"slot":0,"generation":1,"chunk":39,"phase":0}
+{"event":"phase_summary","run_id":9000001,"phase":"pp","tokens":20480,"ubatches":40,"wall_us":1000000,"layers_run":1,"graph_builds":0}
+{"event":"run_end","run_id":9000001,"exit_status":0,"peak_vram_bytes":1000000}

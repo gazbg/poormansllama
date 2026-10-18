@@ -1,0 +1,2 @@
+{"event":"run_start","run_id":1,"t0_us":10,"arch":"foo","policy":"off","residency":"off","capability_reason":"no layer-residency policy for this architecture","pp_tokens":8,"tg_tokens":2,"ctx_size":256}
+{"event":"run_end","run_id":1,"exit_status":0,"peak_vram_bytes":0,"n_tokens_generated":2,"failed":false,"error":"none","total_patch_us":0.0}

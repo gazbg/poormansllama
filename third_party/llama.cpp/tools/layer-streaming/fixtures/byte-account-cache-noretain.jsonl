@@ -1,0 +1,5 @@
+{"event":"run_start","run_id":9220000,"n_slots":4,"n_layer":64,"schedule":"layer-major","rowset":"on","act_slab_bytes":0}
+{"event":"rowset_init","run_id":9220000,"policy":"moe-row-set","n_slots":4,"slot_bytes":4717996544,"window_tokens":1,"n_expert":256,"top_k":8,"retain_k":0,"t_us":0}
+{"event":"byte_account","run_id":9220000,"full_model_plus_runtime":21451547136,"bounded_window":4717996544,"static":957530112,"per_layer":1597483520,"slot_window":2088763392,"kv":8355840,"state":65863680,"act_slab":0,"reserve":536870912,"free_vram":22226665472,"total_vram":25650855936,"residency_budget_mib":0,"row_cache":2291531776,"residency_cap":0,"full_exceeds_free":false,"bounded_within_free":true}
+{"event":"phase_summary","run_id":9220000,"phase":"tg","tokens":4,"ubatches":4,"wall_us":100000,"tokens_per_s":40.0,"bytes_transferred":2291531776,"evictions":0,"total_transfer_us":50000.0,"total_wait_us":100.0,"total_compute_us":40000.0,"layers_run":64,"graph_prep_us":10.0,"graph_builds":0}
+{"event":"run_end","run_id":9220000,"exit_status":0,"peak_vram_bytes":22226665472,"n_tokens_generated":4,"failed":false,"error":"none"}

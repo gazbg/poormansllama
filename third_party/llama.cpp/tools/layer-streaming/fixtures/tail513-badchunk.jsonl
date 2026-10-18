@@ -1,0 +1,264 @@
+{"event": "run_start", "run_id": 9200000, "n_slots": 4, "n_layer": 64, "schedule": "layer-major", "telemetry_chunk_stride": 1, "act_slab_bytes": 21012480, "pp_tokens": 513, "pp_n_chunks": 2, "pp_chunks": ["0:512", "512:1"]}
+{"event": "act_bind", "run_id": 9200000, "chunk": 0, "slab": 0, "off_bytes": 0, "n_bytes": 10485760}
+{"event": "act_bind", "run_id": 9200000, "chunk": 0, "slab": 1, "off_bytes": 0, "n_bytes": 10485760}
+{"event": "act_bind", "run_id": 9200000, "chunk": 1, "slab": 0, "off_bytes": 10485760, "n_bytes": 20480}
+{"event": "act_bind", "run_id": 9200000, "chunk": 1, "slab": 1, "off_bytes": 10485760, "n_bytes": 20480}
+{"event": "copy_submit", "run_id": 9200000, "layer": 0, "slot": 0, "generation": 1, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 0, "slot": 0, "generation": 1, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 0, "slot": 0, "generation": 1, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 0, "slot": 0, "generation": 1, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 1}
+{"event": "copy_submit", "run_id": 9200000, "layer": 1, "slot": 1, "generation": 1, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 1, "slot": 1, "generation": 1, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 1, "slot": 1, "generation": 1, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 10}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 1, "slot": 1, "generation": 1, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 11}
+{"event": "copy_submit", "run_id": 9200000, "layer": 2, "slot": 2, "generation": 1, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 2, "slot": 2, "generation": 1, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 2, "slot": 2, "generation": 1, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 20}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 2, "slot": 2, "generation": 1, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 21}
+{"event": "copy_submit", "run_id": 9200000, "layer": 3, "slot": 3, "generation": 1, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 3, "slot": 3, "generation": 1, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 3, "slot": 3, "generation": 1, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 30}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 3, "slot": 3, "generation": 1, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 31}
+{"event": "copy_submit", "run_id": 9200000, "layer": 4, "slot": 0, "generation": 2, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 4, "slot": 0, "generation": 2, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 4, "slot": 0, "generation": 2, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 40}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 4, "slot": 0, "generation": 2, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 41}
+{"event": "copy_submit", "run_id": 9200000, "layer": 5, "slot": 1, "generation": 2, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 5, "slot": 1, "generation": 2, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 5, "slot": 1, "generation": 2, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 50}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 5, "slot": 1, "generation": 2, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 51}
+{"event": "copy_submit", "run_id": 9200000, "layer": 6, "slot": 2, "generation": 2, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 6, "slot": 2, "generation": 2, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 6, "slot": 2, "generation": 2, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 60}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 6, "slot": 2, "generation": 2, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 61}
+{"event": "copy_submit", "run_id": 9200000, "layer": 7, "slot": 3, "generation": 2, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 7, "slot": 3, "generation": 2, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 7, "slot": 3, "generation": 2, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 70}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 7, "slot": 3, "generation": 2, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 71}
+{"event": "copy_submit", "run_id": 9200000, "layer": 8, "slot": 0, "generation": 3, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 8, "slot": 0, "generation": 3, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 8, "slot": 0, "generation": 3, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 80}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 8, "slot": 0, "generation": 3, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 81}
+{"event": "copy_submit", "run_id": 9200000, "layer": 9, "slot": 1, "generation": 3, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 9, "slot": 1, "generation": 3, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 9, "slot": 1, "generation": 3, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 90}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 9, "slot": 1, "generation": 3, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 91}
+{"event": "copy_submit", "run_id": 9200000, "layer": 10, "slot": 2, "generation": 3, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 10, "slot": 2, "generation": 3, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 10, "slot": 2, "generation": 3, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 100}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 10, "slot": 2, "generation": 3, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 101}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 3, "layer": 10, "slot": 2, "generation": 3, "chunk": 2, "compute_us": 1.0, "setup_us": 1.0, "phase": 0, "t_us": 99999}
+{"event": "copy_submit", "run_id": 9200000, "layer": 11, "slot": 3, "generation": 3, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 11, "slot": 3, "generation": 3, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 11, "slot": 3, "generation": 3, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 110}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 11, "slot": 3, "generation": 3, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 111}
+{"event": "copy_submit", "run_id": 9200000, "layer": 12, "slot": 0, "generation": 4, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 12, "slot": 0, "generation": 4, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 12, "slot": 0, "generation": 4, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 120}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 12, "slot": 0, "generation": 4, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 121}
+{"event": "copy_submit", "run_id": 9200000, "layer": 13, "slot": 1, "generation": 4, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 13, "slot": 1, "generation": 4, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 13, "slot": 1, "generation": 4, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 130}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 13, "slot": 1, "generation": 4, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 131}
+{"event": "copy_submit", "run_id": 9200000, "layer": 14, "slot": 2, "generation": 4, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 14, "slot": 2, "generation": 4, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 14, "slot": 2, "generation": 4, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 140}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 14, "slot": 2, "generation": 4, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 141}
+{"event": "copy_submit", "run_id": 9200000, "layer": 15, "slot": 3, "generation": 4, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 15, "slot": 3, "generation": 4, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 15, "slot": 3, "generation": 4, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 150}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 15, "slot": 3, "generation": 4, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 151}
+{"event": "copy_submit", "run_id": 9200000, "layer": 16, "slot": 0, "generation": 5, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 16, "slot": 0, "generation": 5, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 16, "slot": 0, "generation": 5, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 160}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 16, "slot": 0, "generation": 5, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 161}
+{"event": "copy_submit", "run_id": 9200000, "layer": 17, "slot": 1, "generation": 5, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 17, "slot": 1, "generation": 5, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 17, "slot": 1, "generation": 5, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 170}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 17, "slot": 1, "generation": 5, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 171}
+{"event": "copy_submit", "run_id": 9200000, "layer": 18, "slot": 2, "generation": 5, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 18, "slot": 2, "generation": 5, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 18, "slot": 2, "generation": 5, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 180}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 18, "slot": 2, "generation": 5, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 181}
+{"event": "copy_submit", "run_id": 9200000, "layer": 19, "slot": 3, "generation": 5, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 19, "slot": 3, "generation": 5, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 19, "slot": 3, "generation": 5, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 190}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 19, "slot": 3, "generation": 5, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 191}
+{"event": "copy_submit", "run_id": 9200000, "layer": 20, "slot": 0, "generation": 6, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 20, "slot": 0, "generation": 6, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 20, "slot": 0, "generation": 6, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 200}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 20, "slot": 0, "generation": 6, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 201}
+{"event": "copy_submit", "run_id": 9200000, "layer": 21, "slot": 1, "generation": 6, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 21, "slot": 1, "generation": 6, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 21, "slot": 1, "generation": 6, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 210}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 21, "slot": 1, "generation": 6, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 211}
+{"event": "copy_submit", "run_id": 9200000, "layer": 22, "slot": 2, "generation": 6, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 22, "slot": 2, "generation": 6, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 22, "slot": 2, "generation": 6, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 220}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 22, "slot": 2, "generation": 6, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 221}
+{"event": "copy_submit", "run_id": 9200000, "layer": 23, "slot": 3, "generation": 6, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 23, "slot": 3, "generation": 6, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 23, "slot": 3, "generation": 6, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 230}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 23, "slot": 3, "generation": 6, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 231}
+{"event": "copy_submit", "run_id": 9200000, "layer": 24, "slot": 0, "generation": 7, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 24, "slot": 0, "generation": 7, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 24, "slot": 0, "generation": 7, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 240}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 24, "slot": 0, "generation": 7, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 241}
+{"event": "copy_submit", "run_id": 9200000, "layer": 25, "slot": 1, "generation": 7, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 25, "slot": 1, "generation": 7, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 25, "slot": 1, "generation": 7, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 250}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 25, "slot": 1, "generation": 7, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 251}
+{"event": "copy_submit", "run_id": 9200000, "layer": 26, "slot": 2, "generation": 7, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 26, "slot": 2, "generation": 7, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 26, "slot": 2, "generation": 7, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 260}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 26, "slot": 2, "generation": 7, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 261}
+{"event": "copy_submit", "run_id": 9200000, "layer": 27, "slot": 3, "generation": 7, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 27, "slot": 3, "generation": 7, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 27, "slot": 3, "generation": 7, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 270}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 27, "slot": 3, "generation": 7, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 271}
+{"event": "copy_submit", "run_id": 9200000, "layer": 28, "slot": 0, "generation": 8, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 28, "slot": 0, "generation": 8, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 28, "slot": 0, "generation": 8, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 280}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 28, "slot": 0, "generation": 8, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 281}
+{"event": "copy_submit", "run_id": 9200000, "layer": 29, "slot": 1, "generation": 8, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 29, "slot": 1, "generation": 8, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 29, "slot": 1, "generation": 8, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 290}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 29, "slot": 1, "generation": 8, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 291}
+{"event": "copy_submit", "run_id": 9200000, "layer": 30, "slot": 2, "generation": 8, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 30, "slot": 2, "generation": 8, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 30, "slot": 2, "generation": 8, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 300}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 30, "slot": 2, "generation": 8, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 301}
+{"event": "copy_submit", "run_id": 9200000, "layer": 31, "slot": 3, "generation": 8, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 31, "slot": 3, "generation": 8, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 31, "slot": 3, "generation": 8, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 310}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 31, "slot": 3, "generation": 8, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 311}
+{"event": "copy_submit", "run_id": 9200000, "layer": 32, "slot": 0, "generation": 9, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 32, "slot": 0, "generation": 9, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 32, "slot": 0, "generation": 9, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 320}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 32, "slot": 0, "generation": 9, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 321}
+{"event": "copy_submit", "run_id": 9200000, "layer": 33, "slot": 1, "generation": 9, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 33, "slot": 1, "generation": 9, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 33, "slot": 1, "generation": 9, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 330}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 33, "slot": 1, "generation": 9, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 331}
+{"event": "copy_submit", "run_id": 9200000, "layer": 34, "slot": 2, "generation": 9, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 34, "slot": 2, "generation": 9, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 34, "slot": 2, "generation": 9, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 340}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 34, "slot": 2, "generation": 9, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 341}
+{"event": "copy_submit", "run_id": 9200000, "layer": 35, "slot": 3, "generation": 9, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 35, "slot": 3, "generation": 9, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 35, "slot": 3, "generation": 9, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 350}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 35, "slot": 3, "generation": 9, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 351}
+{"event": "copy_submit", "run_id": 9200000, "layer": 36, "slot": 0, "generation": 10, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 36, "slot": 0, "generation": 10, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 36, "slot": 0, "generation": 10, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 360}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 36, "slot": 0, "generation": 10, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 361}
+{"event": "copy_submit", "run_id": 9200000, "layer": 37, "slot": 1, "generation": 10, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 37, "slot": 1, "generation": 10, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 37, "slot": 1, "generation": 10, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 370}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 37, "slot": 1, "generation": 10, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 371}
+{"event": "copy_submit", "run_id": 9200000, "layer": 38, "slot": 2, "generation": 10, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 38, "slot": 2, "generation": 10, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 38, "slot": 2, "generation": 10, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 380}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 38, "slot": 2, "generation": 10, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 381}
+{"event": "copy_submit", "run_id": 9200000, "layer": 39, "slot": 3, "generation": 10, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 39, "slot": 3, "generation": 10, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 39, "slot": 3, "generation": 10, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 390}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 39, "slot": 3, "generation": 10, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 391}
+{"event": "copy_submit", "run_id": 9200000, "layer": 40, "slot": 0, "generation": 11, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 40, "slot": 0, "generation": 11, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 40, "slot": 0, "generation": 11, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 400}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 40, "slot": 0, "generation": 11, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 401}
+{"event": "copy_submit", "run_id": 9200000, "layer": 41, "slot": 1, "generation": 11, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 41, "slot": 1, "generation": 11, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 41, "slot": 1, "generation": 11, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 410}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 41, "slot": 1, "generation": 11, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 411}
+{"event": "copy_submit", "run_id": 9200000, "layer": 42, "slot": 2, "generation": 11, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 42, "slot": 2, "generation": 11, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 42, "slot": 2, "generation": 11, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 420}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 42, "slot": 2, "generation": 11, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 421}
+{"event": "copy_submit", "run_id": 9200000, "layer": 43, "slot": 3, "generation": 11, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 43, "slot": 3, "generation": 11, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 43, "slot": 3, "generation": 11, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 430}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 43, "slot": 3, "generation": 11, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 431}
+{"event": "copy_submit", "run_id": 9200000, "layer": 44, "slot": 0, "generation": 12, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 44, "slot": 0, "generation": 12, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 44, "slot": 0, "generation": 12, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 440}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 44, "slot": 0, "generation": 12, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 441}
+{"event": "copy_submit", "run_id": 9200000, "layer": 45, "slot": 1, "generation": 12, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 45, "slot": 1, "generation": 12, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 45, "slot": 1, "generation": 12, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 450}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 45, "slot": 1, "generation": 12, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 451}
+{"event": "copy_submit", "run_id": 9200000, "layer": 46, "slot": 2, "generation": 12, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 46, "slot": 2, "generation": 12, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 46, "slot": 2, "generation": 12, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 460}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 46, "slot": 2, "generation": 12, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 461}
+{"event": "copy_submit", "run_id": 9200000, "layer": 47, "slot": 3, "generation": 12, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 47, "slot": 3, "generation": 12, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 47, "slot": 3, "generation": 12, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 470}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 47, "slot": 3, "generation": 12, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 471}
+{"event": "copy_submit", "run_id": 9200000, "layer": 48, "slot": 0, "generation": 13, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 48, "slot": 0, "generation": 13, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 48, "slot": 0, "generation": 13, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 480}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 48, "slot": 0, "generation": 13, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 481}
+{"event": "copy_submit", "run_id": 9200000, "layer": 49, "slot": 1, "generation": 13, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 49, "slot": 1, "generation": 13, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 49, "slot": 1, "generation": 13, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 490}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 49, "slot": 1, "generation": 13, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 491}
+{"event": "copy_submit", "run_id": 9200000, "layer": 50, "slot": 2, "generation": 13, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 50, "slot": 2, "generation": 13, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 50, "slot": 2, "generation": 13, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 500}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 50, "slot": 2, "generation": 13, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 501}
+{"event": "copy_submit", "run_id": 9200000, "layer": 51, "slot": 3, "generation": 13, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 51, "slot": 3, "generation": 13, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 51, "slot": 3, "generation": 13, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 510}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 51, "slot": 3, "generation": 13, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 511}
+{"event": "copy_submit", "run_id": 9200000, "layer": 52, "slot": 0, "generation": 14, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 52, "slot": 0, "generation": 14, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 52, "slot": 0, "generation": 14, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 520}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 52, "slot": 0, "generation": 14, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 521}
+{"event": "copy_submit", "run_id": 9200000, "layer": 53, "slot": 1, "generation": 14, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 53, "slot": 1, "generation": 14, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 53, "slot": 1, "generation": 14, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 530}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 53, "slot": 1, "generation": 14, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 531}
+{"event": "copy_submit", "run_id": 9200000, "layer": 54, "slot": 2, "generation": 14, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 54, "slot": 2, "generation": 14, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 54, "slot": 2, "generation": 14, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 540}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 54, "slot": 2, "generation": 14, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 541}
+{"event": "copy_submit", "run_id": 9200000, "layer": 55, "slot": 3, "generation": 14, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 55, "slot": 3, "generation": 14, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 55, "slot": 3, "generation": 14, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 550}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 55, "slot": 3, "generation": 14, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 551}
+{"event": "copy_submit", "run_id": 9200000, "layer": 56, "slot": 0, "generation": 15, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 56, "slot": 0, "generation": 15, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 56, "slot": 0, "generation": 15, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 560}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 56, "slot": 0, "generation": 15, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 561}
+{"event": "copy_submit", "run_id": 9200000, "layer": 57, "slot": 1, "generation": 15, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 57, "slot": 1, "generation": 15, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 57, "slot": 1, "generation": 15, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 570}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 57, "slot": 1, "generation": 15, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 571}
+{"event": "copy_submit", "run_id": 9200000, "layer": 58, "slot": 2, "generation": 15, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 58, "slot": 2, "generation": 15, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 58, "slot": 2, "generation": 15, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 580}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 58, "slot": 2, "generation": 15, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 581}
+{"event": "copy_submit", "run_id": 9200000, "layer": 59, "slot": 3, "generation": 15, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 59, "slot": 3, "generation": 15, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 59, "slot": 3, "generation": 15, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 590}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 59, "slot": 3, "generation": 15, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 591}
+{"event": "copy_submit", "run_id": 9200000, "layer": 60, "slot": 0, "generation": 16, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 60, "slot": 0, "generation": 16, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 60, "slot": 0, "generation": 16, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 600}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 60, "slot": 0, "generation": 16, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 601}
+{"event": "copy_submit", "run_id": 9200000, "layer": 61, "slot": 1, "generation": 16, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 61, "slot": 1, "generation": 16, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 61, "slot": 1, "generation": 16, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 610}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 61, "slot": 1, "generation": 16, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 611}
+{"event": "copy_submit", "run_id": 9200000, "layer": 62, "slot": 2, "generation": 16, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 62, "slot": 2, "generation": 16, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 62, "slot": 2, "generation": 16, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 620}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 62, "slot": 2, "generation": 16, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 621}
+{"event": "copy_submit", "run_id": 9200000, "layer": 63, "slot": 3, "generation": 16, "phase": 0}
+{"event": "copy_complete", "run_id": 9200000, "layer": 63, "slot": 3, "generation": 16, "phase": 0}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 1, "layer": 63, "slot": 3, "generation": 16, "chunk": 0, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 630}
+{"event": "layer_compute", "run_id": 9200000, "ubatch": 2, "layer": 63, "slot": 3, "generation": 16, "chunk": 1, "compute_us": 1000.0, "setup_us": 10.0, "phase": 0, "t_us": 631}
+{"event": "phase_summary", "run_id": 9200000, "phase": "pp", "tokens": 513, "ubatches": 2, "wall_us": 1000000, "tokens_per_s": 100.0, "bytes_transferred": 1000, "evictions": 60, "total_transfer_us": 1000.0, "total_wait_us": 1.0, "total_compute_us": 1000.0, "layers_run": 64, "graph_prep_us": 10.0, "graph_builds": 0}
+{"event": "run_end", "run_id": 9200000, "exit_status": 0, "peak_vram_bytes": 1000000, "n_tokens_generated": 0, "failed": false, "error": "none"}
