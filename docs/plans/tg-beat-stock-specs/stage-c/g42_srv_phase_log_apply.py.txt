@@ -1,0 +1,51 @@
+"""G42 (round 7, the idle-time preparation of the next prompt): LLAMA_SRV_PHASE_LOG=1 logs every llama_decode of the server (tokens, duration, whether it was a prompt batch), so that the fixed costs of an np 1 turn
+(request set-up, cache shrink, slot window, the bank stream of the pass, the checkpoint chunk, the cache regrow) can be read from one log. Diagnostic only; off without the variable.
+Edits: tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    ('''        int ret = 0;
+        queue_tasks.yield_to_queue([&]() {
+            ret = llama_decode(ctx_tgt, batch_view);
+            if (ret == 0 && has_output) {
+                llama_synchronize(ctx_tgt);
+            }
+        });
+''', '''        int ret = 0;
+        static const bool phase_log = getenv("LLAMA_SRV_PHASE_LOG") != nullptr;   // G42
+        const int64_t t_phase0 = phase_log ? ggml_time_us() : 0;
+        queue_tasks.yield_to_queue([&]() {
+            ret = llama_decode(ctx_tgt, batch_view);
+            if (ret == 0 && has_output) {
+                llama_synchronize(ctx_tgt);
+            }
+        });
+        if (phase_log) {
+            SRV_WRN("phase: decode of %d tokens took %.1f ms (ret %d)\\n", (int) batch_view.n_tokens, (ggml_time_us() - t_phase0)/1000.0, ret);
+        }
+'''),
+])
+print("g42 edits matched")

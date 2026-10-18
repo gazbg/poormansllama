@@ -1,0 +1,21 @@
+"""G31t: the prompt-seeding strength defaults to the last 16 tokens (was 32). Measured (g413 / g441 / g442, growth to 138k and the SRV-2 cells): K = 0 / 8 / 16 / 32: growth TG mean over turns 1-8 88.4 / 88.1 / 84.6 / 80.9 t/s,
+24k cold TG 91.9 / 92.4 / 93.8 / 96.6 t/s. A prompt that ends in a tool dump seeds routing the next generation (a tool call) does not use, so a strong seed costs the agentic case what it gains the topic-switch case;
+16 keeps the 24k cold cell at >= 3.0x with a margin and costs the agentic growth 4%."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+
+patch(CH, [
+    ('''    int32_t     hybrid_moe_seed           = 32;''', '''    int32_t     hybrid_moe_seed           = 16;'''),
+])
+patch(AC, [
+    ('''(default: 32; 0 = off)''', '''(default: 16; 0 = off)'''),
+])

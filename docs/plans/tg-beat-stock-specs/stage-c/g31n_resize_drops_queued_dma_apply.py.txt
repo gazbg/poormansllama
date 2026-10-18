@@ -1,0 +1,47 @@
+"""G31n: resize() no longer refuses because promotion copies of the last decoded token are still queued. The copies queued by on_token() are normally taken by a host request of the same token; when a token has no miss they stay
+queued (dma_state 1) until the next token starts, i.e. across the end of a request, and the first KV commit of the next prompt would find the engine "not idle" and could not make room for the commit (the shrink was skipped,
+the margin broken by the size of the commit). They refer to the cache that resize() is about to free, so they are DROPPED (claimed 1 -> 2, vectors cleared, state 0); a copy that is being submitted (state 2/3) is waited for, at most 100 ms."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+MH = NEST + r"\src\llama-moe-hybrid.cpp"
+
+patch(MH, [
+    ('''bool moe_hybrid_engine::resize(int new_slots) {
+    if (new_slots == n_slot) {
+        return true;
+    }
+    if (new_slots < 1 || new_slots > n_expert || freq_.empty() || cache_buf == nullptr || dma_state.load() != 0) {
+        return false;
+    }''', '''bool moe_hybrid_engine::resize(int new_slots) {
+    if (new_slots == n_slot) {
+        return true;
+    }
+    if (new_slots < 1 || new_slots > n_expert || freq_.empty() || cache_buf == nullptr) {
+        return false;
+    }
+    // G31n: promotion copies of the last decoded token may still be queued (state 1): they target the cache that is about to be freed, drop them; wait (<= 100 ms) for a submission in progress (2, 3)
+    {
+        const auto tw = moe_clock::now();
+        for (int st = dma_state.load(std::memory_order_acquire); st != 0; st = dma_state.load(std::memory_order_acquire)) {
+            int queued = 1;
+            if (st == 1 && dma_state.compare_exchange_strong(queued, 2, std::memory_order_acquire)) {
+                dma_dst.clear();
+                dma_src.clear();
+                dma_size.clear();
+                dma_state.store(0, std::memory_order_release);
+                break;
+            }
+            if (moe_hybrid_us(tw) > 100000.0) {
+                return false;
+            }
+            MOE_HYBRID_PAUSE();
+        }
+    }'''),
+])

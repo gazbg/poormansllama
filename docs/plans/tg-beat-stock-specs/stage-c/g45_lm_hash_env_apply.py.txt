@@ -1,0 +1,71 @@
+"""G45 (fix of g43 / g44, found by the first fused session k5101): the blob hash that LLAMA_LM_LOG=1 printed cost ~100 ms per 63 MiB checkpoint (a byte loop), which inflated every request by ~1 s and hid the
+gain. The hash is now printed only with LLAMA_LM_HASH=1 (library and server); LLAMA_LM_LOG=1 keeps the timing lines. Edits: src/llama-lm-prefill.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    (r'''            sn.cut = pl.snap_cuts[k];
+''', r'''            sn.cut = pl.snap_cuts[k];
+            {
+                size_t est = 4096;      // the blob is the rows plus a few headers: one allocation, no regrowth
+                for (const auto & r : snap_rows[k].rows) {
+                    est += r.second.size();
+                }
+                sn.blob.reserve(est);
+            }
+'''),
+    (r'''            if (snap_ok) {
+                if (lm_log_on()) {
+                    LLAMA_LOG_WARN("lm-prefill: snapshot %d: %d tokens into the batch (position %d), %zu bytes, fnv %016llx\n", (int) k, (int) pl.snap_cuts[k], (int) (pl.p0 + pl.snap_cuts[k] - 1), sn.blob.size(),
+                                   (unsigned long long) lm_fnv64(sn.blob.data(), sn.blob.size()));
+                }
+                S.snaps.push_back(std::move(sn));''', r'''            if (snap_ok) {
+                if (lm_log_on()) {
+                    static const bool hash_on = getenv("LLAMA_LM_HASH") != nullptr;     // a byte loop over 63 MiB: ~100 ms, never in a timing run
+                    LLAMA_LOG_WARN("lm-prefill: snapshot %d: %d tokens into the batch (position %d), %zu bytes, fnv %016llx\n", (int) k, (int) pl.snap_cuts[k], (int) (pl.p0 + pl.snap_cuts[k] - 1), sn.blob.size(),
+                                   (unsigned long long) (hash_on ? lm_fnv64(sn.blob.data(), sn.blob.size()) : 0));
+                }
+                S.snaps.push_back(std::move(sn));'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    (r'''        if (getenv("LLAMA_LM_LOG") != nullptr) {
+            uint64_t h = 1469598103934665603ULL;
+            for (const uint8_t b : cur.data_tgt) {
+                h ^= b;
+                h *= 1099511628211ULL;
+            }
+            SRV_WRN("lm-fuse: checkpoint n_tokens''', r'''        if (getenv("LLAMA_LM_LOG") != nullptr) {
+            uint64_t h = 0;
+            if (getenv("LLAMA_LM_HASH") != nullptr) {      // a byte loop over 63 MiB: ~100 ms, never in a timing run
+                h = 1469598103934665603ULL;
+                for (const uint8_t b : cur.data_tgt) {
+                    h ^= b;
+                    h *= 1099511628211ULL;
+                }
+            }
+            SRV_WRN("lm-fuse: checkpoint n_tokens'''),
+])
+print("g45 edits matched")

@@ -1,0 +1,26 @@
+"""G30 / M2b follow-up: allow `--pp-stock-below` with `--mtp` (found by the smoke session g94-smoke-sc24: the flag validation still refused the combination that g30_mtp_catchup_apply already supports in the PP branch).
+A prompt below --pp-stock-below takes the stock path whatever the schedule, with or without --mtp (the plain branch has always ordered it that way).
+Apply after g30_mtp_catchup_apply. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''    if (pp_stock_below > 0 && (!tg_hybrid || mtp)) {
+        fprintf(stderr, "error: --pp-stock-below needs --tg-hybrid (the stock graph path is the hybrid decode path) and cannot be combined with --mtp\n");
+        return 2;
+    }''', r'''    if (pp_stock_below > 0 && !tg_hybrid) {
+        fprintf(stderr, "error: --pp-stock-below needs --tg-hybrid (the stock graph path is the hybrid decode path)\n");
+        return 2;
+    }'''),
+    (r'''            if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+                // G30: layer-major sweep with the capture''', r'''            if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && !stock_prefill) {
+                // G30: layer-major sweep with the capture'''),
+])

@@ -1,0 +1,90 @@
+"""G30 / M2l: the late draft bring-up (g30h) without the page-fault cost. Contract: the plan's "G30 CONTRACT".
+
+Measured (g103-ic1k, arm MFL, build g53): the migration of the draft head's 432 MiB of routed experts took 292.6 ms (1.5 GB/s: the source is a file-backed mapping whose pages are touched for the first time inside
+the prefill wall), and the first catch-up call after the re-reserve built its graph inside the wall (118.9 ms for 2 calls against 13 ms in the warm arm). Repair: at start-up, outside the timed prefill, copy the
+head's expert tensors from the mapping into a page-locked staging buffer (host RAM only, no VRAM), so the migration is a DMA from pinned memory (~14 GB/s); and print each catch-up call's time in this mode.
+Apply after g30h. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    # state
+    (r'''    ggml_backend_buffer_t mtp_head_buf       = nullptr;   // the device buffer that now holds the draft head's routed experts
+''', r'''    ggml_backend_buffer_t mtp_head_buf       = nullptr;   // the device buffer that now holds the draft head's routed experts
+    ggml_backend_buffer_t mtp_head_stage     = nullptr;   // page-locked host copy of those experts, made at start-up (outside the timed prefill)
+    std::vector<const void *> mtp_head_src;                // per tensor of the head's expert set: where its bytes can be read from (the staging copy, or the mapping)
+'''),
+    # use the staged copy
+    (r'''                const void * src = t->data;
+                const size_t nb  = ggml_nbytes(t);
+                t->data   = nullptr;
+                t->buffer = nullptr;''', r'''                const void * src = t->data;
+                for (size_t k = 0; k < 4; ++k) {
+                    if (moving[k] == t && k < mtp_head_src.size() && mtp_head_src[k] != nullptr) {
+                        src = mtp_head_src[k];
+                    }
+                }
+                const size_t nb  = ggml_nbytes(t);
+                t->data   = nullptr;
+                t->buffer = nullptr;'''),
+    # free the staging copy after the migration
+    (r'''        fprintf(stderr, "MTP: draft head experts moved to the GPU: %.1f MiB in %.1f ms\n", (double) total / 1048576.0, (ggml_time_us() - t_m0) / 1000.0);''', r'''        fprintf(stderr, "MTP: draft head experts moved to the GPU: %.1f MiB in %.1f ms (%s)\n", (double) total / 1048576.0, (ggml_time_us() - t_m0) / 1000.0,
+                mtp_head_stage != nullptr ? "from the page-locked staging copy" : "from the mapping");
+        if (mtp_head_stage != nullptr) {
+            ggml_backend_buffer_free(mtp_head_stage);
+            mtp_head_stage = nullptr;
+            mtp_head_src.clear();
+        }'''),
+    # stage at start-up, right after the lean draft context exists
+    (r'''        llama_set_embeddings_nextn(ctx, true, false);   // target: per-position hidden rows
+        llama_set_embeddings_nextn(ctx_dft, true, true); // draft: chained head-internal rows''', r'''        if (mtp_draft_late) {
+            // G30: stage the head's host experts in page-locked memory now (start-up work, not part of the timed prefill)
+            const int64_t t_s0 = ggml_time_us();
+            llama_layer & hl0 = model->layers[n_layer];
+            ggml_tensor * stage_ts[4] = { hl0.ffn_gate_exps, hl0.ffn_up_exps, hl0.ffn_down_exps, hl0.ffn_gate_up_exps };
+            size_t stage_total = 0;
+            for (ggml_tensor * t : stage_ts) {
+                if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                    stage_total += GGML_PAD(ggml_nbytes(t), 4096);
+                }
+            }
+            if (stage_total > 0) {
+                mtp_head_stage = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), stage_total);
+                if (mtp_head_stage != nullptr) {
+                    char * base = (char *) ggml_backend_buffer_get_base(mtp_head_stage);
+                    size_t off = 0;
+                    mtp_head_src.assign(4, nullptr);
+                    for (size_t k = 0; k < 4; ++k) {
+                        ggml_tensor * t = stage_ts[k];
+                        if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                            memcpy(base + off, t->data, ggml_nbytes(t));
+                            mtp_head_src[k] = base + off;
+                            off += GGML_PAD(ggml_nbytes(t), 4096);
+                        }
+                    }
+                }
+                fprintf(stderr, "MTP: draft head experts staged in page-locked memory: %.1f MiB in %.1f ms (%s)\n", (double) stage_total / 1048576.0, (ggml_time_us() - t_s0) / 1000.0,
+                        mtp_head_stage != nullptr ? "ok" : "page-locked allocation failed, the migration will read the mapping");
+            }
+        }
+        llama_set_embeddings_nextn(ctx, true, false);   // target: per-position hidden rows
+        llama_set_embeddings_nextn(ctx_dft, true, true); // draft: chained head-internal rows'''),
+    # per-call catch-up time in late mode
+    (r'''                            mtp_hrows = h_rows.data() + (size_t) off * (size_t) n_embd_out;
+                            ret = mtp_mirror(ub, off, n_tok);
+                            mtp_hrows = nullptr;''', r'''                            mtp_hrows = h_rows.data() + (size_t) off * (size_t) n_embd_out;
+                            const int64_t t_call0 = ggml_time_us();
+                            ret = mtp_mirror(ub, off, n_tok);
+                            if (mtp_draft_late && n_calls < 3) {
+                                fprintf(stderr, "MTP: catch-up call %d (%d rows) %.1f ms\n", n_calls, n_tok, (ggml_time_us() - t_call0) / 1000.0);
+                            }
+                            mtp_hrows = nullptr;'''),
+])

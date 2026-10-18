@@ -1,0 +1,637 @@
+"""G43 (G42 round 7): checkpoints taken INSIDE the layer-major pass, and the pass prepared in the idle time (library side).
+
+  * llama_lm_prefill_snap_request / _snap_count / _snap_cut / _snap_data: the caller asks, for the next llama_decode, for the recurrent state at token counts inside the batch. The pass cuts a chunk boundary at
+    each, copies the two recurrent-state rows of every recurrent layer to the host when the chunk that ends there has gone through the layer, and writes each snapshot as the blob
+    llama_state_seq_get_data_ext(PARTIAL_ONLY) would have written at that position (the real serializer with a substitute llama_io_write_i and the cell position overridden).
+  * llama_lm_prefill_arm / _disarm / _armed / _n_pass: make room, allocate the slot window + slab + pass scheduler and copy the banks of the first n_slots streamed layers BEFORE the batch arrives (idle time),
+    or for a batch the caller has decided to send whole; the pass adopts the armed resources.
+
+Edits: include/llama-hybrid.h, src/llama-context.h, src/llama-context.cpp, src/llama-lm-prefill.h, src/llama-lm-prefill.cpp, src/llama-memory-recurrent.h, src/llama-memory-recurrent.cpp.
+PATCH_DRY=1 checks every anchor and writes nothing; G22_APPLY=1 writes."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+# ---------------------------------------------------------------- public header
+patch(NEST + r"\include\llama-hybrid.h", [
+    (r'''LLAMA_API bool llama_lm_prefill_active(const struct llama_context * ctx);
+''', r'''LLAMA_API bool llama_lm_prefill_active(const struct llama_context * ctx);
+
+// G42: checkpoints taken INSIDE the layer-major pass. For the NEXT llama_decode only: token counts (from the batch's first token, 0 < cut < n_tokens) at which the sequence's recurrent state is wanted.
+// A pass that takes the batch cuts a chunk boundary at each of them and keeps the state there; llama_lm_prefill_snap_count says how many it made (0: the batch took the ordinary path, nothing was kept).
+LLAMA_API void    llama_lm_prefill_snap_request(struct llama_context * ctx, const int32_t * cuts, int32_t n_cuts);
+LLAMA_API int32_t llama_lm_prefill_snap_count(const struct llama_context * ctx);
+LLAMA_API int32_t llama_lm_prefill_snap_cut(const struct llama_context * ctx, int32_t i);
+// the bytes llama_state_seq_get_data_ext(ctx, dst, size, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) would have written when the sequence ended at that cut; dst == NULL: the size. Valid until the next llama_decode.
+LLAMA_API size_t  llama_lm_prefill_snap_data(struct llama_context * ctx, int32_t i, uint8_t * dst, size_t size);
+
+// G42: prepare the pass before the batch arrives. seq_id < 0: in the idle time, for a batch of about n_tokens (make room, allocate the slot window / slab / pass scheduler, copy the banks of the first layers);
+// seq_id >= 0: for the batch of n_tokens that continues this sequence and that the caller is about to send whole (the sequence's cache layout is checked too; the batch is then taken whatever its size).
+// true: the resources are held (armed) and the next llama_decode of a batch the pass can take uses them; any decode of <= 16 tokens, or of a big batch the pass cannot take, gives them back.
+LLAMA_API bool    llama_lm_prefill_arm(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens);
+LLAMA_API void    llama_lm_prefill_disarm(struct llama_context * ctx);
+LLAMA_API bool    llama_lm_prefill_armed(const struct llama_context * ctx);
+LLAMA_API int64_t llama_lm_prefill_n_pass(const struct llama_context * ctx);
+'''),
+])
+
+# ---------------------------------------------------------------- context header
+patch(NEST + r"\src\llama-context.h", [
+    (r'''    std::vector<int32_t> widths;              // chunk widths, in order
+''', r'''    std::vector<int32_t> widths;              // chunk widths, in order
+    std::vector<int32_t> snap_cuts;           // G42: token counts at which the recurrent state is kept (each one is a chunk boundary)
+    std::vector<int32_t> snap_chunk;          // G42: the chunk that ends at each of them
+'''),
+    (r'''    int  lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all);   // 0 done, 1 nothing changed (ordinary path), < 0 failed
+''', r'''    int  lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all);   // 0 done, 1 nothing changed (ordinary path), < 0 failed
+    bool lm_acquire_n(int64_t n_tokens, int32_t wmax);               // G42: the resources for a batch of n_tokens whose widest chunk is wmax
+    bool lm_stage_first();                                           // G42: copy the banks of the first streamed layers into the slot window
+    bool lm_prearm(llama_seq_id seq, int64_t n_tokens);              // G42: see llama_lm_prefill_arm
+    void lm_disarm();
+    void lm_snap_request(const int32_t * cuts, int32_t n_cuts);
+    int32_t lm_snap_count() const;
+    int32_t lm_snap_cut(int32_t i) const;
+    size_t  lm_snap_data(int32_t i, uint8_t * dst, size_t size) const;
+    int64_t lm_n_pass() const;
+    bool    lm_is_armed() const;
+'''),
+])
+
+# ---------------------------------------------------------------- state
+patch(NEST + r"\src\llama-lm-prefill.h", [
+    (r'''    int64_t                t_acquire_us  = 0;       // time the last lm_acquire took
+''', r'''    int64_t                t_acquire_us  = 0;       // time the last lm_acquire took
+
+    // G42: checkpoints taken inside the pass
+    std::vector<int32_t>   snap_req;                // token counts (from the first token of the next batch) at which the recurrent state is wanted
+    struct snap_t {
+        int32_t              cut = 0;               // tokens of the batch before the snapshot
+        std::vector<uint8_t> blob;                  // what llama_state_seq_get_data_ext(PARTIAL_ONLY) writes for the sequence at that point
+    };
+    std::vector<snap_t>    snaps;                   // the snapshots the last decode made (empty: that decode made none)
+    int64_t                n_snap        = 0;
+
+    // G42: the pass prepared in the idle time
+    bool                   armed         = false;   // slot window, slab and pass scheduler are held for the next pass (live is true too)
+    bool                   armed_batch   = false;   // ... for a batch the caller decided to send whole: taken whatever its size
+    int32_t                armed_w       = 0;       // widest chunk the armed room was made for
+    int64_t                n_arm         = 0;
+    int64_t                n_arm_used    = 0;
+    int64_t                n_arm_wasted  = 0;
+    int64_t                t_arm_us      = 0;       // time the last arm took
+'''),
+])
+
+# ---------------------------------------------------------------- recurrent memory: the position written by state_write
+patch(NEST + r"\src\llama-memory-recurrent.h", [
+    (r'''    uint32_t used = 0; // used cells (i.e. at least one seq_id)
+''', r'''    uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // G42: >= 0 makes state_write record this position for the cell (a snapshot taken inside a layer-major pass is written as the state of an earlier position)
+    llama_pos state_pos_override = -1;
+'''),
+])
+patch(NEST + r"\src\llama-memory-recurrent.cpp", [
+    (r'''            const llama_pos pos      = cell.pos;
+''', r'''            const llama_pos pos      = state_pos_override >= 0 ? state_pos_override : cell.pos;   // G42
+'''),
+])
+
+# ---------------------------------------------------------------- context: decode() and the destructor
+patch(NEST + r"\src\llama-context.cpp", [
+    (r'''    if (lm_state != nullptr) {
+        lm_plan = lm_make_plan(batch_inp);
+        lm_note(batch_inp, lm_plan);
+        if (lm_plan.ok) {
+            lm_scope.on = lm_acquire(lm_plan);
+            lm_plan.ok  = lm_scope.on;
+        }
+    }
+''', r'''    if (lm_state != nullptr) {
+        lm_state->snaps.clear();                       // G42: the snapshots of an earlier decode go
+        lm_plan = lm_make_plan(batch_inp);
+        lm_state->snap_req.clear();                    // G42: a request holds for one decode
+        lm_note(batch_inp, lm_plan);
+        if (lm_plan.ok) {
+            lm_scope.on = lm_acquire(lm_plan);
+            lm_plan.ok  = lm_scope.on;
+        } else if (lm_state->armed && (batch_inp.n_tokens <= 16 || batch_inp.n_tokens >= lm_state->p.min_tokens)) {
+            // G42: a decode step (the cache must be whole again) or a big batch the pass cannot take (the prefill window may open): the prepared resources go back
+            lm_disarm();
+        }
+    }
+'''),
+    (r'''    // wait for any pending asynchronous copies into the output buffers before they are freed
+    synchronize();
+
+#ifdef LLAMA_LAYER_STREAMING
+    // T-Q36-AER: stop the hybrid MoE engine while its backend still exists
+''', r'''    // wait for any pending asynchronous copies into the output buffers before they are freed
+    synchronize();
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G42: a pass that is armed (prepared in the idle time) gives its resources back while the backends exist
+    if (lm_state != nullptr && lm_state->live) {
+        lm_release();
+    }
+    // T-Q36-AER: stop the hybrid MoE engine while its backend still exists
+'''),
+])
+
+# ---------------------------------------------------------------- the pass
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    # includes
+    (r'''#include "llama-lm-prefill.h"
+
+#include "ggml-backend.h"
+''', r'''#include "llama-lm-prefill.h"
+#include "llama-io.h"
+
+#include "ggml-backend.h"
+'''),
+    (r'''#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+''', r'''#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+'''),
+    # the substitute writer
+    (r'''//
+// plan
+//
+
+llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {''', r'''// G42: the serializer of a snapshot. llama_memory_recurrent::state_write writes the rows through write_tensor(); this writer serves them from the host copies taken inside the pass, so the blob has the format
+// llama_state_seq_get_data_ext() gives (the serializer is the real one, nothing is duplicated)
+static constexpr uint32_t k_lm_io_magic = 0xaf143cd8;     // io_magic of llama-context.cpp
+
+class llama_io_write_lm_snap : public llama_io_write_i {
+public:
+    llama_io_write_lm_snap(std::vector<uint8_t> & out_, const std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> & rows_) : out(out_), rows(rows_) {}
+
+    void write(const void * src, size_t size) override {
+        const uint8_t * p = (const uint8_t *) src;
+        out.insert(out.end(), p, p + size);
+    }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        GGML_UNUSED(offset);
+        for (const auto & r : rows) {
+            if (r.first == tensor) {
+                if (r.second.size() != size) {
+                    throw std::runtime_error("lm snapshot: the row of a tensor has another size than the serializer asks for");
+                }
+                out.insert(out.end(), r.second.begin(), r.second.end());
+                return;
+            }
+        }
+        throw std::runtime_error("lm snapshot: no snapshot row for a tensor the serializer writes");
+    }
+    size_t n_bytes() override {
+        return out.size();
+    }
+
+private:
+    std::vector<uint8_t> & out;
+    const std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> & rows;
+};
+
+static uint64_t lm_fnv64(const uint8_t * p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+//
+// plan
+//
+
+llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {'''),
+    # min tokens: a batch the caller decided to send whole is taken whatever its size
+    (r'''    if (b.n_tokens < P.min_tokens) {
+        pl.why = "below --lm-prefill-min";
+        return pl;
+    }
+''', r'''    if (b.n_tokens < P.min_tokens && !lm_state->armed_batch) {
+        pl.why = "below --lm-prefill-min";
+        return pl;
+    }
+'''),
+    # chunk layout with the cuts
+    (r'''    const int32_t W = P.ubatch;
+    for (int32_t t = 0; t < n;) {
+        const int32_t w = std::min(W - (int32_t) ((p0 + t) % W), n - t);
+        pl.widths.push_back(w);
+        t += w;
+    }
+''', r'''    const int32_t W = P.ubatch;
+    {
+        // G42: a chunk boundary at every requested cut as well (the cuts are ascending); a cut that sits on a multiple of W costs nothing
+        const std::vector<int32_t> & cuts = lm_state->snap_req;
+        size_t ci = 0;
+        for (int32_t t = 0; t < n;) {
+            int32_t w = std::min(W - (int32_t) ((p0 + t) % W), n - t);
+            while (ci < cuts.size() && cuts[ci] <= t) {
+                ci++;
+            }
+            if (ci < cuts.size() && cuts[ci] < t + w) {
+                w = cuts[ci] - t;
+            }
+            pl.widths.push_back(w);
+            t += w;
+            if (ci < cuts.size() && cuts[ci] == t && t < n) {
+                pl.snap_cuts.push_back(t);
+                pl.snap_chunk.push_back((int32_t) pl.widths.size() - 1);
+                ci++;
+            }
+        }
+    }
+'''),
+    # acquire: adopt armed resources, else the old body as lm_acquire_n
+    (r'''    int32_t wmax = 1;
+    for (const int32_t w : pl.widths) {
+        wmax = std::max(wmax, w);
+    }
+    const int64_t slot_total = (int64_t) (slot_bytes + 4096) * P.n_slots;''', r'''    const int64_t slot_total = (int64_t) (slot_bytes + 4096) * P.n_slots;'''),
+    (r'''    const int64_t seg_tokens = std::min<int64_t>(pl.n, P.segment);''', r'''    const int64_t seg_tokens = std::min<int64_t>(n_tokens, P.segment);'''),
+    (r'''bool llama_context::lm_acquire(const llama_lm_plan & pl) {
+    auto & S = *lm_state;
+    const auto & P = S.p;
+
+''', r'''bool llama_context::lm_acquire(const llama_lm_plan & pl) {
+    auto & S = *lm_state;
+    int32_t wmax = 1;
+    for (const int32_t w : pl.widths) {
+        wmax = std::max(wmax, w);
+    }
+    if (S.armed) {
+        // G42: the resources were prepared (in the idle time, or for this very batch): adopt them when they are big enough, else give them back and acquire again (the cache is shrunk already: no new shrink)
+        if (S.slab_tokens >= std::min<int64_t>(pl.n, S.p.segment) && S.armed_w >= wmax) {
+            S.armed        = false;
+            S.armed_batch  = false;
+            S.cur_w        = wmax;
+            S.free_pre     = lm_dev_free() + S.slot_total + 2*(int64_t) S.slab_half;
+            S.t_acquire_us = 0;
+            S.n_arm_used++;
+            return true;
+        }
+        S.free_pre = 0;     // no pass ran: nothing to measure
+        lm_release();
+    }
+    return lm_acquire_n(pl.n, wmax);
+}
+
+bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
+    auto & S = *lm_state;
+    const auto & P = S.p;
+
+'''),
+    (r'''    S.slab.reset();
+    S.live = false;
+''', r'''    S.slab.reset();
+    S.live = false;
+    S.armed = false;
+    S.armed_batch = false;
+'''),
+    # lm_run: snapshot bookkeeping
+    (r'''    std::vector<chunk_t> chunks((size_t) n_chunks);
+''', r'''    std::vector<chunk_t> chunks((size_t) n_chunks);
+
+    // G42: the recurrent state at the plan's cuts: rows copied to the host when the chunk that ends at a cut has gone through a recurrent layer
+    struct snap_rows_t {
+        std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> rows;
+    };
+    std::vector<snap_rows_t> snap_rows(pl.snap_chunk.size());
+    std::vector<int>         snap_of_chunk((size_t) n_chunks, -1);
+    for (size_t k = 0; k < pl.snap_chunk.size(); ++k) {
+        snap_of_chunk[(size_t) pl.snap_chunk[k]] = (int) k;
+    }
+    double t_snap_copy = 0.0;
+'''),
+    (r'''                if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
+                    return fail("layer failed", -3);
+                }
+            }
+''', r'''                if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
+                    return fail("layer failed", -3);
+                }
+                if (snap_of_chunk[(size_t) c] >= 0 && hparams.is_recr(il)) {
+                    // G42: the layer's state now is the state at the end of this chunk (the piece is synchronised)
+                    const int64_t t_s0 = ggml_time_us();
+                    const auto * rcs = static_cast<const llama_memory_hybrid_context *>(chunks[c].mctx.get())->get_recr();
+                    const uint32_t hd = rcs->get_head();
+                    auto & sr = snap_rows[(size_t) snap_of_chunk[(size_t) c]];
+                    for (ggml_tensor * t : { rcs->get_r_l(il), rcs->get_s_l(il) }) {
+                        if (t == nullptr) {
+                            continue;
+                        }
+                        const size_t rb = t->nb[1];
+                        sr.rows.emplace_back(t, std::vector<uint8_t>(rb));
+                        ggml_backend_tensor_get(t, sr.rows.back().second.data(), (size_t) hd*rb, rb);
+                    }
+                    t_snap_copy += (double) (ggml_time_us() - t_s0);
+                }
+            }
+'''),
+    (r'''    // outputs as the ordinary decode would leave them
+    n_outputs = n_outputs_all;
+''', r'''    // G42: the snapshots become the blobs the caller stores as checkpoints (the real serializer, the host rows and the cell position substituted)
+    S.snaps.clear();
+    if (!snap_rows.empty()) {
+        const int64_t t_b0 = ggml_time_us();
+        llama_memory_recurrent * mr = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr();
+        bool snap_ok = true;
+        for (size_t k = 0; k < snap_rows.size() && snap_ok; ++k) {
+            llama_lm_state::snap_t sn;
+            sn.cut = pl.snap_cuts[k];
+            llama_io_write_lm_snap io(sn.blob, snap_rows[k].rows);
+            io.write(&k_lm_io_magic, sizeof(k_lm_io_magic));
+            io.write(&pl.seq, sizeof(pl.seq));
+            mr->state_pos_override = pl.p0 + pl.snap_cuts[k] - 1;
+            try {
+                mr->state_write(io, pl.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: lm-prefill: snapshot %d at %d tokens could not be written: %s\n", __func__, (int) k, (int) pl.snap_cuts[k], e.what());
+                snap_ok = false;
+            }
+            mr->state_pos_override = -1;
+            if (snap_ok) {
+                if (lm_log_on()) {
+                    LLAMA_LOG_WARN("lm-prefill: snapshot %d: %d tokens into the batch (position %d), %zu bytes, fnv %016llx\n", (int) k, (int) pl.snap_cuts[k], (int) (pl.p0 + pl.snap_cuts[k] - 1), sn.blob.size(),
+                                   (unsigned long long) lm_fnv64(sn.blob.data(), sn.blob.size()));
+                }
+                S.snaps.push_back(std::move(sn));
+            }
+        }
+        if (!snap_ok) {
+            S.snaps.clear();
+        }
+        S.n_snap += (int64_t) S.snaps.size();
+        if (lm_log_on()) {
+            LLAMA_LOG_WARN("lm-prefill: %d snapshots: copies %.0f ms, blobs %.0f ms\n", (int) S.snaps.size(), t_snap_copy/1e3, (double) (ggml_time_us() - t_b0)/1e3);
+        }
+    }
+
+    // outputs as the ordinary decode would leave them
+    n_outputs = n_outputs_all;
+'''),
+    # arm / disarm / snapshots API of the context, before enable/disable
+    (r'''//
+// enable / disable
+//
+''', r'''//
+// G42: the pass prepared in the idle time, and the snapshots
+//
+
+bool llama_context::lm_stage_first() {
+    auto & S  = *lm_state;
+    auto & ls = *S.ls;
+    ggml_backend_t backend_cuda = nullptr;
+    for (auto * b : backend_ptrs) {
+        if (ggml_backend_is_cuda(b)) {
+            backend_cuda = b;
+            break;
+        }
+    }
+    if (backend_cuda == nullptr) {
+        return false;
+    }
+    ls.backend_compute = backend_cuda;
+    ls.phase           = 0;
+    // the same layers the pass preloads at the start of a segment: the first n_slots streamed ones, one per slot
+    std::vector<uint8_t> slot_taken((size_t) ls.n_slots, 0);
+    int preloaded = 0;
+    for (int il = 0; il < S.n_layer && preloaded < ls.n_slots; ++il) {
+        if (S.native[(size_t) il] != 0 || slot_taken[(size_t) (il % ls.n_slots)]) {
+            continue;
+        }
+        slot_taken[(size_t) (il % ls.n_slots)] = 1;
+        bool copied = false;
+        if (!ls.load_layer(il, copied)) {
+            LLAMA_LOG_WARN("%s: lm-prefill: the first banks could not be staged: %s\n", __func__, ls.error_msg.c_str());
+            return false;
+        }
+        preloaded++;
+    }
+    return true;
+}
+
+bool llama_context::lm_prearm(llama_seq_id seq, int64_t n_tokens) {
+    if (lm_state == nullptr || n_tokens < 1) {
+        return false;
+    }
+    auto & S = *lm_state;
+    const auto & P = S.p;
+    if (S.live && !S.armed) {
+        return false;     // a pass is running
+    }
+    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn || cparams.n_rs_seq != 0 ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || layer_streaming != nullptr) {
+        return false;
+    }
+    auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (mh == nullptr) {
+        return false;
+    }
+    if (seq >= 0) {
+        // the checks lm_make_plan makes for the batch itself
+        std::string detail;
+        const llama_pos p0 = memory->seq_pos_max(seq) + 1;
+        const bool ok = (uint32_t) seq < cparams.n_seq_max && !mh->get_mem_attn()->get_has_shift() &&
+                        mh->get_mem_attn()->lm_block(seq, p0, (uint32_t) n_tokens, &detail) >= 0 && mh->get_mem_recr()->seq_pos_max(seq) == p0 - 1;
+        if (!ok) {
+            if (lm_log_on()) {
+                LLAMA_LOG_WARN("lm-prefill: not armed for %lld tokens of sequence %d at position %d: %s\n", (long long) n_tokens, (int) seq, (int) p0, detail.empty() ? "the recurrent state or the cache layout" : detail.c_str());
+            }
+            return false;
+        }
+    }
+    const int64_t rows = std::min<int64_t>(n_tokens, P.segment);
+    const int32_t wmax = (int32_t) std::min<int64_t>(n_tokens, P.ubatch);
+    if (S.armed) {
+        if (S.slab_tokens >= rows && S.armed_w >= wmax) {
+            S.armed_batch = S.armed_batch || seq >= 0;
+            return true;
+        }
+        S.free_pre = 0;
+        lm_release();      // too small for this batch: acquire again (the cache is shrunk already)
+    }
+    const int64_t t0 = ggml_time_us();
+    if (!lm_acquire_n(n_tokens, wmax)) {
+        return false;
+    }
+    if (!lm_stage_first()) {
+        S.free_pre = 0;
+        lm_release();
+        return false;
+    }
+    S.armed       = true;
+    S.armed_batch = seq >= 0;
+    S.armed_w     = wmax;
+    S.n_arm++;
+    S.t_arm_us    = ggml_time_us() - t0;
+    if (lm_log_on()) {
+        LLAMA_LOG_WARN("lm-prefill: armed for %lld tokens (%s): %.0f ms (room and allocation %.0f ms)\n", (long long) n_tokens, seq >= 0 ? "a batch" : "the idle time", (double) S.t_arm_us/1e3, (double) S.t_acquire_us/1e3);
+    }
+    return true;
+}
+
+void llama_context::lm_disarm() {
+    if (lm_state != nullptr && lm_state->armed) {
+        lm_state->n_arm_wasted++;
+        if (lm_log_on()) {
+            LLAMA_LOG_WARN("lm-prefill: disarmed: the prepared pass was not used\n");
+        }
+        lm_state->free_pre = 0;
+        lm_release();
+    }
+}
+
+void llama_context::lm_snap_request(const int32_t * cuts, int32_t n_cuts) {
+    if (lm_state == nullptr) {
+        return;
+    }
+    auto & v = lm_state->snap_req;
+    v.clear();
+    for (int32_t i = 0; cuts != nullptr && i < n_cuts; ++i) {
+        if (cuts[i] > 0) {
+            v.push_back(cuts[i]);
+        }
+    }
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+}
+
+int32_t llama_context::lm_snap_count() const {
+    return lm_state != nullptr ? (int32_t) lm_state->snaps.size() : 0;
+}
+
+int32_t llama_context::lm_snap_cut(int32_t i) const {
+    return lm_state != nullptr && i >= 0 && (size_t) i < lm_state->snaps.size() ? lm_state->snaps[(size_t) i].cut : -1;
+}
+
+size_t llama_context::lm_snap_data(int32_t i, uint8_t * dst, size_t size) const {
+    if (lm_state == nullptr || i < 0 || (size_t) i >= lm_state->snaps.size()) {
+        return 0;
+    }
+    const auto & b = lm_state->snaps[(size_t) i].blob;
+    if (dst == nullptr) {
+        return b.size();
+    }
+    if (size < b.size()) {
+        return 0;
+    }
+    memcpy(dst, b.data(), b.size());
+    return b.size();
+}
+
+int64_t llama_context::lm_n_pass() const {
+    return lm_state != nullptr ? lm_state->n_pass : 0;
+}
+
+bool llama_context::lm_is_armed() const {
+    return lm_state != nullptr && lm_state->armed;
+}
+
+//
+// enable / disable
+//
+'''),
+    # C API
+    (r'''bool llama_lm_prefill_active(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->lm_prefill_is_enabled();
+}
+
+#else // LLAMA_LAYER_STREAMING''', r'''bool llama_lm_prefill_active(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->lm_prefill_is_enabled();
+}
+
+void llama_lm_prefill_snap_request(struct llama_context * ctx, const int32_t * cuts, int32_t n_cuts) {
+    if (ctx != nullptr) {
+        ctx->lm_snap_request(cuts, n_cuts);
+    }
+}
+
+int32_t llama_lm_prefill_snap_count(const struct llama_context * ctx) {
+    return ctx != nullptr ? ctx->lm_snap_count() : 0;
+}
+
+int32_t llama_lm_prefill_snap_cut(const struct llama_context * ctx, int32_t i) {
+    return ctx != nullptr ? ctx->lm_snap_cut(i) : -1;
+}
+
+size_t llama_lm_prefill_snap_data(struct llama_context * ctx, int32_t i, uint8_t * dst, size_t size) {
+    return ctx != nullptr ? ctx->lm_snap_data(i, dst, size) : 0;
+}
+
+bool llama_lm_prefill_arm(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {
+    bool ok = false;
+    try {
+        ok = ctx != nullptr && ctx->lm_prearm(seq_id, n_tokens);
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_ERROR("%s: lm-prefill: %s\n", __func__, ex.what());
+        ok = false;
+    }
+    return ok;
+}
+
+void llama_lm_prefill_disarm(struct llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->lm_disarm();
+    }
+}
+
+bool llama_lm_prefill_armed(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->lm_is_armed();
+}
+
+int64_t llama_lm_prefill_n_pass(const struct llama_context * ctx) {
+    return ctx != nullptr ? ctx->lm_n_pass() : 0;
+}
+
+#else // LLAMA_LAYER_STREAMING'''),
+    (r'''bool llama_lm_prefill_active(const struct llama_context *) {
+    return false;
+}
+''', r'''bool llama_lm_prefill_active(const struct llama_context *) {
+    return false;
+}
+
+void llama_lm_prefill_snap_request(struct llama_context *, const int32_t *, int32_t) {}
+int32_t llama_lm_prefill_snap_count(const struct llama_context *) { return 0; }
+int32_t llama_lm_prefill_snap_cut(const struct llama_context *, int32_t) { return -1; }
+size_t llama_lm_prefill_snap_data(struct llama_context *, int32_t, uint8_t *, size_t) { return 0; }
+bool llama_lm_prefill_arm(struct llama_context *, llama_seq_id, int32_t) { return false; }
+void llama_lm_prefill_disarm(struct llama_context *) {}
+bool llama_lm_prefill_armed(const struct llama_context *) { return false; }
+int64_t llama_lm_prefill_n_pass(const struct llama_context *) { return 0; }
+'''),
+])
+print("g43 edits matched")

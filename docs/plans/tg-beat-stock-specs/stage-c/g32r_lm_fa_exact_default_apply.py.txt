@@ -1,0 +1,44 @@
+"""G32r (after the exactness experiment g32p, sessions k1001-k1021): the exact flash-attention mode is the DEFAULT of --lm-prefill.
+
+Measured with LLAMA_LM_FA_EXACT=1 + FAFIX_CAUSAL_GQA=1 (g32p): at equal chunk shape the pass is bit-identical to the ordinary path to within noise (first token over 20 prompts in the realistic checkpoint flow: median 0.0000, max 0.0002 nats against
+stock -ub 512 with 512-token chunks; 64-token continuations of 16 prompts: 15 identical, 1 near-tie flip of 0.049 nats, none above 0.25), and the pass is FASTER at long context (24k +2.6%, 50k +11%, 100k +21%, nothing lost below).
+So the server now makes it the default: (1) llama-graph.cpp: the key range of the pass's flash attention is the 256-padded one unless LLAMA_LM_FA_EXACT=0; (2) the server sets FAFIX_CAUSAL_GQA=1 (when not set) BEFORE the model is loaded, because ggml-cuda
+reads it once at the first flash-attention call. Opt out: LLAMA_LM_FA_EXACT=0 and FAFIX_CAUSAL_GQA=0. Edits: src/llama-graph.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-graph.cpp", [
+    ('''                    // LLAMA_LM_FA_EXACT=1: the key range is the 256-padded one the ordinary path's view has for the same chunk (see g32p); default: exactly the live keys
+                    static const bool fa_exact = getenv("LLAMA_LM_FA_EXACT") != nullptr && getenv("LLAMA_LM_FA_EXACT")[0] == '1';''',
+     '''                    // the key range is the 256-padded one the ordinary path's view has for the same chunk (g32p, default since g32r); LLAMA_LM_FA_EXACT=0: exactly the live keys
+                    static const bool fa_exact = !(getenv("LLAMA_LM_FA_EXACT") != nullptr && getenv("LLAMA_LM_FA_EXACT")[0] == '0');'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    (r'''                SRV_INF("lm-prefill: logical batch size (-b) %d (one layer-major pass per batch)\n", params_base.n_batch);
+            }
+        }
+
+        llama_init = common_init_from_params(params_base);''', r'''                SRV_INF("lm-prefill: logical batch size (-b) %d (one layer-major pass per batch)\n", params_base.n_batch);
+            }
+            // G32: the pass's flash attention takes the same (GQA-packed) kernel variant as the ordinary path, which makes it equal to the ordinary path at the same chunk shape; ggml-cuda reads this once at the first
+            // flash-attention call, i.e. during the model load below (FAFIX_CAUSAL_GQA=0 in the environment keeps the old variant)
+#if defined(_WIN32)
+            if (getenv("FAFIX_CAUSAL_GQA") == nullptr) {
+                _putenv_s("FAFIX_CAUSAL_GQA", "1");
+            }
+#else
+            setenv("FAFIX_CAUSAL_GQA", "1", 0);
+#endif
+        }
+
+        llama_init = common_init_from_params(params_base);'''),
+])
+print("g32r edits matched")

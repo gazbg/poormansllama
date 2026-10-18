@@ -1,0 +1,55 @@
+"""G31k (S3a): --hybrid-moe takes -ub 2048 when -ub is not given (--hybrid-moe-ubatch N, 0 = keep the stock default).
+Measured (g250-g253, natdeep 24,000-token prompt, hybrid preset, cache sized to the 16,000 MiB margin for each -ub): PP 715 / 1,208 / 1,856 / 2,429 t/s at -ub 1024 / 2048 / 4096 / 8192 against 380 t/s at 512
+(STOCK 264 t/s); expert cache 44 / 36 / 18 / 8 slots; TG 99.9 / 96.5 / 81.0 / 71.4 t/s; -ub 8192 cannot keep the margin (14,785 MiB free). 2048 is the best point that keeps TG >= 3x STOCK."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(CH, [
+    ('''    std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
+''', '''    std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
+    int32_t     hybrid_moe_ubatch = 2048; // physical batch size (-ub) used with --hybrid-moe when -ub is not given; 0 = keep the stock default
+    bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
+'''),
+])
+
+patch(AC, [
+    ('''        [](common_params & params, int value) {
+            params.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH"));''', '''        [](common_params & params, int value) {
+            params.n_ubatch     = value;
+            params.n_ubatch_set = true;
+        }
+    ).set_env("LLAMA_ARG_UBATCH"));'''),
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--hybrid-moe-ubatch"}, "N",
+        "physical batch size used with --hybrid-moe when -ub is not given (default: 2048; 0 = keep the stock default 512). A bigger ubatch copies each expert bank once per 2048 tokens instead of once per 512",
+        [](common_params & params, int value) {
+            params.hybrid_moe_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(SV, [
+    ('''            params_base.fit_params = false;
+            llama_hybrid_prepare_env(''', '''            params_base.fit_params = false;
+            if (!params_base.n_ubatch_set && params_base.hybrid_moe_ubatch > 0) {
+                params_base.n_ubatch = params_base.hybrid_moe_ubatch;
+                params_base.n_batch  = std::max(params_base.n_batch, params_base.n_ubatch);
+                SRV_INF("hybrid-moe: physical batch size (-ub) %d, logical %d\\n", params_base.n_ubatch, params_base.n_batch);
+            }
+            llama_hybrid_prepare_env('''),
+])

@@ -1,0 +1,308 @@
+"""G31 / S2: lazily committed KV with on-demand commit, and the hybrid cache giving way to it. Contract: docs/plans/llama-server-integration.md.
+
+Measured (g211/g213, build s1): with --hybrid-moe and the full 262,000-token KV committed (2.7 GB) the expert cache gets 17 slots per layer under the 16,000 MiB keep-free target; the KV rows of a
+context that is mostly empty are VRAM the cache could use. The CUDA backend already has a lazily committed KV buffer (LLAMA_KV_LAZY, used by the runner, which commits the rows of its one prompt up front;
+reads of uncommitted pages return zeros through a shared read-only granule, a write to one faults). The server writes cells at positions it does not know in advance, so the commit must follow the writes:
+
+ * ggml-cuda.cu: ggml_backend_cuda_lazy_commit_cost(rows) = the physical bytes committing the first `rows` rows would still map.
+ * llama-kv-cache.h/.cpp: with LLAMA_KV_LAZY (single stream, flash-attention layout) the cache commits rows [0, max written cell + 1 + headroom) in steps of 4096 rows BEFORE a ubatch is applied
+   (llama_kv_cache_context::apply, and the state restore path); a failed commit makes the decode fail loudly (no silent write to an uncommitted page); everything that touches the whole window
+   (K shift) commits all rows first. Before a commit it calls a pressure callback with the bytes it is about to map, so the VRAM expert cache can make room.
+ * llama-moe-hybrid.cpp / llama-hybrid-api.cpp / llama-hybrid.h: llama_hybrid_set_margin(keep_free, safety, slack): registers that callback; it synchronizes the device and shrinks the expert cache so that
+   `keep_free + safety` MiB stay free after the commit (plus a slack so that the next commits do not shrink again), and drops the context's cached decode graph. prepare_env turns LLAMA_KV_LAZY on.
+Without the environment variable nothing changes. Apply after g31b. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CU = NEST + r"\ggml\src\ggml-cuda\ggml-cuda.cu"
+KH = NEST + r"\src\llama-kv-cache.h"
+KC = NEST + r"\src\llama-kv-cache.cpp"
+HY = NEST + r"\src\llama-moe-hybrid.cpp"
+HH = NEST + r"\src\llama-moe-hybrid.h"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+HI = NEST + r"\include\llama-hybrid.h"
+
+patch(CU, [
+    (r'''extern "C" __declspec(dllexport) bool ggml_backend_cuda_buft_is_lazy_capable(int device) {''', r'''// G31: the physical bytes that committing the first `rows` rows of every lazily committed cache tensor would still map (an uncommitted or aliased granule counts once)
+extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
+    int64_t total = 0;
+    for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        std::vector<uint8_t> seen(lz->mapped.size(), 0);
+        for (ggml_tensor * t : lz->tensors) {
+            const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
+            const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                const size_t o = off + (size_t) s*t->nb[2];
+                const size_t b = (size_t) r*t->nb[1];
+                if (b == 0) {
+                    continue;
+                }
+                const size_t g0 = o / lz->gran;
+                const size_t g1 = std::min((o + b + lz->gran - 1) / lz->gran, lz->mapped.size());
+                for (size_t g = g0; g < g1; ++g) {
+                    if (lz->mapped[g] != 1 && !seen[g]) {
+                        seen[g] = 1;
+                        total += (int64_t) lz->gran;
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
+extern "C" __declspec(dllexport) bool ggml_backend_cuda_buft_is_lazy_capable(int device) {'''),
+])
+
+patch(KH, [
+    (r'''    uint32_t get_n_kv_reserve() const;
+''', r'''    uint32_t get_n_kv_reserve() const;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: lazily committed KV (LLAMA_KV_LAZY). Commit the rows a ubatch is about to write (false: the driver refused, the caller must not write), or every row (whole-window graphs).
+    bool lazy_ensure(const slot_info & sinfo, llama_context * lctx);
+    bool lazy_commit_rows(uint32_t rows, llama_context * lctx);
+    bool is_lazy() const { return lazy_kv; }
+#endif
+'''),
+    (r'''    // T-GPLR-71: phase-scoped override of n_pad inside get_n_kv(); 0 = off
+    uint32_t n_pad_view = 0;
+''', r'''    // T-GPLR-71: phase-scoped override of n_pad inside get_n_kv(); 0 = off
+    uint32_t n_pad_view = 0;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: rows [0, lazy_rows) of the lazily committed cache tensors are committed
+    bool     lazy_kv   = false;
+    uint32_t lazy_rows = 0;
+#endif
+'''),
+])
+
+patch(KC, [
+    (r'''void ggml_backend_cuda_lazy_set_next_alloc(bool on);
+}''', r'''void ggml_backend_cuda_lazy_set_next_alloc(bool on);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows);
+}'''),
+    (r'''            bool kv_lazy = false;
+            if (getenv("LLAMA_KV_LAZY") != nullptr) {''', r'''            bool kv_lazy = false;
+            // G31: the commit works on whole cell rows of one stream: not with several streams or the transposed V layout
+            if (getenv("LLAMA_KV_LAZY") != nullptr && n_stream == 1 && !v_trans) {'''),
+    (r'''            if (kv_lazy) {
+                ggml_backend_cuda_lazy_set_next_alloc(false);
+            }''', r'''            if (kv_lazy) {
+                ggml_backend_cuda_lazy_set_next_alloc(false);
+                lazy_kv = true;
+            }'''),
+    (r'''uint32_t llama_kv_cache::get_n_kv_reserve() const {''', r'''#ifdef LLAMA_LAYER_STREAMING
+// G31: called with the bytes a commit is about to map (llama-hybrid-api.cpp registers it: the VRAM expert cache makes room)
+void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes) = nullptr;
+
+bool llama_kv_cache::lazy_commit_rows(uint32_t rows, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }
+    rows = std::min<uint32_t>(rows, get_size());
+    if (rows <= lazy_rows) {
+        return true;
+    }
+    const uint32_t target = std::min<uint32_t>(get_size(), ((rows + 1024u + 4095u) / 4096u) * 4096u);   // steps of 4096 rows plus headroom
+    const int64_t cost = ggml_backend_cuda_lazy_commit_cost(target);
+    if (cost > 0 && llama_kv_lazy_pressure_cb != nullptr) {
+        llama_kv_lazy_pressure_cb(lctx, cost);
+    }
+    const int64_t total = ggml_backend_cuda_lazy_commit_rows(target);
+    if (total < 0) {
+        LLAMA_LOG_ERROR("%s: the driver could not commit KV rows [0, %u) (%.1f MiB more): out of device memory\n", __func__, target, (double) cost/1048576.0);
+        return false;
+    }
+    LLAMA_LOG_DEBUG("%s: KV rows [0, %u) committed (+%.1f MiB, %.1f MiB committed in total)\n", __func__, target, (double) cost/1048576.0, (double) total/1048576.0);
+    lazy_rows = target;
+    return true;
+}
+
+bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }
+    uint32_t need = 0;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            need = std::max(need, (uint32_t) sinfo.idxs[s][ii] + 1u);
+        }
+    }
+    return lazy_commit_rows(need, lctx);
+}
+#endif
+
+uint32_t llama_kv_cache::get_n_kv_reserve() const {'''),
+    (r'''        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
+        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        apply_ubatch(sinfo, ubatch);''', r'''        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
+        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+#ifdef LLAMA_LAYER_STREAMING
+        if (!lazy_ensure(sinfo, nullptr)) {
+            return false;
+        }
+#endif
+        apply_ubatch(sinfo, ubatch);'''),
+    (r'''    bool updated = false;
+
+    auto * sched = lctx->get_sched();
+''', r'''    bool updated = false;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G31: the shift graph rewrites the whole window
+    if (do_shift && !lazy_commit_rows(get_size(), lctx)) {
+        return false;
+    }
+#endif
+
+    auto * sched = lctx->get_sched();
+'''),
+    (r'''    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur]);''', r'''#ifdef LLAMA_LAYER_STREAMING
+    // G31: commit the rows this ubatch writes before it is applied
+    if (!kv->lazy_ensure(sinfos[i_cur], lctx)) {
+        return false;
+    }
+#endif
+    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur]);'''),
+])
+
+patch(HH, [
+    (r'''// G31: resize the cache so that keep_free_bytes''', r'''// G31: shrink the cache so that need_free_bytes of device memory are free (and slack_bytes more when it has to shrink); synchronizes the device first. No-op when they already are free.
+// *shrunk is set when the cache changed. False when there is no engine or the resize failed.
+bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_bytes, int min_slots, bool * shrunk);
+
+// G31: resize the cache so that keep_free_bytes'''),
+])
+
+patch(HY, [
+    (r'''// G31: size the cache to a keep-free target (the rule of the runner's tg_transition(), plus shrinking).''', r'''bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_bytes, int min_slots, bool * shrunk) {
+    if (shrunk != nullptr) {
+        *shrunk = false;
+    }
+    moe_hybrid_engine * eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+        if (g_moe_hybrid_engines.size() != 1) {
+            return false;
+        }
+        eng = g_moe_hybrid_engines.begin()->second.get();
+    }
+    if (eng->cache_buf == nullptr || eng->cuda == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(eng->cuda);
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_dev_memory(dev, &free_b, &total_b);
+    if ((int64_t) free_b >= need_free_bytes) {
+        return true;
+    }
+    const int64_t cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
+    const int64_t row_bytes   = cache_bytes / (eng->n_slot + 1);
+    if (row_bytes <= 0) {
+        return false;
+    }
+    const int64_t deficit   = need_free_bytes - (int64_t) free_b + slack_bytes;
+    const int64_t drop_rows = (deficit + row_bytes - 1) / row_bytes;
+    const int     new_slots = (int) std::max<int64_t>(std::max(1, min_slots), (int64_t) eng->n_slot - drop_rows);
+    if (new_slots >= eng->n_slot) {
+        return true;   // already at the floor: the caller tries the commit anyway
+    }
+    ggml_backend_synchronize(eng->cuda);   // a graph of the ubatch before this one may still read the cache
+    LLAMA_LOG_INFO("%s: moe_hybrid: device memory is short by %.1f MiB: expert cache %d -> %d slots per layer\n", __func__, (double) (need_free_bytes - (int64_t) free_b)/1048576.0, eng->n_slot, new_slots);
+    if (!llama_moe_hybrid_resize_impl(new_slots)) {
+        return false;
+    }
+    if (shrunk != nullptr) {
+        *shrunk = true;
+    }
+    return true;
+}
+
+// G31: size the cache to a keep-free target (the rule of the runner's tg_transition(), plus shrinking).'''),
+])
+
+patch(HI, [
+    (r'''#ifdef __cplusplus
+}
+#endif
+
+#endif // LLAMA_HYBRID_H''', r'''// Keep keep_free_mib + safety_mib of device memory free while the lazily committed KV cache grows (LLAMA_KV_LAZY): before every commit the expert cache shrinks as far as needed,
+// by slack_mib more than the commit asks, so that the next commits do not shrink it again. ctx is the context whose decode graph is dropped when that happens outside a decode (a state restore).
+// Call once, after the first llama_hybrid_auto_size.
+LLAMA_API void llama_hybrid_set_margin(struct llama_context * ctx, int32_t keep_free_mib, int32_t safety_mib, int32_t slack_mib, int32_t min_slots);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // LLAMA_HYBRID_H'''),
+])
+
+patch(HA, [
+    (r'''#ifdef LLAMA_LAYER_STREAMING
+#include "llama-moe-hybrid.h"
+#endif
+''', r'''#ifdef LLAMA_LAYER_STREAMING
+#include "llama-moe-hybrid.h"
+extern void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes);   // llama-kv-cache.cpp
+#endif
+'''),
+    (r'''    hybrid_setenv_default("LLAMA_FATTN_GQA8", "1");             // packed GQA decode attention (1-4 rows)''', r'''    hybrid_setenv_default("LLAMA_FATTN_GQA8", "1");             // packed GQA decode attention (1-4 rows)
+    hybrid_setenv_default("LLAMA_KV_LAZY", "1");                // the KV cache commits its rows on demand (the expert cache gets the rest)'''),
+    (r'''bool llama_hybrid_active(void) {''', r'''#ifdef LLAMA_LAYER_STREAMING
+static int64_t g_hybrid_keep_free = 0;
+static int64_t g_hybrid_safety    = 0;
+static int64_t g_hybrid_slack     = 0;
+static int     g_hybrid_min_slots = 8;
+static llama_context * g_hybrid_ctx = nullptr;
+
+static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {
+    bool shrunk = false;
+    if (!llama_moe_hybrid_make_room_impl(commit_bytes + g_hybrid_keep_free + g_hybrid_safety, g_hybrid_slack, g_hybrid_min_slots, &shrunk)) {
+        LLAMA_LOG_WARN("%s: hybrid-moe: could not make room for a KV commit of %.1f MiB\n", __func__, (double) commit_bytes/1048576.0);
+        return;
+    }
+    if (shrunk) {
+        if (lctx != nullptr) {
+            lctx->drop_graph_reuse();
+        }
+        if (g_hybrid_ctx != nullptr && g_hybrid_ctx != lctx) {
+            g_hybrid_ctx->drop_graph_reuse();
+        }
+    }
+}
+#endif
+
+void llama_hybrid_set_margin(struct llama_context * ctx, int32_t keep_free_mib, int32_t safety_mib, int32_t slack_mib, int32_t min_slots) {
+#ifdef LLAMA_LAYER_STREAMING
+    const int64_t MiB = 1048576;
+    g_hybrid_keep_free = (int64_t) keep_free_mib*MiB;
+    g_hybrid_safety    = (int64_t) safety_mib*MiB;
+    g_hybrid_slack     = (int64_t) slack_mib*MiB;
+    g_hybrid_min_slots = min_slots > 0 ? min_slots : 8;
+    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(keep_free_mib); GGML_UNUSED(safety_mib); GGML_UNUSED(slack_mib); GGML_UNUSED(min_slots);
+#endif
+}
+
+bool llama_hybrid_active(void) {'''),
+])

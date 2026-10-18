@@ -1,0 +1,89 @@
+"""G30 / M2g: give the draft context's catch-up compute buffer back before the decode. Contract: the plan's "G30 CONTRACT".
+
+Measured (g94-lc4k, certified): raising the draft context's n_ubatch to 512 for the prompt catch-up (g30_mtp_catchup_apply) leaves a 296.0 MiB CUDA compute buffer in the draft context for the whole decode
+(it was 1.73 MiB at 3 rows): 4.3 cache slots (68.3 MiB each) lost, 53 slots against 58 (the batch-major MTP arm) and 67 without MTP. The target context releases its prefill buffers with
+`--tg-release-compute` (llama_context::reserve_for_decode); this adds the same operation for the draft context with the ubatch it decodes at (2 + draft rows), right after the catch-up.
+
+Edits: llama-context.h (reserve_ubatch), llama-layer-streaming.cpp (implementation + the C API shim llama_layer_streaming_reserve_ubatch), llama-layer-streaming.h (declaration),
+main.cpp (the call at the start of the MTP decode section; prints the freed bytes).
+Apply after g30_mtp_catchup_apply (and g30b). G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+X = NEST + r"\src\llama-context.h"
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(X, [
+    (r'''    int64_t reserve_for_decode();
+#endif''', r'''    int64_t reserve_for_decode();
+
+    // G30: the same with an explicit ubatch (the MTP draft context after its prompt catch-up decodes at most 2 + draft rows). Returns the bytes released, or -1.
+    int64_t reserve_ubatch(uint32_t n_ubatch_new);
+#endif'''),
+])
+
+patch(H, [
+    (r'''LLAMA_API int64_t llama_layer_streaming_reserve_decode(llama_context * ctx);
+''', r'''LLAMA_API int64_t llama_layer_streaming_reserve_decode(llama_context * ctx);
+
+// G30: see llama_context::reserve_ubatch. Returns the bytes released, or -1.
+LLAMA_API int64_t llama_layer_streaming_reserve_ubatch(llama_context * ctx, uint32_t n_ubatch);
+'''),
+])
+
+patch(C, [
+    (r'''int64_t llama_layer_streaming_reserve_decode(llama_context * ctx) {
+    return ctx->reserve_for_decode();
+}
+''', r'''int64_t llama_layer_streaming_reserve_decode(llama_context * ctx) {
+    return ctx->reserve_for_decode();
+}
+
+int64_t llama_layer_streaming_reserve_ubatch(llama_context * ctx, uint32_t n_ubatch) {
+    return ctx->reserve_ubatch(n_ubatch);
+}
+'''),
+    (r'''// One owner for the structured failure shape (error_msg -> failed -> error
+// event -> GGML_STATUS_FAILED); byte-identical to the inline copies it''', r'''// G30: reserve_for_decode with an explicit ubatch, for the MTP draft context: its prompt catch-up decodes up to 512 rows (a 296 MiB compute buffer), its rounds at most 2 + draft rows.
+int64_t llama_context::reserve_ubatch(uint32_t n_ubatch_new) {
+    if (!sched || n_ubatch_new < 1) {
+        return -1;
+    }
+    synchronize();
+    auto total = [this]() {
+        size_t s = 0;
+        for (ggml_backend_t b : backend_ptrs) {
+            s += ggml_backend_sched_get_buffer_size(sched.get(), b);
+        }
+        return s;
+    };
+    const size_t before = total();
+    cparams.n_ubatch   = n_ubatch_new;
+    sched_need_reserve = true;
+    sched_reserve();
+    return (int64_t) before - (int64_t) total();
+}
+
+// One owner for the structured failure shape (error_msg -> failed -> error
+// event -> GGML_STATUS_FAILED); byte-identical to the inline copies it'''),
+])
+
+patch(M, [
+    (r'''        if (mtp && exit_status == 0) {
+            // --- MTP draft/verify/accept loop (T-Q38HG-06) ---''', r'''        if (mtp && exit_status == 0) {
+            // G30: the prompt catch-up needed up to --mtp-catchup rows per draft decode; the rounds decode at most 2 + draft rows. Give the difference of the draft context's compute buffer back (before
+            // tg_transition() below sizes the hybrid cache from the free memory).
+            if (ctx_dft != nullptr && std::min(mtp_catchup, ubatch) > 2 + mtp_draft) {
+                const int64_t freed_d = llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) (2 + mtp_draft));
+                fprintf(stderr, "MTP: draft context compute buffers re-reserved for the rounds (%d rows), %.1f MiB released\n", 2 + mtp_draft, (double) freed_d / 1048576.0);
+            }
+            // --- MTP draft/verify/accept loop (T-Q38HG-06) ---'''),
+])

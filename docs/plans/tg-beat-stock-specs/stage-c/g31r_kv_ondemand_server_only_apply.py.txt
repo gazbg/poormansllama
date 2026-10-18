@@ -1,0 +1,34 @@
+"""G31r: the on-demand KV commit (g31c) is for the SERVER only (LLAMA_KV_LAZY_ONDEMAND=1, set by llama_hybrid_prepare_env). The runner (--kv-lazy -> LLAMA_KV_LAZY) commits the rows of its one prompt up front itself; g31c's commit
+code also ran in the runner and committed [0, max cell + 1 + 1024 headroom) in steps of 4096 rows on top of that, ~40 MiB more device memory: the SRV-8 identity session (g320/g321-sc24) showed the tg-hybrid auto sizing at 68 slots
+instead of 69 (device in use 4,569.6 against 4,529.6 MiB), the same 512 ids but logit margins that differ by a median of 0.1336 (the cache holds different experts). With the gate the runner is what it was."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+KC = NEST + r"\src\llama-kv-cache.cpp"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(KC, [
+    ('''bool llama_kv_cache::lazy_commit_rows(uint32_t rows, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }''', '''bool llama_kv_cache::lazy_commit_rows(uint32_t rows, llama_context * lctx) {
+    if (!lazy_kv || other) {
+        return true;
+    }
+    // G31r: only the server (llama_hybrid_prepare_env) commits on demand; the runner commits its prompt's rows itself
+    static const bool on_demand = getenv("LLAMA_KV_LAZY_ONDEMAND") != nullptr;
+    if (!on_demand) {
+        return true;
+    }'''),
+])
+
+patch(HA, [
+    ('''    hybrid_setenv_default("LLAMA_KV_LAZY", "1");                // the KV cache commits its rows on demand (the expert cache gets the rest)''', '''    hybrid_setenv_default("LLAMA_KV_LAZY", "1");                // the KV cache commits its rows on demand (the expert cache gets the rest)
+    hybrid_setenv_default("LLAMA_KV_LAZY_ONDEMAND", "1");       // ... and the cache itself does the committing (G31r; the runner commits its rows up front)'''),
+])

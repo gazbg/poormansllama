@@ -1,0 +1,70 @@
+"""G30 / M2j: the fused MoE router (softmax -> top-k -> normalise) for 2-4 row decodes, behind LLAMA_CUDA_TOPK_MOE_SMALL=1. Contract: the plan's "G30 CONTRACT".
+
+Measured (nsys of g94-lc4k, `tools/g30-nsys-rounds.py` / the pair profile, plan "G30 M3 ROUND 2"): a plain decode token routes every MoE layer with ONE fused `topk_moe` kernel; the 2-row MTP verify runs
+the unfused chain soft_max + k_argsort + get_rows + reduce_rows + div + clamp instead (38.6 layers x 6 kernels, 438 us of GPU time and five extra launches per layer on the critical path of every round).
+The fusion is refused for more than one row by `ggml_cuda_check_fusion_memory_ranges`: the fused kernel writes ids/weights where the allocator may have put the logits it still has to read for the NEXT
+row. With ONE row "each row is read entirely before writing" makes that safe. For 2-4 rows the rows share ONE block (rows_per_block = 4, one warp per row), so a block barrier between the last read of the
+logits / bias and the first write of ids / weights gives the same guarantee. Warps of rows >= n_rows have exited and count as arrived.
+Opt-in: with the variable unset the check and the kernel behave exactly as before (the barrier is behind a config flag that is false). Apply after g30f. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+T = NEST + r"\ggml\src\ggml-cuda\topk-moe.cu"
+H = NEST + r"\ggml\src\ggml-cuda\topk-moe.cuh"
+G = NEST + r"\ggml\src\ggml-cuda\ggml-cuda.cu"
+
+patch(T, [
+    (r'''struct topk_moe_config {
+    bool use_sigmoid;
+    bool use_sqrt_softplus;
+    bool with_norm;
+    bool delayed_softmax;
+};''', r'''struct topk_moe_config {
+    bool use_sigmoid;
+    bool use_sqrt_softplus;
+    bool with_norm;
+    bool delayed_softmax;
+    bool sync_rows;   // G30: 2-4 rows share one block: wait for every row's reads before the first write (see ggml_cuda_topk_moe_small_rows)
+};'''),
+    (r'''    ggml_cuda_pdl_lc();
+    for (int k = 0; k < n_expert_used; k++) {''', r'''    if (config.sync_rows) {
+        // G30: all reads of the logits (and the bias) of this row are done; the rows of this launch share one block, so after the barrier no row can still be reading what another row writes below
+        __syncthreads();
+    }
+
+    ggml_cuda_pdl_lc();
+    for (int k = 0; k < n_expert_used; k++) {'''),
+    (r'''void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
+                           const ggml_tensor *             logits,''', r'''// G30: LLAMA_CUDA_TOPK_MOE_SMALL=1 lets the fused router run for 2-4 rows even where the output may alias the logits (see the barrier in the kernel)
+bool ggml_cuda_topk_moe_small_rows() {
+    static const bool on = []() { const char * e = getenv("LLAMA_CUDA_TOPK_MOE_SMALL"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
+                           const ggml_tensor *             logits,'''),
+    (r'''    config.delayed_softmax   = args.delayed_softmax;
+''', r'''    config.delayed_softmax   = args.delayed_softmax;
+    config.sync_rows         = n_rows > 1 && n_rows <= 4 && ggml_cuda_topk_moe_small_rows();
+'''),
+])
+
+patch(H, [
+    (r'''bool ggml_cuda_should_use_topk_moe(''', r'''bool ggml_cuda_topk_moe_small_rows();   // G30: LLAMA_CUDA_TOPK_MOE_SMALL=1
+
+bool ggml_cuda_should_use_topk_moe('''),
+])
+
+patch(G, [
+    (r'''    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+        return true;
+    }''', r'''    if (is_topk_moe && (ggml_nrows(cgraph->nodes[node_idx]) == 1 || (ggml_nrows(cgraph->nodes[node_idx]) <= 4 && ggml_cuda_topk_moe_small_rows()))) {
+        return true;   // G30: 2-4 rows share one block, the kernel waits at a barrier between its reads and its writes (topk-moe.cu)
+    }'''),
+])

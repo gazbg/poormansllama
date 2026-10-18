@@ -1,0 +1,37 @@
+{
+ "steps": [
+  {
+   "name": "warmup",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/mtpcode-512.txt",
+   "body": {
+    "n_predict": 4,
+    "temperature": 0,
+    "cache_prompt": false,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p8k-a",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/natdeep-8191.txt",
+   "body": {
+    "n_predict": 8,
+    "temperature": 0,
+    "cache_prompt": false,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p8k-b",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/natdeep-8191.txt",
+   "body": {
+    "n_predict": 8,
+    "temperature": 0,
+    "cache_prompt": false,
+    "seed": 1
+   }
+  }
+ ]
+}

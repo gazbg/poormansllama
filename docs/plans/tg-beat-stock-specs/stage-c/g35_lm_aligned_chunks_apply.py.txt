@@ -1,0 +1,49 @@
+"""G35 (round 3): the layer-major pass cuts its chunks at ABSOLUTE positions that are multiples of the chunk size.
+
+A pass that resumes at position p0 (behind a cached prefix: a cache hit, a rollback to a checkpoint, a restored prompt) cut its chunks at p0, p0 + W, p0 + 2W, ...; a fresh pass over the same
+prompt cuts them at 0, W, 2W, ... The chunk shape moves the numbers of the recurrent layers (chunked delta-net) and of the attention tiles, and a rollback request (checkpoint at 11,640, 1,948 new
+tokens) differs from the fresh one by 0.276 nats at token 12 although the decode is deterministic (frozen expert cache, k1601/k1602; the unmodified stock server shows 0.287 for the same pair,
+g763). Now the first chunk of a resumed pass is the short one that reaches the next multiple of W and every later chunk starts at a multiple of W, as the fresh pass's chunks do. When p0 is a
+multiple of W (every fresh prompt) nothing changes. Edits: src/llama-lm-prefill.cpp (the chunk layout in the plan)."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    ('''    // the chunk layout: full chunks of `ubatch` tokens and a tail
+    const int32_t W = P.ubatch;
+    for (int32_t t = 0; t < n; t += W) {
+        pl.widths.push_back(std::min(W, n - t));
+    }
+''', '''    // the chunk layout: chunk boundaries sit at multiples of `ubatch` in ABSOLUTE position (a pass that resumes at p0 starts with the short chunk that reaches the next multiple), so a pass
+    // behind a cached prefix cuts its chunks where a fresh pass over the same prompt cuts them
+    const int32_t W = P.ubatch;
+    for (int32_t t = 0; t < n;) {
+        const int32_t w = std::min(W - (int32_t) ((p0 + t) % W), n - t);
+        pl.widths.push_back(w);
+        t += w;
+    }
+'''),
+])
+print("g35 edits matched")

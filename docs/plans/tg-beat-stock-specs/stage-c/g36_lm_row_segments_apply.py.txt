@@ -1,0 +1,56 @@
+"""G36 (found by the growth session of the s39 battery, `k1856`: watcher minimum 15,999 MiB, 1 MiB under the 16,000 MiB line; s33/s36 had 16,035): segments of the pass hold as many whole chunks as fit in
+`--lm-prefill-segment` ROWS, not a fixed number of chunks.
+
+With the absolute chunk boundaries of G35 the first chunk of a resumed pass is short, so a 16,384-token pass at a misaligned position has 9 chunks; the old fixed count of 8 chunks per segment cut it
+into two segments (a second sweep of all 40 expert banks, +1 s, and a different memory profile). The slab half has `segment` rows, so a segment may take chunks until their rows reach `segment`.
+For a pass that starts at a multiple of the chunk size nothing changes. Edits: src/llama-lm-prefill.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    ('''    const int seg_chunks = std::max<int>(1, (int) (P.segment / P.ubatch));
+    const int n_segs     = (n_chunks + seg_chunks - 1) / seg_chunks;
+''', '''    // segments: as many whole chunks as fit in `segment` rows (the slab half has that many rows); the first chunk of a resumed pass can be short
+    std::vector<int> seg_first;
+    {
+        int64_t rows = 0;
+        for (int c = 0; c < n_chunks; ++c) {
+            if (c == 0 || rows + pl.widths[c] > P.segment) {
+                seg_first.push_back(c);
+                rows = 0;
+            }
+            rows += pl.widths[c];
+        }
+        seg_first.push_back(n_chunks);
+    }
+    const int n_segs = (int) seg_first.size() - 1;
+'''),
+    ('''        const int c0 = seg * seg_chunks;
+        const int c1 = std::min(n_chunks, c0 + seg_chunks);
+''', '''        const int c0 = seg_first[(size_t) seg];
+        const int c1 = seg_first[(size_t) seg + 1];
+'''),
+])
+print("g36 edits matched")

@@ -1,0 +1,69 @@
+"""G39 (round 5, more np 2 soak workloads than the seed-11 mix): the layer-major pass's memory request no longer fails by a few MiB.
+
+Six other soak workloads (k3301-k3306, s42 against s40) showed two declines that G38 does not touch, both logged by G37:
+ - k3301 s42: "no room for 1429 MiB + margin 16160 MiB: free 16337 -> 17565 MiB, expert cache 26 -> 8 slots (min 8)": the cache is at the decode floor of 8 slots and 24 MiB are still missing (the lazily committed KV of the
+   long contexts holds the rest). The pass blocks the server loop, so nothing decodes while it holds the room: the cache may go below the decode floor for its duration (it regrows at the first small decode).
+ - k3302 s42: "no room for 1297 MiB + margin 16160 MiB: free 16297 -> 17457 MiB, expert cache 31 -> 14 slots (min 8)": make_room estimated the freed bytes from the mean row size and landed less than 1 MiB short of the target,
+   one row above the floor. The shrink now aims 64 MiB above the target (and 256 MiB if the check still fails), the check stays at the target.
+Edits: src/llama-hybrid-api.cpp (hybrid_lm_vram)."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-hybrid-api.cpp", [
+    ('''        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        int64_t cache_b0 = 0, cache_b1 = 0;
+        int     slots0 = 0, slots1 = 0;
+        llama_moe_hybrid_cache_info_impl(&cache_b0, &slots0);
+        const int64_t free0 = hybrid_free_bytes();
+        const bool room_ok = llama_moe_hybrid_make_room_impl(need_bytes + margin_b, 0, g_hybrid_min_slots, &shrunk);
+        if (shrunk) {
+            ctx->drop_graph_reuse();
+        }
+        if (hybrid_free_bytes() < need_bytes + margin_b) {''', '''        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        const int64_t target_b = need_bytes + margin_b;
+        // the pass blocks the server loop, so no decode runs while it holds the room: the cache may drop below the decode floor for its duration (it regrows at the first small decode)
+        const int     pass_floor = std::max(2, g_hybrid_min_slots/4);
+        bool shrunk = false;
+        int64_t cache_b0 = 0, cache_b1 = 0;
+        int     slots0 = 0, slots1 = 0;
+        llama_moe_hybrid_cache_info_impl(&cache_b0, &slots0);
+        const int64_t free0 = hybrid_free_bytes();
+        bool room_ok = true;
+        if (free0 < target_b) {
+            // make_room estimates the freed bytes from the mean row size, so a shrink can land a MiB short of the target: aim above it, the check below stays at the target
+            room_ok = llama_moe_hybrid_make_room_impl(target_b + (int64_t) 64*1048576, 0, pass_floor, &shrunk);
+            if (hybrid_free_bytes() < target_b) {
+                bool shrunk2 = false;
+                room_ok = llama_moe_hybrid_make_room_impl(target_b + (int64_t) 256*1048576, 0, pass_floor, &shrunk2) && room_ok;
+                shrunk = shrunk || shrunk2;
+            }
+        }
+        if (shrunk) {
+            ctx->drop_graph_reuse();
+        }
+        if (hybrid_free_bytes() < target_b) {'''),
+])
+print("g39 edits matched")

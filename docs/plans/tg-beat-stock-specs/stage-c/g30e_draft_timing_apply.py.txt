@@ -1,0 +1,60 @@
+"""G30 / M2e: split the draft stage's host time and let a draft-vocabulary restriction be measured. Contract: the plan's "G30 CONTRACT".
+
+Measured (g94-lc4k, certified): the draft stage costs 1.9 ms per round; the nsys profile of the same arm (g30-nsys/lc4k) puts ~0.6 ms of it on the GPU (the draft head's full-vocabulary lm head alone is
+497 us: 417 MB of Q6_K re-read, bandwidth bound) and the rest on the host. This adds (1) sub-timers of the draft stage (decode call = graph build + launch, logits fetch = GPU wait + D2H, scan + hidden-row copy)
+printed in the existing `MTP host timing` line, and (2) LLAMA_MTP_DRAFT_VOCAB_N=N: the draft's greedy pick scans only token ids [0, N) of the logits row. Measurement only: the logits are still computed in full, so
+the variable shows what a pruned draft lm head would do to the acceptance rate; the verify is unchanged, so the output text cannot change.
+Apply after g30d. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''        int64_t mt_draft_us = 0, mt_verify_us = 0, mt_fetch_us = 0, mt_samp_us = 0, mt_mirror_us = 0, mt_rounds_t = 0;   // host time per stage of the MTP rounds (measurement only)
+''', r'''        int64_t mt_draft_us = 0, mt_verify_us = 0, mt_fetch_us = 0, mt_samp_us = 0, mt_mirror_us = 0, mt_rounds_t = 0;   // host time per stage of the MTP rounds (measurement only)
+        int64_t mt_dd_dec_us = 0, mt_dd_get_us = 0, mt_dd_scan_us = 0;   // G30: the draft stage split into the decode call, the logits fetch (GPU wait + D2H) and the scan
+        int draft_vocab_n = 0;   // G30: LLAMA_MTP_DRAFT_VOCAB_N, measurement of a pruned draft vocabulary (0 = all)
+        if (const char * e_dv = getenv("LLAMA_MTP_DRAFT_VOCAB_N")) {
+            draft_vocab_n = atoi(e_dv);
+        }
+'''),
+    (r'''                    const int drc = llama_decode(ctx_dft, db);
+                    if (drc == 0) {
+                        const float * dlogits = llama_get_logits_ith(ctx_dft, n_pre);   // outputs are indexed by batch row: the seed row is the last of the fused batch
+''', r'''                    const int64_t tm_dd0 = ggml_time_us();
+                    const int drc = llama_decode(ctx_dft, db);
+                    const int64_t tm_dd1 = ggml_time_us();
+                    mt_dd_dec_us += tm_dd1 - tm_dd0;
+                    if (drc == 0) {
+                        const float * dlogits = llama_get_logits_ith(ctx_dft, n_pre);   // outputs are indexed by batch row: the seed row is the last of the fused batch
+                        const int64_t tm_dd2 = ggml_time_us();
+                        mt_dd_get_us += tm_dd2 - tm_dd1;
+'''),
+    (r'''                            bd = (llama_token) ls_top2_exact(dlogits, n_vocab).best;
+                        } else {
+                            // T-GPLR-06: penalized copy; the ring must see the''', r'''                            bd = (llama_token) ls_top2_exact(dlogits, draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab).best;
+                        } else {
+                            // T-GPLR-06: penalized copy; the ring must see the'''),
+    (r'''                        if (hd != nullptr) {
+                            memcpy(pending_h.data(), hd, row_bytes);
+                        }
+                    }
+                    llama_batch_free(db); // frees token + embd + pos...''', r'''                        if (hd != nullptr) {
+                            memcpy(pending_h.data(), hd, row_bytes);
+                        }
+                        mt_dd_scan_us += ggml_time_us() - tm_dd2;
+                    }
+                    llama_batch_free(db); // frees token + embd + pos...'''),
+    (r'''                        (double) mt_samp_us / mt_rounds_t, (double) mt_fetch_us / mt_rounds_t, (double) mt_mirror_us / mt_rounds_t);
+''', r'''                        (double) mt_samp_us / mt_rounds_t, (double) mt_fetch_us / mt_rounds_t, (double) mt_mirror_us / mt_rounds_t);
+                fprintf(stderr, "MTP draft stage split, us per round: decode call (graph build + launch) %.1f, logits fetch (GPU wait + D2H) %.1f, scan + hidden-row copy %.1f (draft vocab %d)\n",
+                        (double) mt_dd_dec_us / mt_rounds_t, (double) mt_dd_get_us / mt_rounds_t, (double) mt_dd_scan_us / mt_rounds_t, draft_vocab_n > 0 ? draft_vocab_n : n_vocab);
+'''),
+])

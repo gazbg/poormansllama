@@ -1,0 +1,58 @@
+"""G47 (G42 round 7, found by the fault-injection sessions k5311-k5313): a fused batch whose pass is declined AFTER the arm leaves no checkpoint (by design, D4), so the arm must refuse every reason the pass could
+decline for that is not an injected fault: the output buffer is reserved at arm time (lm_run reserves it first and declines when it cannot), and a slot's pending fused checkpoints are dropped when a generation decode
+comes (a failed or abandoned batch must not leak them into the next one). Edits: src/llama-lm-prefill.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    (r'''    const int64_t rows = std::min<int64_t>(n_tokens, P.segment);
+    const int32_t wmax = (int32_t) std::min<int64_t>(n_tokens, P.ubatch);
+    if (S.armed) {''', r'''    if (seq >= 0 && (output_reserve(1) < 1 || logits.data == nullptr)) {
+        // lm_run declines a batch whose outputs cannot be reserved: find out now, while the caller can still cut the batch at its checkpoints
+        return false;
+    }
+    const int64_t rows = std::min<int64_t>(n_tokens, P.segment);
+    const int32_t wmax = (int32_t) std::min<int64_t>(n_tokens, P.ubatch);
+    if (S.armed) {'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    (r'''    void fuse_before_decode(int32_t off, int32_t n_view) {
+        server_slot * s = fuse_slot();
+        if (s == nullptr) {
+            return;
+        }
+''', r'''    void fuse_before_decode(int32_t off, int32_t n_view) {
+        server_slot * s = fuse_slot();
+        if (s == nullptr) {
+            return;
+        }
+        if (s->state == SLOT_STATE_GENERATING) {
+            s->fuse_at.clear();      // a batch that was abandoned (an error, a cancelled request): its checkpoints are not owed any more
+            return;
+        }
+'''),
+])
+print("g47 edits matched")

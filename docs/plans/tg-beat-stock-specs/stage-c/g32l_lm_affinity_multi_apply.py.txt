@@ -1,0 +1,98 @@
+"""G32l (after the np2 soak g895 with the g32k scheduling): sequence affinity for batches that carry SEVERAL sequences.
+
+g895 showed the remaining declines under two concurrent clients: "the block starting at cell 0 breaks at cell 1 (seq 1 pos 0, expected seq 0 pos 1)" -- when both slots decode at once the server's batch holds one token of each, and
+find_slot (stock placement, g32j only handled ubatches of ONE sequence) puts them into adjacent cells, so both sequences become interleaved cell by cell and no later prompt chunk can take the pass.
+
+What: with --lm-prefill active (lm_affinity), find_slot places EVERY token of a ubatch right behind the last cell of its own sequence when those cells are free: per sequence the tokens must continue its remembered tail
+(position tail + 1, then +1 ...), the cells [tail + 1, tail + 1 + k) of the different sequences must be in bounds, empty and disjoint; any other batch (a fresh sequence, a gap in positions, taken cells) gets the stock placement.
+Each sequence keeps its own contiguous block while others decode next to it, as long as the gap in front of the next block (lm_block leaves min(16384, size/16) cells) lasts.
+Edits: src/llama-kv-cache.cpp (replaces the single-sequence branch of g32j)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ("@between", '''        if (lm_affinity && n_stream == 1 && ubatch.n_seqs_unq == 1 && n_tokens > 0 && ubatch.pos[0] > 0 && seq_id >= 0 && (size_t) seq_id < lm_tail_cell.size()) {''',
+     '''#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];''',
+     '''        if (lm_affinity && n_stream == 1 && n_tokens > 0) {
+            // G32: every token goes right behind the last cell of its own sequence when those cells are free (the remembered tails are validated against the cells); anything else gets the stock placement
+            struct run_t { llama_seq_id seq; uint32_t first; uint32_t n; llama_pos next_pos; };
+            std::vector<run_t> runs;
+            bool ok = true;
+            for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+                if (ubatch.n_seq_id[i] != 1) {
+                    ok = false;
+                    break;
+                }
+                const llama_seq_id sid = ubatch.seq_id[i][0];
+                if (sid < 0 || (size_t) sid >= lm_tail_cell.size()) {
+                    ok = false;
+                    break;
+                }
+                run_t * r = nullptr;
+                for (auto & x : runs) {
+                    if (x.seq == sid) {
+                        r = &x;
+                        break;
+                    }
+                }
+                if (r == nullptr) {
+                    const int32_t tc = lm_tail_cell[sid];
+                    if (tc < 0 || lm_tail_pos[sid] != (int32_t) ubatch.pos[i] - 1 || cells.is_empty((uint32_t) tc) || cells.seq_count((uint32_t) tc) != 1 ||
+                        cells.seq_get((uint32_t) tc) != sid || cells.pos_get((uint32_t) tc) != ubatch.pos[i] - 1) {
+                        ok = false;
+                        break;
+                    }
+                    runs.push_back({ sid, (uint32_t) tc + 1, 0u, ubatch.pos[i] });
+                    r = &runs.back();
+                }
+                if (ubatch.pos[i] != r->next_pos) {
+                    ok = false;
+                    break;
+                }
+                r->n++;
+                r->next_pos++;
+            }
+            for (size_t a = 0; a < runs.size() && ok; ++a) {
+                // each run [first, first + n) must be in bounds, empty and disjoint from the runs before it
+                if ((uint64_t) runs[a].first + runs[a].n > cells.size()) {
+                    ok = false;
+                    break;
+                }
+                for (uint32_t k = 0; k < runs[a].n; ++k) {
+                    if (!cells.is_empty(runs[a].first + k)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                for (size_t b = 0; b < a && ok; ++b) {
+                    if (runs[a].first < runs[b].first + runs[b].n && runs[b].first < runs[a].first + runs[a].n) {
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) {
+                std::vector<uint32_t> taken(runs.size(), 0u);
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const llama_seq_id sid = ubatch.seq_id[i][0];
+                    for (size_t a = 0; a < runs.size(); ++a) {
+                        if (runs[a].seq == sid) {
+                            res.idxs[s].push_back(runs[a].first + taken[a]++);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+'''),
+])
+print("g32l edits matched")

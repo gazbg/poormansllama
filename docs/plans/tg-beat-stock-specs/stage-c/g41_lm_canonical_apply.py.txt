@@ -1,0 +1,131 @@
+"""G41 (round 6): --lm-prefill-canonical, an opt-in mode in which a cache hit equals a fresh run bit for bit (stock decode and --hybrid-moe-frozen).
+
+Why: rounds 3-5 reported the suite's hit-versus-fresh checks as failing and called a bit-equal hit "not delivered by a server with a prefix cache". That was an expectation, never tested. A hit differs from a fresh run
+in how the prompt is partitioned into batches: the cached prefix was computed inside an earlier request (its batches ended 516 and 4 tokens before the prompt's end, for the checkpoints), the tokens that decode produced
+were computed one at a time, and the resumed pass starts wherever the checkpoint was. The layer-major pass already cuts its chunks at absolute multiples of the chunk size (G35). What was missing is a prompt whose OTHER
+seams also sit on those boundaries:
+ - checkpoints only at multiples of the chunk size (the batch that ends the prompt is cut at the last multiple below N, N-1 at most; no 4 + ubatch tail, no 4-token tail, no user-message checkpoints), created by the
+   batch that starts there;
+ - a continuation always resumes from the newest such checkpoint that precedes the common prefix of the old and the new prompt (never from the state that decode left behind), or from 0 when there is none, and
+   everything after it is prefilled again;
+ so that the tokens after a checkpoint are prefilled in the same chunks as in a fresh run: the pass cuts [A, N) at the same absolute boundaries, the part that is shorter than --lm-prefill-min takes the same ordinary path with the
+ same batch width, and the KV below A comes from complete aligned chunks of the earlier request.
+Price: a repeat or a short follow-up re-prefills up to one chunk (2,048 tokens, ~1 s) beyond its new tokens instead of 4. Needs --lm-prefill, context checkpoints (default) and -b a multiple of --lm-prefill-ubatch.
+Edits: common/common.h, common/arg.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\common\common.h", [
+    ('''    int32_t     lm_prefill_ckpt    = 0; ''', '''    bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
+    int32_t     lm_prefill_ckpt    = 0; '''),
+])
+
+patch(NEST + r"\common\arg.cpp", [
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--lm-prefill-canonical"},
+        "with --lm-prefill: make a cache hit equal a fresh run bit for bit (with stock decode or --hybrid-moe-frozen). Context checkpoints exist only at multiples of --lm-prefill-ubatch (no 4 + ubatch tail, no user-message checkpoints) "
+        "and a continuation always resumes from the newest one before the common prefix of the old and the new prompt (never from the state that decode left behind), so that the tokens after it are prefilled in the same chunks as in a "
+        "fresh run. The price: a repeat or a follow-up prefills up to one chunk more than its new tokens (about 1 s) instead of 4 tokens. Needs -b to be a multiple of --lm-prefill-ubatch and context checkpoints",
+        [](common_params & params) {
+            params.lm_prefill_canonical = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_CANONICAL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    # 1. validation at start-up
+    ('''            // G32: the pass's flash attention takes the same (GQA-packed) kernel variant as the ordinary path, which makes it equal to the ordinary path at the same chunk shape; ggml-cuda reads this once at the first''',
+     '''            if (params_base.lm_prefill_canonical) {
+                if (params_base.n_ctx_checkpoints <= 0) {
+                    SRV_ERR("%s", "--lm-prefill-canonical needs context checkpoints (--ctx-checkpoints > 0)\\n");
+                    return false;
+                }
+                if (params_base.lm_prefill_ubatch < 1 || params_base.n_batch % params_base.lm_prefill_ubatch != 0) {
+                    SRV_ERR("--lm-prefill-canonical needs -b (%d) to be a multiple of --lm-prefill-ubatch (%d)\\n", params_base.n_batch, params_base.lm_prefill_ubatch);
+                    return false;
+                }
+                SRV_INF("lm-prefill: canonical chunks: context checkpoints only at multiples of %d tokens, a continuation resumes from one\\n", params_base.lm_prefill_ubatch);
+            }
+            // G32: the pass's flash attention takes the same (GQA-packed) kernel variant as the ordinary path, which makes it equal to the ordinary path at the same chunk shape; ggml-cuda reads this once at the first'''),
+    # 2. flag next to lm_iso
+    ('''        const bool lm_iso = params_base.lm_prefill && params_base.n_parallel > 1 && params_base.kv_unified && !spec;''',
+     '''        const bool lm_iso = params_base.lm_prefill && params_base.n_parallel > 1 && params_base.kv_unified && !spec;
+        const bool lm_canon = params_base.lm_prefill && params_base.lm_prefill_canonical;   // G41'''),
+    # 3. a continuation resumes from a checkpoint on a chunk boundary, always
+    ('''                                if (pos_min >= pos_min_thold) {
+                                    // search for a context checkpoint''',
+     '''                                // G41: canonical chunks: never keep the state that decode left behind, resume from the newest checkpoint (they sit on chunk boundaries) that precedes the common prefix, or from 0
+                                if (lm_canon || pos_min >= pos_min_thold) {
+                                    // search for a context checkpoint'''),
+    # 4. remember whether checkpoints are allowed at all for this task
+    ('''                    bool has_mtmd = false;
+
+                    // check if we should process the mtmd chunk''',
+     '''                    const bool ckpt_ok = do_checkpoint;   // G41
+
+                    bool has_mtmd = false;
+
+                    // check if we should process the mtmd chunk'''),
+    # 5. the batch is cut at the last chunk boundary below the prompt's end
+    ('''                    const auto last_user_pos = spans.last_user_message_pos();
+''', '''                    const auto last_user_pos = spans.last_user_message_pos();
+
+                    // G41: canonical chunks: the batch that ends the prompt is cut at the last multiple of the chunk size below N (N - 1 at most); the checkpoint taken there is the one a continuation resumes from
+                    const int canon_A = lm_canon ? (int) (((int64_t) slot.task->n_tokens() - 1) / params_base.lm_prefill_ubatch) * params_base.lm_prefill_ubatch : 0;
+'''),
+    ('''                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {''',
+     '''                        if (!lm_canon && do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {'''),
+    ('''                        if (do_checkpoint) {
+                            // G32: --lm-prefill-ckpt-chunk makes the chunk before the last 4 tokens smaller than n_ubatch''',
+     '''                        if (lm_canon && canon_A > 0 && slot.prompt.n_tokens() == canon_A) {
+                            break;
+                        }
+
+                        if (!lm_canon && do_checkpoint) {
+                            // G32: --lm-prefill-ckpt-chunk makes the chunk before the last 4 tokens smaller than n_ubatch'''),
+    # 6. the checkpoint is taken exactly when a batch starts at the boundary
+    ('''                    // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                    //       yet processed and therefore it is not part of the checkpoint.
+                    if (do_checkpoint) {''',
+     '''                    if (lm_canon) {
+                        // G41: a checkpoint exactly when this batch starts at the boundary (the state it saves is the one after the cut batch), none otherwise, none twice
+                        bool have = false;
+                        for (const auto & c : slot.prompt.checkpoints) {
+                            if (c.n_tokens == (int64_t) n_tokens_start) {
+                                have = true;
+                                break;
+                            }
+                        }
+                        do_checkpoint = ckpt_ok && canon_A > 0 && (int) n_tokens_start == canon_A && pos_min >= 0 && !has_mtmd && !have;
+                    }
+
+                    // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                    //       yet processed and therefore it is not part of the checkpoint.
+                    if (do_checkpoint) {'''),
+])
+print("g41 edits matched")

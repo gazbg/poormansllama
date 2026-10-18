@@ -1,0 +1,41 @@
+"""G32q (after the second review: "80 errors labelled expected without an independent check"): do not ask the driver to register a range that is already page-locked.
+
+compute-sanitizer's ERROR SUMMARY of every --lm-prefill session under --hybrid-moe counted 80 errors: 40 x cudaHostRegister + 40 x cudaGetLastError, error 712 "part or all of the requested memory range is already mapped", all raised
+in llama_lm_prefill_enable -> register_all_pkg_sources -> ggml_backend_cuda_register_host_range, because the hybrid engine had pinned the spans before and the code treats that message as "pinned by someone else, carry on".
+Instead of arguing that this is harmless, the call is skipped: ggml_backend_cuda_register_host_range first asks cudaPointerGetAttributes (no error for an unregistered pointer on CUDA >= 11) whether the first and the last byte of the range are page-locked
+host memory already and, if so, returns false with the SAME message the driver would have produced ("... already mapped"), so every caller behaves as before. Unpinned ranges take the old path unchanged. A memcheck session should then end with
+ERROR SUMMARY: 0 errors. Edits: ggml/src/ggml-cuda/ggml-cuda.cu."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\ggml\src\ggml-cuda\ggml-cuda.cu", [
+    ('''#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    cudaError_t e = cudaHostRegister(const_cast<void *>(ptr), nbytes,
+                                     cudaHostRegisterPortable | cudaHostRegisterReadOnly);''', '''#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    {
+        // G32q: a range whose first and last byte are page-locked host memory already (the hybrid engine pinned it) is reported exactly as the driver reports it -- "already mapped" -- without asking
+        // the driver to register it a second time, which would only return that error (and make every sanitizer run count it)
+        cudaPointerAttributes a0, a1;
+        const bool pin0 = cudaPointerGetAttributes(&a0, ptr) == cudaSuccess && a0.type == cudaMemoryTypeHost;
+        const bool pin1 = pin0 && nbytes > 0 && cudaPointerGetAttributes(&a1, (const char *) ptr + (nbytes - 1)) == cudaSuccess && a1.type == cudaMemoryTypeHost;
+        (void) cudaGetLastError();
+        if (pin0 && pin1) {
+            if (err != nullptr && err_len > 0) {
+                snprintf(err, err_len, "part or all of the requested memory range is already mapped");
+            }
+            return false;
+        }
+    }
+#endif
+    cudaError_t e = cudaHostRegister(const_cast<void *>(ptr), nbytes,
+                                     cudaHostRegisterPortable | cudaHostRegisterReadOnly);'''),
+])
+print("g32q edits matched")

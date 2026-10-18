@@ -1,0 +1,272 @@
+"""G32a: the graph-builder half of the layer-major prefill in the server. A new llm_graph_lm describes ONE piece of a layer-major pass (the embedding of a chunk, one decoder layer of a chunk,
+or the head of one hidden row); llama-lm-prefill.cpp builds such a piece per launch with the ordinary graph machinery (no persistent graph sets), so every input is set by the ordinary res->set_inputs
+from the chunk's own memory context. The piece reads / writes its activations through the pass's slab (tensors bound to slab addresses, which the scheduler leaves alone), takes the routed experts from
+the slot bundle, and uses the implicit causal mask of flash attention (window known at build time)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+GH = NEST + r"\src\llama-graph.h"
+GC = NEST + r"\src\llama-graph.cpp"
+QM = NEST + r"\src\models\qwen35moe.cpp"
+MH = NEST + r"\src\models\models.h"
+
+patch(GH, [
+    ('''struct llama_layer_streaming;
+
+struct llm_graph_params {''', '''struct llama_layer_streaming;
+
+// G32: one piece of a layer-major prefill pass, built per launch by llama-lm-prefill.cpp (nullptr in every other path).
+//   kind 0: embed the ubatch's tokens into act_out
+//   kind 1: decoder layer il: act_in -> act_out, with the weights of `layer` (the routed experts are the slot's device bank)
+//   kind 2: head: row act_in (one row) -> final norm -> logits
+// act_in / act_out are device addresses inside the pass's slab (act_buf); the flash attention of kind 1 uses the implicit causal mask:
+// the ubatch's first query is cell q_pos_base, keys [0, n_kv_valid) are live.
+struct llm_graph_lm {
+    int                  kind            = 0;
+    int                  il              = -1;
+    const llama_layer *  layer           = nullptr;
+    ggml_backend_buffer_t act_buf        = nullptr;
+    ggml_type            act_type        = GGML_TYPE_F32;
+    void *               act_in          = nullptr;
+    void *               act_out         = nullptr;
+    bool                 implicit_causal = true;
+    int32_t              q_pos_base      = 0;
+    int32_t              n_kv_valid      = 0;
+};
+
+struct llm_graph_params {'''),
+    ('''    llm_graph_result * res;
+
+    // return true if the "other" params would result in a graph with the same topology as with the current params''', '''    llm_graph_result * res;
+
+    // G32: when set, the graph is ONE piece of a layer-major prefill pass (see llm_graph_lm). The LAST member, so the positional initialisers of llm_graph_params stay valid.
+    const llm_graph_lm * lm = nullptr;
+
+    // return true if the "other" params would result in a graph with the same topology as with the current params'''),
+    ('''    const llama_layer_streaming * layer_streaming;
+
+    const int64_t n_embd;''', '''    const llama_layer_streaming * layer_streaming;
+    const llm_graph_lm *          lm;
+
+    const int64_t n_embd;'''),
+])
+
+patch(GC, [
+    ('''    layer_streaming  (params.layer_streaming),
+''', '''    layer_streaming  (params.layer_streaming),
+    lm               (params.lm),
+'''),
+    ('''bool llm_graph_context::use_implicit_causal_mask() const {
+#ifdef LLAMA_LAYER_STREAMING
+    return layer_streaming != nullptr &&''', '''bool llm_graph_context::use_implicit_causal_mask() const {
+#ifdef LLAMA_LAYER_STREAMING
+    if (lm != nullptr) {
+        // G32: the layer-major pass builds its pieces per launch; the window is part of the piece
+        return lm->implicit_causal &&
+            cparams.causal_attn && cparams.flash_attn &&
+            hparams.swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+            ubatch.n_seqs_unq == 1 && ubatch.equal_seqs();
+    }
+    return layer_streaming != nullptr &&'''),
+    ('''        if (use_implicit_causal_mask()) {
+#ifdef LLAMA_LAYER_STREAMING
+            // T-Q38CTX-01: the causal window comes from the immutable chunk
+            // descriptor (cumulative token offset), not the uniform
+            // chunk_id * n_tokens assumption, so a 1..ubatch tail chunk sees
+            // exactly its own token range.
+            const llama_ls_chunk & ck = layer_streaming->chunks[layer_streaming->cur_chunk_id];
+            ggml_flash_attn_ext_set_causal(cur, (int32_t) ck.token_start,
+                                           (int32_t) (ck.token_start + ck.n_tokens));
+#endif
+        }''', '''        if (use_implicit_causal_mask()) {
+#ifdef LLAMA_LAYER_STREAMING
+            if (lm != nullptr) {
+                // G32: the K/V views are as wide as the chunk's memory context made them (padded to 256); the kernel iterates the view, so cut it to the live keys, as layer_major_pp's per-chunk patch does
+                GGML_ASSERT(lm->n_kv_valid <= cur->src[1]->ne[1]);
+                ggml_flash_attn_ext_set_causal(cur, lm->q_pos_base, lm->n_kv_valid);
+                cur->src[1]->ne[1] = lm->n_kv_valid;
+                cur->src[2]->ne[1] = lm->n_kv_valid;
+            } else {
+            // T-Q38CTX-01: the causal window comes from the immutable chunk
+            // descriptor (cumulative token offset), not the uniform
+            // chunk_id * n_tokens assumption, so a 1..ubatch tail chunk sees
+            // exactly its own token range.
+            const llama_ls_chunk & ck = layer_streaming->chunks[layer_streaming->cur_chunk_id];
+            ggml_flash_attn_ext_set_causal(cur, (int32_t) ck.token_start,
+                                           (int32_t) (ck.token_start + ck.n_tokens));
+            }
+#endif
+        }'''),
+])
+
+patch(MH, [
+    ("@between", """struct llama_model_qwen35moe : public llama_model_base {""", """        ggml_tensor * build_layer_attn(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_layer_attn_linear(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
+        ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il,
+                    ggml_tensor * selected_experts_in = nullptr,
+                    ggml_tensor * selected_experts_weight_in = nullptr,
+                    // T-GPLR-82 S2: when set, this leg's routed weights are""",
+     """struct llama_model_qwen35moe : public llama_model_base {
+    llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+    private:
+        // layer-view indirection: normal mode returns model.layers[il];
+        // layer-streaming mode returns the slot-bound tensor bundle for il
+        // (defined in qwen35moe.cpp where the streaming type is complete)
+        const llama_layer & layer(int il) const;
+
+#ifdef LLAMA_LAYER_STREAMING
+        // build one cgraph per piece: embed, one per decoder layer, output
+        void build_streaming_graphs();
+
+        // G32: ONE piece of a layer-major prefill pass, per launch (params.lm; llama-lm-prefill.cpp)
+        void build_lm_graph();
+#endif
+
+"""),
+])
+
+patch(QM, [
+    ('''const llama_layer & llama_model_qwen35moe::graph::layer(int il) const {
+#ifdef LLAMA_LAYER_STREAMING
+    if (ls != nullptr) {''', '''const llama_layer & llama_model_qwen35moe::graph::layer(int il) const {
+#ifdef LLAMA_LAYER_STREAMING
+    if (lm != nullptr && lm->layer != nullptr) {
+        return *lm->layer;
+    }
+    if (ls != nullptr) {'''),
+    ('''    ls = const_cast<llama_layer_streaming *>(params.layer_streaming);
+    if (ls != nullptr) {
+        build_streaming_graphs();
+        return;
+    }
+#endif''', '''    ls = const_cast<llama_layer_streaming *>(params.layer_streaming);
+    if (ls != nullptr) {
+        build_streaming_graphs();
+        return;
+    }
+    if (params.lm != nullptr) {
+        build_lm_graph();
+        return;
+    }
+#endif'''),
+    ('''    if (ls == nullptr && selected_experts_in == nullptr && moe_weights_in == nullptr && routed_rows == 0) {''', '''    if (ls == nullptr && lm == nullptr && selected_experts_in == nullptr && moe_weights_in == nullptr && routed_rows == 0) {'''),
+    ('''// T-GPLR-82 S2: the HOST expert sub-op.
+//
+// WHY IT BINDS model.layers[il] AND NOT layer(il).''', '''// G32: ONE piece of a layer-major prefill pass, built per launch (llama-lm-prefill.cpp), see llm_graph_lm. The pieces hand the hidden state to each other through the pass's slab; every
+// INPUT tensor of the piece is pulled into the graph at the end, because a piece of one layer type never reads the inputs of the other type (an unallocated input would crash set_inputs).
+#ifdef LLAMA_LAYER_STREAMING
+void llama_model_qwen35moe::graph::build_lm_graph() {
+    GGML_ASSERT(lm != nullptr);
+
+    const int64_t n_embd_io = hparams.n_embd_inp();
+    const bool    slab_bf16 = (lm->act_type == GGML_TYPE_BF16);
+
+    auto act = [&](void * addr, int64_t rows) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx0, lm->act_type, n_embd_io, rows);
+        ggml_set_name(t, "lm_act");
+        ggml_backend_tensor_alloc(lm->act_buf, t, addr);
+        return t;
+    };
+
+    ggml_tensor * cur;
+
+    if (lm->kind == 0) {
+        cur = build_inp_embd(model.tok_embd);
+        cb(cur, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else if (lm->kind == 1) {
+        const int il = lm->il;
+
+        int sections[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+        auto * inp = build_inp_mem_hybrid();
+
+        ggml_tensor * inp_pos = build_inp_pos();
+
+        ggml_tensor * inpSA = act(lm->act_in, n_tokens);
+        if (slab_bf16) {
+            inpSA = ggml_cast(ctx0, inpSA, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(inpSA, layer(il).attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        if (hparams.is_recr(il)) {
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else {
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+        }
+
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "attn_residual", il);
+
+        ggml_tensor * ffn_residual = cur;
+
+        ggml_tensor * attn_post_norm = build_norm(cur, layer(il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(attn_post_norm, "attn_post_norm", il);
+
+        cur = build_layer_ffn(attn_post_norm, il);
+        cb(cur, "ffn_out", il);
+
+        cur = ggml_add(ctx0, cur, ffn_residual);
+        cb(cur, "post_moe", il);
+
+        cur = build_cvec(cur, il);
+        cb(cur, "l_out", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else {
+        cur = act(lm->act_in, 1);
+        if (slab_bf16) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+}
+#endif // LLAMA_LAYER_STREAMING
+
+// T-GPLR-82 S2: the HOST expert sub-op.
+//
+// WHY IT BINDS model.layers[il] AND NOT layer(il).'''),
+])

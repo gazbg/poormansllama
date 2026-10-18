@@ -1,0 +1,48 @@
+"""G30 / M2m: the late draft bring-up with the first-use cost paid at start-up (--mtp-draft-late). Contract: the plan's "G30 CONTRACT".
+
+Measured (g104-lc24k, arm MFLt, build g54): after the migration the first catch-up call takes 110.5 ms against 6.1 ms for the second (one-time kernel-module loads and graph build of the 512-row draft graph, inside the
+PP wall), which with the migration (42 ms) and the re-reserve (46 ms) puts the PP of the 24k cell at 0.949 of B0's -- 6 ms under the contract's 0.95. The lean context was not warmed up (g30h skipped g30d's warm-up
+because its KV rows are not committed). Repair: run the same warm-up decode as g30d at start-up, outside the timed prefill, in the late mode too: commit the few KV rows it touches (512 rows = 1 MiB), widen the draft
+context to the catch-up width, decode (the head's experts are still on the host, every other kernel of the draft graph is the one the catch-up uses), empty the KV, and narrow the context again to the rounds' width.
+The transient 296 MiB compute buffer exists only at start-up, far below the prefill's peak.
+Apply after g30i. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''        if (!mtp_draft_late) {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill
+            const int64_t t_w0 = ggml_time_us();
+            const int n_w = std::max(1, std::min(mtp_catchup, ubatch));
+''', r'''        {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill
+            const int64_t t_w0 = ggml_time_us();
+            const int n_w = std::max(1, std::min(mtp_catchup, ubatch));
+            if (mtp_draft_late) {
+                // the lean context: commit the KV rows this decode touches and widen the context to the catch-up width (both undone below)
+                if (ggml_backend_cuda_lazy_commit_rows(n_w) < 0) {
+                    fprintf(stderr, "error: --mtp-draft-late: the driver could not commit %d draft KV rows for the warm-up\n", n_w);
+                    return 1;
+                }
+                (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) std::max(2 + mtp_draft, n_w));
+            }
+'''),
+    (r'''                fprintf(stderr, "MTP: draft context warm-up (%d rows, rc %d) in %.1f ms\n", n_w, wrc, (ggml_time_us() - t_w0) / 1000.0);
+            }
+            llama_batch_free(wb);
+''', r'''                fprintf(stderr, "MTP: draft context warm-up (%d rows, rc %d) in %.1f ms\n", n_w, wrc, (ggml_time_us() - t_w0) / 1000.0);
+            }
+            llama_batch_free(wb);
+            if (mtp_draft_late) {
+                (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) (2 + mtp_draft));
+            }
+'''),
+])

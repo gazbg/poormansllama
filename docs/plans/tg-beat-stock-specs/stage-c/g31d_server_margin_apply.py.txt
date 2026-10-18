@@ -1,0 +1,33 @@
+"""G31 / S2: the server registers the keep-free margin with the lazy-KV pressure callback and leaves the first commits some slack. Contract: docs/plans/llama-server-integration.md.
+
+hybrid_size_cache(): the start-up sizing leaves keep-free + 160 MiB + 512 MiB free (the slack: the first KV commits of a request then do not shrink the cache), and registers the margin
+(llama_hybrid_set_margin) so that every later KV commit keeps keep-free + 160 MiB free by shrinking the cache (by 512 MiB more than the commit asks). A fixed --hybrid-moe-slots N never shrinks.
+Apply after g31c. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(SV, [
+    (r'''        if (!llama_hybrid_auto_size(ctx_tgt, keep_free_mib, 160, min_slots, max_slots, &before, &after, &free_mib)) {
+            SRV_WRN("hybrid-moe: sizing of the expert cache failed (%s)\n", why);
+            return;
+        }
+        SRV_INF("hybrid-moe: expert cache %d -> %d slots per layer (%s): free VRAM was %d MiB, margin %d MiB + 160 MiB, %.1f ms\n",
+                before, after, why, free_mib, keep_free_mib, (ggml_time_us() - t0) / 1000.0);''', r'''        constexpr int32_t safety_mib = 160;    // as the runner's auto sizing
+        constexpr int32_t slack_mib  = 512;    // free VRAM above the margin at the start: the first KV commits of a request then do not shrink the cache
+        if (!llama_hybrid_auto_size(ctx_tgt, keep_free_mib, safety_mib + slack_mib, min_slots, max_slots, &before, &after, &free_mib)) {
+            SRV_WRN("hybrid-moe: sizing of the expert cache failed (%s)\n", why);
+            return;
+        }
+        // every later commit of KV rows keeps the margin free by shrinking the cache (a fixed slot count never shrinks)
+        llama_hybrid_set_margin(ctx_tgt, keep_free_mib, safety_mib, slack_mib, min_slots);
+        SRV_INF("hybrid-moe: expert cache %d -> %d slots per layer (%s): free VRAM was %d MiB, margin %d MiB + %d MiB (+ %d MiB slack), %.1f ms\n",
+                before, after, why, free_mib, keep_free_mib, safety_mib, slack_mib, (ggml_time_us() - t0) / 1000.0);'''),
+])

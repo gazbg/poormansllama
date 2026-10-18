@@ -1,0 +1,53 @@
+"""G32f (after the fault-injection runs g676-g678 and the variant runs g680-g683): (1) LLAMA_LM_FAIL_RUN=1|2 fails ONE pass attempt (LLAMA_LM_FAIL_AT=k, default the first; 0 = every attempt) so that the recovery after a failed pass can be
+tested (g678 failed every pass and showed only that the failure path returns a clean error); (2) a batch that is big enough but not taken says why (LLAMA_LM_LOG=1: 'takes the ordinary path: ...'); (3) when the pass declines after it
+acquired its resources (nothing changed) the hybrid decode hook runs again, so that the prefill window opens for the batch as it would have without the pass (g677: the fallback ran at -ub 512, 402 t/s instead of the window's 740).
+llama-lm-prefill.cpp / .h are copied again."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = WT + r"\docs\plans\tg-beat-stock-specs\stage-c"
+CXH = NEST + r"\src\llama-context.h"
+CXC = NEST + r"\src\llama-context.cpp"
+
+patch(CXH, [
+    ('''    std::vector<int32_t> widths;              // chunk widths, in order
+};''', '''    std::vector<int32_t> widths;              // chunk widths, in order
+    const char *         why         = nullptr; // when !ok: the reason (a static string)
+};'''),
+    ('''    llama_lm_plan lm_make_plan(const llama_batch & b) const;''', '''    llama_lm_plan lm_make_plan(const llama_batch & b) const;
+    void lm_note(const llama_batch & b, const llama_lm_plan & pl) const;   // LLAMA_LM_LOG=1: why a big enough batch was not taken'''),
+])
+
+patch(CXC, [
+    ('''        lm_plan = lm_make_plan(batch_inp);
+        if (lm_plan.ok) {''', '''        lm_plan = lm_make_plan(batch_inp);
+        lm_note(batch_inp, lm_plan);
+        if (lm_plan.ok) {'''),
+    ('''        // nothing was changed: give the pass's resources back and take the ordinary path
+        lm_release();
+        lm_scope.on = false;
+''', '''        // nothing was changed: give the pass's resources back and take the ordinary path (the hybrid prefill window opens for it now, as it would have without the pass)
+        lm_release();
+        lm_scope.on = false;
+        llama_lm_prefill_pending = false;
+        if (llama_hybrid_decode_hook != nullptr) {
+            llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+        }
+'''),
+])
+
+for name in ("llama-lm-prefill.cpp", "llama-lm-prefill.h"):
+    src = HERE + "\\" + name + ".txt"
+    dst = NEST + r"\src" + "\\" + name
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK new file %s <- %s (%d bytes)" % (dst, src, os.path.getsize(src)))
+    else:
+        shutil.copyfile(src, dst)
+        print("wrote %s" % dst)

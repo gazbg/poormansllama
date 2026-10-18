@@ -1,0 +1,52 @@
+"""G32n (after the np2 soak g952q on s31: 35 of 60 declines were "the block starting at cell N breaks at cell M (seq A pos P, expected seq B pos Q)", 14 more "(empty, expected ...)"): sequence affinity recovers the tail after a rollback.
+
+The soak's requests share a 1,473-token prefix and diverge after it, so the server rolls a slot back (seq_rm from position 1,473) and processes the new tokens from there. seq_rm removes the cell that the remembered tail pointed at, the
+affinity check fails, the stock placement puts the new tokens at the head -- next to the other sequence -- and the sequence is no longer one block ("breaks at cell 1537 (seq 0 pos 1473 ...)"). A sequence restored from the host cache
+has no remembered tail either.
+What: when the remembered tail of a sequence does not match the batch's first position, find_slot looks for the cell that holds position first - 1 of that sequence (one scan of the cells) and continues right behind it if the cells there are free.
+Edits: src/llama-kv-cache.cpp (inside the multi-sequence affinity branch of g32l)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ('''                if (r == nullptr) {
+                    const int32_t tc = lm_tail_cell[sid];
+                    if (tc < 0 || lm_tail_pos[sid] != (int32_t) ubatch.pos[i] - 1 || cells.is_empty((uint32_t) tc) || cells.seq_count((uint32_t) tc) != 1 ||
+                        cells.seq_get((uint32_t) tc) != sid || cells.pos_get((uint32_t) tc) != ubatch.pos[i] - 1) {
+                        ok = false;
+                        break;
+                    }
+                    runs.push_back({ sid, (uint32_t) tc + 1, 0u, ubatch.pos[i] });
+                    r = &runs.back();
+                }''', '''                if (r == nullptr) {
+                    int32_t tc = lm_tail_cell[sid];
+                    const bool tail_ok = tc >= 0 && lm_tail_pos[sid] == (int32_t) ubatch.pos[i] - 1 && !cells.is_empty((uint32_t) tc) && cells.seq_count((uint32_t) tc) == 1 &&
+                                         cells.seq_get((uint32_t) tc) == sid && cells.pos_get((uint32_t) tc) == ubatch.pos[i] - 1;
+                    if (!tail_ok) {
+                        // after a rollback (seq_rm) or a restore the remembered tail is gone: the cell that holds position pos - 1 of this sequence is the tail
+                        tc = -1;
+                        if (ubatch.pos[i] > 0) {
+                            for (uint32_t c = 0; c < cells.size(); ++c) {
+                                if (!cells.is_empty(c) && cells.pos_get(c) == ubatch.pos[i] - 1 && cells.seq_count(c) == 1 && cells.seq_get(c) == sid) {
+                                    tc = (int32_t) c;
+                                    break;
+                                }
+                            }
+                        }
+                        if (tc < 0) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    runs.push_back({ sid, (uint32_t) tc + 1, 0u, ubatch.pos[i] });
+                    r = &runs.back();
+                }'''),
+])
+print("g32n edits matched")

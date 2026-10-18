@@ -1,0 +1,21 @@
+"""G32o (after the np2 soak g962q on s32): the gap that a fresh sequence leaves is half as large.
+
+g962q (tail recovery in place) engaged 17 passes and declined only 4 batches for "several sequences", but 26 batches were declined by the memory guard of lm_acquire ("could not make ~1,400 MiB of device memory available"):
+the KV cache is committed lazily by cell INDEX (rows [0, highest cell used)), so a gap of 65,536 cells in front of the second sequence commits 65,536 rows (690 MiB at 10.6 KiB per row) that hold nothing, the expert cache is
+squeezed to its floor, and the pass cannot get its slot window. Gap H = min(size/8, max(16384, size / (4 * n_seq_max))): 32,768 cells for the 262,144-cell cache at -np 2 (345 MiB), 16,384 at -np 4 or more.
+Edits: src/llama-kv-cache.cpp (lm_gap)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ('''    return std::min<uint32_t>(size / 4u, std::max<uint32_t>(16384u, size / (2u * std::max<uint32_t>(1u, n_seq_max))));''',
+     '''    return std::min<uint32_t>(size / 8u, std::max<uint32_t>(16384u, size / (4u * std::max<uint32_t>(1u, n_seq_max))));'''),
+])
+print("g32o edits matched")

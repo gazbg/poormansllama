@@ -1,0 +1,114 @@
+"""G30 / depth study: --mtp-draft-p-min P, the draft chain stops extending when the head is not confident. Owner request of 2026-10-14 ("MTP 2/4/6/8 and min P 0.1").
+
+llama.cpp's speculative loop (common_speculative_gen_draft) samples the draft token, and stops drafting as soon as the top candidate's probability is below p_min: that token is NOT added. This is the same rule
+for the MTP draft chain of the runner: after each draft decode the top token's probability among the candidates it was picked from (the pruned vocabulary when --mtp-draft-vocab is on) is
+1 / sum(exp(l_i - l_max)); if it is below P the token is dropped and the chain stops (an empty draft makes the round a plain one-row step). Needs --tg-fast-sample and no repetition penalty (the exact fast pick is
+where the logits row is read in place). Default 0 = off: the chain always runs to --mtp-draft tokens, exactly as before.
+Apply after g30l. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''        "  --mtp-draft-late      G30: the draft head's routed experts load on the host''', r'''        "  --mtp-draft-p-min P   G30: stop extending the draft chain when the head's top token has a probability below P (llama.cpp's draft p_min; the token is dropped); default 0 = off\n"
+        "  --mtp-draft-late      G30: the draft head's routed experts load on the host'''),
+    (r'''    bool mtp_draft_late = false;     // G30: --mtp-draft-late''', r'''    double mtp_draft_pmin = 0.0;     // G30: --mtp-draft-p-min P: the draft chain stops when the top token's probability is below P (0 = off)
+    bool mtp_draft_late = false;     // G30: --mtp-draft-late'''),
+    (r'''        } else if (arg == "--mtp-draft-late") {
+            mtp_draft_late = true;
+''', r'''        } else if (arg == "--mtp-draft-p-min") {
+            mtp_draft_pmin = atof(arg_value(argc, argv, i, "--mtp-draft-p-min").c_str());
+        } else if (arg == "--mtp-draft-late") {
+            mtp_draft_late = true;
+'''),
+    (r'''    if (mtp_draft_late && (!mtp ||''', r'''    if (mtp_draft_pmin < 0.0 || mtp_draft_pmin >= 1.0 || (mtp_draft_pmin > 0.0 && (!mtp || !tg_fast_sample || (rep_penalty != 1.0 && rep_last_n != 0)))) {
+        fprintf(stderr, "error: --mtp-draft-p-min needs --mtp, --tg-fast-sample, no repetition penalty and a value in [0, 1)\n");
+        return 2;
+    }
+    if (mtp_draft_late && (!mtp ||'''),
+    (r'''        int draft_vocab_n = 0;   // G30: LLAMA_MTP_DRAFT_VOCAB_N, measurement of a pruned draft vocabulary (0 = all)
+''', r'''        int draft_vocab_n = 0;   // G30: LLAMA_MTP_DRAFT_VOCAB_N, measurement of a pruned draft vocabulary (0 = all)
+        int64_t mt_pmin_checked = 0, mt_pmin_cut = 0, mt_pmin_us = 0;   // G30: --mtp-draft-p-min: draft steps checked, chains stopped, host time of the check
+'''),
+    (r'''                const int64_t tm_d0 = ggml_time_us();
+                for (int d = 0; d < mtp_draft && (int) generated.size() + (int) draft.size() < tg_tokens; ++d) {''', r'''                const int64_t tm_d0 = ggml_time_us();
+                bool pmin_stop = false;   // G30: the last draft step was not confident enough: the chain ends
+                for (int d = 0; d < mtp_draft && (int) generated.size() + (int) draft.size() < tg_tokens; ++d) {'''),
+    (r'''                        llama_token bd = 0;
+                        float bdv = dlogits[0];
+''', r'''                        llama_token bd = 0;
+                        float bdv = dlogits[0];
+                        bool pmin_keep = true;
+'''),
+    (r'''                            bd = (llama_token) ls_top2_exact(dlogits, draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab).best;''', r'''                            const int scan_n_d = draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab;
+                            const ls_top2 r2d = ls_top2_exact(dlogits, scan_n_d);
+                            bd  = (llama_token) r2d.best;
+                            bdv = r2d.best_val;
+                            if (mtp_draft_pmin > 0.0) {
+                                // the top token's probability among its candidates: 1 / sum(exp(l - l_max)); terms below -20 are zero in float
+                                const int64_t tm_pm0 = ggml_time_us();
+                                float ssum = 0.0f;
+                                for (int i = 0; i < scan_n_d; ++i) {
+                                    const float dd = dlogits[i] - bdv;
+                                    if (dd > -20.0f) {
+                                        ssum += expf(dd);
+                                    }
+                                }
+                                pmin_keep = (1.0f / ssum) >= (float) mtp_draft_pmin;
+                                mt_pmin_checked++;
+                                mt_pmin_cut += pmin_keep ? 0 : 1;
+                                mt_pmin_us += ggml_time_us() - tm_pm0;
+                            }'''),
+    (r'''                        draft.push_back(bd);
+                        td = bd;
+                        draft_ring.accept(bd);
+                        // chained h row of the drafted token (draft head's
+                        // own nextn row)
+                        const float * hd = llama_get_embeddings_nextn_ith(ctx_dft, n_pre);
+                        if (hd != nullptr) {
+                            memcpy(pending_h.data(), hd, row_bytes);
+                        }
+                        mt_dd_scan_us += ggml_time_us() - tm_dd2;''', r'''                        if (pmin_keep) {
+                            draft.push_back(bd);
+                            td = bd;
+                            draft_ring.accept(bd);
+                            // chained h row of the drafted token (draft head's
+                            // own nextn row)
+                            const float * hd = llama_get_embeddings_nextn_ith(ctx_dft, n_pre);
+                            if (hd != nullptr) {
+                                memcpy(pending_h.data(), hd, row_bytes);
+                            }
+                        } else {
+                            pmin_stop = true;
+                        }
+                        mt_dd_scan_us += ggml_time_us() - tm_dd2;'''),
+    (r'''                        break;
+                    }
+                }
+                if (exit_status != 0) {
+                    break;
+                }
+                mt_draft_us += ggml_time_us() - tm_d0;''', r'''                        break;
+                    }
+                    if (pmin_stop) {
+                        break;
+                    }
+                }
+                if (exit_status != 0) {
+                    break;
+                }
+                mt_draft_us += ggml_time_us() - tm_d0;'''),
+    (r'''            if (mtp && mrounds_batch > 0) {
+                fprintf(stderr, "MTP batch verify: rounds %lld,''', r'''            if (mtp && mrounds_batch > 0) {
+                fprintf(stderr, "MTP depth: --mtp-draft %d, p-min %.2f: %.3f drafted tokens per round, %.3f tokens committed per round; p-min checks %lld, chains stopped %lld, %.1f us per round\n", mtp_draft, mtp_draft_pmin,
+                    (double) mtp_drafted / (double) mrounds_batch, (double) (mtp_accepted + mrounds_batch) / (double) mrounds_batch, (long long) mt_pmin_checked, (long long) mt_pmin_cut,
+                    (double) mt_pmin_us / (double) mrounds_batch);
+                fprintf(stderr, "MTP batch verify: rounds %lld,'''),
+])

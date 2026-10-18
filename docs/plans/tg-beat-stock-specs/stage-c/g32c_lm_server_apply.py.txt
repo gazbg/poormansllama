@@ -1,0 +1,144 @@
+"""G32c: llama-server --lm-prefill (+ --lm-prefill-min / -ubatch / -segment / -slots / -bf16 / -batch). The flag is independent of --hybrid-moe: with it the decode after the prefill is the hybrid expert cache,
+without it the stock decode of whatever placement the model was loaded with (-ncmoe N / -cmoe / the fit step); the layers whose experts are on the host stream through the slot window, the others compute in place."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SC = NEST + r"\tools\server\server-context.cpp"
+
+patch(CH, [
+    ('''    bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
+''', '''    bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
+    bool        n_batch_set      = false; // -b / LLAMA_ARG_BATCH was given
+
+    // G32 (private fork, CUDA): layer-major prefill. A prompt batch of >= lm_prefill_min tokens runs layer by layer: every expert bank is copied from the host once while all chunks of the batch go through the layer.
+    bool        lm_prefill         = false;
+    int32_t     lm_prefill_min     = 2048;    // smallest batch (tokens) that is taken
+    int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
+    int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
+    int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
+    bool        lm_prefill_bf16    = false;   // bf16 activation slab
+    int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
+'''),
+])
+
+patch(AC, [
+    ('''            params.n_batch = value;
+        }
+    ).set_env("LLAMA_ARG_BATCH"));''', '''            params.n_batch     = value;
+            params.n_batch_set = true;
+        }
+    ).set_env("LLAMA_ARG_BATCH"));'''),
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--lm-prefill"},
+        "layer-major prefill (private fork, CUDA, Qwen3.5/3.6 MoE): a prompt batch of --lm-prefill-min tokens or more runs layer by layer, every routed-expert bank is copied from the host ONCE into a VRAM slot window while "
+        "all chunks of the batch go through the layer (the ordinary path copies all banks once per ubatch). Works with --hybrid-moe (hybrid decode) and without it (stock decode of the placement given by -ncmoe/-cmoe/the fit step: the layers whose experts are on the host stream, the others compute in place). "
+        "Takes -b 16384 unless -b is given",
+        [](common_params & params) {
+            params.lm_prefill = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-min"}, "N",
+        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 2048)",
+        [](common_params & params, int value) {
+            params.lm_prefill_min = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-ubatch"}, "N",
+        "tokens per chunk of the --lm-prefill pass (default: 2048)",
+        [](common_params & params, int value) {
+            params.lm_prefill_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-segment"}, "N",
+        "tokens per activation-slab segment of the --lm-prefill pass, a multiple of --lm-prefill-ubatch (default: 16384); a longer batch repeats the layer sweep per segment",
+        [](common_params & params, int value) {
+            params.lm_prefill_segment = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_SEGMENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-slots"}, "N",
+        "layer slots in the --lm-prefill VRAM window (default: 2: the next bank is copied while the current layer computes)",
+        [](common_params & params, int value) {
+            params.lm_prefill_slots = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-bf16"},
+        "keep the activations of the --lm-prefill pass in bf16 (half the slab, not validated against f32)",
+        [](common_params & params) {
+            params.lm_prefill_bf16 = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_BF16").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-batch"}, "N",
+        "logical batch size (-b) used with --lm-prefill when -b is not given (default: 16384)",
+        [](common_params & params, int value) {
+            params.lm_prefill_batch = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_BATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(SC, [
+    ('''        llama_init = common_init_from_params(params_base);
+
+        model_tgt = llama_init->model();''', '''        if (params_base.lm_prefill) {
+            if (!llama_hybrid_available()) {
+                SRV_ERR("%s", "--lm-prefill needs a build with LLAMA_LAYER_STREAMING (CUDA)\\n");
+                return false;
+            }
+            if (!params_base.n_batch_set && params_base.n_batch < params_base.lm_prefill_batch) {
+                params_base.n_batch = params_base.lm_prefill_batch;
+                SRV_INF("lm-prefill: logical batch size (-b) %d (one layer-major pass per batch)\\n", params_base.n_batch);
+            }
+        }
+
+        llama_init = common_init_from_params(params_base);
+
+        model_tgt = llama_init->model();'''),
+    ('''        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_active()) {
+                SRV_ERR("%s", "--hybrid-moe: no hybrid engine in this process (is the model a supported MoE with its expert banks on the host?)\\n");
+                return false;
+            }
+            hybrid_size_cache("start");
+        }
+''', '''        if (params_base.lm_prefill) {
+            // before the expert cache is sized: the slot window is allocated once here and freed at once, the cache then takes the rest
+            llama_lm_prefill_params lp = llama_lm_prefill_default_params();
+            lp.n_slots    = params_base.lm_prefill_slots;
+            lp.ubatch     = params_base.lm_prefill_ubatch;
+            lp.segment    = params_base.lm_prefill_segment;
+            lp.min_tokens = params_base.lm_prefill_min;
+            lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            char err[512] = { 0 };
+            if (!llama_lm_prefill_enable(ctx_tgt, &lp, err, sizeof(err))) {
+                SRV_ERR("--lm-prefill: %s\\n", err);
+                return false;
+            }
+            SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\\n",
+                    lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+        }
+
+        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_active()) {
+                SRV_ERR("%s", "--hybrid-moe: no hybrid engine in this process (is the model a supported MoE with its expert banks on the host?)\\n");
+                return false;
+            }
+            hybrid_size_cache("start");
+        }
+'''),
+])

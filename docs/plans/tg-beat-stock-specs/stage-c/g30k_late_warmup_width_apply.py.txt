@@ -1,0 +1,24 @@
+"""G30 / M2n: the late bring-up's start-up warm-up runs at 128 rows, not at the catch-up width. Contract: the plan's "G30 CONTRACT".
+
+Measured (g105-sgc50k, g105-lc24k, build g55): the 512-row warm-up of g30j cut the first catch-up call from 110 to 29 ms, but its transient 296 MiB compute buffer is allocated at start-up, when the target's own
+buffers and (at 50k) 560 MiB of committed KV already sit on the device: the whole-run minimum free memory fell to 15,893 MiB and the poller peak rose to 7,483 MiB at 49,999 tokens (7,323 / 16,053 at 23,995) -- the
+repair of G30-4 created a new violation of G30-4. A 128-row warm-up needs a ~75 MiB buffer and still runs the kernels the catch-up uses (the matmul tiles top out at 128 columns; the attention, norm and
+routing kernels are the same). Apply after g30j. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''            const int64_t t_w0 = ggml_time_us();
+            const int n_w = std::max(1, std::min(mtp_catchup, ubatch));
+            if (mtp_draft_late) {''', r'''            const int64_t t_w0 = ggml_time_us();
+            const int n_w = mtp_draft_late ? std::max(1, std::min(std::min(mtp_catchup, ubatch), 128)) : std::max(1, std::min(mtp_catchup, ubatch));
+            if (mtp_draft_late) {'''),
+])

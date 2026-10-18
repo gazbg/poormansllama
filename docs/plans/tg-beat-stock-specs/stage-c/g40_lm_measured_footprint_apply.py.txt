@@ -1,0 +1,108 @@
+"""G40 (round 5): the pass's room request is based on what the last pass really cost on the device, not only on the scheduler's buffer.
+
+k3502 (s43, workload 2, 4 clients) dipped to 15,995 MiB free, 5 MiB under the 16,000 line, during the SECOND pass of the run: "room for 1270 MiB made ... free 17527 MiB", then 15,995 = 17,527 - 1,532. The request was
+slot window (996 MiB) + slab + the previous pass's scheduler buffer (a few hundred MiB) + 64 MiB; the pass really took about 260 MiB more, because the CUDA pools (mul_mat_id staging, flash-attention temporaries)
+and the graph temporaries are not in the scheduler's buffer. The 160 MiB safety absorbed most of it, not all.
+Now lm_acquire records the device's free memory when the room is made and lm_release reads it again just before the pass's resources are freed: the difference, minus the slot window and the slab, is what the pass
+needed besides them; the next pass requests that (scaled up if its widest chunk is wider, plus 32 MiB) when it is larger than the scheduler estimate. The first pass of a run keeps the conservative formula.
+Edits: src/llama-lm-prefill.h (fields), src/llama-lm-prefill.cpp (lm_acquire, lm_release)."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.h", [
+    ('''    size_t                 sched_est     = 0;       // compute buffer the last pass needed (for the next pass's room estimate)
+''', '''    size_t                 sched_est     = 0;       // compute buffer the last pass needed (for the next pass's room estimate)
+    int64_t                free_pre      = 0;       // device free memory when the room was made for the running pass
+    int64_t                slot_total    = 0;       // the running pass's slot window
+    int32_t                cur_w         = 0;       // the running pass's widest chunk
+    int64_t                var_meas      = 0;       // what the last pass really took besides slot window and slab (scheduler buffer, CUDA pools, temporaries)
+    int32_t                var_w         = 0;       // the widest chunk of that pass
+'''),
+])
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    ('''bool llama_context::lm_acquire(const llama_lm_plan & pl) {''', '''static int64_t lm_dev_free() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(d, &f, &t);
+            return (int64_t) f;
+        }
+    }
+    return 0;
+}
+
+bool llama_context::lm_acquire(const llama_lm_plan & pl) {'''),
+    ('''    const int64_t sched_est = S.sched_est > 0 ? (int64_t) S.sched_est : (int64_t) ((double) P.ubatch/2048.0*560.0*1048576.0) + (int64_t) 96*1048576;
+    const int64_t need      = (int64_t) (slot_bytes + 4096) * P.n_slots + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
+
+    if (llama_lm_vram_hook != nullptr && !llama_lm_vram_hook(this, need, 1)) {
+        LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\\n", __func__, (double) need/1048576.0);
+        return false;
+    }
+''', '''    int32_t wmax = 1;
+    for (const int32_t w : pl.widths) {
+        wmax = std::max(wmax, w);
+    }
+    const int64_t slot_total = (int64_t) (slot_bytes + 4096) * P.n_slots;
+    int64_t sched_est = S.sched_est > 0 ? (int64_t) S.sched_est : (int64_t) ((double) P.ubatch/2048.0*560.0*1048576.0) + (int64_t) 96*1048576;
+    // G40: the scheduler's buffer is not all a pass costs (CUDA pools, graph temporaries): ask for what the last pass really took, scaled to this plan's widest chunk
+    if (S.var_meas > 0 && S.var_w > 0) {
+        const double scale = std::max(1.0, (double) wmax/(double) S.var_w);
+        sched_est = std::max(sched_est, (int64_t) ((double) S.var_meas*scale) + (int64_t) 32*1048576);
+    }
+    const int64_t need = slot_total + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
+
+    if (llama_lm_vram_hook != nullptr && !llama_lm_vram_hook(this, need, 1)) {
+        LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\\n", __func__, (double) need/1048576.0);
+        return false;
+    }
+    S.free_pre   = lm_dev_free();
+    S.slot_total = slot_total;
+    S.cur_w      = wmax;
+'''),
+    ('''    auto & S = *lm_state;
+    const int64_t t_r0 = ggml_time_us();
+
+    if (S.sched_swapped) {''', '''    auto & S = *lm_state;
+    const int64_t t_r0 = ggml_time_us();
+
+    // G40: what this pass really took on the device besides the slot window and the slab (the next pass asks for it)
+    if (S.live && S.free_pre > 0) {
+        const int64_t var = S.free_pre - lm_dev_free() - S.slot_total - 2*(int64_t) S.slab_half;
+        if (var > 0) {
+            S.var_meas = var;
+            S.var_w    = S.cur_w;
+        }
+        if (lm_log_on()) {
+            LLAMA_LOG_WARN("lm-prefill: footprint beyond the slot window and the slab: %.0f MiB (widest chunk %d)\\n", (double) var/1048576.0, (int) S.cur_w);
+        }
+    }
+    S.free_pre = 0;
+
+    if (S.sched_swapped) {'''),
+])
+print("g40 edits matched")

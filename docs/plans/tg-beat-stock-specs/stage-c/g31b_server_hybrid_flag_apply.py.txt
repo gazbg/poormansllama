@@ -1,0 +1,134 @@
+"""G31 / S1b: the server flags of the hybrid MoE decode and the start-up sizing of the expert cache. Contract: docs/plans/llama-server-integration.md.
+
+ * common/common.h: common_params.hybrid_moe / hybrid_moe_slots / hybrid_moe_freq.
+ * common/arg.cpp: --hybrid-moe, --hybrid-moe-slots N, --hybrid-moe-freq FILE (server only; env LLAMA_ARG_HYBRID_MOE ...).
+ * tools/server/server-context.cpp: with --hybrid-moe: the MoE expert banks stay on the host (the -cmoe override), the fit step is off (the placement is explicit), the engine's environment is
+   prepared before the context exists (llama-hybrid.h), and after the model is loaded and warmed up the expert cache is sized to the --fit-target margin (free VRAM stays >= the margin + 160 MiB).
+Without the flag nothing changes. Apply after g31a. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CM = NEST + r"\common\common.h"
+AR = NEST + r"\common\arg.cpp"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(CM, [
+    (r'''    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+''', r'''    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    // G31 (private fork, CUDA): hybrid MoE decode. The expert banks stay on the host, a VRAM expert cache sized to the fit-target margin serves most experts.
+    bool        hybrid_moe       = false;
+    int32_t     hybrid_moe_slots = -1;   // -1: size the cache to the --fit-target margin; N > 0: N slots per layer
+    std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
+'''),
+])
+
+patch(AR, [
+    (r'''    add_opt(common_arg(
+        {"-kvu", "--kv-unified"},''', r'''    add_opt(common_arg(
+        {"--hybrid-moe"},
+        "hybrid MoE decode (private fork, CUDA): the expert banks stay on the host and a VRAM expert cache, sized so that the --fit-target margin stays free, serves most experts; "
+        "also sets the engine environment variables you did not set and turns --fit off",
+        [](common_params & params) {
+            params.hybrid_moe = true;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-slots"}, "N",
+        "expert-cache slots per layer for --hybrid-moe (default: -1 = size the cache to the --fit-target margin)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_slots = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",
+        "expert frequency table (n_layer x n_expert counts, whitespace separated) that fills the --hybrid-moe cache at start (default: uniform prior)",
+        [](common_params & params, const std::string & value) {
+            params.hybrid_moe_freq = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_FREQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-kvu", "--kv-unified"},'''),
+])
+
+patch(SV, [
+    (r'''#include "llama.h"
+#include "log.h"
+#include "sampling.h"''', r'''#include "llama.h"
+#include "llama-hybrid.h"
+#include "log.h"
+#include "sampling.h"'''),
+    (r'''    // load the model and initialize llama_context
+    // this may also be called to resume from sleeping state
+    bool load_model(common_params & params) {''', r'''    // G31: size the hybrid MoE expert cache to the fit-target margin (between requests only)
+    void hybrid_size_cache(const char * why) {
+        if (!params_base.hybrid_moe || ctx_tgt == nullptr) {
+            return;
+        }
+        const int32_t keep_free_mib = (int32_t) (params_base.fit_params_target.empty() ? 1024 : params_base.fit_params_target[0] / (1024*1024));
+        int32_t before = 0, after = 0, free_mib = 0;
+        const int64_t t0 = ggml_time_us();
+        const int32_t max_slots = params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 256;
+        const int32_t min_slots = params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 8;
+        if (!llama_hybrid_auto_size(ctx_tgt, keep_free_mib, 160, min_slots, max_slots, &before, &after, &free_mib)) {
+            SRV_WRN("hybrid-moe: sizing of the expert cache failed (%s)\n", why);
+            return;
+        }
+        SRV_INF("hybrid-moe: expert cache %d -> %d slots per layer (%s): free VRAM was %d MiB, margin %d MiB + 160 MiB, %.1f ms\n",
+                before, after, why, free_mib, keep_free_mib, (ggml_time_us() - t0) / 1000.0);
+    }
+
+    // load the model and initialize llama_context
+    // this may also be called to resume from sleeping state
+    bool load_model(common_params & params) {'''),
+    (r'''        llama_init = common_init_from_params(params_base);
+
+        model_tgt = llama_init->model();
+        ctx_tgt   = llama_init->context();
+''', r'''        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_available()) {
+                SRV_ERR("%s", "--hybrid-moe needs a build with LLAMA_LAYER_STREAMING (CUDA)\n");
+                return false;
+            }
+            // the expert banks stay on the host (the -cmoe override), the placement is explicit so the fit step is off.
+            // The argument parser pads the list with empty terminators: drop them, add the override, pad again.
+            auto & ov = params_base.tensor_buft_overrides;
+            while (!ov.empty() && ov.back().pattern == nullptr) {
+                ov.pop_back();
+            }
+            ov.push_back(llm_ffn_exps_cpu_override());
+            while (ov.size() < llama_max_tensor_buft_overrides()) {
+                ov.push_back({nullptr, nullptr});
+            }
+            params_base.fit_params = false;
+            llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
+            SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
+        }
+
+        llama_init = common_init_from_params(params_base);
+
+        model_tgt = llama_init->model();
+        ctx_tgt   = llama_init->context();
+'''),
+    (r'''        vocab = llama_model_get_vocab(model_tgt);
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+''', r'''        if (params_base.hybrid_moe) {
+            if (!llama_hybrid_active()) {
+                SRV_ERR("%s", "--hybrid-moe: no hybrid engine in this process (is the model a supported MoE with its expert banks on the host?)\n");
+                return false;
+            }
+            hybrid_size_cache("start");
+        }
+
+        vocab = llama_model_get_vocab(model_tgt);
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+'''),
+])

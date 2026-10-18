@@ -1,0 +1,74 @@
+"""G31q: the statistics-keeping refill of resize() (g31j) is OPT-IN for the server, the runner's resize stays bit-for-bit what it was.
+Found by the SRV-8 identity session (g320-sc24): the runner built from the g31 tree decoded the same 512 ids as the last accepted build g58 (firstdiv None, TG +0.46%), but its logit margins differed by a median of 0.1336
+(every earlier identity session printed dlogitmed 0.0000): the prompt's last chunk reaches the engine, so `ema` is not all zero when the runner's TG transition calls resize(), and the new refill order (ema + tie) put different
+experts in the cache than the old one (frequency table only). The server wants the new order (a shrink keeps what the engine learned), the runner is recorded behaviour: llama_hybrid_set_margin() switches it on."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+MH = NEST + r"\src\llama-moe-hybrid.cpp"
+MHH = NEST + r"\src\llama-moe-hybrid.h"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(MH, [
+    ('''    // policy state and initial fill: as init() does for the new slot count, but the popularity statistics (ema, last_sel) are KEPT, so a shrink keeps the experts the engine found hot (G31j)
+    const size_t ne = (size_t) n_layer*n_expert;
+    map.assign(ne, -1);
+    slot_of.assign(ne, -1);
+    slot_expert.assign(slot_off[(size_t) n_layer], -1);
+    pending.clear();''', '''    // policy state and initial fill, exactly as init() does for the new slot count. With keep_stats (the server, G31j/G31q) the popularity statistics (ema, last_sel) are KEPT and the refill takes the experts with the
+    // highest policy score, so a shrink keeps the experts the engine found hot; without it (the runner) the statistics are reset and the order is the frequency table's, as recorded
+    const bool   keep_stats = g_moe_hybrid_keep_stats.load();
+    const size_t ne = (size_t) n_layer*n_expert;
+    map.assign(ne, -1);
+    slot_of.assign(ne, -1);
+    slot_expert.assign(slot_off[(size_t) n_layer], -1);
+    if (!keep_stats) {
+        last_sel.assign(recency ? ne : 0, 0);
+        ema.assign(ne, 0.0);
+    }
+    pending.clear();'''),
+    ('''        const double * em = ema.data() + (size_t) il*n_expert;
+        const double * tt = tie.data() + (size_t) il*n_expert;
+        std::stable_sort(order.begin(), order.end(), [em, tt](int a, int b) { return em[a] + tt[a] > em[b] + tt[b]; });''', '''        if (keep_stats) {
+            const double * em = ema.data() + (size_t) il*n_expert;
+            const double * tt = tie.data() + (size_t) il*n_expert;
+            std::stable_sort(order.begin(), order.end(), [em, tt](int a, int b) { return em[a] + tt[a] > em[b] + tt[b]; });
+        } else {
+            const int64_t * fl = freq_.data() + (size_t) il*n_expert;
+            std::stable_sort(order.begin(), order.end(), [fl](int a, int b) { return fl[a] > fl[b]; });
+        }'''),
+    ('''bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot) {''', '''void llama_moe_hybrid_set_keep_stats(bool keep) {
+    g_moe_hybrid_keep_stats.store(keep);
+}
+
+bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot) {'''),
+    ('''struct moe_hybrid_engine {
+    const llama_model * model = nullptr;''', '''std::atomic<bool> g_moe_hybrid_keep_stats{false};   // see llama_moe_hybrid_set_keep_stats()
+
+struct moe_hybrid_engine {
+    const llama_model * model = nullptr;'''),
+])
+
+patch(MHH, [
+    ('''bool llama_moe_hybrid_make_room_impl(''', '''// the refill after a resize keeps the popularity statistics and takes the highest-scoring experts (the server, G31j); off (the default, the runner): statistics reset, frequency-table order, as recorded
+void llama_moe_hybrid_set_keep_stats(bool keep);
+
+bool llama_moe_hybrid_make_room_impl('''),
+])
+
+patch(HA, [
+    ('''    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;''', '''    g_hybrid_ctx       = ctx;
+    llama_moe_hybrid_set_keep_stats(true);
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;'''),
+    ('''    llama_hybrid_decode_hook = nullptr;
+    g_hp = hybrid_prefill_state();''', '''    llama_hybrid_decode_hook = nullptr;
+    llama_moe_hybrid_set_keep_stats(false);
+    g_hp = hybrid_prefill_state();'''),
+])

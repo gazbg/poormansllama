@@ -1,0 +1,51 @@
+"""G32d (after the first measurements of build s21, sessions g601 / g602): (1) the expert cache grows back at the first SMALL decode after a layer-major pass instead of at the end of every pass (a request with two passes
+and a checkpoint chunk paid ~0.4 s per pass; g602 log: 'prefill window: expert cache 30 -> 49 slots' 0.37 s after each pass); (2) the pass resources are timed (LLAMA_LM_LOG=1 prints 'resources: acquire / release');
+(3) fault-injection knobs for the tests (LLAMA_LM_FAIL_ACQUIRE, LLAMA_LM_FAIL_RUN=1|2). llama-lm-prefill.cpp / .h are copied again (they carry (2) and (3))."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = WT + r"\docs\plans\tg-beat-stock-specs\stage-c"
+HAC = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(HAC, [
+    ('''static hybrid_prefill_state g_hp;
+''', '''static hybrid_prefill_state g_hp;
+static bool g_lm_regrow_pending = false;   // G32: the expert cache shrank for a layer-major pass and has not grown back yet
+'''),
+    ('''static void hybrid_prefill_regrow(llama_context * ctx) {
+    int before = 0, after = 0;''', '''static void hybrid_prefill_regrow(llama_context * ctx) {
+    g_lm_regrow_pending = false;
+    int before = 0, after = 0;'''),
+    ('''    hybrid_prefill_regrow(ctx);
+    return true;
+}
+
+static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {''', '''    // the cache grows back at the first small decode (the checkpoint chunk of the server is not one; the first token of the answer is): consecutive passes of one request, and the chunks between them, share one shrink
+    g_lm_regrow_pending = true;
+    return true;
+}
+
+static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {'''),
+    ('''    if (g_seed.on) {
+        // probe the prompt-like decodes below the window's size''', '''    if (g_lm_regrow_pending && !llama_lm_prefill_pending && n_tokens <= 16) {
+        hybrid_prefill_regrow(ctx);
+    }
+    if (g_seed.on) {
+        // probe the prompt-like decodes below the window's size'''),
+])
+
+for name in ("llama-lm-prefill.cpp", "llama-lm-prefill.h"):
+    src = HERE + "\\" + name + ".txt"
+    dst = NEST + "\\src\\" + name
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK new file %s <- %s (%d bytes)" % (dst, src, os.path.getsize(src)))
+    else:
+        shutil.copyfile(src, dst)
+        print("wrote %s" % dst)

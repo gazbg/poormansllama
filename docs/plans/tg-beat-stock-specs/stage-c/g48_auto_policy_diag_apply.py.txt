@@ -1,0 +1,99 @@
+"""G48 (G42 round 7, found by the small-turn fixture S, sessions k5331-k5342): the `auto` idle preparation armed when 2 of the last 4 requests used the pass, but an unused preparation costs a cache regrow
+(~0.4 s) and a used one saves ~0.26 s, so it pays only above ~60% hits: on a fixture whose turns alternate between pass-sized and small, `auto` was 1.044x of the fused server without preparation (contract GA-9: <= 1.03x).
+The rule is now 3 of the last 4 (decision D7 amended before the rerun). Also two diagnostics that are off without their variables: the time of the checkpoint restore (LLAMA_LM_LOG) and a drain of the staged banks at the end of
+the arm (LLAMA_LM_ARM_SYNC=1: says whether the 70-90 ms between launch and the first decode of a prepared request is the staging copies still in flight). And a batch that was armed for is taken whatever its
+size only if it has exactly the armed size (an abandoned fused batch must not make the next, unrelated, small batch run as a pass).
+Edits: common/arg.cpp, src/llama-lm-prefill.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\common\arg.cpp", [
+    (r'''"MODE: off (default), always, auto (when at least 2 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode",''',
+     r'''"MODE: off (default), always, auto (when at least 3 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode, a used one saves ~0.26 s",'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    (r'''            want = c >= 2;''', r'''            want = c >= 3;       // an unused preparation costs ~0.4 s (the cache regrow), a used one saves ~0.26 s: it pays above ~60% hits'''),
+    (r'''                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+''', r'''                                        const int64_t t_restore0 = ggml_time_us();
+                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (getenv("LLAMA_LM_LOG") != nullptr) {
+                                            SRV_WRN("lm-fuse: checkpoint of %" PRId64 " tokens restored in %.1f ms\n", it->n_tokens, (ggml_time_us() - t_restore0)/1000.0);
+                                        }
+'''),
+])
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    (r'''        preloaded++;
+    }
+    return true;
+}
+
+bool llama_context::lm_prearm(''', r'''        preloaded++;
+    }
+    static const bool arm_sync = getenv("LLAMA_LM_ARM_SYNC") != nullptr;      // diagnostic: wait for the staged banks here
+    if (arm_sync) {
+        const int64_t t_s0 = ggml_time_us();
+        ls.ls_stage_drain();
+        LLAMA_LOG_WARN("lm-prefill: the staged banks of the arm are in place after %.1f ms more\n", (double) (ggml_time_us() - t_s0)/1e3);
+    }
+    return true;
+}
+
+bool llama_context::lm_prearm('''),
+])
+# a batch is taken whatever its size only when it is the batch the caller armed for (an abandoned fused batch must not make the next, unrelated, small batch run as a pass)
+patch(NEST + r"\src\llama-lm-prefill.h", [
+    (r'''    int32_t                armed_w       = 0;       // widest chunk the armed room was made for
+''', r'''    int32_t                armed_w       = 0;       // widest chunk the armed room was made for
+    int64_t                armed_n       = 0;       // tokens of the batch it was armed for (armed_batch)
+'''),
+])
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    (r'''    if (b.n_tokens < P.min_tokens && !lm_state->armed_batch) {''', r'''    if (b.n_tokens < P.min_tokens && !(lm_state->armed_batch && lm_state->armed_n == b.n_tokens)) {'''),
+    (r'''        if (S.slab_tokens >= rows && S.armed_w >= wmax) {
+            S.armed_batch = S.armed_batch || seq >= 0;
+            return true;
+        }''', r'''        if (S.slab_tokens >= rows && S.armed_w >= wmax) {
+            S.armed_batch = S.armed_batch || seq >= 0;
+            if (seq >= 0) {
+                S.armed_n = n_tokens;
+            }
+            return true;
+        }'''),
+    (r'''    S.armed       = true;
+    S.armed_batch = seq >= 0;
+    S.armed_w     = wmax;''', r'''    S.armed       = true;
+    S.armed_batch = seq >= 0;
+    S.armed_n     = seq >= 0 ? n_tokens : 0;
+    S.armed_w     = wmax;'''),
+    (r'''    plan = lm_make_plan(b);
+    S.snap_req.clear();                    // a request holds for one decode''', r'''    plan = lm_make_plan(b);
+    S.snap_req.clear();                    // a request holds for one decode
+    if (!plan.ok) {
+        S.armed_batch = false;             // the batch armed for was not this one
+    }'''),
+])
+print("g48 edits matched")

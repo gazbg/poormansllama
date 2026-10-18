@@ -1,0 +1,18 @@
+"""G31g: the slack the server leaves above the keep-free margin is overridable by LLAMA_HYBRID_SLACK_MIB (default 512), so that a test can force a shrink of the expert cache every few KV commits
+(slack 0 = the cache is sized right at the margin; every ~12 ubatches of a prompt shrink it by a slot). Test knob only; the default is unchanged."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(SV, [
+    ('''        constexpr int32_t slack_mib  = 512;    // free VRAM above the margin at the start: the first KV commits of a request then do not shrink the cache''',
+     '''        const char *  slack_env = getenv("LLAMA_HYBRID_SLACK_MIB");   // test knob: 0 forces frequent shrinks
+        const int32_t slack_mib = slack_env != nullptr ? std::max(0, atoi(slack_env)) : 512;    // free VRAM above the margin at the start: the first KV commits of a request then do not shrink the cache'''),
+])

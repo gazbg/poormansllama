@@ -1,0 +1,171 @@
+"""G33: the lean host leg can compute the expert matmuls like the CUDA kernels (q8_1-style activation, ggml-cpu/q81x.c), so that a request gives the same numbers whether an expert
+is resident in the VRAM cache or was missed. Opt-in: env LLAMA_MOE_HYBRID_Q81=1 (needs the lean leg, Q4_K up/gate banks and Q4_K or Q6_K down banks). Edits: src/llama-moe-lean.h, src/llama-moe-hybrid.cpp."""
+import os
+import sys
+
+NEST = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp"
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+lean = NEST + r"\src\llama-moe-lean.h"
+patch(lean, [
+    # 1. support predicate for the q8_1-style path
+    ('''inline std::vector<char> quantize_router_q8(''', '''// G33: the shapes the q8_1-style path computes (Q4_K up and gate, Q4_K or Q6_K down, rows of a multiple of 256 values)
+inline bool supported_q81(const layer_banks & lb) {
+    return lb.up.type == GGML_TYPE_Q4_K && lb.gate.type == GGML_TYPE_Q4_K && (lb.down.type == GGML_TYPE_Q4_K || lb.down.type == GGML_TYPE_Q6_K) &&
+           lb.up.k % 256 == 0 && lb.down.k % 256 == 0;
+}
+
+inline std::vector<char> quantize_router_q8('''),
+    # 2. members and setter
+    ('''        xq_.alloc((size_t) 4*n_embd + 64);               // up to 4 bytes per element (f32 activations)
+''', '''        n_ff_ = n_ff;
+        xq_.alloc((size_t) 4*n_embd + 64);               // up to 4 bytes per element (f32 activations)
+'''),
+    ('''    int n_threads() const { return nth_; }
+''', '''    int n_threads() const { return nth_; }
+
+    // G33: compute like the CUDA kernels (q8_1-style activation); call before the first run(). Needs supported_q81() banks.
+    void set_q81(bool on) {
+        q81_ = on;
+        if (on) {
+            x81_qs_.assign((size_t) n_embd_ + 64, 0);
+            x81_d_.assign((size_t) n_embd_/32 + 8, 0.0f);
+            x81_s_.assign((size_t) n_embd_/16 + 16, 0);
+            for (auto & t : tc_) {
+                t.a81_qs.assign((size_t) MAX_M*n_ff_ + 64, 0);
+                t.a81_d.assign((size_t) MAX_M*(n_ff_/32) + 8, 0.0f);
+                t.a81_s.assign((size_t) MAX_M*(n_ff_/16) + 16, 0);
+            }
+        }
+    }
+    bool q81() const { return q81_; }
+'''),
+    ('''        abuf               xq8;   // the request row in q8_0, for the router dot products of the post stage
+''', '''        abuf               xq8;   // the request row in q8_0, for the router dot products of the post stage
+        std::vector<int8_t>  a81_qs;  // G33: the quantized activation of every expert (q8_1-style), see ggml-cpu/q81x.c
+        std::vector<float>   a81_d;
+        std::vector<int16_t> a81_s;
+'''),
+    ('''    int64_t               n_expert_;
+''', '''    int64_t               n_expert_;
+    int64_t               n_ff_ = 0;
+    bool                  q81_ = false;
+    std::vector<int8_t>   x81_qs_;   // G33: the request row, q8_1-style
+    std::vector<float>    x81_d_;
+    std::vector<int16_t>  x81_s_;
+'''),
+    # 3. stage A
+    ('''        {
+            const int64_t bs = ggml_blck_size(vdt);
+            const int64_t nb = k/bs;
+            const int64_t b0 = (ith*nb)/nth_;
+            const int64_t b1 = ((ith + 1)*nb)/nth_;
+            if (b1 > b0) {
+                q_x(j.x + b0*bs, xq_.p + (size_t) b0*ggml_type_size(vdt), (b1 - b0)*bs);''', '''        {
+            const int64_t bs = q81_ ? 32 : ggml_blck_size(vdt);
+            const int64_t nb = k/bs;
+            const int64_t b0 = (ith*nb)/nth_;
+            const int64_t b1 = ((ith + 1)*nb)/nth_;
+            if (b1 > b0) {
+                if (q81_) {
+                    ggml_cpu_quantize_q81x(j.x + b0*bs, (b1 - b0)*bs, x81_qs_.data() + b0*bs, x81_d_.data() + b0, x81_s_.data() + 2*b0);
+                } else {
+                    q_x(j.x + b0*bs, xq_.p + (size_t) b0*ggml_type_size(vdt), (b1 - b0)*bs);
+                }'''),
+    # 4. stage B
+    ('''                for (int64_t r = r0; r < r1; ++r) {
+                    tu->vec_dot((int) k, ou + r, 0, pu + (size_t) r*lb.up.row_bytes,   0, xq_.p, 0, 1);
+                    tg->vec_dot((int) k, og + r, 0, pg + (size_t) r*lb.gate.row_bytes, 0, xq_.p, 0, 1);
+                }''', '''                if (q81_) {
+                    for (int64_t r = r0; r < r1; ++r) {
+                        ggml_cpu_vec_dot_q4_K_q81x((int) k, ou + r, pu + (size_t) r*lb.up.row_bytes,   x81_qs_.data(), x81_d_.data(), x81_s_.data());
+                        ggml_cpu_vec_dot_q4_K_q81x((int) k, og + r, pg + (size_t) r*lb.gate.row_bytes, x81_qs_.data(), x81_d_.data(), x81_s_.data());
+                    }
+                    continue;
+                }
+                for (int64_t r = r0; r < r1; ++r) {
+                    tu->vec_dot((int) k, ou + r, 0, pu + (size_t) r*lb.up.row_bytes,   0, xq_.p, 0, 1);
+                    tg->vec_dot((int) k, og + r, 0, pg + (size_t) r*lb.gate.row_bytes, 0, xq_.p, 0, 1);
+                }'''),
+    # 5. stage C
+    ('''            ggml_cpu_swiglu_f32((int) n_ff, tc.act.data() + (size_t) e*n_ff, gate_.data() + (size_t) e*n_ff, up_.data() + (size_t) e*n_ff);
+            q_a(tc.act.data() + (size_t) e*n_ff, tc.actq.p + (size_t) e*arow, n_ff);''', '''            ggml_cpu_swiglu_f32((int) n_ff, tc.act.data() + (size_t) e*n_ff, gate_.data() + (size_t) e*n_ff, up_.data() + (size_t) e*n_ff);
+            if (q81_) {
+                ggml_cpu_quantize_q81x(tc.act.data() + (size_t) e*n_ff, n_ff, tc.a81_qs.data() + (size_t) e*n_ff, tc.a81_d.data() + (size_t) e*(n_ff/32), tc.a81_s.data() + (size_t) e*(n_ff/16));
+            } else {
+                q_a(tc.act.data() + (size_t) e*n_ff, tc.actq.p + (size_t) e*arow, n_ff);
+            }'''),
+    # 6. stage D
+    ('''                for (int64_t r = d0; r < d1; ++r) {
+                    td->vec_dot((int) n_ff, ex + (r - d0), 0, pd + (size_t) r*lb.down.row_bytes, 0, aq, 0, 1);
+                }''', '''                if (q81_) {
+                    const int8_t  * aqs = tc.a81_qs.data() + (size_t) e*n_ff;
+                    const float   * ad  = tc.a81_d.data()  + (size_t) e*(n_ff/32);
+                    const int16_t * as  = tc.a81_s.data()  + (size_t) e*(n_ff/16);
+                    if (lb.down.type == GGML_TYPE_Q4_K) {
+                        for (int64_t r = d0; r < d1; ++r) {
+                            ggml_cpu_vec_dot_q4_K_q81x((int) n_ff, ex + (r - d0), pd + (size_t) r*lb.down.row_bytes, aqs, ad, as);
+                        }
+                    } else {
+                        for (int64_t r = d0; r < d1; ++r) {
+                            ggml_cpu_vec_dot_q6_K_q81x((int) n_ff, ex + (r - d0), pd + (size_t) r*lb.down.row_bytes, aqs, ad, as);
+                        }
+                    }
+                    continue;
+                }
+                for (int64_t r = d0; r < d1; ++r) {
+                    td->vec_dot((int) n_ff, ex + (r - d0), 0, pd + (size_t) r*lb.down.row_bytes, 0, aq, 0, 1);
+                }'''),
+])
+
+hyb = NEST + r"\src\llama-moe-hybrid.cpp"
+patch(hyb, [
+    ('''    int                                lean_prof    = 0;      // LLAMA_MOE_HYBRID_LEAN_PROF=1: stage times of the team (thread 0's view)
+''', '''    int                                lean_prof    = 0;      // LLAMA_MOE_HYBRID_LEAN_PROF=1: stage times of the team (thread 0's view)
+    int                                lean_q81     = 0;      // LLAMA_MOE_HYBRID_Q81=1 (G33): the lean leg computes like the CUDA kernels (q8_1-style activation), so a request does not depend on which experts are cached
+'''),
+    ('''    lean_prof    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_PROF", 0);
+''', '''    lean_prof    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_PROF", 0);
+    lean_q81     = moe_hybrid_env_int("LLAMA_MOE_HYBRID_Q81", 0);
+'''),
+    ('''                lean_mode = 0;
+                lean_lb.clear();
+                lean_pf_k = 0;''', '''                lean_mode = 0;
+                lean_lb.clear();
+                lean_pf_k = 0;
+                lean_q81  = 0;'''),
+    ('''            lean_y.assign((size_t) n_embd, 0.0f);
+            std::string list;''', '''            lean_y.assign((size_t) n_embd, 0.0f);
+            if (lean_q81 != 0) {
+                bool all_ok = lean_mode != 2;
+                for (const auto & lb : lean_lb) {
+                    all_ok = all_ok && moe_lean::supported_q81(lb);
+                }
+                if (all_ok) {
+                    lean_team->set_q81(true);
+                    LLAMA_LOG_INFO("%s: moe_hybrid: the lean host leg computes like the CUDA kernels (q8_1-style activation, LLAMA_MOE_HYBRID_Q81)\\n", __func__);
+                } else {
+                    LLAMA_LOG_WARN("%s: moe_hybrid: LLAMA_MOE_HYBRID_Q81 needs Q4_K up/gate and Q4_K or Q6_K down banks and LLAMA_MOE_HYBRID_LEAN=1; ignored, the host leg keeps the ggml-cpu numerics\\n", __func__);
+                    lean_q81 = 0;
+                }
+            }
+            std::string list;'''),
+])
+print("g33 lean edits matched")

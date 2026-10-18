@@ -1,0 +1,286 @@
+"""G30 / M2a + M2b (MTP draft-head catch-up after a layer-major prefill, and MTP with the stock graph path). Contract: the plan's "G30 CONTRACT".
+
+Why: the runner refused `--mtp` with everything but the batch-major prefill because the draft head's KV is filled per target ubatch (`mtp_mirror`: one (next token, hidden row) pair per prompt position)
+and the layer-major controller has no per-ubatch hook. But the controller's OUTPUT graph of every chunk already computes `t_h_nextn` (the post-output-norm hidden state of EVERY token of the chunk:
+qwen35moe.cpp build_streaming_graphs, flagged as an output by llm_graph_result::set_outputs), so the rows can simply be copied to the host while the output stage runs and the catch-up can run after the
+sweep. Same rows, same pairing, only the moment differs.
+
+Edits (all opt-in: nothing changes without --mtp; the new members are inert while pp_nextn_dst == nullptr):
+  src/llama-layer-streaming.h    members pp_nextn_dst / pp_nextn_cap / pp_nextn_n_embd / pp_nextn_n
+  src/llama-layer-streaming.cpp  stage 4 of layer_major_pp: after a chunk's output graph, copy its t_h_nextn rows to pp_nextn_dst[token_start ...]
+  tools/layer-streaming/main.cpp flags --mtp-catchup N (rows per draft catch-up decode, default 512) and --mtp-mirror-tail N (0 = every position);
+                                 --mtp allowed with --pp-schedule layer-major (also --pp-segment-tokens and --pp-cpu-layers) and with --pp-stock-below (the stock graph path);
+                                 layer-major + --mtp keeps the MTP loop's convention (no --tg-first-pp-token, D99); the draft context's n_ubatch = max(2 + draft, min(catchup, ubatch));
+                                 mtp_mirror reads its rows through mtp_hrows (the captured buffer) when set, else from the target context as before;
+                                 PP branch: layer-major sweep with capture, then the catch-up loop (timed and printed), or the per-ubatch loop on the stock path.
+Apply ONLY when no attested session is running or queued:  G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root> to try it on a copy)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+H = NEST + r"\src\llama-layer-streaming.h"
+C = NEST + r"\src\llama-layer-streaming.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(H, [
+    (r'''    int64_t pp_seg_tokens = 0;
+    int64_t slab_tokens   = 0;
+''', r'''    int64_t pp_seg_tokens = 0;
+    int64_t slab_tokens   = 0;
+
+    // G30: capture of the post-norm hidden rows (the output graph's t_h_nextn, [n_embd, n_tokens] f32) of every chunk of the layer-major prefill into a host buffer, for the MTP draft head's catch-up.
+    // pp_nextn_dst == nullptr = off (the default). The buffer holds pp_nextn_cap tokens of pp_nextn_n_embd floats in token order; pp_nextn_n is the number of tokens captured so far.
+    float *  pp_nextn_dst    = nullptr;
+    int64_t  pp_nextn_cap    = 0;
+    int64_t  pp_nextn_n_embd = 0;
+    int64_t  pp_nextn_n      = 0;
+'''),
+])
+
+patch(C, [
+    (r'''        if (st != GGML_STATUS_SUCCESS) {
+            ret = st;
+            return -2;
+        }
+    }
+    led_output += (double) (ggml_time_us() - t_led_out0);
+''', r'''        if (st != GGML_STATUS_SUCCESS) {
+            ret = st;
+            return -2;
+        }
+        if (ls->pp_nextn_dst != nullptr) {
+            // G30: the chunk's post-norm hidden rows for the MTP draft head (valid until the next graph is allocated; run_graph has synchronized)
+            ggml_tensor * hn = sets[c]->res->t_h_nextn;
+            const int64_t n_c  = ls->chunks[c].n_tokens;
+            const int64_t t0_c = ls->chunks[c].token_start;
+            if (hn == nullptr || hn->type != GGML_TYPE_F32 || hn->ne[0] != ls->pp_nextn_n_embd || hn->ne[1] != n_c || t0_c + n_c > ls->pp_nextn_cap) {
+                ls->error_msg = "layer_major_pp: the MTP hidden-row capture does not match the output graph (chunk " + std::to_string(c) + ", rows " +
+                                (hn ? std::to_string((long long) hn->ne[1]) : std::string("none")) + ", expected " + std::to_string((long long) n_c) + ")";
+                ls->failed = true;
+                ls->tel_error(ls->error_msg.c_str());
+                ret = GGML_STATUS_FAILED;
+                return -2;
+            }
+            ggml_backend_tensor_get(hn, ls->pp_nextn_dst + (size_t) t0_c * (size_t) ls->pp_nextn_n_embd, 0, ggml_nbytes(hn));
+            ls->pp_nextn_n = std::max<int64_t>(ls->pp_nextn_n, t0_c + n_c);
+        }
+    }
+    led_output += (double) (ggml_time_us() - t_led_out0);
+'''),
+])
+
+MIRROR_OLD_START = r'''            auto mtp_mirror = [&](const llama_batch & ub, int off, int n_tok) -> int {
+'''
+MIRROR_END = r'''            // T-GPLR-28: in-process PP repeat.'''
+MIRROR_NEW = r'''            // G30: when set, slot i of a mirror call is the captured row mtp_hrows + i * n_embd_out (the layer-major prefill's catch-up); otherwise the target context's per-call nextn slot i (the per-ubatch loops)
+            const float * mtp_hrows = nullptr;
+            auto mirror_h = [&](int i) -> const float * {
+                return mtp_hrows != nullptr ? mtp_hrows + (size_t) i * (size_t) n_embd_out : llama_get_embeddings_nextn_ith(ctx, i);
+            };
+            auto mtp_mirror = [&](const llama_batch & ub, int off, int n_tok) -> int {
+                int n_rows = 0;
+                if (mtail_off >= 0) {
+                    // bridge: the previous ubatch's deferred row
+                    // (x_off, h_{off-1}) at pos off-1
+                    dbatch.token[n_rows]   = ub.token[0];
+                    dbatch.pos[n_rows]     = (llama_pos) (off - 1);
+                    dbatch.n_seq_id[n_rows] = 1;
+                    dbatch.seq_id[n_rows][0] = 0;
+                    dbatch.logits[n_rows]   = false;
+                    memcpy(dbatch.embd, mtail_h.data(), row_bytes);
+                    n_rows++;
+                }
+                // shifted rows: (x[i+1], h[off+i]) at pos off+i, reading the
+                // current call's slots 0..n_tok-2 (h of off..off+n_tok-2)
+                for (int i = 0; i < n_tok - 1; ++i) {
+                    dbatch.token[n_rows]   = ub.token[i + 1];
+                    dbatch.pos[n_rows]     = (llama_pos) (off + i);
+                    dbatch.n_seq_id[n_rows] = 1;
+                    dbatch.seq_id[n_rows][0] = 0;
+                    dbatch.logits[n_rows]   = false;
+                    const float * h = mirror_h(i);
+                    if (h == nullptr) {
+                        fprintf(stderr, "error: no target nextn row at PP mirror slot %d\n", i);
+                        return -1;
+                    }
+                    memcpy(dbatch.embd + (size_t) n_rows * n_embd_out, h, row_bytes);
+                    n_rows++;
+                }
+                if (n_rows == 0) {
+                    // stash the deferred h (n_tok == 1 ubatch: only the tail)
+                    const float * h_last = mirror_h(n_tok - 1);
+                    if (h_last != nullptr) {
+                        memcpy(mtail_h.data(), h_last, row_bytes);
+                    }
+                    mtail_off = off;
+                    return 0;
+                }
+                dbatch.n_tokens = n_rows;
+                const int rc = llama_decode(ctx_dft, dbatch);
+                if (rc != 0) {
+                    fprintf(stderr, "error: MTP prompt mirror decode failed (%d)\n", rc);
+                    return rc;
+                }
+                // stash the deferred h (the LAST row of this call = slot
+                // n_tok-1; the next ubatch's bridge pairs with it)
+                const float * h_last = mirror_h(n_tok - 1);
+                if (h_last == nullptr) {
+                    fprintf(stderr, "error: no target nextn row at PP mirror slot %d\n", n_tok - 1);
+                    return -1;
+                }
+                memcpy(mtail_h.data(), h_last, row_bytes);
+                mtail_off = off;
+                return 0;
+            };
+
+'''
+
+LM_BRANCH = r'''            if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR) {
+                // G30: layer-major sweep with the capture of every chunk's post-norm hidden rows, then the draft head's catch-up from the captured rows (same pairs as the per-ubatch mirror)
+                std::vector<float> h_rows;
+                bool cap_ok = true;
+                try {
+                    h_rows.resize((size_t) pp_tokens * (size_t) n_embd_out);
+                } catch (const std::exception &) {
+                    fprintf(stderr, "error: MTP catch-up: cannot allocate %.1f MiB for the hidden rows of %d prompt tokens\n", (double) pp_tokens * (double) row_bytes / 1048576.0, pp_tokens);
+                    cap_ok = false;
+                }
+                if (cap_ok) {
+                    ls.pp_nextn_dst    = h_rows.data();
+                    ls.pp_nextn_cap    = pp_tokens;
+                    ls.pp_nextn_n_embd = n_embd_out;
+                    ls.pp_nextn_n      = 0;
+                }
+                ggml_status st = GGML_STATUS_SUCCESS;
+                ret = cap_ok ? llama_layer_major_pp(ctx, batch, st) : 1;
+                ls.pp_nextn_dst = nullptr;
+                if (st != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "error: layer-major PP failed: %s\n", ls.error_msg.c_str());
+                    ls.failed = true;
+                }
+                if (ret == 0 && !ls.failed && ctx_dft != nullptr) {
+                    if (ls.pp_nextn_n != pp_tokens) {
+                        fprintf(stderr, "error: MTP catch-up: the layer-major prefill captured %lld of %d hidden rows\n", (long long) ls.pp_nextn_n, pp_tokens);
+                        ret = 1;
+                    } else {
+                        const int64_t t_cu0 = ggml_time_us();
+                        const int step = std::max(1, std::min(mtp_catchup, ubatch));
+                        const int tail0 = (mtp_mirror_tail > 0 && mtp_mirror_tail < pp_tokens) ? pp_tokens - mtp_mirror_tail : 0;
+                        int n_calls = 0;
+                        for (int off = tail0; off < pp_tokens && ret == 0; off += step) {
+                            const int n_tok = std::min(step, pp_tokens - off);
+                            llama_batch ub = llama_batch_init(n_tok, 0, 1);
+                            for (int i = 0; i < n_tok; ++i) {
+                                ub.token[i]   = batch.token[off + i];
+                                ub.pos[i]     = off + i;
+                                ub.n_seq_id[i] = 1;
+                                ub.seq_id[i][0] = 0;
+                                ub.logits[i]   = false;
+                            }
+                            ub.n_tokens = n_tok;
+                            mtp_hrows = h_rows.data() + (size_t) off * (size_t) n_embd_out;
+                            ret = mtp_mirror(ub, off, n_tok);
+                            mtp_hrows = nullptr;
+                            llama_batch_free(ub);
+                            n_calls++;
+                        }
+                        fprintf(stderr, "MTP: draft-head catch-up over %d prompt positions (%d calls of up to %d rows) in %.1f ms\n",
+                                pp_tokens - tail0, n_calls, step, (ggml_time_us() - t_cu0) / 1000.0);
+                    }
+                }
+            } else if (mtp) {
+                // G30: the stock graph path (--pp-stock-below) with MTP: arm it exactly like the plain stock branch below, then the per-ubatch loop mirrors every ubatch as before
+                if (stock_prefill && !stock_prefill_armed) {
+                    if (!ls.begin_tg_stock()) {
+                        fprintf(stderr, "error: pp-stock: release failed: %s\n", ls.error_msg.c_str());
+                        ls.failed = true;
+                    }
+                    ls.phase = 1;
+                    if (kv_graph_pad > 0 && ctx != nullptr && !ctx->set_attn_view_pad((uint32_t) kv_graph_pad)) {
+                        fprintf(stderr, "error: pp-stock: --kv-graph-pad %lld is not supported by this memory type\n", kv_graph_pad);
+                        ls.failed = true;
+                    }
+                    stock_prefill_armed = true;
+                }
+                // per-ubatch prompt decodes so the draft head can mirror each
+                // row (T-Q38HG-06).
+                for (int off = 0; off < pp_tokens && exit_status == 0 && !ls.failed; off += ubatch) {
+'''
+
+patch(M, [
+    # declarations
+    (r'''    bool mtp_experts_gpu = false;    // --mtp-draft-experts-gpu:''',
+     r'''    int mtp_catchup = 512;           // G30: --mtp-catchup N: rows per draft-head catch-up decode after a layer-major prefill (the draft context's n_ubatch is raised to it)
+    int mtp_mirror_tail = 0;         // G30: --mtp-mirror-tail N: mirror only the last N prompt positions into the draft head (0 = every position)
+    bool mtp_experts_gpu = false;    // --mtp-draft-experts-gpu:'''),
+    # help
+    (r'''        "  --mtp-draft N         draft tokens per round (default 2)\n"
+''', r'''        "  --mtp-draft N         draft tokens per round (default 2)\n"
+        "  --mtp-catchup N       G30: rows per draft-head catch-up decode after a layer-major / stock-path prefill (default 512)\n"
+        "  --mtp-mirror-tail N   G30: mirror only the last N prompt positions into the draft head (default 0 = every position)\n"
+'''),
+    # parse
+    (r'''            mtp_draft = atoi(arg_value(argc, argv, i, "--mtp-draft").c_str());
+''', r'''            mtp_draft = atoi(arg_value(argc, argv, i, "--mtp-draft").c_str());
+        } else if (arg == "--mtp-catchup") {
+            mtp_catchup = atoi(arg_value(argc, argv, i, "--mtp-catchup").c_str());
+        } else if (arg == "--mtp-mirror-tail") {
+            mtp_mirror_tail = atoi(arg_value(argc, argv, i, "--mtp-mirror-tail").c_str());
+'''),
+    # schedule check
+    (r'''    // T-Q38HG-06: the MTP prompt catch-up mirrors each PP ubatch into the
+    // draft context, so the runner drives PP itself (batch-major ubatches).
+    // The layer-major controller has no per-ubatch hook; reject the combo.
+    if (mtp && schedule != LLAMA_PP_SCHEDULE_BATCH_MAJOR) {
+        fprintf(stderr, "error: --mtp requires --pp-schedule batch-major\n");
+        return 2;
+    }
+''', r'''    // T-Q38HG-06: the MTP prompt catch-up mirrors each PP ubatch into the draft context (batch-major ubatches and the stock graph path).
+    // G30: the layer-major controller has no per-ubatch hook, but its output stage copies every chunk's post-norm hidden rows (t_h_nextn) to the host, and the runner runs the same
+    // catch-up after the sweep. The MTP loop's positions follow the harness convention (the last prompt token is decoded again at position P), so a layer-major MTP run takes no
+    // --tg-first-pp-token (D99).
+    if (mtp && schedule == LLAMA_PP_SCHEDULE_LAYER_MAJOR && tg_first_pp) {
+        fprintf(stderr, "error: --mtp with --pp-schedule layer-major keeps the MTP loop's first-token convention: drop --tg-first-pp-token (use --pp-no-logits)\n");
+        return 2;
+    }
+    if (mtp && (mtp_catchup < 1 || mtp_mirror_tail < 0)) {
+        fprintf(stderr, "error: --mtp-catchup must be >= 1 and --mtp-mirror-tail >= 0\n");
+        return 2;
+    }
+'''),
+    # segments
+    (r'''        if (mtp || pp_copy_piece_mib > 0 || (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") || pp_stock_below > 0) {
+            fprintf(stderr, "error: --pp-segment-tokens is not validated with --mtp, paced copies (--pp-copy-piece-mib), the CPU leg (--pp-cpu-layers) or the stock prefill path (--pp-stock-below)\n");
+            return 2;
+        }''', r'''        if (pp_copy_piece_mib > 0 || (!pp_cpu_layers_arg.empty() && pp_cpu_layers_arg != "none") || pp_stock_below > 0) {
+            fprintf(stderr, "error: --pp-segment-tokens is not validated with paced copies (--pp-copy-piece-mib), the CPU leg (--pp-cpu-layers) or the stock prefill path (--pp-stock-below)\n");
+            return 2;
+        }'''),
+    # cpu layers
+    (r'''        if (pp_schedule != "layer-major" || mtp) {
+            fprintf(stderr, "error: --pp-cpu-layers needs --pp-schedule layer-major and no --mtp\n");
+            return 2;
+        }''', r'''        if (pp_schedule != "layer-major") {
+            fprintf(stderr, "error: --pp-cpu-layers needs --pp-schedule layer-major\n");
+            return 2;
+        }'''),
+    # draft context n_ubatch
+    (r'''        dparams.n_ubatch     = 2 + mtp_draft;   // G12:''',
+     r'''        dparams.n_ubatch     = (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch));   // G30: a prompt catch-up decode takes up to --mtp-catchup rows in one launch (it was 2 + draft, i.e. 3 rows per launch). G12:'''),
+    # the mirror lambda
+    ("@between", MIRROR_OLD_START, MIRROR_END, MIRROR_NEW + "            // (G30: the lambda above is the T-Q38HG-06 mirror with its row source made switchable)\n"),
+    # stock prefill with MTP
+    (r'''            const bool stock_prefill = pp_stock_below > 0 && pp_tokens < pp_stock_below && tg_hybrid && !mtp;''',
+     r'''            const bool stock_prefill = pp_stock_below > 0 && pp_tokens < pp_stock_below && tg_hybrid;   // G30: also with --mtp (the per-ubatch mirror loop below)'''),
+    # the PP branch
+    (r'''            if (mtp) {
+                // per-ubatch prompt decodes so the draft head can mirror each
+                // row (T-Q38HG-06).
+                for (int off = 0; off < pp_tokens && exit_status == 0; off += ubatch) {
+''', LM_BRANCH),
+])

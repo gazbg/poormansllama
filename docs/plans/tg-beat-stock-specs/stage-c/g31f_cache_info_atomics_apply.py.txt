@@ -1,0 +1,66 @@
+"""G31f: the expert cache's size and slot count are published through atomics, so that another thread (the server's free-memory watcher) never touches cache_buf while resize() frees and re-creates it.
+Measured defect (g235/g236, 2026-10-14): with LLAMA_HYBRID_FREE_WATCH_MS set, the server died silently right after an expert-cache shrink (the watcher read the freed cache_buf); the same session without the watcher survived (g237)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+MH = NEST + r"\src\llama-moe-hybrid.cpp"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(MH, [
+    ('''    int n_slot   = 0;
+    int n_embd   = 0;
+''', '''    int n_slot   = 0;
+    int n_embd   = 0;
+    // read by OTHER threads (the server's free-memory watcher) while resize() runs: they must never touch cache_buf, which resize() frees and re-creates
+    std::atomic<int64_t> info_cache_bytes{0};
+    std::atomic<int>     info_n_slot{0};      // 0 while the cache is being rebuilt
+'''),
+    ('''        ggml_backend_buffer_clear(cache_buf, 0);
+    }
+
+    // mailboxes (one per token of a step) + trace''', '''        ggml_backend_buffer_clear(cache_buf, 0);
+        info_cache_bytes.store((int64_t) ggml_backend_buffer_get_size(cache_buf));
+        info_n_slot.store(n_slot);
+    }
+
+    // mailboxes (one per token of a step) + trace'''),
+    ('''    const auto t0 = moe_clock::now();
+    ggml_backend_cuda_aux_synchronize(cuda);
+    join_scan();''', '''    const auto t0 = moe_clock::now();
+    info_n_slot.store(0);
+    ggml_backend_cuda_aux_synchronize(cuda);
+    join_scan();'''),
+    ('''    ggml_backend_cuda_aux_synchronize(cuda);
+    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots''', '''    ggml_backend_cuda_aux_synchronize(cuda);
+    info_cache_bytes.store((int64_t) ggml_backend_buffer_get_size(cache_buf));
+    info_n_slot.store(n_slot);
+    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots'''),
+    ('''    if (eng->cache_buf == nullptr) {
+        return false;
+    }
+    *cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
+    *n_slot      = eng->n_slot;
+    return true;''', '''    const int slots = eng->info_n_slot.load();
+    if (slots <= 0) {
+        return false;   // no cache yet, or resize() is rebuilding it
+    }
+    *cache_bytes = eng->info_cache_bytes.load();
+    *n_slot      = slots;
+    return true;'''),
+])
+
+# the watcher stops on the shutdown flag only: a resize() in progress is not the end of the engine
+patch(HA, [
+    ('''    while (!g_watch_stop.load() && llama_moe_hybrid_cache_info_impl(&cache_bytes, &n_slot)) {
+        size_t free_b = 0, total_b = 0;''', '''    while (!g_watch_stop.load()) {
+        if (!llama_moe_hybrid_cache_info_impl(&cache_bytes, &n_slot)) {
+            n_slot = 0;    // the cache is being rebuilt (or is gone): sample the memory anyway
+        }
+        size_t free_b = 0, total_b = 0;'''),
+])

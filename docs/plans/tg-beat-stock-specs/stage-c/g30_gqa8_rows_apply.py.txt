@@ -1,0 +1,104 @@
+"""G30 / M2c: the GQA8 decode attention kernel (LLAMA_FATTN_GQA8=1) for a 2-4 row verify step. Contract: the plan's "G30 CONTRACT" (M2c).
+
+Why (measured, g93-c4k .. g93-c50k): with MTP on the engine's GPU front ("attn" of the hybrid timeline) is 1.82x / 1.93x / 2.18x a plain token's at 4k / 24k / 50k tokens, while the plain token's front grows only
+4.09 -> 4.41 ms between 24k and 50k (GQA8, one row); the verify step's two rows run the VECTOR kernel (GQA8 applies to one row only), which costs ~5x more per added key. A 2-row GQA8 step removes
+the depth-dependent part of that excess (cost model: R at 50k code 0.90 -> ~1.0; at 24k 0.98 -> ~1.06).
+
+Change (opt-in with LLAMA_FATTN_GQA8=1, as before; one-row behaviour identical): one CTA per (row, KV head, tile group): blockIdx.x = the row (token) of the step, so the K/V tiles of the second row are read by a CTA that runs next to the first
+one (same tile, same KV head, adjacent blockIdx.x) and hit in L2; the partial results use the vector kernel's [token][head][parallel block] layout, which flash_attn_combine_results already finishes for ne01 > 1.
+Edits: ggml/src/ggml-cuda/fattn-gqa8.cuh (kernel parameters nb01 / mask_stride / n_head, row offsets, applies() accepts Q->ne[1] in 1..4, the wave search counts rows, launch grids), tests/test-backend-ops.cpp (the
+MTP verify shapes: nb = 2 and 3 with q8_0 K and V at 512 / 2048 / 8192 keys).
+Apply ONLY when no attested session is running or queued:  G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root> to try it on a copy)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+K = NEST + r"\ggml\src\ggml-cuda\fattn-gqa8.cuh"
+T = NEST + r"\tests\test-backend-ops.cpp"
+
+patch(K, [
+    # header comment
+    (r'''// Opt-in decode attention for one query token, head_dim 256, q8_0 K and V, 8 query heads per KV head (LLAMA_FATTN_GQA8=1).''',
+     r'''// Opt-in decode attention for one query token (G30: up to four, the rows of an MTP verify step), head_dim 256, q8_0 K and V, 8 query heads per KV head (LLAMA_FATTN_GQA8=1).
+// G30: blockIdx.x is the row (token) of the step; every row is its own CTA, the K/V tiles of the rows are read by neighbouring CTAs and hit in L2.'''),
+    # kernel parameters
+    (r'''        const float scale, const int N, const int nb02, const int nb11, const int nb12, const int nb21, const int nb22) {
+#ifdef FLASH_ATTN_AVAILABLE
+    const int lane  = threadIdx.x;''',
+     r'''        const float scale, const int N, const int nb01, const int nb02, const int nb11, const int nb12, const int nb21, const int nb22, const int mask_stride, const int n_head) {
+#ifdef FLASH_ATTN_AVAILABLE
+    const int row   = blockIdx.x;                    // G30: the token of the step
+    mask += (size_t) row * mask_stride;
+    const int lane  = threadIdx.x;'''),
+    # Q rows
+    (r'''        const float * Q_f = (const float *) (Qp + (size_t) (head0 + j) * nb02);''',
+     r'''        const float * Q_f = (const float *) (Qp + (size_t) row * nb01 + (size_t) (head0 + j) * nb02);'''),
+    # output writes
+    (r'''        *(float2 *) &dst[((size_t) (head0 + h) * gridDim.y + blockIdx.y) * D + 2 * tid] = make_float2(o0, o1);
+        if (tid == 0) dst_meta[(size_t) (head0 + h) * gridDim.y + blockIdx.y] = make_float2(mt, st);''',
+     r'''        *(float2 *) &dst[(((size_t) row * n_head + head0 + h) * gridDim.y + blockIdx.y) * D + 2 * tid] = make_float2(o0, o1);
+        if (tid == 0) dst_meta[((size_t) row * n_head + head0 + h) * gridDim.y + blockIdx.y] = make_float2(mt, st);'''),
+    (r'''    GGML_UNUSED_VARS(Qp, Kp, Vp, mask, dst, dst_meta, scale, N, nb02, nb11, nb12, nb21, nb22);''',
+     r'''    GGML_UNUSED_VARS(Qp, Kp, Vp, mask, dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, n_head);'''),
+    # applies(): up to four rows
+    (r'''// Shapes this kernel serves: one token, one sequence,''', r'''// Shapes this kernel serves: one to four tokens (G30), one sequence,'''),
+    (r'''        Q->ne[1] == 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&''',
+     r'''        Q->ne[1] >= 1 && Q->ne[1] <= 4 && mask->ne[1] >= Q->ne[1] && Q->nb[1] % sizeof(float) == 0 && mask->nb[1] % sizeof(ggml_fp16_t) == 0 &&
+        Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&'''),
+    # wave search counts the rows
+    (r'''static int ggml_cuda_fattn_gqa8_parallel_blocks(const int N, const int nkv, const int nsm, const int occ) {''',
+     r'''static int ggml_cuda_fattn_gqa8_parallel_blocks(const int N, const int nkv, const int nrows, const int nsm, const int occ) {'''),
+    (r'''        const int nblocks_total = nkv * pbt;''', r'''        const int nblocks_total = nkv * nrows * pbt;'''),
+    # launch
+    (r'''static void ggml_cuda_fattn_gqa8_launch(const char * Q, const int nb02, const char * K, const int nb11, const int nb12, const char * V, const int nb21, const int nb22,
+        const half * mask, float * dst, float * dst_tmp, float2 * dst_meta, const int N, const int nkv, const int pb, const float scale, cudaStream_t stream) {
+    fattn_gqa8::kernel<<<dim3(1, pb, nkv), dim3(32, fattn_gqa8::NW, 1), 0, stream>>>(
+        Q, K, V, mask, pb > 1 ? dst_tmp : dst, dst_meta, scale, N, nb02, nb11, nb12, nb21, nb22);
+    CUDA_CHECK(cudaGetLastError());
+    if (pb > 1) {
+        flash_attn_combine_results<fattn_gqa8::D><<<dim3(1, nkv * fattn_gqa8::NH, 1), dim3(fattn_gqa8::D, 1, 1), pb * sizeof(float2), stream>>>(dst_tmp, dst_meta, dst, pb);''',
+     r'''static void ggml_cuda_fattn_gqa8_launch(const char * Q, const int nb01, const int nb02, const char * K, const int nb11, const int nb12, const char * V, const int nb21, const int nb22,
+        const half * mask, const int mask_stride, float * dst, float * dst_tmp, float2 * dst_meta, const int N, const int nkv, const int nrows, const int pb, const float scale, cudaStream_t stream) {
+    fattn_gqa8::kernel<<<dim3(nrows, pb, nkv), dim3(32, fattn_gqa8::NW, 1), 0, stream>>>(
+        Q, K, V, mask, pb > 1 ? dst_tmp : dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, nkv * fattn_gqa8::NH);
+    CUDA_CHECK(cudaGetLastError());
+    if (pb > 1) {
+        flash_attn_combine_results<fattn_gqa8::D><<<dim3(nrows, nkv * fattn_gqa8::NH, 1), dim3(fattn_gqa8::D, 1, 1), pb * sizeof(float2), stream>>>(dst_tmp, dst_meta, dst, pb);'''),
+    # the host entry
+    (r'''    const int N   = (int) K->ne[1];
+    const int nkv = (int) K->ne[2];
+    const int pb  = ggml_cuda_fattn_gqa8_parallel_blocks(N, nkv, ggml_cuda_info().devices[ctx.device].nsm, ggml_cuda_fattn_gqa8_occupancy(ctx.device));''',
+     r'''    const int N     = (int) K->ne[1];
+    const int nkv   = (int) K->ne[2];
+    const int nrows = (int) Q->ne[1];
+    const int pb    = ggml_cuda_fattn_gqa8_parallel_blocks(N, nkv, nrows, ggml_cuda_info().devices[ctx.device].nsm, ggml_cuda_fattn_gqa8_occupancy(ctx.device));'''),
+    (r'''    ggml_cuda_fattn_gqa8_launch((const char *) Q->data, (int) Q->nb[2], (const char *) K->data, (int) K->nb[1], (int) K->nb[2],
+        (const char *) V->data, (int) V->nb[1], (int) V->nb[2], (const half *) mask->data, (float *) dst->data, dst_tmp.ptr, dst_meta.ptr, N, nkv, pb, scale, ctx.stream());''',
+     r'''    ggml_cuda_fattn_gqa8_launch((const char *) Q->data, (int) Q->nb[1], (int) Q->nb[2], (const char *) K->data, (int) K->nb[1], (int) K->nb[2],
+        (const char *) V->data, (int) V->nb[1], (int) V->nb[2], (const half *) mask->data, (int) (mask->nb[1] / sizeof(ggml_fp16_t)), (float *) dst->data, dst_tmp.ptr, dst_meta.ptr,
+        N, nkv, nrows, pb, scale, ctx.stream());'''),
+])
+
+patch(T, [
+    (r'''    for (int64_t kv : { 512, 2048, 8192 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+''', r'''    for (int64_t kv : { 512, 2048, 8192 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    // G30: the rows of an MTP verify step (frontier + 1 or 2 drafts): the GQA8 kernel serves up to four tokens
+    for (int64_t kv : { 512, 2048, 8192 }) {
+        for (int64_t nb : { 2, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+'''),
+])

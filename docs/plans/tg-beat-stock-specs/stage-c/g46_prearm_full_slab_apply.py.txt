@@ -1,0 +1,53 @@
+"""G46 (fix of g44, found by the prearm session k5104): the idle preparation was sized from the largest of the last 4 requests, so a bigger request (12,393 tokens after prompts of <= 6,255) found a slab that was too
+small, gave the prepared resources back and acquired again (+0.1 s and a second shrink). The idle preparation is now sized for a full segment (the slab is 2 x segment rows; 268 MiB with the f32 slab): the room is
+taken from the expert cache while the server is idle, the next pass shrinks it anyway. The size history goes. Edits: tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    (r'''    int32_t lm_hint[4]    = { 0, 0, 0, 0 };        // new prompt tokens of the last 4 requests
+    int32_t lm_hint_i     = 0;
+''', r''''''),
+    (r'''        int32_t hint = 2048;
+        for (int i = 0; i < 4; ++i) {
+            hint = std::max(hint, lm_hint[i]);
+        }
+        hint = std::min(hint, params_base.lm_prefill_segment);
+''', r'''        const int32_t hint = params_base.lm_prefill_segment;     // a full segment: the next batch is not known, and a slab that is too small costs a second acquisition
+'''),
+    (r'''                        lm_hint[(lm_hint_i++) & 3] = std::max(0, slot.task->n_tokens() - n_past);     // G42
+''', r''''''),
+    # time the arm call of a batch
+    (r'''                        if (left >= params_base.lm_prefill_fuse_min) {
+                            fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
+                        }''', r'''                        if (left >= params_base.lm_prefill_fuse_min) {
+                            const int64_t t_arm0 = ggml_time_us();
+                            fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
+                            if (getenv("LLAMA_LM_LOG") != nullptr) {
+                                SRV_WRN("lm-fuse: arm for %d tokens: %s, %.1f ms\n", (int) std::min<int64_t>(left, n_batch), fuse ? "armed" : "refused", (ggml_time_us() - t_arm0)/1000.0);
+                            }
+                        }'''),
+])
+print("g46 edits matched")

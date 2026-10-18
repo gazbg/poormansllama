@@ -1,0 +1,64 @@
+"""G37 (round 3, the np 2 cascade of memory-guard declines): say WHY the layer-major pass was declined for memory.
+
+In 3 of 11 np 2 soak runs a first decline "lm_acquire: could not make N MiB of device memory available" is followed by a long run of the same declines (passes 38-48 of 72-77 big batches instead of 60-64).
+The hook (hybrid_lm_vram) shrinks the expert cache by make_room and then compares the free device memory with need + margin; the log of a bad run shows no shrink between the window's regrow and the decline.
+This logs, at the decline only: the need, the margin, the free memory before and after make_room, the cache slots before and after, make_room's result. Edits: src/llama-hybrid-api.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-hybrid-api.cpp", [
+    ('''        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        llama_moe_hybrid_make_room_impl(need_bytes + margin_b, 0, g_hybrid_min_slots, &shrunk);
+        if (shrunk) {
+            ctx->drop_graph_reuse();
+        }
+        if (hybrid_free_bytes() < need_bytes + margin_b) {
+            if (shrunk) {
+                hybrid_prefill_regrow(ctx);
+            }
+            return false;
+        }''', '''        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        int64_t cache_b0 = 0, cache_b1 = 0;
+        int     slots0 = 0, slots1 = 0;
+        llama_moe_hybrid_cache_info_impl(&cache_b0, &slots0);
+        const int64_t free0 = hybrid_free_bytes();
+        const bool room_ok = llama_moe_hybrid_make_room_impl(need_bytes + margin_b, 0, g_hybrid_min_slots, &shrunk);
+        if (shrunk) {
+            ctx->drop_graph_reuse();
+        }
+        if (hybrid_free_bytes() < need_bytes + margin_b) {
+            llama_moe_hybrid_cache_info_impl(&cache_b1, &slots1);
+            LLAMA_LOG_WARN("hybrid-moe: lm-prefill: no room for %.0f MiB + margin %.0f MiB: free %lld -> %lld MiB, expert cache %d -> %d slots (min %d), make_room %s, shrunk %d\\n",
+                           (double) need_bytes/1048576.0, (double) margin_b/1048576.0, (long long) (free0/1048576), (long long) (hybrid_free_bytes()/1048576), slots0, slots1, g_hybrid_min_slots,
+                           room_ok ? "true" : "false", shrunk ? 1 : 0);
+            if (shrunk) {
+                hybrid_prefill_regrow(ctx);
+            }
+            return false;
+        }'''),
+])
+print("g37 edits matched")

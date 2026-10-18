@@ -1,0 +1,202 @@
+"""G32g (after the -np 2 runs g761-g763 and the owner-facing review): the layer-major pass takes a sequence whose KV cells are ONE CONTIGUOUS BLOCK that does not start at cell 0 (a second slot of a unified cache, -np > 1).
+
+Before: lm_identity_ok demanded cell == position from cell 0, nothing else in the cache, and find_slot continuing the layout -- at -np 2 the second sequence (and every sequence while the other one holds cells) failed it,
+so the pass was taken once in 160 soak requests.
+Now: (1) llama_kv_cache::lm_block(seq, p0, n_new) returns c0, the cell of position 0 (or the start of the first run of n_new empty cells for a fresh sequence), when the sequence's cells are exactly c0 + position, one
+sequence per cell, contiguous, and the n_new cells behind them are empty; -1 otherwise (the ordinary path then takes the batch, nothing changed). (2) While the pass applies a chunk, find_slot is told where to put it
+(llama_kv_cache::lm_force: the cells [c0 + p0 + t0, + n) or failure), so the layout cannot drift from what the plan checked. (3) The flash-attention K and V views of the pass's graph start at cell c0 (view_offs moved by
+c0 rows), so the implicit causal mask (key index == position) is exact; the K/V writes of the ubatch go to the true cells as before.
+
+Edits: src/llama-kv-cache.{h,cpp}, src/llama-context.h (plan.c0), src/llama-graph.{h,cpp} (llm_graph_lm.kv_cell0 + the view shift), and llama-lm-prefill.cpp / .h (patched here in stage-c, then copied)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = os.environ.get("G32_STAGE", WT + r"\docs\plans\tg-beat-stock-specs\stage-c")
+
+patch(NEST + r"\src\llama-kv-cache.h", [
+    ('''    // G32: can the layer-major prefill take n_new tokens at position p0 of seq_id? It needs the cache laid out cell == position for the sequence (the implicit causal mask of the flash attention kernel
+    // addresses keys by cell), nothing else in the cache, and find_slot to continue that layout; w0 is the width of the first chunk.
+    bool lm_identity_ok(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, uint32_t w0) const;
+''', '''    // G32: where would the layer-major prefill put n_new tokens at position p0 of seq_id? The implicit causal mask of its flash attention addresses keys by cell relative to the sequence's first cell c0, so the
+    // sequence's cells must be exactly c0 + position (one sequence per cell, contiguous) with the n_new cells behind them empty. Returns c0 (for a fresh sequence: the start of the first run of n_new empty cells),
+    // or -1 when the layout does not allow a pass (the ordinary path then takes the batch).
+    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new) const;
+    // while >= 0, find_slot puts the next ubatch at exactly the cells [cell, cell + n) (and fails when one of them is occupied); the pass sets it before it applies each chunk and clears it afterwards
+    void    lm_force(int64_t cell) { lm_force_cell = cell; }
+    int64_t lm_force_cell = -1;
+'''),
+])
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ("@between", "bool llama_kv_cache::lm_identity_ok(", "bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {",
+     '''int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new) const {
+    if (other || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0 || n_new == 0) {
+        return -1;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t size  = cells.size();
+    const uint32_t n_old = (uint32_t) p0;
+    if ((uint64_t) n_old + n_new > size) {
+        return -1;
+    }
+
+    uint32_t c0 = 0;
+    if (n_old == 0) {
+        // a fresh sequence: the first run of n_new empty cells
+        uint32_t run = 0;
+        bool     found = false;
+        for (uint32_t i = 0; i < size; ++i) {
+            run = cells.is_empty(i) ? run + 1 : 0;
+            if (run == n_new) {
+                c0    = i + 1 - n_new;
+                found = true;
+                break;
+            }
+        }
+        return found ? (int64_t) c0 : -1;
+    }
+
+    // the cell of position 0 of the sequence
+    bool found = false;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (!cells.is_empty(i) && cells.pos_get(i) == 0 && cells.seq_count(i) == 1 && cells.seq_get(i) == seq_id) {
+            c0    = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found || (uint64_t) c0 + n_old + n_new > size) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < n_old; ++i) {
+        const uint32_t c = c0 + i;
+        if (cells.is_empty(c) || cells.seq_count(c) != 1 || cells.seq_get(c) != seq_id || cells.pos_get(c) != (llama_pos) i) {
+            return -1;
+        }
+    }
+    for (uint32_t i = 0; i < n_new; ++i) {
+        if (!cells.is_empty(c0 + n_old + i)) {
+            return -1;
+        }
+    }
+    return (int64_t) c0;
+}
+
+'''),
+    ('''        const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+
+        // if we have enough unused cells before the current head ->''', '''        const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+#ifdef LLAMA_LAYER_STREAMING
+        if (lm_force_cell >= 0) {
+            // G32: a layer-major pass fixes where its chunk goes (cell == c0 + position); anything else is a failure, never a silent placement elsewhere
+            if (n_stream != 1 || (uint64_t) lm_force_cell + n_tokens > cells.size()) {
+                return { };
+            }
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                if (!cells.is_empty((uint32_t) lm_force_cell + i)) {
+                    return { };
+                }
+                res.idxs[s].push_back((uint32_t) lm_force_cell + i);
+            }
+            continue;
+        }
+#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+
+        // if we have enough unused cells before the current head ->'''),
+])
+
+patch(NEST + r"\src\llama-context.h", [
+    ('''    llama_pos            p0          = 0;     // position of the batch's first token
+''', '''    llama_pos            p0          = 0;     // position of the batch's first token
+    int64_t              c0          = 0;     // KV cell of position 0 of the sequence (the pass addresses keys relative to it)
+'''),
+])
+
+patch(NEST + r"\src\llama-graph.h", [
+    ('''// the ubatch's first query is cell q_pos_base, keys [0, n_kv_valid) are live.''',
+     '''// the ubatch's first query is position q_pos_base, keys [kv_cell0, kv_cell0 + n_kv_valid) are live (the sequence's cells are kv_cell0 + position).'''),
+    ('''    int32_t              n_kv_valid      = 0;
+};''', '''    int32_t              n_kv_valid      = 0;
+    int32_t              kv_cell0        = 0;     // cell of position 0 of the sequence
+};'''),
+])
+
+patch(NEST + r"\src\llama-graph.cpp", [
+    ('''                GGML_ASSERT(lm->n_kv_valid <= cur->src[1]->ne[1]);
+                ggml_flash_attn_ext_set_causal(cur, lm->q_pos_base, lm->n_kv_valid);
+                cur->src[1]->ne[1] = lm->n_kv_valid;
+                cur->src[2]->ne[1] = lm->n_kv_valid;
+''', '''                GGML_ASSERT((int64_t) lm->kv_cell0 + lm->n_kv_valid <= cur->src[1]->ne[1]);
+                ggml_flash_attn_ext_set_causal(cur, lm->q_pos_base, lm->n_kv_valid);
+                cur->src[1]->ne[1] = lm->n_kv_valid;
+                cur->src[2]->ne[1] = lm->n_kv_valid;
+                if (lm->kv_cell0 != 0) {
+                    // the sequence's cells start at kv_cell0 (a second slot of a unified cache): the K and V views start there, so key index == position as the implicit causal mask assumes
+                    for (ggml_tensor * t : { cur->src[1], cur->src[2] }) {
+                        GGML_ASSERT(t->view_src != nullptr);
+                        const size_t off = (size_t) lm->kv_cell0 * t->nb[1];
+                        t->view_offs += off;
+                        if (t->data != nullptr) {
+                            t->data = (char *) t->data + off;
+                        }
+                    }
+                }
+'''),
+])
+
+# the executor: patched in stage-c (the record), then copied to the tree
+LMC = HERE + r"\llama-lm-prefill.cpp.txt"
+patch(LMC, [
+    ('''    // the cache must be laid out cell == position, and the recurrent state must stand exactly at p0
+    if (!mh->get_mem_attn()->lm_identity_ok(seq, p0, (uint32_t) n, (uint32_t) pl.widths[0])) {
+        pl.why = "the KV cache is not laid out cell == position for this sequence (other sequences, a shift, a restored state)";
+        return pl;
+    }
+''', '''    // the sequence's cells must be one contiguous block (cell == c0 + position) with room behind it, and the recurrent state must stand exactly at p0
+    const int64_t c0 = mh->get_mem_attn()->lm_block(seq, p0, (uint32_t) n);
+    if (c0 < 0) {
+        pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
+        return pl;
+    }
+'''),
+    ('''    pl.p0  = p0;
+    pl.n   = n;
+    return pl;''', '''    pl.p0  = p0;
+    pl.c0  = c0;
+    pl.n   = n;
+    return pl;'''),
+    ('''    char * slab_base = (char *) ggml_backend_buffer_get_base(S.slab.get());
+''', '''    char * slab_base = (char *) ggml_backend_buffer_get_base(S.slab.get());
+
+    // find_slot places every chunk at exactly the cells the plan checked (c0 + position); cleared on every way out of the pass
+    struct force_guard_t {
+        llama_kv_cache * kv;
+        ~force_guard_t() { kv->lm_force(-1); }
+    } force_guard { static_cast<llama_memory_hybrid *>(memory.get())->get_mem_attn() };
+'''),
+    ('''            auto vmctx = memory->init_batch(vballoc, n_c, output_all);''', '''            force_guard.kv->lm_force(pl.c0 + pl.p0 + chunk_t0[c]);
+            auto vmctx = memory->init_batch(vballoc, n_c, output_all);'''),
+    ('''                lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
+''', '''                lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
+                lmi.kv_cell0   = (int32_t) pl.c0;
+'''),
+])
+
+if os.environ.get("PATCH_DRY"):
+    print("DRY-OK stage-c llama-lm-prefill.cpp patched in memory only; the tree copy is skipped")
+else:
+    shutil.copyfile(LMC, NEST + r"\src\llama-lm-prefill.cpp")
+    shutil.copyfile(HERE + r"\llama-lm-prefill.h.txt", NEST + r"\src\llama-lm-prefill.h")
+    print("copied llama-lm-prefill.cpp / .h")

@@ -1,0 +1,102 @@
+"""G30 / M2i: a pruned draft lm head (--mtp-draft-vocab N). Contract: the plan's "G30 CONTRACT".
+
+Measured (g96-dvc4k, g96-dvp4k, build g50, certified): the draft stage costs 2.1 ms per round, of which the draft head's full-vocabulary lm head is ~0.5 ms of GPU time (Q6_K, 248,320 rows, 417 MB re-read
+every round; nsys g30-nsys/lc4k) and the host scan over the 248,320-entry logits row 75 us. The draft pick only has to be a good guess (the verify keeps the output exact), and restricting the pick to token ids
+< 32,768 left the acceptance unchanged (g96, see the plan). The first N rows of the head are a contiguous PREFIX of the weight, so a 2-D view of them costs no memory: the lm head reads N / n_vocab of the
+bytes. The logits are padded back to n_vocab (ggml_pad, zeros) so the context's logits layout and every consumer stay unchanged; the runner scans only [0, N).
+Edits: src/models/qwen35moe.cpp (graph_mtp: the view + pad, driven by LLAMA_MTP_DRAFT_VOCAB_N), tools/layer-streaming/main.cpp (the flag --mtp-draft-vocab N, which sets that variable before the draft
+context is created, rounded up to a multiple of 256; the scalar pick loop bounded; a print of the draft context's decode / graph-reuse counters).
+Apply after g30e. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+Q = NEST + r"\src\models\qwen35moe.cpp"
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(Q, [
+    (r'''    GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+    cur = build_lora_mm(head_w, cur, head_s);
+''', r'''    GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+    // G30: LLAMA_MTP_DRAFT_VOCAB_N = N > 0 draws the draft only from the token ids [0, N). The first N rows of the head are a contiguous prefix of the weight, so a 2-D view of them costs nothing and the
+    // lm head reads N / n_vocab of the bytes; the draft pick only has to be a good guess (the verify keeps the output exact). The logits are padded back to the full row so the logits layout is unchanged.
+    static const int64_t g30_draft_vocab_n = []() { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB_N"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    const int64_t g30_head_rows = head_w->ne[1];
+    if (g30_draft_vocab_n > 0 && g30_draft_vocab_n < g30_head_rows) {
+        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], g30_draft_vocab_n, head_w->nb[1], 0);
+        cur = build_lora_mm(head_sub, cur, head_s);
+        cur = ggml_pad(ctx0, cur, (int) (g30_head_rows - g30_draft_vocab_n), 0, 0, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
+'''),
+])
+
+patch(M, [
+    (r'''        "  --mtp-mirror-tail N   G30: mirror only the last N prompt positions into the draft head (default 0 = every position)\n"
+''', r'''        "  --mtp-mirror-tail N   G30: mirror only the last N prompt positions into the draft head (default 0 = every position)\n"
+        "  --mtp-draft-vocab N   G30: the draft head draws only from the token ids [0, N) (rounded up to a multiple of 256; its lm head reads N / n_vocab of the bytes); default 0 = all\n"
+'''),
+    (r'''    int mtp_mirror_tail = 0;         // G30: --mtp-mirror-tail N: mirror only the last N prompt positions into the draft head (0 = every position)
+''', r'''    int mtp_mirror_tail = 0;         // G30: --mtp-mirror-tail N: mirror only the last N prompt positions into the draft head (0 = every position)
+    int mtp_draft_vocab = 0;         // G30: --mtp-draft-vocab N: the draft head draws only from the token ids [0, N) (0 = all)
+'''),
+    (r'''        } else if (arg == "--mtp-mirror-tail") {
+            mtp_mirror_tail = atoi(arg_value(argc, argv, i, "--mtp-mirror-tail").c_str());
+''', r'''        } else if (arg == "--mtp-mirror-tail") {
+            mtp_mirror_tail = atoi(arg_value(argc, argv, i, "--mtp-mirror-tail").c_str());
+        } else if (arg == "--mtp-draft-vocab") {
+            mtp_draft_vocab = atoi(arg_value(argc, argv, i, "--mtp-draft-vocab").c_str());
+'''),
+    (r'''    if (mtp && (mtp_catchup < 1 || mtp_mirror_tail < 0)) {
+        fprintf(stderr, "error: --mtp-catchup must be >= 1 and --mtp-mirror-tail >= 0\n");
+        return 2;
+    }
+''', r'''    if (mtp && (mtp_catchup < 1 || mtp_mirror_tail < 0)) {
+        fprintf(stderr, "error: --mtp-catchup must be >= 1 and --mtp-mirror-tail >= 0\n");
+        return 2;
+    }
+    if (mtp_draft_vocab < 0 || (mtp_draft_vocab > 0 && !mtp)) {
+        fprintf(stderr, "error: --mtp-draft-vocab needs --mtp and a value >= 0\n");
+        return 2;
+    }
+'''),
+    (r'''    llama_context * ctx_dft = nullptr;
+    if (mtp) {
+        llama_context_params dparams = llama_context_default_params();
+''', r'''    llama_context * ctx_dft = nullptr;
+    if (mtp) {
+        if (mtp_draft_vocab > 0) {
+            // G30: the draft graph reads LLAMA_MTP_DRAFT_VOCAB_N when it is built (inside llama_init_from_model below)
+            char dv[32];
+            snprintf(dv, sizeof(dv), "%d", ((mtp_draft_vocab + 255) / 256) * 256);
+#ifdef _WIN32
+            _putenv_s("LLAMA_MTP_DRAFT_VOCAB_N", dv);
+#else
+            setenv("LLAMA_MTP_DRAFT_VOCAB_N", dv, 1);
+#endif
+        }
+        llama_context_params dparams = llama_context_default_params();
+'''),
+    (r'''                            std::vector<float> plogits(dlogits, dlogits + n_vocab);
+                            draft_ring.apply(plogits.data(), n_vocab, (float) rep_penalty);
+                            bdv = plogits[0];  // penalized seed
+                            for (int v = 1; v < n_vocab; ++v) {''', r'''                            std::vector<float> plogits(dlogits, dlogits + n_vocab);
+                            draft_ring.apply(plogits.data(), n_vocab, (float) rep_penalty);
+                            bdv = plogits[0];  // penalized seed
+                            for (int v = 1; v < (draft_vocab_n > 0 && draft_vocab_n < n_vocab ? draft_vocab_n : n_vocab); ++v) {'''),
+    (r'''                fprintf(stderr, "MTP draft stage split, us per round: decode call (graph build + launch) %.1f, logits fetch (GPU wait + D2H) %.1f, scan + hidden-row copy %.1f (draft vocab %d)\n",
+                        (double) mt_dd_dec_us / mt_rounds_t, (double) mt_dd_get_us / mt_rounds_t, (double) mt_dd_scan_us / mt_rounds_t, draft_vocab_n > 0 ? draft_vocab_n : n_vocab);
+''', r'''                fprintf(stderr, "MTP draft stage split, us per round: decode call (graph build + launch) %.1f, logits fetch (GPU wait + D2H) %.1f, scan + hidden-row copy %.1f (draft vocab %d)\n",
+                        (double) mt_dd_dec_us / mt_rounds_t, (double) mt_dd_get_us / mt_rounds_t, (double) mt_dd_scan_us / mt_rounds_t, draft_vocab_n > 0 ? draft_vocab_n : n_vocab);
+                if (ctx_dft != nullptr) {
+                    const llama_perf_context_data pd = llama_perf_context(ctx_dft);
+                    fprintf(stderr, "MTP draft context: graphs reused %d, evaluated tokens %d, decoded prompt tokens %d, over %lld rounds\n", pd.n_reused, pd.n_eval, pd.n_p_eval, (long long) mt_rounds_t);
+                }
+'''),
+])

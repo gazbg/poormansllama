@@ -1,0 +1,188 @@
+"""G30 / M2k: the repair of criterion G30-4 -- the draft head does not take VRAM while the prefill needs it (--mtp-draft-late). Contract: the plan's "G30 CONTRACT".
+
+Measured (g99-ic1k, g99-lc24k, g99-sgc50k, tools/g30-bars.py): with MTP the whole-run bars of the keep-free rule fail in three cells where B0 holds them: interleave 1,023 tokens (poller peak 8,091 MiB, minimum free
+15,285), layer-major 23,995 (7,905 / 15,471), segmented 49,999 (8,117 / 15,259). The excess (+698 .. +936 MiB) is the draft head's routed experts (432 MiB of the 472 MiB model buffer), the target's RS buffer
+(+62.8 MiB, unavoidable), the draft context's 296 MiB catch-up compute buffer and the lazily committed draft KV: all resident DURING the prefill, when B0 has 163-215 MiB of headroom. Cause, not symptom.
+Repair: with --mtp-draft-late (a) the head's routed experts load on the HOST like every other expert bank, (b) the draft context is created lean (3-row compute buffer, KV reserved but not committed, no warm-up),
+(c) after the layer-major sweep the target's prefill-sized scheduler buffers are released first (the transition work B0 does outside its PP wall; its time is excluded from the PP wall for that reason),
+then the experts move to a device buffer, the draft KV is committed, the draft context re-reserves at the catch-up width, and the catch-up runs. Everything from the migration on is inside the PP wall.
+The output is unchanged (same weights, same arithmetic; the draft context's graph is re-reserved against the device buffers).
+Apply after g30g. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    # 1. usage
+    (r'''        "  --mtp-draft-vocab N   G30: the draft head draws only from the token ids [0, N) (rounded up to a multiple of 256; its lm head reads N / n_vocab of the bytes); default 0 = all\n"
+''', r'''        "  --mtp-draft-vocab N   G30: the draft head draws only from the token ids [0, N) (rounded up to a multiple of 256; its lm head reads N / n_vocab of the bytes); default 0 = all\n"
+        "  --mtp-draft-late      G30: the draft head's routed experts load on the host and its context stays lean until the layer-major prefill has finished and its buffers are released; then the experts\n"
+        "                        move to the GPU, the draft KV is committed and the catch-up runs (restores the whole-run VRAM bars; needs --pp-schedule layer-major, --kv-lazy, --tg-hybrid --tg-release-compute)\n"
+'''),
+    # 2. declaration
+    (r'''    int mtp_draft_vocab = 0;         // G30: --mtp-draft-vocab N: the draft head draws only from the token ids [0, N) (0 = all)
+''', r'''    int mtp_draft_vocab = 0;         // G30: --mtp-draft-vocab N: the draft head draws only from the token ids [0, N) (0 = all)
+    bool mtp_draft_late = false;     // G30: --mtp-draft-late: the draft head's experts and context come up after the layer-major prefill (keeps the prefill's VRAM headroom)
+'''),
+    # 3. parse
+    (r'''        } else if (arg == "--mtp-draft-vocab") {
+            mtp_draft_vocab = atoi(arg_value(argc, argv, i, "--mtp-draft-vocab").c_str());
+''', r'''        } else if (arg == "--mtp-draft-vocab") {
+            mtp_draft_vocab = atoi(arg_value(argc, argv, i, "--mtp-draft-vocab").c_str());
+        } else if (arg == "--mtp-draft-late") {
+            mtp_draft_late = true;
+'''),
+    # 4. validation
+    (r'''    if (mtp_draft_vocab < 0 || (mtp_draft_vocab > 0 && !mtp)) {
+        fprintf(stderr, "error: --mtp-draft-vocab needs --mtp and a value >= 0\n");
+        return 2;
+    }
+''', r'''    if (mtp_draft_vocab < 0 || (mtp_draft_vocab > 0 && !mtp)) {
+        fprintf(stderr, "error: --mtp-draft-vocab needs --mtp and a value >= 0\n");
+        return 2;
+    }
+    if (mtp_draft_late && (!mtp || schedule != LLAMA_PP_SCHEDULE_LAYER_MAJOR || !kv_lazy || !tg_hybrid || !tg_release_compute || residency != "moe-expert-bank")) {
+        fprintf(stderr, "error: --mtp-draft-late needs --mtp, --pp-schedule layer-major, --kv-lazy, --tg-hybrid, --tg-release-compute and --residency moe-expert-bank\n");
+        return 2;
+    }
+'''),
+    # 5. the head's experts follow the host override
+    (r'''    if (mtp && mtp_experts_gpu && residency == "moe-expert-bank") {''', r'''    if (mtp && mtp_draft_late) {
+        fprintf(stderr, "MTP: the draft layer's routed experts load on the host and move to the GPU after the prefill (--mtp-draft-late)\n");
+    }
+    if (mtp && mtp_experts_gpu && !mtp_draft_late && residency == "moe-expert-bank") {'''),
+    # 6a. the lambda and its state, before the draft context is created
+    (r'''    llama_context * ctx_dft = nullptr;
+    if (mtp) {
+        if (mtp_draft_vocab > 0) {''', r'''    llama_context * ctx_dft = nullptr;
+    // G30 (--mtp-draft-late): state and bring-up of the draft head after the layer-major prefill (see stage-c/g30h_draft_late_apply.py.txt)
+    bool                mtp_compute_released = false;     // the target's prefill-sized scheduler buffers were already released by the bring-up (tg_transition then skips its own release)
+    int64_t             mtp_pp_excl_us       = 0;         // time of that release: it is transition work B0 also does outside its PP wall
+    ggml_backend_buffer_t mtp_head_buf       = nullptr;   // the device buffer that now holds the draft head's routed experts
+    auto mtp_late_bringup = [&]() -> bool {
+        const int64_t t_l0 = ggml_time_us();
+        if (tg_hybrid && tg_release_compute && !mtp_compute_released) {
+            const int64_t t_rc0 = ggml_time_us();
+            const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
+            if (freed < 0) {
+                fprintf(stderr, "error: --mtp-draft-late: the scheduler re-reserve failed\n");
+                ls.failed = true;
+                return false;
+            }
+            mtp_compute_released = true;
+            mtp_pp_excl_us += ggml_time_us() - t_rc0;
+            fprintf(stderr, "tg-hybrid: scheduler compute buffers re-reserved for decode, %.1f MiB released in %.1f ms (early, for --mtp-draft-late; not part of the PP wall)\n",
+                    (double) freed / 1048576.0, (double) (ggml_time_us() - t_rc0) / 1e3);
+        }
+        ls_vram_trace(device, "late draft: before the migration");
+        const int64_t t_m0 = ggml_time_us();
+        llama_layer & hl = model->layers[n_layer];
+        ggml_tensor * moving[4] = { hl.ffn_gate_exps, hl.ffn_up_exps, hl.ffn_down_exps, hl.ffn_gate_up_exps };
+        ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+        size_t total = 0;
+        for (ggml_tensor * t : moving) {
+            if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                total += GGML_PAD(ggml_nbytes(t), align);
+            }
+        }
+        if (total > 0) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+            if (buf == nullptr) {
+                fprintf(stderr, "error: --mtp-draft-late: cannot allocate %.1f MiB on the device for the draft head's experts\n", (double) total / 1048576.0);
+                ls.failed = true;
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_tallocr ta = ggml_tallocr_new(buf);
+            for (ggml_tensor * t : moving) {
+                if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                const void * src = t->data;
+                const size_t nb  = ggml_nbytes(t);
+                t->data   = nullptr;
+                t->buffer = nullptr;
+                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "error: --mtp-draft-late: cannot place %s in the device buffer\n", t->name);
+                    ls.failed = true;
+                    return false;
+                }
+                ggml_backend_tensor_set(t, src, 0, nb);
+            }
+            mtp_head_buf = buf;
+        }
+        fprintf(stderr, "MTP: draft head experts moved to the GPU: %.1f MiB in %.1f ms\n", (double) total / 1048576.0, (ggml_time_us() - t_m0) / 1000.0);
+        ls_vram_trace(device, "late draft: after the migration");
+        // the draft KV (reserved lazily at creation): commit the rows this run can use
+        const int64_t kv_rows_d  = std::min<int64_t>((int64_t) n_ctx_total, (int64_t) pp_tokens + (int64_t) tg_tokens + 1024);
+        const int64_t kv_bytes_d = ggml_backend_cuda_lazy_commit_rows(kv_rows_d);
+        if (kv_bytes_d < 0) {
+            fprintf(stderr, "error: --mtp-draft-late: the driver could not commit the draft context's %lld KV rows\n", (long long) kv_rows_d);
+            ls.failed = true;
+            return false;
+        }
+        fprintf(stderr, "kv-lazy: draft context committed, lazily committed KV now %.1f MiB in total\n", (double) kv_bytes_d / 1048576.0);
+        // the draft context decodes the catch-up in up to --mtp-catchup rows: re-reserve at that width (against the device-resident experts); the rounds' width is restored after the catch-up
+        const int64_t t_r0 = ggml_time_us();
+        (void) llama_layer_streaming_reserve_ubatch(ctx_dft, (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch)));
+        fprintf(stderr, "MTP: draft context re-reserved at %d rows in %.1f ms; late bring-up %.1f ms in total\n", std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch)),
+                (ggml_time_us() - t_r0) / 1000.0, (ggml_time_us() - t_l0) / 1000.0);
+        ls_vram_trace(device, "late draft: ready for the catch-up");
+        return true;
+    };
+    if (mtp) {
+        if (mtp_draft_vocab > 0) {'''),
+    # 6b. a lean draft context
+    (r'''        dparams.n_ubatch     = (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch));''', r'''        dparams.n_ubatch     = mtp_draft_late ? (uint32_t) (2 + mtp_draft) : (uint32_t) std::max(2 + mtp_draft, std::min(mtp_catchup, ubatch));'''),
+    # 6c. the KV commit waits for the bring-up
+    (r'''        if (kv_lazy) {
+            // the draft context's KV cache was reserved lazily too (LLAMA_KV_LAZY is still set) after the target's rows were committed: commit again, which only maps the new buffer''', r'''        if (kv_lazy && !mtp_draft_late) {
+            // the draft context's KV cache was reserved lazily too (LLAMA_KV_LAZY is still set) after the target's rows were committed: commit again, which only maps the new buffer'''),
+    # 6d. no warm-up decode of a lean context (its KV is not committed yet)
+    (r'''        {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill''', r'''        if (!mtp_draft_late) {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill'''),
+    # 7. the bring-up between the sweep and the catch-up
+    (r'''                    } else {
+                        const int64_t t_cu0 = ggml_time_us();
+                        const int step = std::max(1, std::min(mtp_catchup, ubatch));''', r'''                    } else {
+                        if (mtp_draft_late && !mtp_late_bringup()) {
+                            ret = 1;
+                        }
+                        const int64_t t_cu0 = ggml_time_us();
+                        const int step = std::max(1, std::min(mtp_catchup, ubatch));'''),
+    # 8. the PP wall excludes the early release
+    (r'''            const int64_t t1 = ggml_time_us();
+
+            if (ret != 0) {
+                fprintf(stderr, "error: PP decode failed with %d: %s\n", ret, ls.error_msg.c_str());''', r'''            const int64_t t1 = ggml_time_us() - mtp_pp_excl_us;
+
+            if (ret != 0) {
+                fprintf(stderr, "error: PP decode failed with %d: %s\n", ret, ls.error_msg.c_str());'''),
+    # 9. tg_transition skips a release that already happened
+    (r'''            if (tg_hybrid && tg_release_compute && exit_status == 0) {
+                const int64_t t_rc0 = ggml_time_us();
+                const int64_t freed = llama_layer_streaming_reserve_decode(ctx);''', r'''            if (tg_hybrid && tg_release_compute && exit_status == 0 && !mtp_compute_released) {
+                const int64_t t_rc0 = ggml_time_us();
+                const int64_t freed = llama_layer_streaming_reserve_decode(ctx);'''),
+    # 10. free the device buffer after the draft context
+    (r'''        if (ctx_dft) {
+            llama_free(ctx_dft);
+            ctx_dft = nullptr;
+        }''', r'''        if (ctx_dft) {
+            llama_free(ctx_dft);
+            ctx_dft = nullptr;
+        }
+        if (mtp_head_buf != nullptr) {
+            ggml_backend_buffer_free(mtp_head_buf);
+            mtp_head_buf = nullptr;
+        }'''),
+])

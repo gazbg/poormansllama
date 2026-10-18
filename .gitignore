@@ -79,3 +79,6 @@ desktop.ini
 
 # Freebuff session worktrees (tool-managed; each carries its own repo state)
 /.freebuff/worktrees/
+
+# G42: per-session server configs written by tools/server-config-gen.py (reproducible, hundreds of files)
+/tools/server-configs/

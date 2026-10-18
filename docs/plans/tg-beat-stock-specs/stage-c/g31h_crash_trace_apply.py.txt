@@ -1,0 +1,96 @@
+"""G31h: diagnostic crash tracer (Windows). With LLAMA_HYBRID_CRASH_TRACE=1 an access violation prints the exception, the faulting address and a symbolised stack of the faulting thread to stderr before the process dies.
+Used to root-cause the intermittent 0xC0000005 right after an expert-cache shrink (g244-hang4). Needs the PDB next to the DLLs for names (build with CL=/Z7 _LINK_=/DEBUG). Diagnostic only; nothing runs without the env var."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(HA, [
+    ('''#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+''', '''#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+'''),
+    ('''static std::thread       g_watch;''', '''#ifdef _WIN32
+// diagnostic only (LLAMA_HYBRID_CRASH_TRACE=1): symbolised stack of an access violation
+static LONG WINAPI hybrid_crash_filter(EXCEPTION_POINTERS * ep) {
+    if (ep == nullptr || ep->ExceptionRecord == nullptr || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, nullptr, TRUE);
+    const EXCEPTION_RECORD * er = ep->ExceptionRecord;
+    fprintf(stderr, "CRASH-TRACE: access violation: %s of address %p at %p, thread %lu\\n", er->ExceptionInformation[0] == 0 ? "read" : (er->ExceptionInformation[0] == 1 ? "write" : "execute"),
+            (void *) er->ExceptionInformation[1], er->ExceptionAddress, (unsigned long) GetCurrentThreadId());
+    void * frames[64];
+    const USHORT n = CaptureStackBackTrace(0, 64, frames, nullptr);
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
+    for (USHORT i = 0; i < n; ++i) {
+        SYMBOL_INFO * sym = (SYMBOL_INFO *) buf;
+        memset(sym, 0, sizeof(SYMBOL_INFO));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen   = 511;
+        DWORD64 disp = 0;
+        IMAGEHLP_LINE64 line;
+        memset(&line, 0, sizeof(line));
+        line.SizeOfStruct = sizeof(line);
+        DWORD ldisp = 0;
+        IMAGEHLP_MODULE64 mod;
+        memset(&mod, 0, sizeof(mod));
+        mod.SizeOfStruct = sizeof(mod);
+        const DWORD64 a = (DWORD64) frames[i];
+        const bool has_mod = SymGetModuleInfo64(proc, a, &mod) != FALSE;
+        if (SymFromAddr(proc, a, &disp, sym)) {
+            if (SymGetLineFromAddr64(proc, a, &ldisp, &line)) {
+                fprintf(stderr, "CRASH-TRACE: #%02u %s!%s+0x%llx (%s:%lu)\\n", (unsigned) i, has_mod ? mod.ModuleName : "?", sym->Name, (unsigned long long) disp, line.FileName, (unsigned long) line.LineNumber);
+            } else {
+                fprintf(stderr, "CRASH-TRACE: #%02u %s!%s+0x%llx\\n", (unsigned) i, has_mod ? mod.ModuleName : "?", sym->Name, (unsigned long long) disp);
+            }
+        } else {
+            fprintf(stderr, "CRASH-TRACE: #%02u %s+0x%llx\\n", (unsigned) i, has_mod ? mod.ModuleName : "?", has_mod ? (unsigned long long) (a - mod.BaseOfImage) : (unsigned long long) a);
+        }
+    }
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+static std::thread       g_watch;'''),
+    ('''    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;''', '''    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;
+#ifdef _WIN32
+    if (const char * c = getenv("LLAMA_HYBRID_CRASH_TRACE"); c != nullptr && atoi(c) > 0) {
+        static std::atomic<bool> installed{false};
+        if (!installed.exchange(true)) {
+            AddVectoredExceptionHandler(1, hybrid_crash_filter);
+        }
+    }
+#endif'''),
+])

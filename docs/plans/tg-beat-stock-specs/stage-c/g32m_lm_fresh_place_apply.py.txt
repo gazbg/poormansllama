@@ -1,0 +1,93 @@
+"""G32m (after the np2 soak g934 on s30): a FRESH sequence gets a gap in front of it from the ordinary path too, and the gap scales with the cache.
+
+The soak log showed the remaining declines at -np 2: "the block starting at cell 0 breaks at cell 1538 (seq 0 pos 0, expected seq 1 pos 1538)" -- two conversations that both START with a prompt too small for a layer-major pass
+(first batch < --lm-prefill-min) are placed by the ordinary path back to back (stock placement: the first free cells from the head), so neither has room to grow when its big turn comes; and the gap that lm_block leaves
+(16,384 cells) is small next to a 24k-token turn.
+What: (1) the placement of a fresh sequence (first position 0, one sequence in the ubatch, other sequences in the cache) is the same function in lm_block and in find_slot (lm_fresh_place): the first run of empty cells that leaves a
+gap of H cells in front of it and H empty cells behind it, else the first run that fits; (2) H = min(size/4, max(16384, size / (2 * n_seq_max))): 65,536 cells for the 262,144-cell cache at -np 2.
+An empty cache keeps the stock placement (cell 0). Active only with --lm-prefill (lm_affinity). Edits: src/llama-kv-cache.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    # 1. the helpers, before find_slot
+    ('''llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+''', '''#ifdef LLAMA_LAYER_STREAMING
+// G32: the gap that a layer-major-friendly placement leaves in front of and behind a fresh sequence
+static uint32_t lm_gap(uint32_t size, uint32_t n_seq_max) {
+    return std::min<uint32_t>(size / 4u, std::max<uint32_t>(16384u, size / (2u * std::max<uint32_t>(1u, n_seq_max))));
+}
+
+// G32: where a FRESH sequence of n_new tokens goes: the first run of empty cells that leaves a gap of H cells in front of it (room for the left neighbour to grow into) and H empty cells behind it;
+// else the first run that fits. -1: none.
+static int64_t lm_fresh_place(const llama_kv_cells & cells, uint32_t size, uint32_t n_new, uint32_t H) {
+    int64_t  first_fit = -1;
+    uint32_t s = 0;
+    while (s < size) {
+        if (!cells.is_empty(s)) {
+            ++s;
+            continue;
+        }
+        uint32_t e = s;
+        while (e < size && cells.is_empty(e)) {
+            ++e;
+        }
+        const uint32_t len  = e - s;           // [s, e) is a maximal run of empty cells
+        const uint32_t lead = s == 0 ? 0u : H;
+        if (first_fit < 0 && len >= n_new) {
+            first_fit = s;
+        }
+        if ((uint64_t) len >= (uint64_t) lead + n_new + H) {
+            return (int64_t) (s + lead);
+        }
+        s = e;
+    }
+    return first_fit;
+}
+#endif
+
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+'''),
+    # 2. the ordinary path
+    ('''                continue;
+            }
+        }
+#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];''', '''                continue;
+            }
+        }
+        if (lm_affinity && n_stream == 1 && ubatch.n_seqs_unq == 1 && n_tokens > 0 && ubatch.pos[0] == 0 && cells.get_used() > 0) {
+            // G32: a fresh sequence next to other sequences: leave gaps (the same placement as lm_block's)
+            const int64_t c = lm_fresh_place(cells, cells.size(), n_tokens, lm_gap(cells.size(), n_seq_max));
+            if (c >= 0) {
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    res.idxs[s].push_back((uint32_t) c + i);
+                }
+                continue;
+            }
+        }
+#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];'''),
+    # 3. lm_block uses the same function
+    ("@between", '''    uint32_t c0 = 0;
+    if (n_old == 0) {''', '''    // the cell of position 0 of the sequence
+    bool found = false;''',
+     '''    uint32_t c0 = 0;
+    if (n_old == 0) {
+        // a fresh sequence: the same placement as the ordinary path's (gaps in front of and behind it, else the first run that fits)
+        const int64_t c = lm_fresh_place(cells, size, n_new, lm_gap(size, n_seq_max));
+        return c >= 0 ? c : no("no run of " + std::to_string(n_new) + " empty cells for a fresh sequence (" + std::to_string(cells.get_used()) + " of " + std::to_string(size) + " cells used)");
+    }
+
+'''),
+])
+print("g32m edits matched")

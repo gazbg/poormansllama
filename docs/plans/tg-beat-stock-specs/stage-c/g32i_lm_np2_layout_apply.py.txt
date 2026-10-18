@@ -1,0 +1,81 @@
+"""G32i (after the decline reasons of g840/g841): two changes that make the layer-major pass fit the common -np 2 pattern, a conversation per slot taking turns.
+
+The g32h diagnostics showed WHY the second turn of a conversation was declined at -np 2:
+  - default cache (--cache-ram 8192, unified KV): when a task switches slots the server restores the prompt from the host cache into the slot while the previous slot still holds its cells (they are saved and cleared only
+    AFTER the task is launched), so the restored sequence is scattered around those cells: "the block starting at cell 518 breaks at cell 24042 (empty ...)".
+  - --cache-ram 0 (idle slots keep their cells): a fresh conversation was placed right behind the first one, so the first one had no room behind its block on its next turn: "the room behind the block (cells 24000 ..) is taken at cell 24051".
+Changes:
+  1. server (only with --lm-prefill, unified KV and idle-slot caching): before the prompt is restored into the selected slot, the OTHER idle slots are saved to the host cache and cleared -- which the server does right after the
+     launch anyway -- so the restore lands in an emptier cache, as one contiguous block.
+  2. llama_kv_cache::lm_block, fresh sequence: prefer a place with a gap of H = min(16384, size/16) cells in front of it (room for the left neighbour to grow into) and H empty cells behind it; fall back to the first run that fits.
+Edits: tools/server/server-context.cpp, src/llama-kv-cache.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    ('''                const int64_t t_start = ggml_time_us();
+
+                ret->prompt_save(*prompt_cache);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {''', '''                const int64_t t_start = ggml_time_us();
+
+                if (params_base.lm_prefill && params_base.kv_unified && params_base.cache_idle_slots) {
+                    // G32: the other idle slots are saved to the host cache and cleared right after this task starts (unified KV); doing it now lets the prompt restored into `ret` land in an emptier cache,
+                    // as one contiguous block, which the layer-major pass can take
+                    for (auto & other : slots) {
+                        if (&other != ret && !other.is_processing()) {
+                            if (other.prompt_save(*prompt_cache)) {
+                                prompt_cache->update();
+                            }
+                            other.prompt_clear();
+                        }
+                    }
+                }
+
+                ret->prompt_save(*prompt_cache);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {'''),
+])
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ("@between", '''    uint32_t c0 = 0;
+    if (n_old == 0) {''', '''    // the cell of position 0 of the sequence
+    bool found = false;''',
+     '''    uint32_t c0 = 0;
+    if (n_old == 0) {
+        // a fresh sequence. Prefer a place with a gap in front of it (room for the left neighbour to grow into on its next turn) and room behind it (for its own next turn); fall back to the first run that fits
+        const uint32_t H = std::min<uint32_t>(16384u, size / 16u);
+        int64_t  first_fit = -1;
+        uint32_t s = 0;
+        while (s < size) {
+            if (!cells.is_empty(s)) {
+                ++s;
+                continue;
+            }
+            uint32_t e = s;
+            while (e < size && cells.is_empty(e)) {
+                ++e;
+            }
+            const uint32_t len  = e - s;           // [s, e) is a maximal run of empty cells
+            const uint32_t lead = s == 0 ? 0u : H;
+            if (first_fit < 0 && len >= n_new) {
+                first_fit = s;
+            }
+            if ((uint64_t) len >= (uint64_t) lead + n_new + H) {
+                return (int64_t) (s + lead);
+            }
+            s = e;
+        }
+        return first_fit >= 0 ? first_fit : no("no run of " + std::to_string(n_new) + " empty cells for a fresh sequence (" + std::to_string(cells.get_used()) + " of " + std::to_string(size) + " cells used)");
+    }
+
+'''),
+])
+print("g32i edits matched")

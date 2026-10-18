@@ -1,0 +1,59 @@
+{
+ "steps": [
+  {
+   "name": "p24k-cold",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/natdeep-24000.txt",
+   "body": {
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": true,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p24k-warm",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/natdeep-24000.txt",
+   "body": {
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": true,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p4k-cold",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/mtpprose-4096.txt",
+   "body": {
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": true,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p2k-cold",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/mtpcode-2048.txt",
+   "body": {
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": true,
+    "seed": 1
+   }
+  },
+  {
+   "name": "p1k-cold",
+   "endpoint": "/completion",
+   "prompt_file": "C:/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1/build/llama-cuda/gplr07-qa-prompts/mtpprose-1024.txt",
+   "body": {
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": true,
+    "seed": 1
+   }
+  }
+ ]
+}

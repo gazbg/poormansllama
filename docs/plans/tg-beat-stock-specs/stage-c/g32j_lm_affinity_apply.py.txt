@@ -1,0 +1,116 @@
+"""G32j (after g842/g843): with --lm-prefill the ordinary path continues a sequence right behind its own last cell when those cells are free ("sequence affinity").
+
+Why: at -np 2 with --cache-ram 0 the first conversation sat at cells [0, n), the second one at [n + H, ...) with a gap H in front of it (g32i), and the layer-major pass of the second one went through its first
+batch fine -- but the 516-token checkpoint tail of the SAME prompt is a separate batch on the ordinary path, and find_slot restarts at cell 0 when the head is far ahead of the used cells, so the tail landed in the first hole
+(the gap behind the first conversation): "the block starting at cell 40435 breaks at cell 63914 (empty, expected seq 0 pos 23479)" and "the room behind the block (cells 24000 ..) is taken at cell 24051".
+
+What: llama_kv_cache remembers, per sequence, the cell and position of the last token it placed (apply_ubatch); find_slot, for a ubatch of ONE sequence that continues that last token (position tail + 1) and when the cells
+right behind the tail are free, places the ubatch there instead of at the head. The remembered tail is validated against the cell contents before it is used, so a stale entry (rolled back, removed) is ignored. Only
+active after llama_context::lm_prefill_enable (llama_kv_cache::lm_set_affinity(true)); without --lm-prefill the placement is the stock one.
+Edits: src/llama-kv-cache.{h,cpp}, and llama-lm-prefill.cpp (patched in stage-c, then copied)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = os.environ.get("G32_STAGE", WT + r"\docs\plans\tg-beat-stock-specs\stage-c")
+
+patch(NEST + r"\src\llama-kv-cache.h", [
+    ('''    void    lm_force(int64_t cell) { lm_force_cell = cell; }
+    int64_t lm_force_cell = -1;
+''', '''    void    lm_force(int64_t cell) { lm_force_cell = cell; }
+    int64_t lm_force_cell = -1;
+    // sequence affinity (on after lm_prefill_enable): find_slot puts a ubatch of one sequence right behind that sequence's last cell when it is free, so that the batches of one prompt stay one contiguous block
+    void    lm_set_affinity(bool on) {
+        lm_affinity = on;
+        lm_tail_cell.assign(on ? LLAMA_MAX_SEQ : 0, -1);
+        lm_tail_pos .assign(on ? LLAMA_MAX_SEQ : 0, -1);
+    }
+    bool                 lm_affinity = false;
+    std::vector<int32_t> lm_tail_cell;   // per sequence: the cell of the last token placed
+    std::vector<int32_t> lm_tail_pos;    // and its position
+'''),
+])
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ('''            continue;
+        }
+#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];''', '''            continue;
+        }
+        if (lm_affinity && n_stream == 1 && ubatch.n_seqs_unq == 1 && n_tokens > 0 && ubatch.pos[0] > 0 && seq_id >= 0 && (size_t) seq_id < lm_tail_cell.size()) {
+            // G32: continue the sequence right behind its last cell when the cells are free (the remembered tail is validated against the cells)
+            const int32_t tc = lm_tail_cell[seq_id];
+            if (tc >= 0 && lm_tail_pos[seq_id] == (int32_t) ubatch.pos[0] - 1 && (uint64_t) tc + 1 + n_tokens <= cells.size() &&
+                !cells.is_empty((uint32_t) tc) && cells.seq_count((uint32_t) tc) == 1 && cells.seq_get((uint32_t) tc) == seq_id && cells.pos_get((uint32_t) tc) == ubatch.pos[0] - 1) {
+                bool room = true;
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    if (!cells.is_empty((uint32_t) tc + 1 + i)) {
+                        room = false;
+                        break;
+                    }
+                }
+                if (room) {
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        res.idxs[s].push_back((uint32_t) tc + 1 + i);
+                    }
+                    continue;
+                }
+            }
+        }
+#endif
+
+        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];'''),
+    ('''            for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
+                cells.seq_add(idx, ubatch.seq_id[i][s]);
+            }
+        }
+    }
+
+    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence''', '''            for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
+                cells.seq_add(idx, ubatch.seq_id[i][s]);
+            }
+
+#ifdef LLAMA_LAYER_STREAMING
+            if (lm_affinity && ubatch.n_seq_id[i] == 1 && (size_t) ubatch.seq_id[i][0] < lm_tail_cell.size()) {
+                lm_tail_cell[ubatch.seq_id[i][0]] = (int32_t) idx;
+                lm_tail_pos [ubatch.seq_id[i][0]] = (int32_t) ubatch.pos[i];
+            }
+#endif
+        }
+    }
+
+    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence'''),
+])
+
+LMC = HERE + r"\llama-lm-prefill.cpp.txt"
+patch(LMC, [
+    ('''    lm_state = std::move(S);
+    return true;
+}''', '''    lm_state = std::move(S);
+    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        mh->get_mem_attn()->lm_set_affinity(true);
+    }
+    return true;
+}'''),
+    ('''    synchronize();
+    lm_state.reset();
+}''', '''    synchronize();
+    lm_state.reset();
+    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        mh->get_mem_attn()->lm_set_affinity(false);
+    }
+}'''),
+])
+
+if os.environ.get("PATCH_DRY"):
+    print("DRY-OK stage-c llama-lm-prefill.cpp patched in memory only; the tree copy is skipped")
+else:
+    shutil.copyfile(LMC, NEST + r"\src\llama-lm-prefill.cpp")
+    print("copied llama-lm-prefill.cpp")

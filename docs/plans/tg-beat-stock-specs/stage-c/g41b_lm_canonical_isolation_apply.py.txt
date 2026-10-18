@@ -1,0 +1,42 @@
+"""G41b (round 6): with --lm-prefill-canonical every prompt batch gets a batch of its own at -np > 1.
+
+k4411 (s45, np 2 soak, canonical): 68 batches of 1,515-4,097 tokens were declined as "the batch holds several sequences" (5 in the default mode) and the soak took 1,125 s instead of ~550 s. The server decides which
+prompt gets an isolated turn from the slot's cached prefix BEFORE the canonical resume throws the tail of that prefix away: a slot that is about to start looked like a prompt with only a few new tokens, got no isolated
+turn, and its re-prefilled tail shared the batch with the other slot's decode tokens. Worse for the point of the mode: which path computes a batch (the pass or the ordinary path) depends on its size, and a hit must take
+the path a fresh run takes, so a prompt batch must never be mixed with another sequence's tokens. In canonical mode every slot that starts or is processing a prompt now counts as the big one (its batches are isolated,
+decode turns alternate with them as before).
+Edits: tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    ('''                } else if (lm_big == nullptr && slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && slot.task &&
+                           slot.task->n_tokens() - slot.prompt.n_tokens() >= params_base.lm_prefill_min) {''',
+     '''                } else if (lm_big == nullptr && slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && slot.task &&
+                           // G41b: canonical chunks: a prompt batch never shares its batch with another sequence's tokens, whatever its size (the size decides which path computes it, and a hit must take the path a fresh run takes);
+                           // a slot that is about to start still counts the cached prefix that the checkpoint resume throws away
+                           (lm_canon || slot.task->n_tokens() - slot.prompt.n_tokens() >= params_base.lm_prefill_min)) {'''),
+])
+print("g41b edits matched")

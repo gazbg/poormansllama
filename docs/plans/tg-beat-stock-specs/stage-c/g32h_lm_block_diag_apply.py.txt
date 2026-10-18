@@ -1,0 +1,119 @@
+"""G32h (after the two-slot runs g805-g810): a batch that the layer-major pass declines because of the KV layout says WHICH cell broke the block (LLAMA_LM_LOG=1), so that the np > 1 engagement can be judged from the log
+instead of guessed ("not one contiguous block with room behind it" covered four different situations).
+
+llama_kv_cache::lm_block gets an optional std::string * why that receives the first violated condition with the cell numbers; llama_lm_plan.why_detail carries it; lm_note prints it.
+Edits: src/llama-kv-cache.{h,cpp}, src/llama-context.h, and llama-lm-prefill.cpp (patched in stage-c, then copied)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = os.environ.get("G32_STAGE", WT + r"\docs\plans\tg-beat-stock-specs\stage-c")
+
+patch(NEST + r"\src\llama-kv-cache.h", [
+    ('''    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new) const;''',
+     '''    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why = nullptr) const;   // why: the first violated condition, with cell numbers'''),
+])
+
+patch(NEST + r"\src\llama-kv-cache.cpp", [
+    ("@between", "int64_t llama_kv_cache::lm_block(", "bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {",
+     '''int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why) const {
+    auto no = [&](const std::string & s) -> int64_t {
+        if (why != nullptr) {
+            *why = s;
+        }
+        return -1;
+    };
+    if (other || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0 || n_new == 0) {
+        return no("unsupported cache (shared cells, several streams, sliding window or a bad sequence id)");
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t size  = cells.size();
+    const uint32_t n_old = (uint32_t) p0;
+    if ((uint64_t) n_old + n_new > size) {
+        return no("the batch does not fit the cache (" + std::to_string(n_old) + " + " + std::to_string(n_new) + " > " + std::to_string(size) + ")");
+    }
+    auto who = [&](uint32_t c) -> std::string {
+        if (cells.is_empty(c)) {
+            return "empty";
+        }
+        if (cells.seq_count(c) != 1) {
+            return "shared by " + std::to_string(cells.seq_count(c)) + " sequences";
+        }
+        return "seq " + std::to_string(cells.seq_get(c)) + " pos " + std::to_string(cells.pos_get(c));
+    };
+
+    uint32_t c0 = 0;
+    if (n_old == 0) {
+        // a fresh sequence: the first run of n_new empty cells
+        uint32_t run = 0;
+        bool     found = false;
+        for (uint32_t i = 0; i < size; ++i) {
+            run = cells.is_empty(i) ? run + 1 : 0;
+            if (run == n_new) {
+                c0    = i + 1 - n_new;
+                found = true;
+                break;
+            }
+        }
+        return found ? (int64_t) c0 : no("no run of " + std::to_string(n_new) + " empty cells for a fresh sequence (" + std::to_string(cells.get_used()) + " of " + std::to_string(size) + " cells used)");
+    }
+
+    // the cell of position 0 of the sequence
+    bool found = false;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (!cells.is_empty(i) && cells.pos_get(i) == 0 && cells.seq_count(i) == 1 && cells.seq_get(i) == seq_id) {
+            c0    = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return no("no cell holds position 0 of sequence " + std::to_string(seq_id));
+    }
+    if ((uint64_t) c0 + n_old + n_new > size) {
+        return no("the block at cell " + std::to_string(c0) + " leaves no room for " + std::to_string(n_new) + " more cells before the end of the cache");
+    }
+    for (uint32_t i = 0; i < n_old; ++i) {
+        const uint32_t c = c0 + i;
+        if (cells.is_empty(c) || cells.seq_count(c) != 1 || cells.seq_get(c) != seq_id || cells.pos_get(c) != (llama_pos) i) {
+            return no("the block starting at cell " + std::to_string(c0) + " breaks at cell " + std::to_string(c) + " (" + who(c) + ", expected seq " + std::to_string(seq_id) + " pos " + std::to_string(i) + ")");
+        }
+    }
+    for (uint32_t i = 0; i < n_new; ++i) {
+        if (!cells.is_empty(c0 + n_old + i)) {
+            return no("the room behind the block (cells " + std::to_string(c0 + n_old) + " ..) is taken at cell " + std::to_string(c0 + n_old + i) + " (" + who(c0 + n_old + i) + ")");
+        }
+    }
+    return (int64_t) c0;
+}
+
+'''),
+])
+
+patch(NEST + r"\src\llama-context.h", [
+    ('''    const char *         why         = nullptr; // when !ok: the reason (a static string)
+''', '''    const char *         why         = nullptr; // when !ok: the reason (a static string)
+    std::string          why_detail;                // when !ok because of the KV layout: which cell broke it
+'''),
+])
+
+LMC = HERE + r"\llama-lm-prefill.cpp.txt"
+patch(LMC, [
+    ('''    const int64_t c0 = mh->get_mem_attn()->lm_block(seq, p0, (uint32_t) n);''',
+     '''    const int64_t c0 = mh->get_mem_attn()->lm_block(seq, p0, (uint32_t) n, &pl.why_detail);'''),
+    ('''        LLAMA_LOG_WARN("lm-prefill: a batch of %d tokens takes the ordinary path: %s\\n", (int) b.n_tokens, pl.why != nullptr ? pl.why : "?");''',
+     '''        LLAMA_LOG_WARN("lm-prefill: a batch of %d tokens takes the ordinary path: %s%s%s%s\\n", (int) b.n_tokens, pl.why != nullptr ? pl.why : "?",
+                       pl.why_detail.empty() ? "" : " [", pl.why_detail.c_str(), pl.why_detail.empty() ? "" : "]");'''),
+])
+
+if os.environ.get("PATCH_DRY"):
+    print("DRY-OK stage-c llama-lm-prefill.cpp patched in memory only; the tree copy is skipped")
+else:
+    shutil.copyfile(LMC, NEST + r"\src\llama-lm-prefill.cpp")
+    print("copied llama-lm-prefill.cpp")

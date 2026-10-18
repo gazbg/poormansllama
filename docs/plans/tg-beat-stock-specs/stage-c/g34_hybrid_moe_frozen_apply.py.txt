@@ -1,0 +1,75 @@
+"""G34 (round 3 of the review of the layer-major integration): `--hybrid-moe-frozen`, the deterministic mode of the hybrid decode as a first-class flag.
+
+The dynamic hybrid decode is not residency-invariant: which experts run on the GPU and which on the host follows the cache state, which changes with every request (promotions) and with the
+history. The two legs agree to ~1.5% of the output (ggml-cpu q8_K activations against the GPU's q8_1; the G33 experiment brought that to 3e-5 with a q8_1-style host kernel, 500-2000x closer) but
+not bit for bit, and the activation quantization of the next matmul re-rounds any ulp difference into a ~0.016-nat first-token difference: identical requests differ above the 0.25-nat rule in
+4-10% of the pairs (results file, Round 3). With the cache frozen (a fixed slot count and no promotions) the residency never changes, the decode is deterministic and every hit-versus-fresh
+expectation of the multi-turn suites is met. The isolating configuration used so far was --hybrid-moe-slots N plus the environment variable LLAMA_MOE_HYBRID_B=0; this makes it one flag.
+
+  --hybrid-moe-frozen   fixed expert cache of --hybrid-moe-slots slots (default 16) and no promotions: identical requests give identical output; slower decode than the dynamic cache
+
+Edits: common/common.h, common/arg.cpp, tools/server/server-context.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\common\common.h", [
+    ('''    int32_t     hybrid_moe_slots = -1;   // -1: size the cache to the --fit-target margin; N > 0: N slots per layer
+''', '''    int32_t     hybrid_moe_slots = -1;   // -1: size the cache to the --fit-target margin; N > 0: N slots per layer
+    bool        hybrid_moe_frozen = false; // fixed expert cache (--hybrid-moe-slots, default 16) and no promotions: the hybrid decode is deterministic
+'''),
+])
+
+patch(NEST + r"\common\arg.cpp", [
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-ubatch"}, "N",''', '''    add_opt(common_arg(
+        {"--hybrid-moe-frozen"},
+        "deterministic hybrid decode: a fixed expert cache of --hybrid-moe-slots slots (default 16 here) and no promotions, so which experts run on the GPU never changes and identical requests give identical output "
+        "(a cache-hit continuation equals a fresh one); the decode is slower than with the dynamic cache",
+        [](common_params & params) {
+            params.hybrid_moe_frozen = true;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_FROZEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-ubatch"}, "N",'''),
+])
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    ('''            llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
+''', '''            if (params_base.hybrid_moe_frozen) {
+                if (params_base.hybrid_moe_slots <= 0) {
+                    params_base.hybrid_moe_slots = 16;
+                }
+                // no promotions: the residency of the experts never changes after the start (the engine environment variable is the one the isolating tests used)
+#if defined(_WIN32)
+                _putenv_s("LLAMA_MOE_HYBRID_B", "0");
+#else
+                setenv("LLAMA_MOE_HYBRID_B", "0", 1);
+#endif
+                SRV_INF("hybrid-moe: frozen expert cache of %d slots per layer, no promotions (deterministic decode)\\n", params_base.hybrid_moe_slots);
+            }
+            llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
+'''),
+])
+print("g34 edits matched")

@@ -1,0 +1,23 @@
+"""G31l: out-of-bounds read of the MMQ MUL_MAT_ID path, found by compute-sanitizer on the UNMODIFIED stock server (bin/s0, -ub 2048): `Invalid __global__ read of size 4` in mul_mat_q<Q4_K, 128, false>,
+block (3060,0,0), 1 byte after a 14 MiB allocation (g264-memcheck). ROOT CAUSE: in the ids branch of ggml_cuda_mul_mat_q() the scratch buffer for the quantised activations gets its slack from
+ggml_cuda_mmq_get_J_max(type, fallback, cc, ne11), but ne11 is 1 (gate/up broadcast) or n_expert_used there, while the kernel picks its tile width J from args.ncols_max = ne12 (the TOKEN count): J = 128 for
+a big ubatch, slack = 8 columns, so the last tile of the last expert reads up to 120 columns past the end. With -ub 512 the overrun stays inside the CUDA pool; with -ub 2048 the buffer ends at the end of the pool
+mapping and the read faults (illegal memory access, first request of a chat prompt of 1.5k-6k tokens; completion-mode token ids of other prompts did not hit it). FIX: size the slack from ne12 (the token count),
+exactly the quantity that selects the tile width. Numerics unchanged (a larger scratch allocation only)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+MQ = NEST + r"\ggml\src\ggml-cuda\mmq.cu"
+
+patch(MQ, [
+    ('''    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);''', '''    // G31l: the tile width J is chosen from ncols_max = ne12 (tokens), so the slack must come from ne12, not from ne11 (1 or n_expert_used)
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);'''),
+])

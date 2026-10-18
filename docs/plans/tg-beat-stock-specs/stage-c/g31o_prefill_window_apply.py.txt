@@ -1,0 +1,252 @@
+"""G31o (S3b): the hybrid PREFILL WINDOW. A bigger physical batch (-ub 2048) makes the stock-path prefill 3.2x faster (the expert banks are copied once per ubatch), but its compute buffer (+843 MiB) takes slots away from the expert cache
+for the whole run: STATIC -ub 2048 measured TG 2.73-2.95x STOCK (SRV-2 needs 3.0x at 4,093 / 24,000 tokens). The window gives both: at the start of a decode whose batch has >= min_tokens tokens the expert cache shrinks to make room, the
+scheduler is re-reserved for the big ubatch; at the first later decode with a smaller batch the ubatch goes back to the base value and the cache grows to what fits. The checkpoint offsets of the server (4 + n_ubatch) are computed at
+the start of update_slots, i.e. in the small mode: the stock granularity (516, 4) is kept.
+Pieces: a decode hook in llama_context::decode (a function pointer, nullptr unless registered), the state machine in llama-hybrid-api.cpp, llama_hybrid_set_prefill() in the API, the server options
+--hybrid-moe-prefill-ubatch (default 2048, 0 = off) and --hybrid-moe-prefill-min (default 1024); --hybrid-moe-ubatch (static) now defaults to 0 (off)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CX = NEST + r"\src\llama-context.cpp"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+HH = NEST + r"\include\llama-hybrid.h"
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(CX, [
+    ('''int llama_context::decode(const llama_batch & batch_inp) {
+''', '''#ifdef LLAMA_LAYER_STREAMING
+// G31o: called at the start of every decode with the batch size; llama-hybrid-api.cpp registers it (the hybrid prefill window)
+void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
+#endif
+
+int llama_context::decode(const llama_batch & batch_inp) {
+'''),
+    ('''    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+
+    const int64_t n_vocab = vocab.n_tokens();
+    const bool    mtp_embd''', '''#ifdef LLAMA_LAYER_STREAMING
+    if (llama_hybrid_decode_hook != nullptr) {
+        llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+    }
+#endif
+
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+
+    const int64_t n_vocab = vocab.n_tokens();
+    const bool    mtp_embd'''),
+])
+
+patch(HA, [
+    ('''#include <atomic>
+#include <chrono>
+''', '''#include <atomic>
+#include <chrono>
+#include <exception>
+'''),
+    ('''extern void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes);   // llama-kv-cache.cpp
+#endif''', '''extern void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes);   // llama-kv-cache.cpp
+extern void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens);          // llama-context.cpp
+#endif'''),
+    ('''static std::thread       g_watch;''', '''// ---- G31o: the prefill window (see g31o_prefill_window_apply.py.txt)
+struct hybrid_prefill_state {
+    bool     on          = false;
+    bool     active      = false;   // the big ubatch is in force
+    bool     failed      = false;   // the big reserve failed once: the window is off for the rest of the run
+    uint32_t big         = 0;
+    uint32_t ub_base     = 0;
+    int32_t  min_tokens  = 1024;
+    int32_t  max_slots   = 256;
+    double   mib_per_row = 0.0;     // measured growth of the compute buffers per extra ubatch row
+    int64_t  n_begin     = 0;
+};
+static hybrid_prefill_state g_hp;
+
+static bool hybrid_diag() {
+    static const bool d = getenv("LLAMA_HYBRID_FREE_WATCH_MS") != nullptr;
+    return d;
+}
+
+static int64_t hybrid_free_bytes() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_dev_memory(ggml_backend_dev_get(i), &free_b, &total_b);
+            return (int64_t) free_b;
+        }
+    }
+    return 0;
+}
+
+static void hybrid_prefill_regrow(llama_context * ctx) {
+    int before = 0, after = 0;
+    int64_t free_before = 0;
+    llama_moe_hybrid_auto_resize_impl(g_hybrid_keep_free, g_hybrid_safety + g_hybrid_slack, g_hybrid_min_slots, g_hp.max_slots, &before, &after, &free_before);
+    ctx->drop_graph_reuse();
+    if (hybrid_diag()) {
+        LLAMA_LOG_WARN("hybrid-moe: prefill window: expert cache %d -> %d slots (free %lld MiB before)\\n", before, after, (long long) (free_before/1048576));
+    }
+}
+
+static void hybrid_prefill_begin(llama_context * ctx) {
+    const int64_t t0 = ggml_time_us();
+    g_hp.ub_base = ctx->get_cparams().n_ubatch;
+    if (g_hp.big <= g_hp.ub_base) {
+        g_hp.failed = true;
+        return;
+    }
+    const int64_t rows  = (int64_t) g_hp.big - (int64_t) g_hp.ub_base;
+    const double  per   = g_hp.mib_per_row > 0.0 ? g_hp.mib_per_row*1.08 : 0.80;   // MiB per extra row: measured after the first window, a safe guess before
+    const int64_t need  = (int64_t) (rows*per*1048576.0);
+    const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+    int64_t n_before = 0;
+    int     slots_before = 0;
+    llama_moe_hybrid_cache_info_impl(&n_before, &slots_before);
+    bool shrunk = false;
+    llama_moe_hybrid_make_room_impl(need + margin_b, 0, g_hybrid_min_slots, &shrunk);
+    if (hybrid_free_bytes() < need + margin_b) {
+        // even the smallest cache cannot make room: this prompt runs on the small ubatch
+        LLAMA_LOG_WARN("hybrid-moe: prefill window skipped: %.0f MiB would be needed for -ub %u and the margin does not allow it\\n", (double) need/1048576.0, g_hp.big);
+        if (shrunk) {
+            hybrid_prefill_regrow(ctx);
+        }
+        return;
+    }
+    int64_t freed = 0;
+    try {
+        freed = ctx->reserve_ubatch(g_hp.big);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("hybrid-moe: prefill window: reserving -ub %u failed (%s); the window is off\\n", g_hp.big, e.what());
+        g_hp.failed = true;
+        try {
+            ctx->reserve_ubatch(g_hp.ub_base);
+        } catch (const std::exception & e2) {
+            LLAMA_LOG_ERROR("hybrid-moe: prefill window: re-reserving -ub %u failed (%s)\\n", g_hp.ub_base, e2.what());
+        }
+        hybrid_prefill_regrow(ctx);
+        return;
+    }
+    const int64_t growth = -freed;
+    if (growth > 0) {
+        g_hp.mib_per_row = (double) growth/1048576.0/(double) rows;
+    }
+    // the estimate may have been short: keep the margin
+    bool shrunk2 = false;
+    llama_moe_hybrid_make_room_impl(margin_b, 0, g_hybrid_min_slots, &shrunk2);
+    ctx->drop_graph_reuse();
+    g_hp.active = true;
+    g_hp.n_begin++;
+    if (hybrid_diag()) {
+        int64_t n_after = 0;
+        int     slots_after = 0;
+        llama_moe_hybrid_cache_info_impl(&n_after, &slots_after);
+        LLAMA_LOG_WARN("hybrid-moe: prefill window #%lld begin: -ub %u -> %u, compute buffers %+.1f MiB (%.3f MiB per row), expert cache %d -> %d slots, free %lld MiB, %.1f ms\\n",
+                       (long long) g_hp.n_begin, g_hp.ub_base, g_hp.big, (double) growth/1048576.0, g_hp.mib_per_row, slots_before, slots_after, (long long) (hybrid_free_bytes()/1048576), (ggml_time_us() - t0)/1000.0);
+    }
+}
+
+static void hybrid_prefill_end(llama_context * ctx) {
+    const int64_t t0 = ggml_time_us();
+    g_hp.active = false;
+    try {
+        ctx->reserve_ubatch(g_hp.ub_base);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("hybrid-moe: prefill window: re-reserving -ub %u failed (%s)\\n", g_hp.ub_base, e.what());
+        g_hp.failed = true;
+    }
+    hybrid_prefill_regrow(ctx);
+    if (hybrid_diag()) {
+        LLAMA_LOG_WARN("hybrid-moe: prefill window end: -ub %u, %.1f ms\\n", g_hp.ub_base, (ggml_time_us() - t0)/1000.0);
+    }
+}
+
+static void hybrid_decode_hook(llama_context * ctx, int32_t n_tokens) {
+    if (!g_hp.on || g_hp.failed || ctx != g_hybrid_ctx) {
+        return;
+    }
+    if (!g_hp.active && n_tokens >= g_hp.min_tokens) {
+        hybrid_prefill_begin(ctx);
+    } else if (g_hp.active && n_tokens < g_hp.min_tokens) {
+        hybrid_prefill_end(ctx);
+    }
+}
+
+static std::thread       g_watch;'''),
+    ('''void llama_hybrid_shutdown(void) {
+#ifdef LLAMA_LAYER_STREAMING''', '''void llama_hybrid_set_prefill(struct llama_context * ctx, int32_t ubatch_big, int32_t min_tokens, int32_t max_slots) {
+#ifdef LLAMA_LAYER_STREAMING
+    g_hp = hybrid_prefill_state();
+    if (ubatch_big <= 0 || ctx == nullptr || ctx != g_hybrid_ctx) {
+        return;
+    }
+    g_hp.on         = true;
+    g_hp.big        = (uint32_t) ubatch_big;
+    g_hp.min_tokens = min_tokens > 0 ? min_tokens : 1024;
+    g_hp.max_slots  = max_slots > 0 ? max_slots : 256;
+    llama_hybrid_decode_hook = hybrid_decode_hook;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(ubatch_big); GGML_UNUSED(min_tokens); GGML_UNUSED(max_slots);
+#endif
+}
+
+void llama_hybrid_shutdown(void) {
+#ifdef LLAMA_LAYER_STREAMING
+    llama_hybrid_decode_hook = nullptr;
+    g_hp = hybrid_prefill_state();'''),
+])
+
+patch(HH, [
+    ('''// Stop the helper threads and the callbacks of this API; call before the context is freed.''', '''// The prefill window: while a decode has a batch of >= min_tokens tokens, the physical batch size is ubatch_big (the stock-path prefill copies every expert bank once per ubatch, so a bigger one is much faster) and the
+// expert cache gives the room for its compute buffers back afterwards. Call once, after llama_hybrid_set_margin. ubatch_big <= the context's ubatch: off.
+LLAMA_API void llama_hybrid_set_prefill(struct llama_context * ctx, int32_t ubatch_big, int32_t min_tokens, int32_t max_slots);
+
+// Stop the helper threads and the callbacks of this API; call before the context is freed.'''),
+])
+
+patch(CH, [
+    ('''    int32_t     hybrid_moe_ubatch = 2048; // physical batch size (-ub) used with --hybrid-moe when -ub is not given; 0 = keep the stock default''', '''    int32_t     hybrid_moe_ubatch = 0;    // physical batch size (-ub) used with --hybrid-moe when -ub is not given, for the whole run (0 = keep the stock default; the prefill window below is the better way)
+    int32_t     hybrid_moe_prefill_ubatch = 2048; // physical batch size while a big prompt batch is processed (the expert cache gives the room back afterwards); 0 = off
+    int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window'''),
+])
+
+patch(AC, [
+    ('''        "physical batch size used with --hybrid-moe when -ub is not given (default: 2048; 0 = keep the stock default 512). A bigger ubatch copies each expert bank once per 2048 tokens instead of once per 512",''', '''        "physical batch size used with --hybrid-moe for the whole run when -ub is not given (default: 0 = keep the stock default 512; the prefill window of --hybrid-moe-prefill-ubatch is the better way: it does not cost expert-cache slots while decoding)",'''),
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--hybrid-moe-prefill-ubatch"}, "N",
+        "physical batch size while a big prompt batch is processed with --hybrid-moe (default: 2048; 0 = off). The stock-path prefill copies each expert bank once per ubatch, so 2048 is ~3x faster than 512; the expert cache shrinks for the duration and grows back afterwards",
+        [](common_params & params, int value) {
+            params.hybrid_moe_prefill_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_PREFILL_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-prefill-min"}, "N",
+        "smallest batch, in tokens, that opens the --hybrid-moe prefill window (default: 1024)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_prefill_min = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(SV, [
+    ('''        llama_hybrid_set_margin(ctx_tgt, keep_free_mib, safety_mib, slack_mib, min_slots);''', '''        llama_hybrid_set_margin(ctx_tgt, keep_free_mib, safety_mib, slack_mib, min_slots);
+        {
+            // the prefill window needs a cache that can shrink and grow: not with a fixed --hybrid-moe-slots
+            const int32_t big = std::min<int32_t>(params_base.hybrid_moe_prefill_ubatch, llama_n_batch(ctx_tgt));
+            if (params_base.hybrid_moe_slots <= 0 && big > (int32_t) llama_n_ubatch(ctx_tgt)) {
+                llama_hybrid_set_prefill(ctx_tgt, big, params_base.hybrid_moe_prefill_min, max_slots);
+                SRV_INF("hybrid-moe: prefill window: -ub %d from batches of %d tokens, -ub %d otherwise\\n", big, params_base.hybrid_moe_prefill_min, (int) llama_n_ubatch(ctx_tgt));
+            }
+        }'''),
+])

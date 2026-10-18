@@ -1,0 +1,294 @@
+"""G31s: seed the expert cache's popularity from the routing of the PROMPT's last tokens (the cold-start penalty).
+Measured: the first 128 tokens after a fresh prefill decode 10-15% slower than a repeat of the same prompt (g336/g337: 24,000 tokens cold 87-89 t/s, warm 96-98 t/s = 2.86-2.92x against 3.0x warm), because the cache holds the
+experts of the PREVIOUS conversation and the promotion budget (16 per step) needs ~100 tokens to adapt. The prompt tells which experts the next tokens will want: when a decode of 17 .. min_tokens-1 tokens runs (the 516-token
+checkpoint chunk the server cuts before the end of a prompt), an evaluation callback reads the router's top-k of its last K tokens (the nodes `ffn_moe_topk-<layer>`, a few hundred KB per layer, one sync per layer) and at the
+next decode of <= 16 tokens (before the window closes and the cache is refilled, and before the first generated token) the engine folds them into its EMA exactly as K decoded tokens would have:
+ema = lambda^K * ema + sum_r (1-lambda) lambda^(K-1-r) [selected in row r]. Server only (registered by llama_hybrid_set_seed), K = --hybrid-moe-seed (default 32, 0 = off).
+Also: the start slack of the server's cache sizing defaults to 128 MiB instead of 512 (the slack above the margin that a window or a KV commit does not need: measured g360 +4.5% TG at 24k cold, watcher minimum unchanged)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CXH = NEST + r"\src\llama-context.h"
+LS = NEST + r"\src\llama-layer-streaming.cpp"
+MH = NEST + r"\src\llama-moe-hybrid.cpp"
+MHH = NEST + r"\src\llama-moe-hybrid.h"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+HH = NEST + r"\include\llama-hybrid.h"
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(CXH, [
+    ('''    void drop_graph_reuse();''', '''    void drop_graph_reuse();
+
+    // G31s: install (or, with nullptr, remove) an evaluation callback for the next decodes; the scheduler's current one is replaced at once
+    void set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data);'''),
+])
+
+patch(LS, [
+    ('''void llama_context::drop_graph_reuse() {''', '''void llama_context::set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data) {
+    cparams.cb_eval           = cb;
+    cparams.cb_eval_user_data = user_data;
+    if (sched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb, user_data);
+    }
+}
+
+void llama_context::drop_graph_reuse() {'''),
+])
+
+patch(MH, [
+    ('''void moe_hybrid_engine::join_scan() {''', '''// G31s: fold the routing of K prompt tokens into the EMA as K decoded tokens would (ids: [K][n_layer][n_used], -1 = no entry)
+void moe_hybrid_engine::seed(const int32_t * ids, int K) {
+    if (K <= 0) {
+        return;
+    }
+    join_scan();   // the helper's scan of the previous token reads the EMA
+    const double decay = 1.0 - lambda;
+    double scale = 1.0;
+    for (int r = 0; r < K; ++r) {
+        scale *= lambda;
+    }
+    for (double & v : ema) {
+        v *= scale;
+    }
+    if (recency) {
+        std::fill(last_sel.begin(), last_sel.end(), (uint8_t) 0);
+    }
+    for (int r = 0; r < K; ++r) {
+        double wgt = decay;
+        for (int q = r + 1; q < K; ++q) {
+            wgt *= lambda;
+        }
+        for (int l = 0; l < n_layer; ++l) {
+            for (int k = 0; k < n_used; ++k) {
+                const int e = ids[((size_t) r*n_layer + l)*n_used + k];
+                if (e < 0 || e >= n_expert) {
+                    continue;
+                }
+                const size_t i = (size_t) l*n_expert + e;
+                ema[i] += wgt;
+                if (recency && r == K - 1) {
+                    last_sel[i] = 1;
+                }
+            }
+        }
+    }
+}
+
+void moe_hybrid_engine::join_scan() {'''),
+    ('''    void        join_scan();''', '''    void        join_scan();
+    void        seed(const int32_t * ids, int K);'''),
+    ('''void llama_moe_hybrid_set_keep_stats(bool keep) {''', '''bool llama_moe_hybrid_seed_impl(const int32_t * ids, int K, int * n_layer, int * n_used) {
+    moe_hybrid_engine * eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+        if (g_moe_hybrid_engines.size() != 1) {
+            return false;
+        }
+        eng = g_moe_hybrid_engines.begin()->second.get();
+    }
+    if (ids == nullptr) {
+        // the caller asks for the geometry
+        if (n_layer != nullptr) {
+            *n_layer = eng->n_layer;
+        }
+        if (n_used != nullptr) {
+            *n_used = eng->n_used;
+        }
+        return true;
+    }
+    eng->seed(ids, K);
+    return true;
+}
+
+void llama_moe_hybrid_set_keep_stats(bool keep) {'''),
+])
+
+patch(MHH, [
+    ('''void llama_moe_hybrid_set_keep_stats(bool keep);''', '''void llama_moe_hybrid_set_keep_stats(bool keep);
+
+// G31s: ids == nullptr: report the engine's geometry; otherwise fold the routing of K prompt tokens (ids [K][n_layer][n_used], -1 = none) into the popularity statistics. False when there is no engine.
+bool llama_moe_hybrid_seed_impl(const int32_t * ids, int K, int * n_layer, int * n_used);'''),
+])
+
+patch(HA, [
+    ('''static void hybrid_decode_hook(llama_context * ctx, int32_t n_tokens) {
+    if (!g_hp.on || g_hp.failed || ctx != g_hybrid_ctx) {
+        return;
+    }
+    if (!g_hp.active && n_tokens >= g_hp.min_tokens) {
+        hybrid_prefill_begin(ctx);
+    } else if (g_hp.active && n_tokens <= 16) {
+        // the big ubatch stays for the chunks that follow the big batches (the 516-token checkpoint chunk); a decode step, a speculative step or the 4-token chunk closes the window
+        hybrid_prefill_end(ctx);
+    }
+}''', '''// ---- G31s: the routing of the prompt's last tokens seeds the expert cache's popularity
+struct hybrid_seed_state {
+    bool                  on         = false;
+    int                   K          = 32;
+    int                   n_layer    = 0;
+    int                   n_used     = 0;
+    int                   filled     = 0;      // tokens captured by the last probed decode (<= K)
+    bool                  valid      = false;  // a capture is waiting for the next small decode
+    int                   n_layers_seen = 0;
+    std::vector<int32_t>  ids;                 // [K][n_layer][n_used]
+    std::vector<uint8_t>  tmp;
+    ggml_backend_sched_eval_callback orig_cb = nullptr;
+    void *                orig_ud    = nullptr;
+};
+static hybrid_seed_state g_seed;
+
+static bool hybrid_probe_cb(ggml_tensor * t, bool ask, void * ud) {
+    GGML_UNUSED(ud);
+    if (strncmp(t->name, "ffn_moe_topk-", 13) != 0) {
+        return ask ? false : true;
+    }
+    if (ask) {
+        return true;
+    }
+    const int il = atoi(t->name + 13);
+    if (il < 0 || il >= g_seed.n_layer || t->type != GGML_TYPE_I32 || t->ne[0] != g_seed.n_used || t->ne[1] < 1) {
+        return true;
+    }
+    const int64_t n_tok = t->ne[1];
+    const int     Kc    = (int) std::min<int64_t>(g_seed.K, n_tok);
+    const size_t  bytes = (size_t) ((n_tok - 1)*t->nb[1] + t->ne[0]*t->nb[0]);
+    g_seed.tmp.resize(bytes);
+    ggml_backend_tensor_get(t, g_seed.tmp.data(), 0, bytes);
+    if (il == 0) {
+        std::fill(g_seed.ids.begin(), g_seed.ids.end(), -1);
+        g_seed.filled        = Kc;
+        g_seed.n_layers_seen = 0;
+    }
+    if (Kc != g_seed.filled) {
+        return true;
+    }
+    for (int j = 0; j < Kc; ++j) {
+        const int64_t row = n_tok - Kc + j;
+        for (int k = 0; k < g_seed.n_used; ++k) {
+            g_seed.ids[((size_t) j*g_seed.n_layer + il)*g_seed.n_used + k] = *(const int32_t *) (g_seed.tmp.data() + row*t->nb[1] + k*t->nb[0]);
+        }
+    }
+    if (++g_seed.n_layers_seen >= g_seed.n_layer) {
+        g_seed.valid = true;
+    }
+    return true;
+}
+
+static void hybrid_decode_hook(llama_context * ctx, int32_t n_tokens) {
+    if (ctx != g_hybrid_ctx) {
+        return;
+    }
+    // a capture from the previous (prompt-like) decode folds into the statistics before the window closes and the cache is refilled, and before the first generated token
+    if (g_seed.on && g_seed.valid) {
+        if (n_tokens <= 16 && g_seed.filled > 0) {
+            llama_moe_hybrid_seed_impl(g_seed.ids.data(), g_seed.filled, nullptr, nullptr);
+        }
+        g_seed.valid = false;
+    }
+    if (g_hp.on && !g_hp.failed) {
+        if (!g_hp.active && n_tokens >= g_hp.min_tokens) {
+            hybrid_prefill_begin(ctx);
+        } else if (g_hp.active && n_tokens <= 16) {
+            // the big ubatch stays for the chunks that follow the big batches (the 516-token checkpoint chunk); a decode step, a speculative step or the 4-token chunk closes the window
+            hybrid_prefill_end(ctx);
+        }
+    }
+    if (g_seed.on) {
+        // probe the prompt-like decodes below the window's size (the checkpoint chunk): the callback reads the router's top-k of the last K tokens; re-applied every call because a re-reserve replaces the scheduler
+        const int32_t hi = g_hp.on ? g_hp.min_tokens : 1024;
+        const bool    want = n_tokens >= 17 && n_tokens < hi;
+        ctx->set_eval_cb(want ? hybrid_probe_cb : g_seed.orig_cb, want ? (void *) &g_seed : g_seed.orig_ud);
+    }
+}'''),
+    ('''void llama_hybrid_shutdown(void) {
+#ifdef LLAMA_LAYER_STREAMING
+    llama_hybrid_decode_hook = nullptr;''', '''void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens) {
+#ifdef LLAMA_LAYER_STREAMING
+    g_seed = hybrid_seed_state();
+    if (n_tokens <= 0 || ctx == nullptr || ctx != g_hybrid_ctx) {
+        return;
+    }
+    int n_layer = 0, n_used = 0;
+    if (!llama_moe_hybrid_seed_impl(nullptr, 0, &n_layer, &n_used)) {
+        return;
+    }
+    g_seed.on      = true;
+    g_seed.K       = n_tokens;
+    g_seed.n_layer = n_layer;
+    g_seed.n_used  = n_used;
+    g_seed.ids.assign((size_t) n_tokens*n_layer*n_used, -1);
+    g_seed.orig_cb = ctx->get_cparams().cb_eval;
+    g_seed.orig_ud = ctx->get_cparams().cb_eval_user_data;
+    llama_hybrid_decode_hook = hybrid_decode_hook;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(n_tokens);
+#endif
+}
+
+void llama_hybrid_shutdown(void) {
+#ifdef LLAMA_LAYER_STREAMING
+    llama_hybrid_decode_hook = nullptr;
+    g_seed = hybrid_seed_state();'''),
+    ('''    g_hp.on         = true;
+    g_hp.big        = (uint32_t) ubatch_big;
+    g_hp.min_tokens = min_tokens > 0 ? min_tokens : 1024;
+    g_hp.max_slots  = max_slots > 0 ? max_slots : 256;
+    llama_hybrid_decode_hook = hybrid_decode_hook;''', '''    g_hp.on         = true;
+    g_hp.big        = (uint32_t) ubatch_big;
+    g_hp.min_tokens = min_tokens > 0 ? min_tokens : 1024;
+    g_hp.max_slots  = max_slots > 0 ? max_slots : 256;
+    llama_hybrid_decode_hook = hybrid_decode_hook;'''),
+    ('''#include <exception>
+#include <cstdio>
+#include <cstdlib>''', '''#include <exception>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>'''),
+])
+
+patch(HH, [
+    ('''// Stop the helper threads and the callbacks of this API; call before the context is freed.''', '''// Seed the expert cache's popularity statistics from the routing of the last n_tokens tokens of a prompt (read from the 17 .. min_tokens-1 token decodes the server cuts before the end of a prompt), so that
+// the first generated tokens already find the experts of the new prompt. n_tokens <= 0: off. Call once, after llama_hybrid_set_margin.
+LLAMA_API void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens);
+
+// Stop the helper threads and the callbacks of this API; call before the context is freed.'''),
+])
+
+patch(CH, [
+    ('''    int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window''', '''    int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window
+    int32_t     hybrid_moe_seed           = 32;   // tokens of the prompt's tail whose routing seeds the expert cache's popularity (0 = off)'''),
+])
+
+patch(AC, [
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--hybrid-moe-seed"}, "N",
+        "with --hybrid-moe: the routing of the last N tokens of a prompt seeds the expert cache's popularity statistics before the first token is generated (default: 32; 0 = off)",
+        [](common_params & params, int value) {
+            params.hybrid_moe_seed = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_SEED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(SV, [
+    ('''        {
+            // the prefill window needs a cache that can shrink and grow: not with a fixed --hybrid-moe-slots''', '''        if (params_base.hybrid_moe_seed > 0) {
+            llama_hybrid_set_seed(ctx_tgt, params_base.hybrid_moe_seed);
+        }
+        {
+            // the prefill window needs a cache that can shrink and grow: not with a fixed --hybrid-moe-slots'''),
+    ('''        const char *  slack_env = getenv("LLAMA_HYBRID_SLACK_MIB");   // test knob: 0 forces frequent shrinks
+        const int32_t slack_mib = slack_env != nullptr ? std::max(0, atoi(slack_env)) : 512;''', '''        const char *  slack_env = getenv("LLAMA_HYBRID_SLACK_MIB");   // test knob: 0 forces frequent shrinks
+        const int32_t slack_mib = slack_env != nullptr ? std::max(0, atoi(slack_env)) : 128;'''),
+])

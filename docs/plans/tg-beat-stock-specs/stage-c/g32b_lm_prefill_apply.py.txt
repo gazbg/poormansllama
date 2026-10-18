@@ -1,0 +1,345 @@
+"""G32b: the layer-major prefill of the server (llama-lm-prefill.cpp): context plumbing, the KV-layout check, the slot window that exists only while a pass runs, the hybrid cache's room hook, the C API.
+The new files (llama-lm-prefill.cpp / .h) are copied from this directory; the edits keep every default path unchanged (lm_state is null unless the frontend enables the feature)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HERE = WT + r"\docs\plans\tg-beat-stock-specs\stage-c"
+
+HH  = NEST + r"\include\llama-hybrid.h"
+CM  = NEST + r"\src\CMakeLists.txt"
+CXH = NEST + r"\src\llama-context.h"
+CXC = NEST + r"\src\llama-context.cpp"
+KVH = NEST + r"\src\llama-kv-cache.h"
+KVC = NEST + r"\src\llama-kv-cache.cpp"
+LSH = NEST + r"\src\llama-layer-streaming.h"
+LSC = NEST + r"\src\llama-layer-streaming.cpp"
+HAC = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(HH, [
+    ('''LLAMA_API void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens);
+''', '''LLAMA_API void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens);
+
+// G32: layer-major prefill. A decode whose batch is >= min_tokens prompt tokens of one sequence runs layer by layer (every routed-expert bank is copied from the host ONCE into a VRAM slot window while all
+// chunks of the batch go through that layer) instead of ubatch by ubatch (every ubatch copies all banks). The slot window, the activation slab and the pass's compute buffer exist only while a pass runs.
+// Works with or without the hybrid engine (the decode after the prefill is whatever the context does: stock placement, or the hybrid expert cache). Batches it cannot take run the ordinary path.
+struct llama_lm_prefill_params {
+    int32_t n_slots;      // layer slots in the VRAM window; 2 overlaps the next bank's copy with the compute of this one
+    int32_t ubatch;       // tokens per chunk (2048)
+    int32_t segment;      // tokens per activation-slab segment, a multiple of ubatch (16384): bounds the slab, the layer sweep repeats per segment
+    int32_t min_tokens;   // smallest batch that is taken (2048)
+    int32_t act_bf16;     // 1: bf16 activation slab (half the memory), 0: f32
+    int32_t device;       // CUDA device index (0)
+};
+LLAMA_API struct llama_lm_prefill_params llama_lm_prefill_default_params(void);
+
+// Qwen3.5/3.6 MoE contexts only (flash attention on). Layers whose routed experts are on the device already (for example -ncmoe N) are computed in place. Call after the context exists and, with the hybrid
+// engine, after llama_hybrid_set_margin. false + err: not enabled.
+LLAMA_API bool llama_lm_prefill_enable(struct llama_context * ctx, const struct llama_lm_prefill_params * p, char * err, size_t err_len);
+LLAMA_API void llama_lm_prefill_disable(struct llama_context * ctx);
+LLAMA_API bool llama_lm_prefill_active(const struct llama_context * ctx);
+'''),
+])
+
+patch(CM, [
+    ('''target_sources(llama PRIVATE llama-hybrid-api.cpp)
+''', '''target_sources(llama PRIVATE llama-hybrid-api.cpp)
+# G32: the layer-major prefill of the server (stubs when LLAMA_LAYER_STREAMING is off)
+target_sources(llama PRIVATE llama-lm-prefill.cpp)
+'''),
+])
+
+patch(CXH, [
+    ('''#ifdef LLAMA_LAYER_STREAMING
+struct llama_layer_streaming;
+#endif
+''', '''#ifdef LLAMA_LAYER_STREAMING
+struct llama_layer_streaming;
+
+// G32: the server's layer-major prefill (llama-lm-prefill.cpp)
+struct llama_lm_prefill_params;
+struct llama_lm_state;
+struct llama_lm_state_deleter { void operator()(llama_lm_state * s) const; };
+
+// what decode() decided about a batch: taken by the layer-major pass or not
+struct llama_lm_plan {
+    bool                 ok          = false;
+    llama_seq_id         seq         = 0;
+    llama_pos            p0          = 0;     // position of the batch's first token
+    int32_t              n           = 0;
+    bool                 want_logits = false; // the last token's logits are wanted
+    std::vector<int32_t> widths;              // chunk widths, in order
+};
+#endif
+'''),
+    ('''    // G31s: install (or, with nullptr, remove) an evaluation callback for the next decodes; the scheduler's current one is replaced at once
+    void set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data);
+#endif''', '''    // G31s: install (or, with nullptr, remove) an evaluation callback for the next decodes; the scheduler's current one is replaced at once
+    void set_eval_cb(ggml_backend_sched_eval_callback cb, void * user_data);
+
+    // G32: layer-major prefill of one sequence's batch (llama-lm-prefill.cpp)
+    bool lm_prefill_enable(const llama_lm_prefill_params & p, std::string & err);
+    void lm_prefill_disable();
+    bool lm_prefill_is_enabled() const { return lm_state != nullptr; }
+    llama_lm_plan lm_make_plan(const llama_batch & b) const;
+    bool lm_acquire(const llama_lm_plan & pl);   // false: nothing is held, the batch takes the ordinary path
+    void lm_release();
+    int  lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all);   // 0 done, 1 nothing changed (ordinary path), < 0 failed
+#endif'''),
+    ('''    // experimental layer-streaming module (owned by the caller)
+    llama_layer_streaming * layer_streaming = nullptr;
+#endif''', '''    // experimental layer-streaming module (owned by the caller)
+    llama_layer_streaming * layer_streaming = nullptr;
+
+    // G32: the server's layer-major prefill; declared last so it is destroyed before the backends and the memory it works on
+    std::unique_ptr<llama_lm_state, llama_lm_state_deleter> lm_state;
+#endif'''),
+])
+
+patch(CXC, [
+    ('''void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
+#endif
+''', '''void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
+extern bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
+#endif
+'''),
+    ('''#ifdef LLAMA_LAYER_STREAMING
+    if (llama_hybrid_decode_hook != nullptr) {
+        llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+    }
+#endif
+''', '''#ifdef LLAMA_LAYER_STREAMING
+    // G32: a batch that the layer-major prefill takes gets its resources first (so the hybrid prefill window does not open for it, and a refusal falls back to the window); they go back when decode() returns
+    llama_lm_plan lm_plan;
+    struct lm_scope_t {
+        llama_context * c;
+        bool            on;
+        explicit lm_scope_t(llama_context * c_) : c(c_), on(false) {}
+        ~lm_scope_t() { if (on) { c->lm_release(); } }
+    } lm_scope(this);
+    if (lm_state != nullptr) {
+        lm_plan = lm_make_plan(batch_inp);
+        if (lm_plan.ok) {
+            lm_scope.on = lm_acquire(lm_plan);
+            lm_plan.ok  = lm_scope.on;
+        }
+    }
+    llama_lm_prefill_pending = lm_plan.ok;
+    if (llama_hybrid_decode_hook != nullptr) {
+        llama_hybrid_decode_hook(this, batch_inp.n_tokens);
+    }
+    llama_lm_prefill_pending = false;
+#endif
+'''),
+    ('''    memory_update(false);
+    tp2 = ggml_time_us();
+
+    llama_memory_context_ptr mctx;
+''', '''    memory_update(false);
+    tp2 = ggml_time_us();
+
+#ifdef LLAMA_LAYER_STREAMING
+    if (lm_plan.ok) {
+        const int lm_ret = lm_run(lm_plan, n_outputs_all);
+        if (lm_ret != 1) {
+            return lm_ret;   // 0: the batch is done (the pass's resources go back with lm_scope); < 0: failed
+        }
+        // nothing was changed: give the pass's resources back and take the ordinary path
+        lm_release();
+        lm_scope.on = false;
+    }
+#endif
+
+    llama_memory_context_ptr mctx;
+'''),
+])
+
+patch(KVH, [
+    ('''    bool lazy_commit_rows(uint32_t rows, llama_context * lctx);
+    bool is_lazy() const { return lazy_kv; }
+#endif''', '''    bool lazy_commit_rows(uint32_t rows, llama_context * lctx);
+    bool is_lazy() const { return lazy_kv; }
+
+    // G32: can the layer-major prefill take n_new tokens at position p0 of seq_id? It needs the cache laid out cell == position for the sequence (the implicit causal mask of the flash attention kernel
+    // addresses keys by cell), nothing else in the cache, and find_slot to continue that layout; w0 is the width of the first chunk.
+    bool lm_identity_ok(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, uint32_t w0) const;
+#endif'''),
+])
+
+patch(KVC, [
+    ('''bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {''', '''bool llama_kv_cache::lm_identity_ok(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, uint32_t w0) const {
+    if (other || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0) {
+        return false;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t n_old = (uint32_t) p0;
+    if ((uint64_t) n_old + n_new > cells.size() || cells.get_used() != n_old) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_old; ++i) {
+        if (cells.is_empty(i) || cells.seq_count(i) != 1 || cells.seq_get(i) != seq_id || cells.pos_get(i) != (llama_pos) i) {
+            return false;
+        }
+    }
+    // find_slot starts at the head, or at the first cell when the head is far ahead of the used cells; both must reach cell n_old first
+    uint32_t h = v_heads[seq_to_stream[seq_id]];
+    if (h > cells.get_used() + 2*w0) {
+        h = 0;
+    }
+    return h <= n_old;
+}
+
+bool llama_kv_cache::lazy_ensure(const slot_info & sinfo, llama_context * lctx) {'''),
+])
+
+patch(LSH, [
+    ('''    // frees the PP slot window and activation slabs, then routes decode through the stock graph path; call once after PP
+    bool begin_tg_stock();''', '''    // frees the PP slot window and activation slabs, then routes decode through the stock graph path; call once after PP
+    bool begin_tg_stock();
+    // G32 (the server's layer-major prefill): the slot window exists only while a pass runs. lm_release_slots waits for the feed and the copy stream and frees the device buffers (the tensor objects of
+    // the bundles stay); lm_alloc_slots allocates them again and binds every bundle tensor.
+    bool lm_alloc_slots();
+    void lm_release_slots();'''),
+])
+
+patch(LSC, [
+    ('''bool llama_layer_streaming::begin_handoff_partial(int partial_from_) {''', '''bool llama_layer_streaming::lm_alloc_slots() {
+    ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
+    for (int s = 0; s < n_slots; ++s) {
+        auto & slot = slots[s];
+        if (slot.buf) {
+            continue;
+        }
+        size_t slot_bytes_max = 0;
+        for (const auto & kv : slot.layer_bytes) {
+            if (!is_cpu_leg(kv.first)) {
+                slot_bytes_max = std::max(slot_bytes_max, kv.second);
+            }
+        }
+        if (slot_bytes_max == 0) {
+            continue;   // every layer of this slot has its experts on the device: nothing to hold
+        }
+        slot.buf.reset(ggml_backend_buft_alloc_buffer(buft_cuda, slot_bytes_max + 4096));
+        if (!slot.buf) {
+            error_msg = "lm_alloc_slots: failed to allocate slot buffer " + std::to_string(s) + " (" + std::to_string(slot_bytes_max + 4096) + " bytes)";
+            return false;
+        }
+        char * buf_base = (char *) ggml_backend_buffer_get_base(slot.buf.get());
+        for (auto & kv : slot.layers) {
+            const int il = kv.first;
+            if (is_cpu_leg(il)) {
+                continue;
+            }
+            std::vector<ggml_tensor *> tensors;
+            for (const auto & m : pkg_cache.at(il).members) {
+                ggml_tensor * t = ls_dst(kv.second, m);
+                if (t != nullptr) {
+                    tensors.push_back(t);
+                }
+            }
+            size_t off = 0;
+            if (!alloc_tensors(slot.buf.get(), buft_cuda, tensors, off)) {
+                error_msg = "lm_alloc_slots: failed to bind the tensors of layer " + std::to_string(il);
+                return false;
+            }
+            auto sp = slot.bank_span.find(il);
+            if (sp != slot.bank_span.end() && sp->second != nullptr) {
+                ggml_backend_tensor_alloc(slot.buf.get(), sp->second, buf_base);
+            }
+        }
+    }
+    return true;
+}
+
+void llama_layer_streaming::lm_release_slots() {
+    af_wait_idle();
+    ls_stage_drain();
+    for (auto & slot : slots) {
+        slot.buf.reset();
+        slot.buf_staging.reset();
+        ls_unregister_slot_source(slot);
+        if (slot.ctx_meta != nullptr) {
+            for (ggml_tensor * t = ggml_get_first_tensor(slot.ctx_meta); t != nullptr; t = ggml_get_next_tensor(slot.ctx_meta, t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+        }
+        slot.logical_layer          = -1;
+        slot.consumer_pending       = false;
+        slot.t_copy_submit_us       = 0;
+        slot.t_copy_enqueue_done_us = 0;
+        slot.af_submitted           = false;
+        slot.stage_il               = -1;
+    }
+    if (af) {
+        std::lock_guard<std::mutex> lk(af->mtx);
+        std::fill(af->free_slot.begin(), af->free_slot.end(), (uint8_t) 1);
+        af->queue.clear();
+    }
+}
+
+bool llama_layer_streaming::begin_handoff_partial(int partial_from_) {'''),
+])
+
+patch(HAC, [
+    ('''extern void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens);          // llama-context.cpp
+#endif''', '''extern void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens);          // llama-context.cpp
+extern bool (*llama_lm_vram_hook)(llama_context * ctx, int64_t need_bytes, int begin);   // llama-lm-prefill.cpp
+extern bool llama_lm_prefill_pending;                                                    // llama-lm-prefill.cpp
+#endif'''),
+    ('''        if (!g_hp.active && n_tokens >= g_hp.min_tokens) {
+            hybrid_prefill_begin(ctx);''', '''        if (!g_hp.active && n_tokens >= g_hp.min_tokens && !llama_lm_prefill_pending) {
+            hybrid_prefill_begin(ctx);'''),
+    ('''static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {''', '''// G32: the layer-major prefill needs the slot window, the slab and the pass's compute buffer: the expert cache gives the room (begin) and takes it back (end)
+static bool hybrid_lm_vram(llama_context * ctx, int64_t need_bytes, int begin) {
+    if (ctx != g_hybrid_ctx) {
+        return true;
+    }
+    if (begin) {
+        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        llama_moe_hybrid_make_room_impl(need_bytes + margin_b, 0, g_hybrid_min_slots, &shrunk);
+        if (shrunk) {
+            ctx->drop_graph_reuse();
+        }
+        if (hybrid_free_bytes() < need_bytes + margin_b) {
+            if (shrunk) {
+                hybrid_prefill_regrow(ctx);
+            }
+            return false;
+        }
+        if (hybrid_diag()) {
+            LLAMA_LOG_WARN("hybrid-moe: lm-prefill: room for %.0f MiB made (%s), free %lld MiB\\n", (double) need_bytes/1048576.0, shrunk ? "the expert cache shrank" : "no shrink needed", (long long) (hybrid_free_bytes()/1048576));
+        }
+        return true;
+    }
+    hybrid_prefill_regrow(ctx);
+    return true;
+}
+
+static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {'''),
+    ('''    llama_moe_hybrid_set_keep_stats(true);
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;''', '''    llama_moe_hybrid_set_keep_stats(true);
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;
+    llama_lm_vram_hook        = hybrid_lm_vram;'''),
+    ('''    llama_kv_lazy_pressure_cb = nullptr;
+    g_hybrid_ctx = nullptr;''', '''    llama_kv_lazy_pressure_cb = nullptr;
+    llama_lm_vram_hook = nullptr;
+    g_hybrid_ctx = nullptr;'''),
+])
+
+# the new files
+for name in ("llama-lm-prefill.cpp", "llama-lm-prefill.h"):
+    src = HERE + "\\" + name + ".txt"
+    dst = NEST + "\\src\\" + name
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK new file %s <- %s (%d bytes)" % (dst, src, os.path.getsize(src)))
+    else:
+        shutil.copyfile(src, dst)
+        print("wrote %s" % dst)

@@ -1,0 +1,48 @@
+"""G30 / M2o: the early scheduler release of the late bring-up is not graph construction in the timed region. Contract: the plan's "G30 CONTRACT".
+
+Measured (g109-qa24000, g109-qa50000, build g56; reproduced on the recorded trace of g107-lc24k and on a 4k smoke with a build-counter print): the answer-stability runs of the late recipe were rejected by the
+runner's own telemetry check -- "phase_summary.graph_builds != 0 (graph construction in timed region)" on the PP and the TG summary -- and the QA grading was skipped (arm failed, rc 1). The counter is
+`ls.build_generation`; the one step of the bring-up that raises it is `llama_layer_streaming_reserve_decode(ctx)` (5 -> 8: the scheduler re-reserve re-derives the persistent graph sets), which the late bring-up
+runs while the layer-major phase is still 0, i.e. BEFORE the PP summary. B0 and the early recipe run the very same call later, in tg_transition(), after `begin_tg_stock()` switched the executor to the stock
+graph path, where it builds nothing. Its time is already excluded from the PP wall (g30h). This excludes its builds from the PP and TG summaries the same way (the baseline moves by exactly the builds the early
+release made); the check is not relaxed, any other build in the timed region is still a violation.
+Apply after g30k. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    # state
+    (r'''    int64_t             mtp_pp_excl_us       = 0;         // time of that release: it is transition work B0 also does outside its PP wall
+''', r'''    int64_t             mtp_pp_excl_us       = 0;         // time of that release: it is transition work B0 also does outside its PP wall
+    uint64_t            mtp_builds_excl      = 0;         // persistent-graph builds that release made (B0 runs it after begin_tg_stock(), where it builds nothing): not graph construction in the timed region
+'''),
+    # count them around the early release
+    (r'''            const int64_t t_rc0 = ggml_time_us();
+            const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
+            if (freed < 0) {
+                fprintf(stderr, "error: --mtp-draft-late: the scheduler re-reserve failed\n");
+                ls.failed = true;
+                return false;
+            }
+            mtp_compute_released = true;''', r'''            const int64_t t_rc0 = ggml_time_us();
+            const uint64_t gen_rc0 = ls.build_generation;
+            const int64_t freed = llama_layer_streaming_reserve_decode(ctx);
+            if (freed < 0) {
+                fprintf(stderr, "error: --mtp-draft-late: the scheduler re-reserve failed\n");
+                ls.failed = true;
+                return false;
+            }
+            mtp_builds_excl += ls.build_generation - gen_rc0;
+            mtp_compute_released = true;'''),
+    # the two summaries
+    (r'''                ls.tel_phase_summary("pp", pp_tokens, t1 - t0, builds0, graph_prep_us);''', r'''                ls.tel_phase_summary("pp", pp_tokens, t1 - t0, builds0 + mtp_builds_excl, graph_prep_us);'''),
+    (r'''            ls.tel_phase_summary("tg", tg_tokens, t1 - t0, builds0, graph_prep_us);''', r'''            ls.tel_phase_summary("tg", tg_tokens, t1 - t0, builds0 + mtp_builds_excl, graph_prep_us);'''),
+])

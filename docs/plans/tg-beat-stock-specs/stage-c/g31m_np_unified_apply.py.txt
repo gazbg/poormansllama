@@ -1,0 +1,39 @@
+"""G31m: --hybrid-moe with -np > 1 uses the unified KV cache unless -kvu / -no-kvu was given. Measured (g274, smoke, 4,093-token prompt): -np 2 without -kvu allocates the KV of both slots up front (lazy commit needs
+ONE stream), the expert cache is sized to the floor (14 -> 8 slots per layer, free VRAM 16,023 MiB) and TG is 75-78 t/s; with -kvu the lazy KV works (35 slots, free 18,149 MiB) and TG is 91-104 t/s."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(CH, [
+    ('''    bool kv_unified        = false; // enable unified KV cache''', '''    bool kv_unified        = false; // enable unified KV cache
+    bool kv_unified_set    = false; // -kvu / -no-kvu was given (--hybrid-moe turns the unified KV on for -np > 1 unless it was)'''),
+])
+
+patch(AC, [
+    ('''        [](common_params & params, bool value) {
+            params.kv_unified = value;
+        }''', '''        [](common_params & params, bool value) {
+            params.kv_unified     = value;
+            params.kv_unified_set = true;
+        }'''),
+    ('''"hybrid MoE decode (private fork, CUDA): the expert banks stay on the host and a VRAM expert cache, sized so that the --fit-target margin stays free, serves most experts; "
+        "also sets the engine environment variables you did not set and turns --fit off",''', '''"hybrid MoE decode (private fork, CUDA): the expert banks stay on the host and a VRAM expert cache, sized so that the --fit-target margin stays free, serves most experts; "
+        "also sets the engine environment variables you did not set, turns --fit off, takes -ub 2048 unless -ub is given and, for -np > 1, the unified KV cache unless -kvu/-no-kvu is given",'''),
+])
+
+patch(SV, [
+    ('''            if (!params_base.n_ubatch_set && params_base.hybrid_moe_ubatch > 0) {''', '''            if (params_base.n_parallel > 1 && !params_base.kv_unified && !params_base.kv_unified_set) {
+                params_base.kv_unified = true;   // the lazily committed KV cache needs a single stream
+                SRV_INF("hybrid-moe: unified KV cache for -np %d (use -no-kvu to keep one KV stream per slot)\\n", params_base.n_parallel);
+            }
+            if (!params_base.n_ubatch_set && params_base.hybrid_moe_ubatch > 0) {'''),
+])

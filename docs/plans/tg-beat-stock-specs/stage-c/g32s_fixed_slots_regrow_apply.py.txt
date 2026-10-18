@@ -1,0 +1,28 @@
+"""G32s (found by the equal-shape equivalence runs k1115/k1116, 2026-10-15): a fixed --hybrid-moe-slots N is also the ceiling of the expert cache's regrow after a layer-major pass.
+
+The regrow that follows a pass (hybrid_prefill_regrow) calls llama_moe_hybrid_auto_resize_impl with g_hp.max_slots, which only llama_hybrid_set_prefill sets and which defaults to 256; the server calls set_prefill only for the prefill window (never with a fixed
+--hybrid-moe-slots). So with `--hybrid-moe --lm-prefill --hybrid-moe-slots 16` the first decode after a pass grew the cache to 52 slots per layer (k1116 log: "expert cache 52 -> 33 slots per layer"), while the window path stayed at 16: the two arms of every
+"frozen cache" comparison decoded with a different cache size, i.e. with a different split between device and host numerics, and their 64-token continuations differed for a reason that has nothing to do with the prefill. llama_hybrid_auto_size (which the
+server calls at start-up with max_slots = N, or 256 when auto) now records its max_slots as the regrow ceiling. Auto sizing is unchanged (256 both ways). Edits: src/llama-hybrid-api.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-hybrid-api.cpp", [
+    ('''    if (!llama_moe_hybrid_auto_resize_impl((int64_t) keep_free_mib*MiB, (int64_t) safety_mib*MiB, (int) min_slots, (int) max_slots, &before, &after, &free_before)) {
+        return false;
+    }
+''', '''    if (!llama_moe_hybrid_auto_resize_impl((int64_t) keep_free_mib*MiB, (int64_t) safety_mib*MiB, (int) min_slots, (int) max_slots, &before, &after, &free_before)) {
+        return false;
+    }
+    // G32s: the count the cache was sized with is also the ceiling of every later regrow (after a layer-major pass, after a prefill window); a fixed --hybrid-moe-slots N must stay N
+    g_hp.max_slots = max_slots > 0 ? max_slots : 256;
+'''),
+])
+print("g32s edits matched")

@@ -1,0 +1,90 @@
+"""G43b (fix of g43, found by the first build): llama-context.cpp does not include llama-lm-prefill.h, so it cannot touch llama_lm_state members (C2027). The decode-time logic moves into
+llama_context::lm_decode_begin and the destructor's release into lm_release_if_live, both defined in llama-lm-prefill.cpp.
+Edits: src/llama-context.h, src/llama-context.cpp, src/llama-lm-prefill.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-context.h", [
+    (r'''    bool lm_stage_first();                                           // G42: copy the banks of the first streamed layers into the slot window
+''', r'''    bool lm_stage_first();                                           // G42: copy the banks of the first streamed layers into the slot window
+    bool lm_decode_begin(const llama_batch & b, llama_lm_plan & plan);   // G42: what decode() does about the pass: plan, acquire (true: the resources are held for this decode), or give an armed pass back
+    void lm_release_if_live();                                       // G42: the destructor's release of an armed pass
+'''),
+])
+
+patch(NEST + r"\src\llama-context.cpp", [
+    (r'''    if (lm_state != nullptr) {
+        lm_state->snaps.clear();                       // G42: the snapshots of an earlier decode go
+        lm_plan = lm_make_plan(batch_inp);
+        lm_state->snap_req.clear();                    // G42: a request holds for one decode
+        lm_note(batch_inp, lm_plan);
+        if (lm_plan.ok) {
+            lm_scope.on = lm_acquire(lm_plan);
+            lm_plan.ok  = lm_scope.on;
+        } else if (lm_state->armed && (batch_inp.n_tokens <= 16 || batch_inp.n_tokens >= lm_state->p.min_tokens)) {
+            // G42: a decode step (the cache must be whole again) or a big batch the pass cannot take (the prefill window may open): the prepared resources go back
+            lm_disarm();
+        }
+    }
+''', r'''    if (lm_state != nullptr) {
+        lm_scope.on = lm_decode_begin(batch_inp, lm_plan);
+    }
+'''),
+    (r'''    if (lm_state != nullptr && lm_state->live) {
+        lm_release();
+    }
+''', r'''    lm_release_if_live();
+'''),
+])
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    (r'''void llama_context::lm_snap_request(const int32_t * cuts, int32_t n_cuts) {''', r'''bool llama_context::lm_decode_begin(const llama_batch & b, llama_lm_plan & plan) {
+    auto & S = *lm_state;
+    S.snaps.clear();                       // the snapshots of an earlier decode go
+    plan = lm_make_plan(b);
+    S.snap_req.clear();                    // a request holds for one decode
+    lm_note(b, plan);
+    if (plan.ok) {
+        const bool on = lm_acquire(plan);
+        plan.ok = on;
+        return on;
+    }
+    if (S.armed && (b.n_tokens <= 16 || b.n_tokens >= S.p.min_tokens)) {
+        // a decode step (the cache must be whole again) or a big batch the pass cannot take (the prefill window may open): the prepared resources go back
+        lm_disarm();
+    }
+    return false;
+}
+
+void llama_context::lm_release_if_live() {
+    if (lm_state != nullptr && lm_state->live) {
+        lm_state->free_pre = 0;
+        lm_release();
+    }
+}
+
+void llama_context::lm_snap_request(const int32_t * cuts, int32_t n_cuts) {'''),
+])
+print("g43b edits matched")

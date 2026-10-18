@@ -1,0 +1,63 @@
+"""G49 (G42 round 7, found by the restore-time diagnostic k5451-k5454, build s52): the checkpoint restore of a request that follows a prepared (armed) pass took 73 ms instead of 10 ms, 3 s of think time or not, and
+draining the staged banks at the end of the arm (LLAMA_LM_ARM_SYNC=1) took ~80 ms and brought the restore back to 10 ms. The copies of the first banks had been queued on the copy stream but not submitted to the GPU
+(a WDDM driver keeps the command buffer until a synchronising call), so "the 2 swaps prepared before the next request arrives" were not in place until the next request's first synchronisation. The idle arm now drains the
+staged copies before it returns (idle time: ~80 ms more in the arm, ~65 ms less in the request); an arm for a known batch does not (the pass follows at once and waits for the banks itself while its embedding pieces run).
+LLAMA_LM_ARM_NOSYNC=1 restores the old behaviour of the idle arm. Edits: src/llama-lm-prefill.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:100]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-lm-prefill.cpp", [
+    # the diagnostic drain of g48 leaves lm_stage_first
+    (r'''    static const bool arm_sync = getenv("LLAMA_LM_ARM_SYNC") != nullptr;      // diagnostic: wait for the staged banks here
+    if (arm_sync) {
+        const int64_t t_s0 = ggml_time_us();
+        ls.ls_stage_drain();
+        LLAMA_LOG_WARN("lm-prefill: the staged banks of the arm are in place after %.1f ms more\n", (double) (ggml_time_us() - t_s0)/1e3);
+    }
+    return true;''', r'''    return true;'''),
+    # ... and becomes part of the idle arm
+    (r'''    if (!lm_stage_first()) {
+        S.free_pre = 0;
+        lm_release();
+        return false;
+    }
+    S.armed       = true;''', r'''    if (!lm_stage_first()) {
+        S.free_pre = 0;
+        lm_release();
+        return false;
+    }
+    // idle preparation: the copies are queued on the copy stream, but a WDDM driver keeps the command buffer until a synchronising call, so the banks would arrive only with the next request's first
+    // synchronisation (73 ms for a checkpoint restore that takes 10 ms otherwise, k5453): wait for them here, in the idle time
+    static const bool no_sync = getenv("LLAMA_LM_ARM_NOSYNC") != nullptr;
+    if (seq < 0 && !no_sync) {
+        const int64_t t_s0 = ggml_time_us();
+        S.ls->ls_stage_drain();
+        if (lm_log_on()) {
+            LLAMA_LOG_WARN("lm-prefill: the staged banks of the arm are in place after %.1f ms more\n", (double) (ggml_time_us() - t_s0)/1e3);
+        }
+    }
+    S.armed       = true;'''),
+])
+print("g49 edits matched")

@@ -1,0 +1,46 @@
+"""G31i: ROOT CAUSE of the intermittent 0xC0000005 right after an expert-cache shrink (g244-hang4, traced by g31h: llama_context::synchronize <- drop_graph_reuse <- hybrid_kv_pressure <- llama_kv_cache::lazy_commit_rows).
+llama_kv_cache_context has two constructors; only the UPDATE one sets `lctx`. A batch context (the one that commits KV rows while a prompt is processed) left it UNINITIALISED and lazy_ensure() passed it on, so
+the pressure callback called drop_graph_reuse() on a garbage pointer (it was nullptr often enough for the earlier probes to pass).
+Fix: (1) `lctx = nullptr` default member initialiser; (2) the pressure callback never uses its argument, only the context registered by llama_hybrid_set_margin()."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+KH = NEST + r"\src\llama-kv-cache.h"
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(KH, [
+    ('''    llama_kv_cache * kv;
+    llama_context * lctx;
+
+    //
+    // update context
+    //''', '''    llama_kv_cache * kv;
+    llama_context * lctx = nullptr;   // set by the update constructor only; a batch context has none (it used to be left uninitialised: G31i)
+
+    //
+    // update context
+    //'''),
+])
+
+patch(HA, [
+    ('''static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {
+    bool shrunk = false;''', '''static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {
+    GGML_UNUSED(lctx);   // not trusted: the registered context is the one whose graphs hold the old cache tensors
+    bool shrunk = false;'''),
+    ('''    if (shrunk) {
+        if (lctx != nullptr) {
+            lctx->drop_graph_reuse();
+        }
+        if (g_hybrid_ctx != nullptr && g_hybrid_ctx != lctx) {
+            g_hybrid_ctx->drop_graph_reuse();
+        }
+    }''', '''    if (shrunk && g_hybrid_ctx != nullptr) {
+        g_hybrid_ctx->drop_graph_reuse();
+    }'''),
+])

@@ -1,0 +1,115 @@
+"""G31 / S2: an in-process watcher of the free device memory for the server (measurement only). Contract: docs/plans/llama-server-integration.md, SRV-3.
+
+nvidia-smi and the CUDA runtime count device memory in different units (cudaMemGetInfo reads ~1,086 MiB LESS free than nvidia-smi on this machine: AGENTS.md "VRAM in use has three values"), and the keep-free target
+(--fit-target) is stated in the runtime's unit. With LLAMA_HYBRID_FREE_WATCH_MS=N a thread samples the runtime's free memory every N ms while the hybrid engine exists and logs every new minimum that is
+>= 64 MiB lower than the last one it logged ("hybrid-moe: free-watch: new minimum ..."), so a session's lowest free memory is the last such line. Started by llama_hybrid_set_margin.
+Apply after g31d. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+HI = NEST + r"\include\llama-hybrid.h"
+SV = NEST + r"\tools\server\server-context.cpp"
+
+patch(HA, [
+    (r'''#include <cstdio>
+#include <cstdlib>
+''', r'''#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+'''),
+    (r'''static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {''', r'''static std::thread       g_watch;
+static std::atomic<bool> g_watch_started{false};
+static std::atomic<bool> g_watch_stop{false};
+
+// measurement only: the runtime's free device memory while the engine exists (see g31e_free_watch_apply.py.txt)
+static void hybrid_free_watch(int period_ms) {
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = ggml_backend_dev_get(i);
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        return;
+    }
+    int64_t lowest = INT64_MAX, logged = INT64_MAX;
+    int64_t cache_bytes = 0;
+    int     n_slot = 0;
+    while (!g_watch_stop.load() && llama_moe_hybrid_cache_info_impl(&cache_bytes, &n_slot)) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+        lowest = std::min<int64_t>(lowest, (int64_t) free_b);
+        if (lowest < logged - 64*1048576) {
+            logged = lowest;
+            LLAMA_LOG_INFO("hybrid-moe: free-watch: new minimum of free device memory %lld MiB (expert cache %d slots)\n", (long long) (lowest/1048576), n_slot);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+    }
+    LLAMA_LOG_INFO("hybrid-moe: free-watch: the engine is gone; lowest free device memory %lld MiB\n", (long long) (lowest/1048576));
+}
+
+static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {'''),
+    (r'''    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;''', r'''    g_hybrid_ctx       = ctx;
+    llama_kv_lazy_pressure_cb = hybrid_kv_pressure;
+    if (const char * w = getenv("LLAMA_HYBRID_FREE_WATCH_MS"); w != nullptr && atoi(w) > 0 && !g_watch_started.exchange(true)) {
+        g_watch_stop = false;
+        g_watch = std::thread(hybrid_free_watch, atoi(w));
+    }'''),
+])
+
+patch(HA, [
+    (r'''bool llama_hybrid_active(void) {''', r'''void llama_hybrid_shutdown(void) {
+#ifdef LLAMA_LAYER_STREAMING
+    g_watch_stop = true;
+    if (g_watch.joinable()) {
+        g_watch.join();
+    }
+    g_watch_started = false;
+    llama_kv_lazy_pressure_cb = nullptr;
+    g_hybrid_ctx = nullptr;
+#endif
+}
+
+bool llama_hybrid_active(void) {'''),
+])
+
+patch(HI, [
+    (r'''#ifdef __cplusplus
+}
+#endif
+
+#endif // LLAMA_HYBRID_H''', r'''// Stop the helper threads and the callbacks of this API; call before the context is freed.
+LLAMA_API void llama_hybrid_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // LLAMA_HYBRID_H'''),
+])
+
+patch(SV, [
+    (r'''        llama_init.reset();
+
+        ctx_tgt = nullptr;
+        model_tgt = nullptr;
+
+        mtmd_free(mctx);''', r'''        llama_hybrid_shutdown();
+        llama_init.reset();
+
+        ctx_tgt = nullptr;
+        model_tgt = nullptr;
+
+        mtmd_free(mctx);'''),
+])

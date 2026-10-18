@@ -1,0 +1,63 @@
+"""G38 (round 3, the np 2 cascade of memory-guard declines; cause shown by the G37 log): the layer-major pass closes an OPEN prefill window before it asks for memory.
+
+The log of the declines (k2501): "no room for 1341 MiB + margin 16160 MiB: free 16279 -> 17097 MiB, expert cache 20 -> 8 slots (min 8)": the cache is shrunk to its floor and ~400 MiB are still missing, because
+the prefill window (ubatch 512 -> 2048, +844 MiB of compute buffers) is open. It was opened for an earlier batch of the same request that the pass had to decline (a batch that held tokens of two sequences at -np 2);
+the window stays open for the batches that follow (the 516-token checkpoint chunk), so the next batch, which the pass would take, finds the memory taken by the window and is declined too. In about one np 2 soak
+run in four this repeats for the rest of the run (passes 38-48 of 72-77 big batches instead of 60-64). Now hybrid_lm_vram closes the window first (re-reserves the base ubatch; the expert cache is not regrown,
+the pass shrinks it again right away: the regrow is left to the first small decode, as after any pass). If the pass is declined for another reason, the decode hook opens the window again as before (G32f).
+Edits: src/llama-hybrid-api.cpp."""
+import os
+import sys
+
+NEST = os.environ.get("G22_NEST", r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1\third_party\llama.cpp")
+
+
+def patch(path, edits):
+    d = open(path, "rb").read().decode("utf-8")
+    crlf = "\r\n" in d
+    text = d.replace("\r\n", "\n")
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit("anchor matched %d times in %s: %r" % (text.count(old), path, old[:80]))
+        text = text.replace(old, new)
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK", path)
+        return
+    if os.environ.get("G22_APPLY") != "1":
+        sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    open(path, "wb").write(text.encode("utf-8"))
+    print("patched", path)
+
+
+patch(NEST + r"\src\llama-hybrid-api.cpp", [
+    ('''static void hybrid_prefill_end(llama_context * ctx) {
+    const int64_t t0 = ggml_time_us();''', '''static void hybrid_prefill_end(llama_context * ctx, bool regrow = true) {
+    const int64_t t0 = ggml_time_us();'''),
+    ('''        g_hp.failed = true;
+    }
+    hybrid_prefill_regrow(ctx);
+    if (hybrid_diag()) {
+        LLAMA_LOG_WARN("hybrid-moe: prefill window end: -ub %u, %.1f ms\\n", g_hp.ub_base, (ggml_time_us() - t0)/1000.0);''', '''        g_hp.failed = true;
+    }
+    if (regrow) {
+        hybrid_prefill_regrow(ctx);
+    } else {
+        g_lm_regrow_pending = true;   // the cache grows back at the first small decode
+    }
+    if (hybrid_diag()) {
+        LLAMA_LOG_WARN("hybrid-moe: prefill window end: -ub %u, %.1f ms\\n", g_hp.ub_base, (ggml_time_us() - t0)/1000.0);'''),
+    ('''    if (begin) {
+        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        int64_t cache_b0 = 0, cache_b1 = 0;''', '''    if (begin) {
+        if (g_hp.active) {
+            // a window opened for an earlier batch of this request (one the pass could not take) holds ~0.8 GiB of compute buffers: close it, the pass takes this batch
+            hybrid_prefill_end(ctx, false);
+        }
+        const int64_t margin_b = g_hybrid_keep_free + g_hybrid_safety;
+        bool shrunk = false;
+        int64_t cache_b0 = 0, cache_b1 = 0;'''),
+])
+print("g38 edits matched")

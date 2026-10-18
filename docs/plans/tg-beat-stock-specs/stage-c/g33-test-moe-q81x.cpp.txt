@@ -1,0 +1,226 @@
+// G33: host-only checks of the q8_1-style kernels of the hybrid MoE host leg (ggml/src/ggml-cpu/q81x.c).
+//  1. the quantizer (AVX2) gives the same bytes as the scalar reference that spells the CUDA formula (d = amax/127, q = roundf(x/d), d stored as fp16), on random rows and on edge cases;
+//  2. the quantizer reproduces the CUDA formula's numbers on rows chosen to sit on rounding boundaries;
+//  3. the Q4_K and Q6_K dot products (AVX2) equal the exact value (double precision, weights dequantized by ggml, activation = d * q) up to float rounding, and equal the scalar reference closely;
+//  4. the lean team with set_q81(true), for every thread count and miss count, equals BIT FOR BIT a single-threaded run of the same kernels in the same order (a wrong slice, a missed barrier, a fused multiply-add would show).
+//
+//   test-moe-q81x            what ctest runs
+#include "../src/llama-moe-lean.h"
+
+#include "ggml-cpu.h"
+#include "ggml.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <vector>
+
+static int n_checks   = 0;
+static int n_failures = 0;
+
+#define CHECK(cond, ...)                                  \
+    do {                                                  \
+        ++n_checks;                                       \
+        if (!(cond)) {                                    \
+            ++n_failures;                                 \
+            std::printf("FAIL %s:%d: ", __FILE__, __LINE__); \
+            std::printf(__VA_ARGS__);                     \
+            std::printf("\n");                            \
+        }                                                 \
+    } while (0)
+
+struct act {
+    std::vector<int8_t>  qs;
+    std::vector<float>   d;
+    std::vector<int16_t> s16;
+    explicit act(int64_t n) : qs((size_t) n), d((size_t) n/32), s16((size_t) n/16) {}
+};
+
+static void check_quantizer(const std::vector<float> & x, const char * what) {
+    const int64_t n = (int64_t) x.size();
+    act a(n), b(n);
+    ggml_cpu_quantize_q81x(x.data(), n, a.qs.data(), a.d.data(), a.s16.data());
+    ggml_cpu_quantize_q81x_ref(x.data(), n, b.qs.data(), b.d.data(), b.s16.data());
+    CHECK(memcmp(a.qs.data(), b.qs.data(), (size_t) n) == 0, "%s: quants differ", what);
+    CHECK(memcmp(a.d.data(), b.d.data(), a.d.size()*sizeof(float)) == 0, "%s: scales differ", what);
+    CHECK(memcmp(a.s16.data(), b.s16.data(), a.s16.size()*sizeof(int16_t)) == 0, "%s: sums differ", what);
+    // the sums are the sums of the quants, the scale is an fp16 value
+    for (int64_t k = 0; k < n/16; ++k) {
+        int s = 0;
+        for (int i = 0; i < 16; ++i) { s += a.qs[(size_t) (k*16 + i)]; }
+        CHECK(s == a.s16[(size_t) k], "%s: s16[%lld] = %d, the quants sum to %d", what, (long long) k, a.s16[(size_t) k], s);
+    }
+    for (size_t k = 0; k < a.d.size(); ++k) {
+        CHECK(ggml_fp16_to_fp32(ggml_fp32_to_fp16(a.d[k])) == a.d[k], "%s: scale %zu is not an fp16 value", what, k);
+    }
+}
+
+static double exact_dot(ggml_type type, const void * wrow, int64_t n, const act & a) {
+    std::vector<float> w((size_t) n);
+    ggml_get_type_traits(type)->to_float(wrow, w.data(), n);
+    double s = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        s += (double) w[(size_t) i]*((double) a.d[(size_t) (i/32)]*(double) a.qs[(size_t) i]);
+    }
+    return s;
+}
+
+static double abs_dot(ggml_type type, const void * wrow, int64_t n, const act & a) {
+    std::vector<float> w((size_t) n);
+    ggml_get_type_traits(type)->to_float(wrow, w.data(), n);
+    double s = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        s += std::fabs((double) w[(size_t) i]*((double) a.d[(size_t) (i/32)]*(double) a.qs[(size_t) i]));
+    }
+    return s;
+}
+
+int main() {
+    std::mt19937 rng(12345);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+
+    // 1. quantizer, random rows of the real shapes and odd magnitudes
+    for (int64_t n : { 256, 512, 2048 }) {
+        for (int rep = 0; rep < 200; ++rep) {
+            std::vector<float> x((size_t) n);
+            const float sc = std::pow(10.0f, ud(rng)*4.0f);
+            for (auto & v : x) { v = nd(rng)*sc; }
+            if (rep % 5 == 0) { for (auto & v : x) { if (ud(rng) > 0.8f) { v = 0.0f; } } }
+            if (rep % 7 == 0) { x[(size_t) (rng() % (uint32_t) n)] *= 50.0f; }
+            check_quantizer(x, "random");
+        }
+    }
+    // 2. edge cases: zeros, a lone nonzero, negative zero, values exactly on k + 0.5 after the division, the maximum itself
+    {
+        std::vector<float> x(256, 0.0f);
+        check_quantizer(x, "zeros");
+        x[3] = 1e-30f; check_quantizer(x, "tiny");
+        x[3] = -0.0f;  check_quantizer(x, "negative zero");
+        for (int k = 0; k < 256; ++k) { x[(size_t) k] = (float) (k % 32 - 16) * 0.5f; }
+        check_quantizer(x, "ramp");
+        // d = amax/127 with amax = 127 gives d = 1 exactly: x/d = x, and x = k + 0.5 sits exactly on a rounding boundary (half away from zero)
+        for (int b = 0; b < 8; ++b) {
+            for (int i = 0; i < 32; ++i) { x[(size_t) (b*32 + i)] = (float) (i - 16) + 0.5f; }
+            x[(size_t) (b*32)] = -127.0f;
+        }
+        check_quantizer(x, "halves");
+        act a(256);
+        ggml_cpu_quantize_q81x(x.data(), 256, a.qs.data(), a.d.data(), a.s16.data());
+        CHECK(a.qs[1] == -15 && a.qs[2] == -14 && a.qs[17] == 2 && a.qs[16] == 1, "halves round away from zero: %d %d %d %d", a.qs[1], a.qs[2], a.qs[17], a.qs[16]);
+    }
+
+    // 3. dot products
+    struct tcase { ggml_type type; int64_t k; };
+    const tcase cases[] = { { GGML_TYPE_Q4_K, 2048 }, { GGML_TYPE_Q4_K, 512 }, { GGML_TYPE_Q6_K, 512 }, { GGML_TYPE_Q6_K, 2048 }, { GGML_TYPE_Q4_K, 256 }, { GGML_TYPE_Q6_K, 256 } };
+    double worst_exact = 0.0, worst_ref = 0.0;
+    for (const tcase & c : cases) {
+        const int64_t rows = 64;
+        std::vector<float> wf((size_t) (rows*c.k));
+        for (auto & v : wf) { v = nd(rng)*0.05f; }
+        const size_t rb = ggml_row_size(c.type, c.k);
+        std::vector<char> wq((size_t) rows*rb);
+        ggml_quantize_chunk(c.type, wf.data(), wq.data(), 0, rows, c.k, nullptr);
+        for (int rep = 0; rep < 40; ++rep) {
+            std::vector<float> x((size_t) c.k);
+            const float sc = std::pow(10.0f, ud(rng)*2.0f);
+            for (auto & v : x) { v = nd(rng)*sc; }
+            if (rep % 4 == 0) { x[(size_t) (rng() % (uint32_t) c.k)] *= 30.0f; }
+            act a(c.k);
+            ggml_cpu_quantize_q81x(x.data(), c.k, a.qs.data(), a.d.data(), a.s16.data());
+            for (int64_t r = 0; r < rows; r += 7) {
+                const char * wr = wq.data() + (size_t) r*rb;
+                float fast = 0.0f, ref = 0.0f;
+                if (c.type == GGML_TYPE_Q4_K) {
+                    ggml_cpu_vec_dot_q4_K_q81x    ((int) c.k, &fast, wr, a.qs.data(), a.d.data(), a.s16.data());
+                    ggml_cpu_vec_dot_q4_K_q81x_ref((int) c.k, &ref,  wr, a.qs.data(), a.d.data(), a.s16.data());
+                } else {
+                    ggml_cpu_vec_dot_q6_K_q81x    ((int) c.k, &fast, wr, a.qs.data(), a.d.data(), a.s16.data());
+                    ggml_cpu_vec_dot_q6_K_q81x_ref((int) c.k, &ref,  wr, a.qs.data(), a.d.data(), a.s16.data());
+                }
+                const double ex  = exact_dot(c.type, wr, c.k, a);
+                const double mag = abs_dot(c.type, wr, c.k, a);
+                const double e1  = std::fabs((double) fast - ex)/std::max(mag, 1e-30);
+                const double e2  = std::fabs((double) fast - (double) ref)/std::max(mag, 1e-30);
+                worst_exact = std::max(worst_exact, e1);
+                worst_ref   = std::max(worst_ref, e2);
+                CHECK(e1 < 2e-6, "%s k %lld row %lld: fast %g exact %g (error %g of the magnitude %g)", ggml_type_name(c.type), (long long) c.k, (long long) r, (double) fast, ex, e1, mag);
+                CHECK(e2 < 2e-6, "%s k %lld row %lld: fast %g reference %g (difference %g)", ggml_type_name(c.type), (long long) c.k, (long long) r, (double) fast, (double) ref, e2);
+            }
+        }
+    }
+    // 4. the lean team in q81 mode against a single-threaded run of the same kernels
+    {
+        const int64_t n_embd = 512, n_ff = 256, n_exp = 16;
+        for (ggml_type dt : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+            struct hold { std::vector<char> data; moe_lean::bank b; };
+            auto mk = [&](ggml_type t, int64_t k, int64_t rows) {
+                hold h;
+                std::vector<float> f((size_t) (k*rows*n_exp));
+                for (auto & v : f) { v = nd(rng)*0.05f; }
+                h.b.type = t; h.b.k = k; h.b.rows = rows; h.b.row_bytes = ggml_row_size(t, k); h.b.expert_bytes = h.b.row_bytes*(size_t) rows;
+                h.data.resize(h.b.expert_bytes*(size_t) n_exp);
+                ggml_quantize_chunk(t, f.data(), h.data.data(), 0, rows*n_exp, k, nullptr);
+                h.b.data = h.data.data();
+                return h;
+            };
+            hold hu = mk(GGML_TYPE_Q4_K, n_embd, n_ff), hg = mk(GGML_TYPE_Q4_K, n_embd, n_ff), hd = mk(dt, n_ff, n_embd);
+            moe_lean::layer_banks lb;
+            lb.up = hu.b; lb.gate = hg.b; lb.down = hd.b;
+            CHECK(moe_lean::supported_q81(lb), "supported_q81 for %s down", ggml_type_name(dt));
+            for (int nth : { 1, 2, 3, 5, 8 }) {
+                moe_lean::team team(nth, n_embd, n_ff, 0, nullptr, 2000);
+                team.set_q81(true);
+                for (int m = 1; m <= moe_lean::MAX_M; ++m) {
+                    for (int rep = 0; rep < 6; ++rep) {
+                        std::vector<float> x((size_t) n_embd), w((size_t) m), y((size_t) n_embd), yr((size_t) n_embd);
+                        for (auto & v : x) { v = nd(rng); }
+                        for (auto & v : w) { v = std::fabs(nd(rng))*0.3f + 0.01f; }
+                        std::vector<int32_t> ids((size_t) m);
+                        std::vector<int> perm((size_t) n_exp);
+                        for (int i = 0; i < n_exp; ++i) { perm[(size_t) i] = i; }
+                        std::shuffle(perm.begin(), perm.end(), rng);
+                        for (int e = 0; e < m; ++e) { ids[(size_t) e] = perm[(size_t) e]; }
+                        moe_lean::job j;
+                        j.lb = &lb; j.m = m; j.ids = ids.data(); j.w = w.data(); j.x = x.data(); j.y = y.data();
+                        team.run(j);
+                        // single-threaded reference with the same kernels, products first, sums in expert order
+                        act a1(n_embd);
+                        ggml_cpu_quantize_q81x(x.data(), n_embd, a1.qs.data(), a1.d.data(), a1.s16.data());
+                        std::vector<float> ex((size_t) m*n_embd);
+                        for (int e = 0; e < m; ++e) {
+                            std::vector<float> up((size_t) n_ff), ga((size_t) n_ff), ac((size_t) n_ff);
+                            for (int64_t r = 0; r < n_ff; ++r) {
+                                ggml_cpu_vec_dot_q4_K_q81x((int) n_embd, &up[(size_t) r], hu.data.data() + (size_t) ids[(size_t) e]*hu.b.expert_bytes + (size_t) r*hu.b.row_bytes, a1.qs.data(), a1.d.data(), a1.s16.data());
+                                ggml_cpu_vec_dot_q4_K_q81x((int) n_embd, &ga[(size_t) r], hg.data.data() + (size_t) ids[(size_t) e]*hg.b.expert_bytes + (size_t) r*hg.b.row_bytes, a1.qs.data(), a1.d.data(), a1.s16.data());
+                            }
+                            ggml_cpu_swiglu_f32((int) n_ff, ac.data(), ga.data(), up.data());
+                            act a2(n_ff);
+                            ggml_cpu_quantize_q81x(ac.data(), n_ff, a2.qs.data(), a2.d.data(), a2.s16.data());
+                            for (int64_t r = 0; r < n_embd; ++r) {
+                                const void * wr = hd.data.data() + (size_t) ids[(size_t) e]*hd.b.expert_bytes + (size_t) r*hd.b.row_bytes;
+                                float v;
+                                if (dt == GGML_TYPE_Q4_K) { ggml_cpu_vec_dot_q4_K_q81x((int) n_ff, &v, wr, a2.qs.data(), a2.d.data(), a2.s16.data()); }
+                                else                      { ggml_cpu_vec_dot_q6_K_q81x((int) n_ff, &v, wr, a2.qs.data(), a2.d.data(), a2.s16.data()); }
+                                volatile float prod = v*w[(size_t) e];
+                                ex[(size_t) e*n_embd + (size_t) r] = prod;
+                            }
+                        }
+                        for (int64_t r = 0; r < n_embd; ++r) {
+                            volatile float acc = ex[(size_t) r];
+                            for (int e = 1; e < m; ++e) { acc = acc + ex[(size_t) e*n_embd + (size_t) r]; }
+                            yr[(size_t) r] = acc;
+                        }
+                        CHECK(memcmp(y.data(), yr.data(), y.size()*sizeof(float)) == 0, "lean q81 team (%d threads, %d experts, down %s) differs from the single-threaded kernels", nth, m, ggml_type_name(dt));
+                    }
+                }
+            }
+        }
+    }
+    std::printf("worst error against the exact value %.3g, against the scalar reference %.3g (relative to the sum of the absolute terms)\n", worst_exact, worst_ref);
+    std::printf("%d checks, %d failures\n", n_checks, n_failures);
+    return n_failures == 0 ? 0 : 1;
+}

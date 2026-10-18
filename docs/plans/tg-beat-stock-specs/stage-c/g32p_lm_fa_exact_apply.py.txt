@@ -1,0 +1,32 @@
+"""G32p (after the second review: the equivalence rests on a calibrated reading, not on bit-equality): an opt-in switch that makes the layer-major pass use the SAME flash-attention kernel variant as the ordinary path.
+
+The pass's flash attention is the mask-free causal-window op on a key range cut to exactly the live keys; the ordinary path's is the masked op on the 256-padded view, and only the masked op may use the GQA-packed kernel variants
+(fattn.cu: `use_gqa_opt` needs a mask, or the FAFIX_CAUSAL_GQA=1 toggle for the causal-window op, AND K->ne[1] % FATTN_KQ_STRIDE == 0). The different variant (and CTA partition, which depends on K->ne[1]) changes the reduction order, so
+the pass is close to the ordinary path but not identical. LLAMA_LM_FA_EXACT=1 cuts the key range to PAD(n_kv_valid, 256) (what the ordinary path's padded view holds for the same chunk) instead of n_kv_valid; with FAFIX_CAUSAL_GQA=1 in the
+environment the causal-window op then takes the GQA-packed variant like the masked op does. Off by default: nothing changes unless the variable is set. Edits: src/llama-graph.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\src\llama-graph.cpp", [
+    ('''                cur->src[1]->ne[1] = lm->n_kv_valid;
+                cur->src[2]->ne[1] = lm->n_kv_valid;
+''', '''                {
+                    // LLAMA_LM_FA_EXACT=1: the key range is the 256-padded one the ordinary path's view has for the same chunk (see g32p); default: exactly the live keys
+                    static const bool fa_exact = getenv("LLAMA_LM_FA_EXACT") != nullptr && getenv("LLAMA_LM_FA_EXACT")[0] == '1';
+                    int64_t n_view = lm->n_kv_valid;
+                    if (fa_exact) {
+                        n_view = std::min<int64_t>(GGML_PAD((int64_t) lm->n_kv_valid, 256), cur->src[1]->ne[1] - lm->kv_cell0);
+                    }
+                    cur->src[1]->ne[1] = n_view;
+                    cur->src[2]->ne[1] = n_view;
+                }
+'''),
+])
+print("g32p edits matched")

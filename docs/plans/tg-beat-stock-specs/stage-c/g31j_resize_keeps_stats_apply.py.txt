@@ -1,0 +1,48 @@
+"""G31j: a shrink of the expert cache keeps what the engine has learned. resize() used to zero the popularity statistics (`ema`, `last_sel`) and refill every layer from the static prior, so the request after a
+shrink decoded with a cold cache (measured g234/g247: 59-66 t/s after each shrink against 83-98 t/s before it). Now the statistics survive and the refill takes, per layer, the experts with the highest
+policy score (ema + tie, the same score compute_pairs() ranks by); with all-zero statistics (the runner's tg transition, a fresh engine) the order is the old frequency order, byte for byte."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+MH = NEST + r"\src\llama-moe-hybrid.cpp"
+
+patch(MH, [
+    ('''    // policy state and initial fill, exactly as init() does for the new slot count
+    const size_t ne = (size_t) n_layer*n_expert;
+    map.assign(ne, -1);
+    slot_of.assign(ne, -1);
+    slot_expert.assign(slot_off[(size_t) n_layer], -1);
+    last_sel.assign(recency ? ne : 0, 0);
+    ema.assign(ne, 0.0);
+    pending.clear();
+    pairs.clear();
+    dma_dst.clear();
+    dma_src.clear();
+    dma_size.clear();
+    std::vector<int> order(n_expert);
+    for (int il = 0; il < n_layer; ++il) {
+        std::iota(order.begin(), order.end(), 0);
+        const int64_t * fl = freq_.data() + (size_t) il*n_expert;
+        std::stable_sort(order.begin(), order.end(), [fl](int a, int b) { return fl[a] > fl[b]; });''', '''    // policy state and initial fill: as init() does for the new slot count, but the popularity statistics (ema, last_sel) are KEPT, so a shrink keeps the experts the engine found hot (G31j)
+    const size_t ne = (size_t) n_layer*n_expert;
+    map.assign(ne, -1);
+    slot_of.assign(ne, -1);
+    slot_expert.assign(slot_off[(size_t) n_layer], -1);
+    pending.clear();
+    pairs.clear();
+    dma_dst.clear();
+    dma_src.clear();
+    dma_size.clear();
+    std::vector<int> order(n_expert);
+    for (int il = 0; il < n_layer; ++il) {
+        std::iota(order.begin(), order.end(), 0);
+        const double * em = ema.data() + (size_t) il*n_expert;
+        const double * tt = tie.data() + (size_t) il*n_expert;
+        std::stable_sort(order.begin(), order.end(), [em, tt](int a, int b) { return em[a] + tt[a] > em[b] + tt[b]; });'''),
+])

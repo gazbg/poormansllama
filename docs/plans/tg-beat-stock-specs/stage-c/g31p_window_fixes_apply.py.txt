@@ -1,0 +1,40 @@
+"""G31p: two corrections to the prefill window (g31o), both from the first measurement (g290):
+(1) the growth of the scheduler's buffers that reserve_ubatch() reports is the sum over ALL backends, the host's compute buffer included: +1,635 MiB (1.064 MiB/row) where the DEVICE grew by about half of that
+    (static -ub 2048 at start: +843 MiB), so the next windows asked for twice the room and shrank the cache by ~13 slots too many. The per-row figure is now the drop of the device's free memory around the reserve.
+(2) the window closed at the first batch below min_tokens, which is the 516-token checkpoint chunk the server cuts off before the end of the prompt (offsets 4 + n_ubatch, 4): that chunk then ran on -ub 512 (2 ubatches = 2 bank copies)
+    and cost a close/open of the window. It now closes at a batch of <= 16 tokens (the 4-token chunk, a decode step, a speculative step); batches in between keep the big ubatch."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HA = NEST + r"\src\llama-hybrid-api.cpp"
+
+patch(HA, [
+    ('''    int64_t freed = 0;
+    try {
+        freed = ctx->reserve_ubatch(g_hp.big);
+    } catch''', '''    int64_t freed = 0;
+    const int64_t dev_free_before = hybrid_free_bytes();
+    try {
+        freed = ctx->reserve_ubatch(g_hp.big);
+    } catch'''),
+    ('''    const int64_t growth = -freed;
+    if (growth > 0) {
+        g_hp.mib_per_row = (double) growth/1048576.0/(double) rows;
+    }''', '''    GGML_UNUSED(freed);   // the sum over all backends (the host's compute buffer too): not what the device pays
+    const int64_t growth = dev_free_before - hybrid_free_bytes();
+    if (growth > 0) {
+        g_hp.mib_per_row = (double) growth/1048576.0/(double) rows;
+    }'''),
+    ('''    } else if (g_hp.active && n_tokens < g_hp.min_tokens) {
+        hybrid_prefill_end(ctx);
+    }''', '''    } else if (g_hp.active && n_tokens <= 16) {
+        // the big ubatch stays for the chunks that follow the big batches (the 516-token checkpoint chunk); a decode step, a speculative step or the 4-token chunk closes the window
+        hybrid_prefill_end(ctx);
+    }'''),
+])

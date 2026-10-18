@@ -1,0 +1,118 @@
+"""G32k (after the np2 soak g831: 79 of 80 batches of >= 1,024 tokens declined with "the batch holds several sequences"): with --lm-prefill, unified KV and several slots the server gives a big prompt chunk a batch of its own.
+
+The layer-major pass takes one sequence per batch. When two clients are active the server mixes the generating slots' tokens (and the other slot's prompt chunk) into the same llama_decode batch as the big prompt chunk, so the pass declines and the
+window serves it. The mix does not buy the other slots anything while a multi-second prompt batch runs (their decode advances one token per batch either way), so the iterations are re-ordered:
+  - a PROMPT TURN carries only the first slot whose remaining prompt is >= --lm-prefill-min tokens (the generating slots' tokens wait one iteration);
+  - a DECODE TURN carries the generating slots' tokens plus the prompts of the other slots (the big one waits one iteration);
+  - while some slot is generating the two turns alternate, so a generating slot still gets one token per big prompt batch, as before; without a generating slot the prompt turn repeats.
+If a prompt turn ends with an empty batch (the big chunk could not add tokens) the generating slots' tokens are added after all, so that the batch is never empty while work is pending.
+Active only with --lm-prefill, -np > 1, the unified KV cache and no speculative decoding. Edits: tools/server/server-context.cpp."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+
+patch(NEST + r"\tools\server\server-context.cpp", [
+    ('''    // Necessary similarity of prompt for slot selection
+    float slot_prompt_similarity = 0.0f;
+''', '''    // Necessary similarity of prompt for slot selection
+    float slot_prompt_similarity = 0.0f;
+
+    // G32: the previous iteration was a prompt turn (a big prompt chunk alone in its batch, see update_slots)
+    bool lm_last_prompt_turn = false;
+'''),
+    ('''        // determine which slots are generating and drafting
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+''', '''        // G32: with --lm-prefill, unified KV and several slots a big prompt chunk gets a batch of its own (the layer-major pass takes one sequence per batch); prompt turns and decode turns alternate
+        const bool lm_iso = params_base.lm_prefill && params_base.n_parallel > 1 && params_base.kv_unified && !spec;
+        server_slot * lm_big = nullptr;
+        bool lm_prompt_turn = false;
+        if (lm_iso) {
+            bool any_generating = false;
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    any_generating = true;
+                } else if (lm_big == nullptr && slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) && slot.task &&
+                           slot.task->n_tokens() - slot.prompt.n_tokens() >= params_base.lm_prefill_min) {
+                    lm_big = &slot;
+                }
+            });
+            if (lm_big != nullptr) {
+                lm_prompt_turn = !(any_generating && lm_last_prompt_turn);
+            }
+            lm_last_prompt_turn = lm_prompt_turn;
+        }
+
+        // determine which slots are generating and drafting
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+'''),
+    ('''        // update the batch with the sampled/drafted tokens
+        iterate(generating, [&](server_slot & slot) {
+            slot.handle_last_sampled_token(batch);
+        });
+''', '''        // update the batch with the sampled/drafted tokens (a prompt turn leaves them for the next iteration)
+        if (!lm_prompt_turn) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
+'''),
+    ('''                if (!slot.is_processing()) {
+                    return;
+                }
+
+                // check if we can batch this slot with the previous one
+                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                    return;
+                }
+
+                // check if this is a child slot''', '''                if (!slot.is_processing()) {
+                    return;
+                }
+
+                // G32: a prompt turn carries the big prompt alone, a decode turn everything except it
+                if (lm_iso && lm_big != nullptr && (lm_prompt_turn ? &slot != lm_big : &slot == lm_big)) {
+                    return;
+                }
+
+                // check if we can batch this slot with the previous one
+                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                    return;
+                }
+
+                // check if this is a child slot'''),
+    ('''                if (!slot_batched) {
+                    slot_batched = &slot;
+                }
+            });
+        }
+    }
+
+    // returns true = success ; false = retry with smaller batch size''', '''                if (!slot_batched) {
+                    slot_batched = &slot;
+                }
+            });
+        }
+
+        // G32: a prompt turn whose big chunk could not add tokens must not leave the generating slots without their token
+        if (lm_prompt_turn && batch.size() == 0) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
+    }
+
+    // returns true = success ; false = retry with smaller batch size'''),
+])
+print("g32k edits matched")

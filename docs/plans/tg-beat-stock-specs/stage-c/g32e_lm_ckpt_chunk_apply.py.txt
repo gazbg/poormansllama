@@ -1,0 +1,69 @@
+"""G32e: --lm-prefill-ckpt-chunk N. The stock server cuts the last 4 + n_ubatch tokens of a prompt into their own batches so that two context checkpoints exist at the end of the prompt (before the 512-token chunk and before the last 4
+tokens). On this model the 512-token chunk goes through the ordinary path (not a layer-major pass: it is below --lm-prefill-min), where it copies all expert banks: ~1.3 s per request (g620: 4k prompt 3.96 s = pass 2.0 + chunk 1.3 + cache 0.6).
+A chunk of fewer than 32 tokens is computed on the CPU by the stock path (no bank copy). With --lm-prefill the checkpoint chunk can therefore be made small: the checkpoint before it is then taken N + 4 tokens before the end of the prompt
+instead of 4 + n_ubatch (a rollback deeper than that falls back to the next older checkpoint). Default 0 = the stock rule (nothing changes).
+Also: the default of --lm-prefill-min becomes 1024 (g630, cold prompts, 3 repetitions: min 2048 / 1024 / 512 / 256 give 3.91 / 3.55 / 4.06 / 4.09 s for 2,047 tokens and 2.45 / 2.45 / 3.35 / 3.65 s for 1,024 tokens: a pass
+below ~1,000 tokens costs more than the ordinary path, and a minimum of 512 or less also takes the 512-token checkpoint chunk into a pass of its own)."""
+import os
+import shutil
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (PATCH_DRY=1 first)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HH = NEST + r"\include\llama-hybrid.h"
+CH = NEST + r"\common\common.h"
+AC = NEST + r"\common\arg.cpp"
+SC = NEST + r"\tools\server\server-context.cpp"
+
+patch(HH, [
+    ('''    int32_t min_tokens;   // smallest batch that is taken (2048)''', '''    int32_t min_tokens;   // smallest batch that is taken (1024)'''),
+])
+
+patch(CH, [
+    ('''    int32_t     lm_prefill_min     = 2048;    // smallest batch (tokens) that is taken
+''', '''    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
+'''),
+    ('''    int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
+''', '''    int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
+    int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule
+'''),
+])
+
+patch(AC, [
+    ('''"smallest prompt batch, in tokens, that --lm-prefill takes (default: 2048)"''', '''"smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024)"'''),
+    ('''    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",''', '''    add_opt(common_arg(
+        {"--lm-prefill-ckpt-chunk"}, "N",
+        "with --lm-prefill: the last N + 4 tokens of a prompt are processed separately so that a context checkpoint exists N + 4 tokens before the end (default: 0 = -ub, the stock rule: 4 + ubatch). A chunk of fewer than 32 tokens "
+        "(for example 24) is computed on the CPU and costs ~0.3 s; a chunk of 512 tokens copies every expert bank (~1.3 s). The price is the depth of the rollback that the checkpoint covers: a request that diverges earlier than N + 4 tokens from the "
+        "end of the previous prompt resumes from the next older checkpoint",
+        [](common_params & params, int value) {
+            params.lm_prefill_ckpt = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_CKPT_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-freq"}, "FILE",'''),
+])
+
+patch(SC, [
+    ('''                        if (do_checkpoint) {
+                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+''', '''                        if (do_checkpoint) {
+                            // G32: --lm-prefill-ckpt-chunk makes the chunk before the last 4 tokens smaller than n_ubatch
+                            const int ckpt_chunk = (params_base.lm_prefill && params_base.lm_prefill_ckpt > 0) ? params_base.lm_prefill_ckpt : n_ubatch;
+                            const int checkpoint_offsets[] = {4 + ckpt_chunk, 4};
+'''),
+])
+
+for name in ("llama-lm-prefill.cpp", "llama-lm-prefill.h"):
+    src = os.path.join(WT, "docs", "plans", "tg-beat-stock-specs", "stage-c", name + ".txt")
+    dst = NEST + r"\src" + "\\" + name
+    if os.environ.get("PATCH_DRY"):
+        print("DRY-OK new file %s <- %s (%d bytes)" % (dst, src, os.path.getsize(src)))
+    else:
+        shutil.copyfile(src, dst)
+        print("wrote %s" % dst)

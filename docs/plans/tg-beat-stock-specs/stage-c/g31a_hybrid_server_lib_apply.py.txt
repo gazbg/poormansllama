@@ -1,0 +1,138 @@
+"""G31 / S1a: library side of the hybrid decode preset for llama-server. Contract: docs/plans/llama-server-integration.md.
+
+ * llama-moe-hybrid.cpp: LLAMA_MOE_HYBRID_FREQ is optional now (a uniform prior when it is unset; a missing file or a wrong size still aborts); new llama_moe_hybrid_auto_resize_impl: size the VRAM
+   expert cache to a keep-free target (free device memory + the current cache - keep-free - safety, in slot rows, clamped to [min_slots, max_slots]; the runner's rule of tg_transition(), but it may also SHRINK).
+ * llama-moe-hybrid.h: its declaration.
+ * llama-context.h + llama-layer-streaming.cpp: llama_context::drop_graph_reuse(): the cached decode graph points at the old cache tensors after a resize, so the next decode must rebuild it.
+ * include/llama-hybrid.h + src/llama-hybrid-api.cpp: the small C API a frontend (llama-server) uses: llama_hybrid_available(), llama_hybrid_prepare_env(), llama_hybrid_auto_size(). The API TU is always
+   built (stubs without LLAMA_LAYER_STREAMING), so the server needs no #ifdef.
+Apply with G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+HY = NEST + r"\src\llama-moe-hybrid.cpp"
+HH = NEST + r"\src\llama-moe-hybrid.h"
+CX = NEST + r"\src\llama-layer-streaming.cpp"
+CH = NEST + r"\src\llama-context.h"
+SC = NEST + r"\src\CMakeLists.txt"
+
+patch(HY, [
+    (r'''        const char * path = getenv("LLAMA_MOE_HYBRID_FREQ");
+        if (path == nullptr || *path == '\0') {
+            GGML_ABORT("moe_hybrid: LLAMA_MOE_HYBRID_FREQ is required");
+        }
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            GGML_ABORT("moe_hybrid: cannot open frequency file %s", path);
+        }
+        size_t n = 0;
+        long long v = 0;
+        while (n < freq.size() && fscanf(f, "%lld", &v) == 1) {
+            freq[n++] = v;
+        }
+        const bool extra = fscanf(f, "%lld", &v) == 1;
+        fclose(f);
+        if (n != freq.size() || extra) {
+            GGML_ABORT("moe_hybrid: frequency file %s must hold exactly %d x %d counts", path, n_layer, n_expert);
+        }''', r'''        const char * path = getenv("LLAMA_MOE_HYBRID_FREQ");
+        if (path == nullptr || *path == '\0') {
+            // G31: a server need not ship a calibration table: without one the initial fill and the tie-break use a uniform prior
+            std::fill(freq.begin(), freq.end(), (int64_t) 1);
+            LLAMA_LOG_INFO("%s: moe_hybrid: no LLAMA_MOE_HYBRID_FREQ table, uniform expert prior\n", __func__);
+        } else {
+            FILE * f = fopen(path, "r");
+            if (f == nullptr) {
+                GGML_ABORT("moe_hybrid: cannot open frequency file %s", path);
+            }
+            size_t n = 0;
+            long long v = 0;
+            while (n < freq.size() && fscanf(f, "%lld", &v) == 1) {
+                freq[n++] = v;
+            }
+            const bool extra = fscanf(f, "%lld", &v) == 1;
+            fclose(f);
+            if (n != freq.size() || extra) {
+                GGML_ABORT("moe_hybrid: frequency file %s must hold exactly %d x %d counts", path, n_layer, n_expert);
+            }
+        }'''),
+    (r'''bool llama_moe_hybrid_resize_impl(int n_slot) {''', r'''// G31: size the cache to a keep-free target (the rule of the runner's tg_transition(), plus shrinking). All sizes in bytes; slots clamp to [min_slots, min(max_slots, n_expert)].
+bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_bytes, int min_slots, int max_slots, int * slots_before, int * slots_after, int64_t * free_before_bytes) {
+    moe_hybrid_engine * eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+        if (g_moe_hybrid_engines.size() != 1) {
+            return false;
+        }
+        eng = g_moe_hybrid_engines.begin()->second.get();
+    }
+    if (eng->cache_buf == nullptr || eng->cuda == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(eng->cuda);
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_dev_memory(dev, &free_b, &total_b);
+    const int64_t cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
+    const int64_t row_bytes   = cache_bytes / (eng->n_slot + 1);
+    if (row_bytes <= 0) {
+        return false;
+    }
+    const int64_t room = (int64_t) free_b + cache_bytes - keep_free_bytes - safety_bytes;
+    int64_t slots = room / row_bytes - 1;
+    slots = std::min<int64_t>(slots, std::min<int64_t>(max_slots, eng->n_expert));
+    slots = std::max<int64_t>(slots, std::max(1, min_slots));
+    if (slots_before != nullptr) {
+        *slots_before = eng->n_slot;
+    }
+    if (free_before_bytes != nullptr) {
+        *free_before_bytes = (int64_t) free_b;
+    }
+    if (slots_after != nullptr) {
+        *slots_after = (int) slots;
+    }
+    if ((int) slots == eng->n_slot) {
+        return true;
+    }
+    return llama_moe_hybrid_resize_impl((int) slots);
+}
+
+bool llama_moe_hybrid_resize_impl(int n_slot) {'''),
+])
+
+patch(HH, [
+    (r'''bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);''', r'''bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);
+
+// G31: resize the cache so that keep_free_bytes + safety_bytes of device memory stay free (slots clamp to [min_slots, max_slots]); between decodes only. False when there is no engine or the resize failed.
+bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_bytes, int min_slots, int max_slots, int * slots_before, int * slots_after, int64_t * free_before_bytes);'''),
+])
+
+patch(CH, [
+    (r'''    int64_t reserve_ubatch(uint32_t n_ubatch_new);''', r'''    int64_t reserve_ubatch(uint32_t n_ubatch_new);
+
+    // G31: forget the cached decode graph (it points at tensors that a hybrid cache resize freed); the next decode builds a new one
+    void drop_graph_reuse();'''),
+])
+
+patch(CX, [
+    (r'''// G30: reserve_for_decode with an explicit ubatch''', r'''// G31: see llama-context.h
+void llama_context::drop_graph_reuse() {
+    synchronize();
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+// G30: reserve_for_decode with an explicit ubatch'''),
+])
+
+patch(SC, [
+    (r'''# private research: experimental CUDA-only layer streaming (default OFF)''', r'''# G31: the C API a frontend uses for the hybrid MoE decode (stubs when LLAMA_LAYER_STREAMING is off)
+target_sources(llama PRIVATE llama-hybrid-api.cpp)
+
+# private research: experimental CUDA-only layer streaming (default OFF)'''),
+])

@@ -1,0 +1,47 @@
+"""G30 / M2h: warm the draft context up at initialisation, outside the timed prefill. Contract: the plan's "G30 CONTRACT".
+
+Measured (g94-sc24, g94-sp24, certified): with a 24-token prompt on the stock graph path the prefill takes 419 ms without MTP and 468 ms with it (+48 ms = -10.4% PP), for ONE draft decode of 24 rows; the same
+catch-up costs 19 ms per 512 rows once the draft graph is warm (g94-lc4k: 8 calls in 154 ms). The difference is first-use cost (graph build, kernel module loads) that is paid inside the first catch-up decode, i.e. inside the
+prefill timer. A server pays it once at start-up, like llama.cpp's own warm-up decode. This decodes one representative batch (min(--mtp-catchup, --ubatch) zero rows at positions 0..n-1, no logits) through the draft context right
+after it is created and drops it again, so the first real catch-up finds a warm context. The draft KV is emptied by seq_rm before the prefill starts: no state is left behind.
+Apply after g30_mtp_catchup_apply. G22_APPLY=1 (PATCH_DRY=1 first; G22_NEST=<copy root>)."""
+import os
+import sys
+if os.environ.get("G22_APPLY") != "1" and not os.environ.get("PATCH_DRY"):
+    sys.exit("refusing to edit the nested tree: set G22_APPLY=1 (and only when no attested session is running or queued)")
+WT = r"C:\Development\AI\qwen38GZI\.claude\worktrees\attribution-handoff-doc-8ed1d1"
+sys.path.insert(0, WT + r"\tools")
+from crlfpatch import patch
+
+NEST = os.environ.get("G22_NEST", WT + r"\third_party\llama.cpp")
+M = NEST + r"\tools\layer-streaming\main.cpp"
+
+patch(M, [
+    (r'''        fprintf(stderr, "MTP: draft head (blk.%d) enabled, n_embd_out %d, n_rs_seq %u\n",
+                n_layer, n_embd_out, (unsigned) cparams.n_rs_seq);
+''', r'''        fprintf(stderr, "MTP: draft head (blk.%d) enabled, n_embd_out %d, n_rs_seq %u\n",
+                n_layer, n_embd_out, (unsigned) cparams.n_rs_seq);
+        {
+            // G30: warm-up decode of the draft context (see stage-c/g30d_draft_warmup_apply.py.txt): first-use costs are paid here, not in the timed prefill
+            const int64_t t_w0 = ggml_time_us();
+            const int n_w = std::max(1, std::min(mtp_catchup, ubatch));
+            llama_batch wb = llama_batch_init(n_w, n_embd_out, 1);
+            wb.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) n_w);
+            if (wb.token != nullptr) {
+                for (int i = 0; i < n_w; ++i) {
+                    wb.token[i]      = 0;
+                    wb.pos[i]        = i;
+                    wb.n_seq_id[i]   = 1;
+                    wb.seq_id[i][0]  = 0;
+                    wb.logits[i]     = false;
+                }
+                memset(wb.embd, 0, (size_t) n_w * row_bytes);
+                wb.n_tokens = n_w;
+                const int wrc = llama_decode(ctx_dft, wb);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1);
+                fprintf(stderr, "MTP: draft context warm-up (%d rows, rc %d) in %.1f ms\n", n_w, wrc, (ggml_time_us() - t_w0) / 1000.0);
+            }
+            llama_batch_free(wb);
+        }
+'''),
+])
