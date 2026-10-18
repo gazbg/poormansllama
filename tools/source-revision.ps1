@@ -119,6 +119,43 @@ function Get-GitChangedPaths {
     return [pscustomobject]@{ tracked = $tracked; untracked = $untracked }
 }
 
+# A vendored subtree: Root is exactly the Scope folder of RepoRoot's own repository
+# (no nested .git), so the subtree has no repository root of its own. Its identity is
+# then the tree at that path and every git query is limited to it. Anything else that
+# sits inside another repository is still refused, so a plain folder can never inherit
+# the enclosing repository's identity.
+function Test-VendoredScope {
+    param(
+        [string] $Root = '',
+        [string] $Scope = '',
+        [string] $RepoRoot = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Scope) -or [string]::IsNullOrWhiteSpace($RepoRoot)) { return $false }
+    if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) { return $false }
+    $scopeNorm = ($Scope -replace '\\', '/').Trim('/')
+    if (-not $scopeNorm -or [System.IO.Path]::IsPathRooted($scopeNorm) -or $scopeNorm.Split('/') -contains '..') { return $false }
+    $want = ([System.IO.Path]::GetFullPath((Join-Path $RepoRoot ($scopeNorm -replace '/', '\')))).TrimEnd('\') -replace '\\', '/'
+    $have = ([System.IO.Path]::GetFullPath($Root)).TrimEnd('\') -replace '\\', '/'
+    if (-not $have.Equals($want, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $outerTop = @(& git -C $RepoRoot rev-parse --show-toplevel 2>$null) | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace("$outerTop")) { return $false }
+    $top = ((Resolve-Path -LiteralPath $RepoRoot).Path -replace '\\', '/').TrimEnd('/')
+    return ("$outerTop" -replace '\\', '/').TrimEnd('/').Equals($top, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Git reports repository-relative paths. For a vendored subtree the scope prefix is
+# removed so every path is relative to the engine root again. Paths outside the
+# scope map to '' and are dropped by the caller.
+function Remove-ScopePrefix {
+    param(
+        [string] $Path = '',
+        [string] $Prefix = ''
+    )
+    if (-not $Prefix) { return $Path }
+    if ($Path.StartsWith($Prefix, [System.StringComparison]::Ordinal)) { return $Path.Substring($Prefix.Length) }
+    return ''
+}
+
 # The engine source tree's identity. `state` names WHY a digest is absent, so an
 # unevaluable tree is never mistaken for an unchanged one:
 #   git          readable; digest is meaningful
@@ -135,6 +172,8 @@ function Get-SourceRevision {
     $r = [ordered]@{
         schema = 'source-revision/1'
         scope = $Scope
+        mode = 'repo'
+        repo_root = ''
         root = (ConvertTo-RepoRelativePath -Path $Root -RepoRoot $RepoRoot)
         state = 'missing'
         head = ''
@@ -176,31 +215,54 @@ function Get-SourceRevision {
         # `rev-parse HEAD` happily climbs to an ENCLOSING repository, so a path
         # that is not itself a checkout would silently report the parent's
         # identity (and the parent's change set). Require the root to be the
-        # toplevel of the repository it just read.
+        # toplevel of the repository it just read, or a vendored subtree of
+        # RepoRoot (Test-VendoredScope). A subtree is read through its outer
+        # repository and every query is limited to its scope path.
+        $gitDir = $Root
+        $headRef = 'HEAD'
+        $scopeArgs = @()
+        $prefix = ''
         $toplevel = @(& git -C $Root rev-parse --show-toplevel 2>$null) | Select-Object -First 1
         if (-not [string]::IsNullOrWhiteSpace("$toplevel")) {
             $a = ("$toplevel" -replace '\\', '/').TrimEnd('/')
             $b = ((Resolve-Path -LiteralPath $Root).Path -replace '\\', '/').TrimEnd('/')
             if ($a -and $b -and -not $a.Equals($b, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $r.state = 'not-a-repo'
-                $r.error = "$Root is inside the repository at $a, not a repository root"
-                return [pscustomobject]$r
+                if (-not (Test-VendoredScope -Root $Root -Scope $Scope -RepoRoot $RepoRoot)) {
+                    $r.state = 'not-a-repo'
+                    $r.error = "$Root is inside the repository at $a, not a repository root"
+                    return [pscustomobject]$r
+                }
+                $scopeNorm = ($Scope -replace '\\', '/').Trim('/')
+                $gitDir = $RepoRoot
+                $headRef = "HEAD:$scopeNorm"
+                $scopeArgs = @('--', $scopeNorm)
+                $prefix = $scopeNorm + '/'
+                $r.mode = 'vendored-subtree'
+                $r.repo_root = $RepoRoot
             }
+        }
+        $head = @(& git -C $gitDir rev-parse $headRef 2>$null) | Select-Object -First 1
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$head")) {
+            $r.state = 'error'; $r.error = "git could not resolve $headRef in $gitDir"
+            return [pscustomobject]$r
         }
         $r.head = "$head".Trim()
 
-        $porcelain = @(& git -C $Root status --porcelain 2>$null)
+        $porcelain = @(& git -C $gitDir status --porcelain @scopeArgs 2>$null)
         # -c on both counts: a pager or colour codes would change the digest for
         # reasons that have nothing to do with the sources.
-        $diff = @(& git -C $Root -c core.pager=cat -c color.ui=false diff HEAD 2>$null)
+        $diff = @(& git -C $gitDir -c core.pager=cat -c color.ui=false diff HEAD @scopeArgs 2>$null)
         $changes = Get-GitChangedPaths -PorcelainLines $porcelain
-        $r.changed_tracked = @($changes.tracked).Count
-        $r.changed_untracked = @($changes.untracked).Count
+        # Repository-relative paths become engine-relative: the scope prefix goes.
+        $changedTracked = @($changes.tracked | ForEach-Object { Remove-ScopePrefix -Path $_ -Prefix $prefix } | Where-Object { $_ })
+        $changedUntracked = @($changes.untracked | ForEach-Object { Remove-ScopePrefix -Path $_ -Prefix $prefix } | Where-Object { $_ })
+        $r.changed_tracked = @($changedTracked).Count
+        $r.changed_untracked = @($changedUntracked).Count
 
         # The newest change is what the "binary predates its sources" test needs.
         # BOTH the newest change of any kind (informational) and the newest
         # COMPILE-RELEVANT change (the one the staleness flag is allowed to use).
-        foreach ($rel in (@($changes.tracked) + @($changes.untracked))) {
+        foreach ($rel in (@($changedTracked) + @($changedUntracked))) {
             $full = Join-Path $Root $rel
             if (-not (Test-Path -LiteralPath $full)) { continue }
             $m = (Get-Item -LiteralPath $full).LastWriteTimeUtc
@@ -218,8 +280,10 @@ function Get-SourceRevision {
         # new directory to one `?? dir/` line (measured 2026-09-22, a scratch
         # `.tmp-split/` appearing mid-pass), which names nothing about what is
         # inside it. Hashing is content work, so it needs the files themselves.
-        $untrackedFiles = @(& git -C $Root ls-files --others --exclude-standard 2>$null) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace("$_") } | Sort-Object
+        $untrackedFiles = @(& git -C $gitDir ls-files --others --exclude-standard @scopeArgs 2>$null) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace("$_") } |
+            ForEach-Object { Remove-ScopePrefix -Path "$_" -Prefix $prefix } |
+            Where-Object { $_ } | Sort-Object
 
         # Canonical text: HEAD, the whole tracked diff, then every untracked file
         # by content hash. Untracked files are build inputs too (a new test source
@@ -235,7 +299,7 @@ function Get-SourceRevision {
 
         # A bounded manifest of WHAT changed, so a drill can be NAMED rather than
         # only counted. The digest is still the comparison; this is the explanation.
-        $all = @(@($changes.tracked) + @($untrackedFiles) | Where-Object { $_ } | Sort-Object -Unique)
+        $all = @(@($changedTracked) + @($untrackedFiles) | Where-Object { $_ } | Sort-Object -Unique)
         $cap = 50
         $r.changed_paths = @($all | Select-Object -First $cap)
         $r.changed_paths_truncated = ($all.Count -gt $cap)

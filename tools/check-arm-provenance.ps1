@@ -329,6 +329,33 @@ function Invoke-ArmProvenanceSelftest {
     Write-Host '=== 10. no behaviour change: capture failure does not break a verdict ==='
     Check 'the verdict was still written with provenance absent-but-named' ($j.fields.provenance.source_error -ne '')
 
+    Write-Host '=== 11. vendored subtree: identity is its own tree, limited to its scope ==='
+    $outer = Join-Path $tmp 'outer'
+    $scopeDir = Join-Path $outer 'third_party\llama.cpp'
+    New-Item -ItemType Directory -Force -Path $scopeDir | Out-Null
+    Set-Content -Path (Join-Path $scopeDir 'core.cpp') -Value 'int core;' -Encoding Ascii
+    Set-Content -Path (Join-Path $outer 'notes.txt') -Value 'outer v1' -Encoding Ascii
+    & git -C $outer init -q 2>$null
+    & git -C $outer config core.autocrlf false
+    & git -C $outer config user.email 'selftest@example.invalid'
+    & git -C $outer config user.name 'arm-provenance selftest'
+    & git -C $outer add -A 2>$null | Out-Null
+    & git -C $outer commit -q -m 'outer fixture' 2>$null | Out-Null
+    $treeAtHead = (& git -C $outer rev-parse 'HEAD:third_party/llama.cpp').Trim()
+    $v1 = Get-SourceRevision -Root $scopeDir -Scope 'third_party/llama.cpp' -RepoRoot $outer
+    Check 'a vendored subtree is read as git, identified by its own tree' ($v1.state -eq 'git' -and $v1.mode -eq 'vendored-subtree' -and $v1.head -eq $treeAtHead) ("state={0} mode={1} head={2}" -f $v1.state, $v1.mode, $v1.head)
+    Set-Content -Path (Join-Path $outer 'notes.txt') -Value 'outer v2' -Encoding Ascii
+    $v2 = Get-SourceRevision -Root $scopeDir -Scope 'third_party/llama.cpp' -RepoRoot $outer
+    Check 'an edit outside the scope leaves the subtree digest unchanged' ($v2.digest -eq $v1.digest -and $v2.changed_tracked -eq 0) ("digest {0} -> {1}" -f $v1.digest, $v2.digest)
+    Set-Content -Path (Join-Path $scopeDir 'core.cpp') -Value 'int core2;' -Encoding Ascii
+    $v3 = Get-SourceRevision -Root $scopeDir -Scope 'third_party/llama.cpp' -RepoRoot $outer
+    Check 'an edit inside the scope changes the digest and names the engine-relative file' ($v3.digest -ne $v1.digest -and $v3.changed_tracked -eq 1 -and (@($v3.changed_paths) -contains 'core.cpp')) ("changed={0} paths={1}" -f $v3.changed_tracked, (@($v3.changed_paths) -join ','))
+    $otherDir = Join-Path $outer 'elsewhere'
+    New-Item -ItemType Directory -Force -Path $otherDir | Out-Null
+    Set-Content -Path (Join-Path $otherDir 'x.cpp') -Value 'int x;' -Encoding Ascii
+    $v4 = Get-SourceRevision -Root $otherDir -Scope 'third_party/llama.cpp' -RepoRoot $outer
+    Check 'a folder inside another repository that is not the scope is still refused' ($v4.state -eq 'not-a-repo') $v4.state
+
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction Continue
     Write-Host ''
     if ($fail -eq 0) { Write-Host 'ALL ARM-PROVENANCE SELFTEST CASES PASS'; return 0 }
