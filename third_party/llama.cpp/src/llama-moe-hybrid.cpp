@@ -2395,13 +2395,19 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     ggml_tensor * ids  = ggml_view_2d(ctx0, p, n_expert_used, n_tok, p->nb[1], 0);
     ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tok);
 
-    ggml_tensor * up = ggml_mul_mat_id(ctx0, eng->c_up[il], cur3, ids); // [n_ff, n_expert_used, T]
+    // every miss in `ids` is the zero slot, so a token's ids repeat a slot; the CUDA dispatch must keep these nodes on the kernels that read one id per output
+    // (floating-point banks, e.g. the bf16 layers of the Q8_K_XL quants, would take mmf, which writes one output per (token, expert) and leaves the rest unwritten)
+    auto mark_dup_ids = [](ggml_tensor * mm) {
+        ((int32_t *) mm->op_params)[GGML_MOE_HYBRID_ID_FLAG_IDX] = GGML_MOE_HYBRID_ID_FLAG_DUP;
+        return mm;
+    };
+    ggml_tensor * up = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_up[il], cur3, ids)); // [n_ff, n_expert_used, T]
     g.cb(up, "ffn_moe_up", il);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx0, eng->c_gate[il], cur3, ids);
+    ggml_tensor * gate = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_gate[il], cur3, ids));
     g.cb(gate, "ffn_moe_gate", il);
     ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
     g.cb(act, "ffn_moe_swiglu", il);
-    ggml_tensor * experts = ggml_mul_mat_id(ctx0, eng->c_down[il], act, ids); // [n_embd, n_expert_used, T]
+    ggml_tensor * experts = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_down[il], act, ids)); // [n_embd, n_expert_used, T]
     g.cb(experts, "ffn_moe_down", il);
     experts = ggml_mul(ctx0, experts, weights);
     g.cb(experts, "ffn_moe_weighted", il);

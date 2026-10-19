@@ -447,6 +447,14 @@ if (LLAMA_LAYER_STREAMING)
     target_link_libraries(test-moe-lean-expert PRIVATE ggml)
     add_test(NAME test-moe-lean-expert COMMAND $<TARGET_FILE:test-moe-lean-expert>)
     set_property(TEST test-moe-lean-expert PROPERTY LABELS main)
+
+    # Hybrid MoE decode with NON-quantized expert banks (bf16 layers of the Q8_K_XL quants): every cache miss is one zero slot, so a token's ids repeat
+    # a slot, and CUDA MUL_MAT_ID (mmf) would write one output per (token, expert) only. Checks the flagged node against the CPU backend for bf16, f16,
+    # f32, q8_0 and q4_K banks. Initializes CUDA when a device exists (SKIP otherwise): run it under tools/with-gpu-lock.ps1.
+    add_executable(test-moe-hybrid-dup-ids test-moe-hybrid-dup-ids.cpp)
+    target_link_libraries(test-moe-hybrid-dup-ids PRIVATE ggml)
+    add_test(NAME test-moe-hybrid-dup-ids COMMAND $<TARGET_FILE:test-moe-hybrid-dup-ids>)
+    set_property(TEST test-moe-hybrid-dup-ids PROPERTY LABELS main gpu)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
