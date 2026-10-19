@@ -22,7 +22,7 @@ static constexpr uint64_t MOE_HYBRID_TIMEOUT_NS = 5000ull * 1000ull * 1000ull;
 static int g_moe_hybrid_timeout_ms = 0;
 
 // exported without touching ggml-cuda.h (every CUDA translation unit includes it); the declaration lives in src/llama-moe-hybrid.cpp
-extern "C" __declspec(dllexport) void ggml_backend_cuda_moe_hybrid_set_timeout_ms(int ms) {
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_moe_hybrid_set_timeout_ms(int ms) {
     g_moe_hybrid_timeout_ms = ms > 0 ? ms : 0;
 }
 
@@ -31,7 +31,7 @@ extern "C" __declspec(dllexport) void ggml_backend_cuda_moe_hybrid_set_timeout_m
 static float * g_moe_hybrid_xd      = nullptr;
 static int     g_moe_hybrid_xd_ntok = 0;
 
-extern "C" __declspec(dllexport) void ggml_backend_cuda_moe_hybrid_set_xdump(void * dev_ptr, int n_tok) {
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_moe_hybrid_set_xdump(void * dev_ptr, int n_tok) {
     g_moe_hybrid_xd      = (float *) dev_ptr;
     g_moe_hybrid_xd_ntok = n_tok > 0 ? n_tok : 0;
 }

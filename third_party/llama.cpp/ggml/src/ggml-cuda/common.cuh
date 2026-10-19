@@ -32,6 +32,13 @@
 #include <utility>
 #include <vector>
 
+// C symbols exported from the CUDA backend: MSVC needs __declspec, GCC and Clang need the visibility attribute
+#ifdef _WIN32
+#define GGML_CUDA_EXPORT __declspec(dllexport)
+#else
+#define GGML_CUDA_EXPORT __attribute__((visibility("default")))
+#endif
+
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
