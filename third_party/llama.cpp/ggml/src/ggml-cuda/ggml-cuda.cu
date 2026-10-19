@@ -2328,6 +2328,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// opt-in hybrid MoE decode: the ids of this node may name one cache slot more than once per token (every miss is the zero slot), see GGML_MOE_HYBRID_ID_FLAG_DUP.
+// mmf and mmq keep one entry per (token, expert) and would leave the other outputs unwritten, so a floating-point bank has to take the per-output mmvf kernel
+static bool ggml_cuda_mul_mat_id_dup_ids(const ggml_tensor * dst) {
+    return ((const int32_t *) dst->op_params)[GGML_MOE_HYBRID_ID_FLAG_IDX] == GGML_MOE_HYBRID_ID_FLAG_DUP;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -2343,7 +2349,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+        } else if (GGML_CUDA_CC_IS_AMD(cc) || ggml_cuda_mul_mat_id_dup_ids(dst)) {
             return false;
         }
     }
@@ -2382,7 +2388,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_AMD(cc) || ggml_cuda_mul_mat_id_dup_ids(dst)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }

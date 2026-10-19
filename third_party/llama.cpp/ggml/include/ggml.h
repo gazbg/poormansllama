@@ -2657,6 +2657,11 @@ extern "C" {
     //             and its selected ids are written to trace[t*trace_stride + il*8 ..]; mailbox and trace must be device-visible host memory
     // wait_add: cur [n_embd, T] F32 -> cur + host result of the misses published in pub, token by token
 #define GGML_MOE_HYBRID_MAX_WIDTH 4
+    // MUL_MAT_ID nodes of the hybrid cache carry GGML_MOE_HYBRID_ID_FLAG_DUP in op_params[GGML_MOE_HYBRID_ID_FLAG_IDX]: their ids may name the same slot more than once
+    // for one token (every cache miss is the zero slot). The CUDA kernels that sort the ids by expert (mmf, mmq) keep ONE entry per (token, expert) and leave the other
+    // outputs unwritten; mmvq and mmvf read one id per output, so the dispatch must keep such a node on them (floating-point expert banks, e.g. bf16, included)
+#define GGML_MOE_HYBRID_ID_FLAG_IDX 1
+#define GGML_MOE_HYBRID_ID_FLAG_DUP 0x484D4944
     GGML_API struct ggml_tensor * ggml_moe_hybrid_publish(
             struct ggml_context * ctx,
             struct ggml_tensor  * selected,
