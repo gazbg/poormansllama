@@ -18,7 +18,7 @@ edit these by hand. Rerun the script.
 | File | What it is |
 |---|---|
 | [history/currentstate-entries.md](history/currentstate-entries.md) | Every dated entry in the current-state record, newest first, with its source line |
-| [history/plans.md](history/plans.md) | Every plan and specification file under `docs/plans/` |
+| [history/plans.md](history/plans.md) | Every tracked file under `docs/plans/`: plans, contracts, specs and scripts |
 | [history/outer-archive-branches.md](history/outer-archive-branches.md) | Commits on each `archive/*` branch that are not on `main` |
 | [history/nested-aer.md](history/nested-aer.md) | Fork commits on the AER branches of a retired nested llama.cpp |
 | [history/nested-freebuff-5e3cb7b5.md](history/nested-freebuff-5e3cb7b5.md) | Fork commits of the MTP predictor work |
