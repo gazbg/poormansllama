@@ -95,6 +95,13 @@ is listed here for the same reason.
 CUDA backend, names starting with `GGML_CUDA_`: `GGML_CUDA_DISABLE_FUSION`,
 `GGML_CUDA_NO_PINNED`, `GGML_CUDA_REGISTER_HOST`, `GGML_CUDA_ENABLE_UNIFIED_MEMORY`.
 
+Linux and Pascal (see [LINUX-PASCAL.md](LINUX-PASCAL.md)): `LLAMA_FATTN_TILE_Q8QK=1`
+turns on int8 QK attention (a q8_0 K cache, head size 256, a GPU without fast FP16;
+off by default). `LLAMA_FATTN_TILE_Q8CFG` picks the block configuration of that
+kernel, 0 to 6, default 0. `LLAMA_MOE_HYBRID_LEAN_CPUS` lists the logical CPUs of
+the expert team, the last one for the engine thread; match it to the CPU's SMT
+layout.
+
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
 tests fail without it, and the CMake cache keeps the value from configure time.
 

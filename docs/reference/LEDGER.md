@@ -34,6 +34,7 @@ Every row points to a source. The full list of dated entries is generated in
 
 | ID | Date | Tried | Result | Why / what it taught | Source |
 |---|---|---|---|---|---|
+| PASCAL-1 | 2026-10-19/20 | Linux build on a GTX 1070 (8 GiB, no tensor cores); prefill limits and optimisations; thread pinning for decode | Built, measured, committed locally. Not certified (no provenance gate, no GPU mutex). Causal attention bug fixed | The tile flash-attention kernel ignored the causal window, so `--lm-prefill` computed wrong attention on this GPU (fixed). Int8 QK (opt-in) makes attention 1.67x faster; cold prefill at 100k tokens 471 s to 332 s. Pinning the expert threads took decode from 5-8 to 30-35 tok/s | [guide/LINUX-PASCAL.md](../guide/LINUX-PASCAL.md); `currentstate.md`, 2026-10-19/20 (PASCAL-1) |
 | G42 | 2026-10-18 | Fused prefill (`--lm-prefill-fuse`), idle preparation (`--lm-prefill-prearm auto`), canonical checkpoints, `-np 1` | Implemented, opt-in. One contract item missed (GA-5a, by 0.017 nats on one dynamic-cache check) | Request wall, fixture A: 4.84 s to 3.66 s (0.755x against BASE). Idle preparation 0.714x. Small turn 0.902x. Canonical 0.787x. Stability soaks to 138k context | `currentstate.md`, 2026-10-18 entry |
 | G32 | 2026-10-15/16 | `--lm-prefill`: batches of 1,024 tokens or more run layer by layer in llama-server | ACCEPTED (own contract LM-1..LM-8) | The owner was right that the G31 estimate of about 1.35x was wrong. Batches below about 1,000 tokens are not taken. Attention-bound past about 50k. The default mode fails hit-versus-fresh checks on swapped fixtures; the canonical mode passes | `currentstate.md`, 2026-10-15/16 entry; `docs/plans/llama-server-integration-results.md` |
 | G31 | 2026-10-14 | `--hybrid-moe -fitt 16000` in llama-server, against the unmodified server with the same flags | ACCEPTED (own contract SRV-1..8) | Token generation 3.0x to 3.7x at 4k, 24k and 100k context. Prompt processing 3.65x to 4.11x. Keep-free margin held (minimum 16,169 MiB). Two 160-request soaks, one with `-np 2`, no failure | `currentstate.md`, 2026-10-14 (G31); `docs/plans/llama-server-integration.md` |
@@ -72,6 +73,13 @@ Every row points to a source. The full list of dated entries is generated in
 | G30 depth | 2026-10-14 | MTP draft depth above 1 | Loses (plan "G30 DEPTH STUDY", ledger row 81) | Keep depth 1 unless a new study shows otherwise |
 | G-n_pad (AGENTS) | 2026-10-12 | Setting `n_pad` small on its own to shorten decode attention | Not a fix. Decode attention cost tracks `--ctx-size` through launch geometry, not KV bytes read | AGENTS gotcha |
 | G-view (AGENTS) | 2026-10-12 | Narrowing the TG graph set's KV view tensors | 18.9% slower | Do not mutate the TG graph's KV views |
+| PASCAL-1 tile | 2026-10-20 | A 128-row MMQ tile for the K-quant MoE matmuls (Q4_K, Q5_K) on Pascal | 14 to 16% slower than the 64-row tile | Only dense Q8_0 gains (24%). With about 64 tokens per expert, fewer larger tiles waste more |
+| PASCAL-1 J cap | 2026-10-20 | Narrower column tiles for the MoE matmuls (J 48 down to 16) | Slower at every value (gate/up 7.4 ms to 10.1 ms, down 9.8 ms to 21.0 ms) | J=64, which the host heuristic already picks, is the best |
+| PASCAL-1 int8 configs | 2026-10-20 | Int8 attention kernel with 128 threads or 64 K rows per iteration | 1.6 to 7.5 times slower than the 256-thread, 32-row layout | Register spills (stack up to 1,960 B per thread) |
+| PASCAL-1 V tile | 2026-10-20 | A whole 32-row V tile in the int8 kernel (fewer barriers) | No change | The kernel is bound by instruction issue, not by barriers |
+| PASCAL-1 force pass | 2026-10-20 | The layer-major pass for every prompt size (`--lm-prefill-fuse-min 1`) | An 8-token prompt 14 times slower (0.21 s to 3.07 s); no gain above 570 tokens | The pass has a fixed floor of about 3.1 s on this machine (PCIe). Never set `--lm-prefill-min 1`: it catches decode steps |
+| PASCAL-1 KV type | 2026-10-20 | f16 instead of q8_0 KV to avoid dequantization in the attention kernel | Same kernel time at every depth | The q8_0 to f16 conversion runs outside the kernel and is small |
+| PASCAL-1 load mode | 2026-10-20 | `--load-mode none` instead of mmap (the server's own log hint) | No faster; 60 s to load against 4 s | |
 
 ## 3. Transfer and staging measurements (facts for the next design)
 
@@ -170,6 +178,17 @@ The full list with dates is in [../../AGENTS.md](../../AGENTS.md), section
   0.25 s of traffic to recover.
 - `llama-completion` and `llama-tokenize` process backslash escapes by default
   (`-e`). The layer-streaming runner does not.
+- Until 2026-10-20 the tile flash-attention kernel (GPUs without tensor cores) did
+  not honour the causal window that `--lm-prefill` passes, so tokens saw later
+  tokens of their own chunk. Any `--lm-prefill` number from such a GPU taken before
+  the fix used the wrong attention (PASCAL-1). Run
+  `test-backend-ops test -o FLASH_ATTN_EXT` on a new GPU before trusting a pass.
+- `LLAMA_MOE_HYBRID_LEAN_CPUS` has to match the CPU's SMT layout. On a CPU whose
+  two threads per core are `i` and `i+4`, the default layout cost a factor of about
+  5 in decode (PASCAL-1).
+- `--lm-prefill-canonical` re-prefills up to one chunk on every follow-up: a
+  3-token follow-up to a 4k-token conversation took 3.2 s with it and 0.12 s
+  without it on a GTX 1070 (PASCAL-1).
 
 ## 9. Owner decisions that set defaults
 
