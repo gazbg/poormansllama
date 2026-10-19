@@ -1100,7 +1100,12 @@ struct LLAMA_API llama_layer_streaming {
         int    host_finite     = -1;
     };
     void tel_layer_compute(int il, double compute_us, double setup_us, uint32_t generation, int64_t chunk,
-                           const tel_layer_compute_params & params = {});
+                           const tel_layer_compute_params & params);
+    // overload instead of a `= {}` default: GCC cannot use the nested struct's member initializers
+    // as a default argument inside its enclosing class
+    void tel_layer_compute(int il, double compute_us, double setup_us, uint32_t generation, int64_t chunk) {
+        tel_layer_compute(il, compute_us, setup_us, generation, chunk, tel_layer_compute_params());
+    }
     // T-GPLR-76: WHICH nodes made a graph "mixed". attn_dev/ffn_dev say a
     // graph straddled host and device; these say which OPS sat on the host
     // side, because that is the actionable half. Accumulated across every

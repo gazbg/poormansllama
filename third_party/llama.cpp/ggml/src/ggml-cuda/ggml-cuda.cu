@@ -535,7 +535,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
-extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void);
+extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_dbg_nodes_launched(void);
 
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
@@ -975,9 +975,9 @@ static std::atomic<int64_t> g_dbg_nodes_launched{0};
 static std::atomic<int>     g_dbg_in_compute{0};
 static std::atomic<int>     g_dbg_aux_idx{0};
 
-extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_dbg_nodes_launched(void) { return g_dbg_nodes_launched.load(std::memory_order_relaxed); }
-extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_in_compute(void)     { return g_dbg_in_compute.load(std::memory_order_relaxed); }
-extern "C" __declspec(dllexport) int     ggml_backend_cuda_dbg_aux_idx(void)        { return g_dbg_aux_idx.load(std::memory_order_relaxed); }
+extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_dbg_nodes_launched(void) { return g_dbg_nodes_launched.load(std::memory_order_relaxed); }
+extern "C" GGML_CUDA_EXPORT int     ggml_backend_cuda_dbg_in_compute(void)     { return g_dbg_in_compute.load(std::memory_order_relaxed); }
+extern "C" GGML_CUDA_EXPORT int     ggml_backend_cuda_dbg_aux_idx(void)        { return g_dbg_aux_idx.load(std::memory_order_relaxed); }
 
 // test knob (LLAMA_CUDA_GRAPH_RESET_EVERY=N): force a CUDA graph warmup reset on every N-th replay, so the direct (not captured) launch path that follows a
 // KV-view pad boundary is exercised often instead of once per 256 tokens
@@ -1001,13 +1001,13 @@ static int ggml_cuda_dbg_free_at() {
 }
 
 // the next device buffer allocation is reserved lazily (set by the KV cache constructor around its allocation, reset right after)
-extern "C" __declspec(dllexport) void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
     g_cuda_lazy_next = on;
 }
 
 // commit the first `rows` rows of every cache tensor held by a lazily committed buffer (the rows beyond stay uncommitted and must never be touched).
 // Returns the physical bytes committed in total, or -1 when the driver ran out of memory (the caller fails loudly).
-extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
+extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
     int64_t total = 0;
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
         for (ggml_tensor * t : lz->tensors) {
@@ -1025,7 +1025,7 @@ extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_rows(int6
 }
 
 // G31: the physical bytes that committing the first `rows` rows of every lazily committed cache tensor would still map (an uncommitted or aliased granule counts once)
-extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
+extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
     int64_t total = 0;
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
         std::vector<uint8_t> seen(lz->mapped.size(), 0);
@@ -1052,7 +1052,7 @@ extern "C" __declspec(dllexport) int64_t ggml_backend_cuda_lazy_commit_cost(int6
     return total;
 }
 
-extern "C" __declspec(dllexport) bool ggml_backend_cuda_buft_is_lazy_capable(int device) {
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_buft_is_lazy_capable(int device) {
     return device >= 0 && device < ggml_cuda_info().device_count && ggml_cuda_info().devices[device].vmm;
 }
 
@@ -1067,7 +1067,7 @@ static __global__ void ggml_cuda_keepalive_spin(long long cycles) {
 static std::thread       g_cuda_keepalive_thread;
 static std::atomic<bool> g_cuda_keepalive_stop{false};
 
-extern "C" __declspec(dllexport) int ggml_backend_cuda_keepalive(int device, int on) {
+extern "C" GGML_CUDA_EXPORT int ggml_backend_cuda_keepalive(int device, int on) {
     if (on) {
         if (g_cuda_keepalive_thread.joinable()) {
             return 1;
@@ -1095,7 +1095,7 @@ extern "C" __declspec(dllexport) int ggml_backend_cuda_keepalive(int device, int
     return 0;
 }
 
-extern "C" __declspec(dllexport) bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
     if (g_cuda_input_batch_open || compute_stream == nullptr) {
         return false; // no nesting
     }
@@ -1164,7 +1164,7 @@ static void ggml_cuda_input_batch_before_compute(cudaStream_t stream) {
     }
 }
 
-extern "C" __declspec(dllexport) void ggml_backend_cuda_input_batch_end(void) {
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_input_batch_end(void) {
     if (!g_cuda_input_batch_open) {
         return;
     }
@@ -5201,8 +5201,14 @@ bool ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
     attrs[0].dstLocHint.type = cudaMemLocationTypeDevice;
     attrs[0].flags           = cudaMemcpyFlagDefault;
     size_t attrs_idx[1] = { 0 };
+#if CUDART_VERSION >= 13000
     cudaError_t err = cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrs_idx, 1,
                                            cuda_ctx->stream());
+#else
+    size_t fail_idx = 0;
+    cudaError_t err = cudaMemcpyBatchAsync((void **) dsts, (void **) srcs, (size_t *) sizes, count, attrs, attrs_idx, 1,
+                                           &fail_idx, cuda_ctx->stream());
+#endif
     return err == cudaSuccess;
 #else
     (void) backend;
@@ -5306,7 +5312,12 @@ bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
     attrs[0].dstLocHint.type = cudaMemLocationTypeDevice;
     attrs[0].flags           = copy_mode == 1 ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
     size_t attrs_idx[1] = { 0 };
+#if CUDART_VERSION >= 13000
     cudaError_t err = cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrs_idx, 1, stream);
+#else
+    size_t fail_idx = 0;
+    cudaError_t err = cudaMemcpyBatchAsync((void **) dsts, (void **) srcs, (size_t *) sizes, count, attrs, attrs_idx, 1, &fail_idx, stream);
+#endif
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
     }

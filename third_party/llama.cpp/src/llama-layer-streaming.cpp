@@ -1381,8 +1381,10 @@ struct llama_layer_streaming::pf_worker {
     std::deque<std::pair<int, int>> queue; // (logical layer, telemetry phase)
     bool                    stop = false;
     llama_layer_streaming * owner = nullptr;
+#if defined(LS_PF_ENABLED)
     // Bound once at configure time; the worker is only started when non-null.
     BOOL (WINAPI * pPrefetchVirtualMemory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG) = nullptr;
+#endif
 
     // stats (guarded by mtx)
     uint64_t n_submit   = 0;
@@ -1391,6 +1393,7 @@ struct llama_layer_streaming::pf_worker {
     uint64_t bytes      = 0;
     uint64_t us         = 0;
 
+#if defined(LS_PF_ENABLED)
     void run() {
         for (;;) {
             int il = -1;
@@ -1444,6 +1447,10 @@ struct llama_layer_streaming::pf_worker {
             owner->tel_prefetch_complete(il, phase, (int) ranges.size(), bytes_total, (double) (t1 - t0), err);
         }
     }
+#else
+    // never started: set_pp_prefetch_ahead refuses without LS_PF_ENABLED
+    void run() {}
+#endif
 };
 
 void llama_layer_streaming::pf_worker_deleter::operator()(pf_worker * w) const {

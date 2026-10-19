@@ -40,7 +40,9 @@ keep-free margin applied. That is not a physical 8 GiB card.
 Limits:
 - Only `-np 1` for the newest prefill features. `-np 2` works for the earlier
   layer-major prefill but with declines under concurrency.
-- Qwen3.5/3.6 MoE only, q8_0 KV only, CUDA only, Windows only in measurements.
+- Qwen3.5/3.6 MoE only, q8_0 KV only, CUDA only. The record above was measured on
+  Windows; a Linux build and measurements on a GTX 1070 are in
+  [docs/guide/LINUX-PASCAL.md](docs/guide/LINUX-PASCAL.md).
 - `--lm-prefill` acts only on prompt batches of 1,024 tokens or more, so small
   turns are not helped. Decoding is handled by `--hybrid-moe`. See
   [DESIGN](docs/guide/DESIGN.md#6-limits) for the full list.
@@ -50,6 +52,7 @@ Limits:
 | Document | Read it for |
 |---|---|
 | [docs/guide/USAGE.md](docs/guide/USAGE.md) | Build, run, first request, measuring, troubleshooting |
+| [docs/guide/LINUX-PASCAL.md](docs/guide/LINUX-PASCAL.md) | Building and running on Linux, and the measured prefill and decode work on a GTX 1070 (8 GiB, no tensor cores) |
 | [docs/guide/DESIGN.md](docs/guide/DESIGN.md) | Why it is built this way, what is on by default, current state and limits |
 | [docs/guide/PARAMETERS.md](docs/guide/PARAMETERS.md) | Every flag and environment variable, defaults, profiles |
 | [docs/reference/LEDGER.md](docs/reference/LEDGER.md) | What was tried, what worked, what did not and why. Read before proposing an optimization |
