@@ -1,0 +1,290 @@
+# Commit-id map of the 2026-10-19 history rewrite
+
+On 2026-10-19 the history of `main` was rewritten to replace the author and
+committer identities with the GitHub noreply address and to remove three
+strings of personal data from three documents. Trees, messages, timestamps and
+parent links are otherwise unchanged (276 of 276 commits, verified commit by
+commit). Every commit id of the outer repository changed; this file maps the
+old id to the new one so that an id quoted in an older document can be found.
+
+Ids in the nested engine history (for example `4403c1097` in AGENTS.md) are ids
+of the old fork and are not affected. Entries in `docs/currentstate/` shards
+keep their old ids on purpose (their text is hash-checked); look them up here.
+
+old_id                                    new_id                                    subject
+1a3fd56303afc4b07b4aa80f7a7d27eaae0c1a8d  385cf7e6c38d06acee7ba168454b00ce8389c01d  Add Qwen3.8 Dense Layer Streaming SDD and testing tools
+e1c83581d5641883d084a052de31fe5618aef4b3  50b69f745a6b83a32966fb68a768c19381cd2a82  Update current state documentation with Q8 token budget defect details and mutex-protected trace results; mark llama.cpp subproject as dirty.
+a848b540f16853aa79b03b237df5b8cdcf70204f  2d0c95b9c30eb9a242ff8a3ece75f9868fbf214e  Record T-Q38FA-01: FA window K/V ne[1] per-chunk patching; mark llama.cpp subproject as dirty.
+374a30cd7bfa67e240fb503d5ab6bd566014bf45  39b681cfc40e637f44e0e1e32c669401918efc97  Record completed tasks: FA window, Q4 KV, PP→TG handoff, and all plan docs
+82142f031bb8d83f4f4c84999eeb041b4fc2b348  dfe758fc3bc332f7044d5c84fe2ce1b8672d7e9b  Record generic layer-residency plan completion and evidence
+7072f8cb8bd568dabcca83a85b32e529879796d7  315d84edd34a67379335b0b8ed91ec43bebff9cb  Update agent guide, environment facts, and Qwen handoff plan for the generic arc
+40e927e443a1aacd1fb12d29e9943bebce470598  b2586ee0c99d0bd87ea05f6f2b14af0718737717  Record layer-residency plan completion milestone tags
+227941dd7dfa8ce2531760765bf1a9c9d427251e  b995c9ddf64eea6bff966c2f6105b2fbf572d9d8  Correct long-PP transfer-time interpretation in currentstate
+7f7f49b03fb17623a94676606e187f58de4ca07c  b554c5d12a13e83392b747cd788f7dc01221a31d  Add semantic-QA gate and Problems-and-Online-Help clauses to the agent guide
+970aadecbd3b0957fc33c30b43f9dd3841b799d3  64b0cc6addb1d98331c57cbb0b7f5a3d7fd4cdf7  Record T-GPLR-08/10/11 completion: falsified prefetch, MoE handoff, tail-ubatch fix
+81c1f4ba0e6f87515ee243b363458e4ded09f1aa  dd4161c5a84bc18a8603480780293b8669fa8ee8  Record T-GPLR-10 follow-up: phantom TG evictions root-caused and fixed
+0db7ac8d0b4d95faab489f1647fdc61b732ebc7d  ea0b7a401b7e98baf9fb022d9f85d90583d396e2  Finalize plan state: resolve commit records, serialization, and stale pointers
+8e9e6c05bbffbd910903c184bf8925e4ef3d8d8e  2b88b822e52d0b9fbec95c116bad207a6ddb10f4  Record T-GPLR-13 close-out and the row-set TG follow-on design work
+3b7b2d044c2d7329e230de2c4cc0c0d01402d240  cdbdd0d5aad1303567b90fd2b867ad1c50e8a1f5  Make the SDD the single owner of the T-GPLR-15 gate rule
+eb3922be9d9c3d7cdf2f0e46948ca99aa57946cb  60ec72eb394f240c8eb799c6f34012a84a330d58  Give the T-GPLR-15 verdict statistic a producer and correct the pilot provenance
+0b7ea55edce417656385092a47c46d68eb7694ce  011c3c1cca803565b27ad5a17524f48a9129fdb5  Annotate the surviving "hand-computed pilot" wording in currentstate
+36edf4dee2e81519c9003d673ae389403964fecd  a83371d6c1fc602b75ae03fd6320bc0b964a6147  Track the rowset telemetry schema so the T-GPLR-15 contract cites a spec a clean checkout contains
+11d80d207770b47b791ee280f5f87c07778c195c  8659f83b0bc0b9b67dde8a87efc204ab52617fbc  Correct the citation claims that the schema-tracking commit overstated
+32dea93ca5de07b720f8ff5f16b5e1ce315ca933  fdbd6f29ce4ea483eae0357264af483c802ddae2  Track the model-run testing standard and the performance review, and record the T-GPLR-15 Phase A results
+dcfd7a732d72975ba3ab6cea7cc4aa8458f71082  3cd56a8ab5aa4ce27935fcd5ce2759e035c1bd48  Track the T-GPLR-15 Phase A analyzer so the gate-9 statistic has a versioned producer
+c5ac08ba23b6f9f7c7fc8c0704d31a0f01b23279  ab6c118b44c5a872ce3bbdc5e51b5f0553cd1523  Add the T8 oracle retention ceiling to the route-overlap analyzer
+f219eb3ca41e4b3a90d961fe6a7b728414be0f43  7d8fc0d22ce0c0a38dd465fedfac6d7643b176dd  Record the T-GPLR-15 gate measurement and close F1 pinned staging falsified-by-evidence
+f8759e16635a9e1ffab94616321081fc0a4eb855  ec99e4e494ece20a2ac9ae8cc8a68d096dc8a18d  Record ba1f31e in the task plan and correct the analyzer's tracked status
+1d1a20d9809f0a1707f6b7d1726169ab1497b93c  0ac04b2056d979e8ce66e1184dd64ffaf66f12ed  Close T-GPLR-15 falsified-by-evidence at the SDD's reference retention band
+9456f2656425bde9a46e176b6176624ffff2b621  09554a0eb28ba3bc5ec289f3ffa40cfd35a61699  Record T-GPLR-15's closing hash in the task plan
+5199acc3848cd101fda431253926f71700ef5f98  ea921c79fd7bca8230584bd50f3d73c93c292691  Publish the gate-9 (b)-versus-K curve as a standalone artifact
+04ec379ecccefb53d9143de0f7ed3df377d0dd97  8e2e2c7aac1cc4fea7a167fa5fec114f84a70682  Correct the plan's claim that T-GPLR-17 is the only ready task
+2816d5edbe94ac5fe22289d03779d88687f59ec2  18bf404e29a6aa0860593940f96976c4abf73f3a  Draft T-GPLR-19 (F2-M1 per-layer row residency) with a pre-registered K=1 prediction
+7b25e249e9ba0d7eba065dd0c2f0a9984850dd7f  18b08b845edfa1c5a762fd3a7ef3e94cede781d7  Decide the T-GPLR-19 A/B driver lives in tracked tools/, and record why
+0b05f67edf5c60fe5534894d51839a79761e988e  2ec3a5dc3b5f51c8e4f81ed6a6e89d3001fe3867  Record T-GPLR-19 and decide the vendored-fork commit convention
+83d5a269a845d43770ec873f26c699e3d539586a  9c6747c2850da51d3fb72d6de3fdde619b6c9b16  Record the outer hash 54c6df4 in T-GPLR-19's Commit field
+d6c98cc2bfdda594ab3e4c70a97b936a071fb4db  4acf365524dc61e1ae393bfe6e8f8758b86ab167  Run the deferred T-GPLR-19 rungs at K=2/4/6/8 and publish the measured series
+585579c1135c38ae0da906e18c20d830e21daaba  fdd3b0a648ad6157ae918567a89bfcf06fe1bfef  Record the K=4 default retention depth for T-GPLR-19's per-layer row cache
+48d7228e850fb8d5fc4ecd13b26b8f3cf3e2c425  b50afe3b6c8f71aa078833d16d77b2555fd3848e  Record the outer hash a193028 in T-GPLR-19's K=4 default-depth record
+b8021354d30a675d2acb79faa615a3b2e50aa0bd  c9a3a387a07019dff8615f7eaef4a26f212734c2  Record the device-fitted default row-cache depth for T-GPLR-19
+32f665d287b3189d6075c34ff957a7685677cb05  3ad990e3ffd385310f3e7a45102b49f7b05ed9e0  Record the outer hash 9564ca5 in the device-fitted default-depth record
+73807ea0074539d33e08b6a662d0c31d3ca0275f  89d567e95d0b4892e78585d730265f2199534b3a  Record the shared VRAM budget model for the preflight and the row-cache fit
+5948599c458a53ca111dcb8edc8cfe60cd52286f  b4824aea8b054a5ee26e737527232abcd88a3b02  Record the outer hash 0d9bc38 in the shared VRAM budget model record
+2ed3d659eb2003b89b12da6b754323286b8dc062  2f0abb879fe8ce0036ad1703d95ed93933804dd0  Record the total --residency-budget-mib residency cap for T-GPLR-19
+ac9b32f4ace91ffb9d581d1172ad55d046a14b3b  778983c521354e6878d985a9914888ac6884c134  Record the outer hash 05bbdd5 in the total residency cap record
+8bcd29a09c04a9029492f11bd50105811dcdad92  c4952fc51464a610b23528e3043ea12ef1adb581  Record the byte_account row cache and total residency cap, and the checker rule that proves containment
+b00746f759cc0b45f167bbb126b14a1ed87288ca  391b786609df16a602491b26a345e6f5e809174f  Record the outer hash e18188a in the byte_account residency-cap record
+3afd53e9ab1f28ca63bc9d24fbe66ae0d3c8608b  129ee1c4c1cb2a467febbe38f8cb7aeeda93f846  Record the T-GPLR-07 4k and 50k ladder rungs and make the long-rung prefill width selectable
+37b908cb8aa8d9aee00e748c2436e353cbef6122  955b0350f708b93ba4093caa216e3ffe11717979  Record the outer hash 3dd3a6a in the ladder-rung record
+572e607a98fcf24e5d009f14e31a3ed9e4254fd4  b0ed8dc059584a355bc0c1baf1a5f2926bf844a3  Record the validation sweep, the T-GPLR-22 refusal records, and the H-A/H-B trace-accounting fixes over vendored 8e9757169
+2c7580a0802e387f76c8df71586126cefbd86aa6  08a7ca59855cc48771e9d399b3a77e8fcf774122  Record the governance update: MoE-Qwen focus is a measurement choice, all gates are soft, owner summary required
+de6e0a92aaa879ea830c3db5c98c75fbc0027131  aa6c150280a6956414461e43e5e3de67b1711e0b  Record the outer hash 49c270d in the governance update entry
+f7a5a4aa90acf65e55c08a1e9fc70475f4316bc2  066dd996ccce1f8d780552aa6d866649769a3b72  Record the T-GPLR-29/30 pinned-pool program and the af-overlap verdicts in the plan and current state
+cbc84de48623f44d6d40256f0e68f6e82efdb0a8  4197ce435e01aa495bec9f91da4e8d23c4ffcfca  T-GPLR-32: serialize-gate A/B falsifies DMA-pair contention; verdicts, scripts, and the goal charter recorded
+7a65935af2d9724e3428859cc06c5c1ab7c28246  777b73ed5986dec952be19980838e608d1d7f30d  Record the T-GPLR-32 commit hashes in the task plan
+621095311b26f413643178143592d2c5e0c04347  9ad5bd6708f517a1a13252a342747a65233f29db  Record the T-GPLR-32 per-submission decomposition and draft T-GPLR-33
+76d986588d98e14167e58297e334efd5de8a2a5e  2d7b5ee8d21073b043278b52acd0cfd5370f67e8  T-GPLR-33: one-submission-per-bank falsified; the DMA-compute chaining model emerges
+a523355f5ddc99c3e2bfa3ff6db79b85b19dd2cd  1f821ae0f156cb3841b72cf61b8c81813e570983  Record the T-GPLR-33 commit hashes in the task plan
+1fc02685ad7ed1d639e7feabdc82361e28ac24ee  8257acfa0cee820b516ae02daca5639b5a002119  T-GPLR-33: submit_batch telemetry reports the taken staging branch
+300dd0a88159cf3ae0df084517eab12cbcfd11fa  96158b6a247296378c3e7fa2524f10b0e6d98582  Record the T-GPLR-33 telemetry-fix outer commit hash in the task plan
+f50f6e0a1371af8f52b885a04055bc6694de5ec5  619d6c6fbdee1c9a938be02fd59407430edb7e22  T-GPLR-34: mid-kernel H2D probe falsifies WDDM cross-engine serialization
+4b9762615d463bdf219637dce94be0029b8d93e6  2ba8bea1d77ae49fa1a0c9ed48c8c08a8536a421  Record the T-GPLR-34 probe commit hash in the state doc
+6226ef1d625bf93edaaa52e32d315df34844ca1e  8a210dd4d4e26c336eee05975c5a054c6e60d08a  T-GPLR-35: draft the PP staging-overlap task and record its V1 state
+7ddf42c7bd4d413d569c5c72c48ad030e69e72cb  3822e7e74e67a4f3034b3518762614ba1ca7cc35  T-GPLR-35: recon run - the staging/compute coupling is not stream topology
+71ae8dee1dfb4f06fd04d5ca60616ce78c47b1c6  3fa535e07811df11a6d58c01f8a6e190ca5c0b11  Record the T-GPLR-35 recon commit hashes (nested 69799064a, outer ed2dd39) in the task plan
+44649d94c31fae5caca4f866b2597184482f65d1  7b07e4d28f7db6789f8b3bcfcbc62e9dcc61880a  T-GPLR-35: add the PP pipeline regression gate and record the slot-depth verdicts
+2d3bc8221303920c676e12e1a34856ff23d36eb5  d68bc4285a3b4dc7ce8adabbc8fa46841047043d  Record the T-GPLR-35 gate/slot-tooling commit hash (outer b7cd387) in the task plan
+2fb40022495093b851195232b87523f6ed054f9d  0dbf91ec2ca0586b4d554d6006b0d174289ecda6  layer-streaming: T-GPLR-37b/c, 38, 39 - staging A/Bs, ubatch sweep, route attribution, and the verdict docs
+4a06f46681b10e701641099e72e4b3cd413f4970  bcb24b309c4994c679790dff25ce43ca13763fcc  docs: record T-GPLR-37/38/39 commit hashes in the plan
+1ddc540d375479e6cfe2f36673011df2401eca5c  03e3d17a495ef0587d50d6a6bb1cf4829f318af2  T-GPLR-43: fix the quantized-KV pass-2 crash (per-pass graph rebuild) and unify act_bind emission
+7a2f93da1291c94275a1cb6a586983d763800617  316794ad3770c55124bcdd5dc3eac1c8d442a767  docs: record the T-GPLR-40..43 commit hashes (nested 0ffd0ab14, outer 0a6e54b) in the task plan
+fe4046933476a631fc087f255a9323247796638e  617f876a49cb52cfcb81341f8eaa887b803f78a6  T-GPLR-43: record the qa-smoke gate verdict and add the repeat-2 gate runner
+0be4850312cdf3912d4e884dff572c1b5dccd794  902136d95cc7a8d2750c0896726db9467a238eb6  tools: commit the gplr13/16/25/29-37 probe, runner and analyzer families
+445e0f7bd20d7c88f2f0113d7c9b4b5699bfa207  e3528c3b24a25dbe3d933c1c973ff6f457a4cf2d  docs: correct the T-GPLR-13 TG compute reading with the 50k width test
+82d2bb70533fc7720e0ba25cfcb1bbbdbca5aa59  bb7eec52525233699ca3f624bfbb6cf163c350bb  chore: track the lean-ctx workspace config and ignore its setup backups
+6a2597494dedb129a314bd03b2ff2f6512092803  afff89fdaca1d355ff4386889e610a7785281b60  docs: record the lean-ctx MCP shell environment facts and the working payload
+bd87957ed2a7152bb5085f8da20b4ed1193170d8  2af8e64a1f138484dd197a41b00ba079ebad9d2a  docs: record the PATHEXT/COMSPEC registry fix and the pending relaunch test
+3bda73ba29e3006fac6760d372d6a0f6113aed88  243944439dfb4bdbd797f179e8cbf5b3bfbaff87  docs: close the lean-ctx PATHEXT/COMSPEC question - the per-call payload is retired
+111db72e447cc777376c485666fd8b8ac67c0ba7  65a27c94279532db1fbe2fce3356b0d9eaeadf81  T-GPLR-39/36 evidence: host top-k selection and the host-memory instrument, with the vendored tree at c5d79ad5c
+41572ebab325ef47eae8d156cf1d894f7c708fd0  eae6fac0de432f15adecfaddda46f0693bcadcf1  docs: record that lean-ctx's shell refuses powershell, not just ctest
+ceafe5ac9beeca33f3d76c4fd40ab4917dd7edb9  12ef078ed76dc196b2c9dbd8c165c2d8810fee6c  docs: close T-GPLR-26 as ADVISORY and record K=8 as the operator-named retention depth
+b3aa0fee44fe870917e6fc4b5a25dd150e96d521  68ccd3d6ae8ecc4eef388668333a5d96cc0f4c01  docs: fill T-GPLR-26's commit field with the closure hash
+1d9452a1a92cb019ff559ff8e92ac8cd3e5304d2  32b406aa5c98ac203ca64a45b837a8f53be5cf52  docs: restore a lost line break in T-GPLR-26's Depends on field
+940587799d35ade7512f86a07c6dda786b14a920  caf98c601367b1e935c986a5aaed7222e123512d  docs: allowlist the names ctx_shell needs, and record why a project allowlist never reaches the MCP tools
+901ad67fb08610457ae7aadeac3780d2149fe66d  0a61752705c026d619ea97f072c5cda07f838254  evidence: row-cache A/B re-run on the honest stream at K=6 and K=8
+237308a57e93984061db408538b7b014bf880160  064f4e6a1cb4d0fb45a8d2c97dad79f2a0752ba9  tools: add a GPU smoke wrapper and record that ctx_shell can now launch a mutex-held arm
+a792dc5c0ad5233c288a4213143db7c2e3434ac0  0ae1a4b7b08b8ad02226fe12ff4cb09eb732a94a  tools: make the non-echoing prompt the default row-cache vehicle
+da432f40cf130982acc3b887873f2b2d4b6e0c95  dcc713de64181afadb74d53fce074b0663f7829f  Make every GPU arm leave a verdict and a .done sentinel, so a launched run needs no watching
+e488355f9dfe3f5852b10526d8b585961a88639c  efe9222dcd56ebdda942daa426453cdba0661e27  Consolidate the detached-job conventions so the next session does not rediscover them
+8d667e265d63ac82df7a1867d895a2143c39a27e  15aa71039e1b64c9edd4f28db3415887cfe203ed  Record the owner-directed default row-cache depth: K=8, not K=4
+a8aa5f404958e0123d25d73722c705c0524c66e2  9972c1812aa48f4000a2d683e1550b4e61f54800  Fill the T-GPLR-26 follow-up's commit field with the recorded hashes
+3a277c14bd718e3636f2c1f012f88baa6821e25c  87b3eab83bfaa526924768ec58343f9096e1d30e  Mark the historical K=4 claims as superseded where they could read as current
+66e1f009b5a0632c2278b43ef0fa20facb9146b8  43388e85d476e1d476851d0fbefbcbd828d31c6d  Record a launch-time start marker so a missing verdict is never ambiguous
+2fe95a74588aa47defb11edb9fdb6f97f3ab94f0  d28ea7e73ba4ef12facf06700cd127b7c4c24081  Record the lean-ctx tool limitations found while auditing today's changes
+4300b34831ce700375abc9697f61f11f08480744  8186de6b75006064bf72727afcf20cb10f08a0bf  Repoint the baseline-log citation at the artifact that actually exists
+f478ceeaea5650879b8bfecb17e56dbd3485e645  5268c913705d9d90781e262bc6974ed5de6622ea  Record the ctx_shell shell-syntax trap that produced a silent false negative
+acc911e845fbd2cf9b649535f49c4bf46cc6817b  489892eba829a4d5d80ee297994d461ddbfeeb61  Close the K=8 default's semantic-QA gap and prove the depth alters only staging
+e22f259f566537b3ee074ee4257004a582f121ec  2c33582762c1e026b5a18dfac9a2cc57ebed53f4  Close T-GPLR-35, T-GPLR-36 and T-GPLR-38, and answer the default question for each
+12c17e87c3b4571146ca96a2484825c191b96c54  0249084cc7ebb61628d99a2fa238526f578c19f9  Fill the four stale Commit fields, verified against git rather than recalled
+d09db28e04be26e346b6ef341d45f9884160edb5  447c4618096118a1e57e9b175aa2e1f0cf7af41b  Correct the hand-back's cost attribution: 9.3 s is the exposure, not the sum of two levers
+3930c9c8c01809178e1b1d1c7a13598d85d6ebdd  7b5e0d1d9173f5ddea7f764ed9631630bad01bd3  Draft T-GPLR-44: scope the per-launch patch to the graph about to run
+7b4e2bf49dff0d1920acccbeed4423df922308db  ce07d2b6ae8321baf45355a920470406431cd439  Record why ctx_search skips the state file, and that rg works again
+aaae7284d23d68218a0c61bf5aa2f7dee0368fed  844423c2b4047c15f8d687bc5de7403f5032828f  Split currentstate.md into verbatim archive shards so search can see it again
+e2d55838f57750a489f6631dc05f3e36fff98a14  d97f24b5a53c8f994154b583a651888cf6ad6e69  Add a host-only guard so a doc cannot silently drop out of search again
+aa6e75444bedf5bdfe9d70cb69d8fffaef952b62  b575d536c97681984b96aaba5893b04e688c6ac0  T-GPLR-44 checkpoint: the composition instrument, its analyzer, and the A/B arms
+d9852c88d24d817a337cc75c543bd80ce15384ac  7aff6b81ace6daf02b656854d9eca5c149ebf3ff  T-GPLR-44: revert identity-failed scoping (nested e045fd611); parameterize the arm for 200k
+7fd4972a0d6c0be3e17bad1fd7e49e0889ab796f  07e4087b12cff4d59040b8bd4d702f5ca4bbb016  Record session learnings in AGENTS.md
+7708e86cb0c55f651c2a18045bbd0a62b78e7d45  dd3bc53c777a2cd572370627696603e05d996a7c  Close T-GPLR-44: reverted-by-falsifier; record the verdict and evidence
+5838cc46001e910be2ecdcbf083ca5e9e874e2e8  0c4c17405b1b0b3419dc561224ae288f016d7df0  Draft T-GPLR-45: drop the zero-consumer inp_embd orphan from the patch restore
+7eb9fca345cf3cfbd1759019fec959ca994327c5  c81309e3c5304c96f9694972c8c6499cc6136242  Draft T-GPLR-46: pre-register the pass-2 compute regression experiment
+d1e895e8b72872aef7cc92fb7cf9c142afc479c5  bcfdacef470108ad5b2defc6649772d780b82096  Add T-GPLR-46 arm harness: rebuild trigger A/B, growth-law and saturation arms
+b4a0f9dbc77cabba153e5ff58cb8cb0eef3b0db2  7aa2514148c6dacc20b40bd865335f9777c5199a  Close T-GPLR-46: pass-2 regression is rebuild-linked; TG answer->echo at 4k layer-major
+2a45921138455774de02de5aa4ccf44f5f866754  ae075e9dae5ff46d50cd3a382edf9d223f7093fa  Draft T-GPLR-47: fresh-context rebuild (swap-in-slot) as the root fix
+1ece9cbe4551ac2e77243b0e9e5698b2d18e5eaf  1092caaa6558b3c2015c63b106f1331ce1821cf2  Own the TG-id decode probe: add tools/decode-tg-ids.py, grade evidence with it
+9aa6e1fdf7cf6da99779b52a21945d73b489ed88  115f62a5e7555fa81ab8b2bc1e17be0afee29e5e  plan: draft T-GPLR-48 -- make --pp-prebuild-per-pass KV-conditional
+16bbf8619c8b56c3be1299d62b5a6f6a8e6de48c  7fcb05adb90268b8f5a7d343cdd8b2f2c8b58c2e  tools: T-GPLR-45 arm harness + analyzer closure assertions, gitlink bump
+90fbce70f732f566d1bc533becd19c7ab6204895  bc4ab9cd5b7d2e3f9c684ceb88e21095e054260e  plan+state: close T-GPLR-45 -- PERFORMANCE verdict met, identity gate clean
+b89a0057d2bca1da7f3ee5f06ceb75616b1bed4e  e34bcffdca18122832d5ef6216de3e61ae6526d1  plan: harden T-GPLR-47 invariant 2 -- replay act-slab offsets, never re-derive them
+cb6e06b669f9aadf24f0a7c5ae97b6c9a2c782ab  a2cfb314335ea4941a5a97d76c9d4a43404f8d89  plan: draft T-GPLR-49 -- fix the layer-major act-slab offset formula
+6517ae3fdf5a109cfcee1faa1db515d76a4c72c9  b9520b4c8828ecc1e22c266d4a0eacbd229a40d8  tools: T-GPLR-49 arm harness (pw identity + --no-pw-probe pairs), gitlink bump
+0a7ebe8ea7abfe353a3255cede41eae518d5feb5  a2c7f7670c0eea15d93c0b1d082ab8f99d6a62cb  plan+state: close T-GPLR-49 -- the pre-fix offset defect is real, the repair lands, the default path does not move
+95198db72e0332aeb268abd680fce2fb5b9487b1  1698c8a3f00bf5bb85dbae1217be7fda4bc8c6ae  docs: record two T-GPLR-49 vendored-engine gotchas
+489c7377683708c0af7d7747818dcee045072258  d1f87f26fb49f275e753616646832d02e9c05e96  tools: T-GPLR-49b echo-attribution pair (schedule x rebuild), graded streams
+db69a1527d7e4ea0ea36dc95947f3d10b8205d73  c7ed868c81a1fb2ae90212ca6e7de7c48a5ec6f4  plan+state: attribute the 4k echo to pw x rebuild; T-GPLR-47 targets the pw rebuild path
+8cd028f3674109e94647fb6b2c73d0ddd03381ce  480f23647d6bf685534064f657debd696424540f  tools: T-GPLR-48 arm harness (KV-conditional default) + host-only route-parity gate; gitlink bump
+cc1fcceda60bb24d15f34250e5140af4fc3d278b  b5c59a99bb59f30e2df481230e7682748f564dc0  plan+state: close T-GPLR-48 -- the f16 default drops the rebuild, quantized KV keeps the crash fix
+2685a9265c981d7374aab08c3d8ad52db5489b0f  36342da5d78a56bbbfcfaf85fdfdeaec9779ea53  tools: T-GPLR-47 validation harness (7 arms + smoke, AC5 dump gate) + gitlink bump
+efe49916cf431520dfc9efa60f9525488a83236c  49870b13b17d5bf3004749834dd3ff2d28519ee3  plan+state: close T-GPLR-47 -- fresh-context swap-in-slot rebuild kills the pass-2 excess and the 4k echo at the root
+13e4328801493c560e9cfa6bc9e3425bc1a8b636  81817c266ede0b2cdcaccbcd4e36ff1d4585709f  docs: split the plan file - 18 closed task blocks move verbatim to an archive shard
+562b41323ded4e27401f33efdf415f31f2488012  7c9ad260363a01864d750dbb9fd6181ebfaead59  tools: T-GPLR-37 validation harness (5 arms + smoke rung) + gitlink bump
+ad2922361630fe0b0a896cb639764dd1fad9806d  206e07bad8649f91d16b2c8394c66195f556f4e9  plan+state: close T-GPLR-37 — mmap-registered staging promoted to default by owner decision
+e3a48f4f6ddf493725bbaba8cee47ed7c3bdc43d  1f77f1b84e47c1459249e8f49527a364e929c89b  layer-streaming: T-GPLR-39 harness (arm/set/qasmoke runners, parity-tool note) + nested gitlink
+e27543f5442702e84fbdd541a20c76bfd248c495  9223cf87b6ba651c7a63adc3105ee91c35c4942f  docs: close T-GPLR-39 - route telemetry defaults off (owner decision), all gates green
+18b8c477b69d79d1964e45c84f3de0be01b7001f  6b09c8fbe8fd804ed48119bb1807dd2554c552c7  tools+docs: re-measure the 200k per-launch patch lever on the current binary - CLOSE it; record the rebuild-OFF pass-2 excess finding
+9d5981764d32ab51f65d237df02c99fbdab82ac7  3911bc08eca4ffb456a647c2f98d516e641c0bd8  docs: resolve both parked oddities from recorded traces (no new arms)
+49078287eb83abfa2e3ca70e1799a74b01abca8c  8e3772e6fdfa029ea0d2005d35f541e3c64cca92  docs: draft T-GPLR-50 - flip the f16 rebuild default back to ON (survey answer for the top remaining PP lever)
+cb38519695a861fbd79ed5f51c27bb60802cbfe8  c191fd009e03c5fa78e9ca38529f78ece21738f6  docs: correct the oddities entry - the pre-T-49b pw stream grades FAIL (echo), not PASS
+99f0702426dda1951ba5cf7b7433f7fb70333e5a  049d2199ff638bb41450844d1f873b3c64e94d45  layer-streaming: T-GPLR-50 - f16 joins the per-pass rebuild default; harness + closure docs
+2e44bbe5787acca287c3d21174bd8b49758a9e67  5b675ec28aa84a5a85821b9b483ddf9dcef246df  gpu-lock: refuse to run (exit 125) while a non-conforming compute process holds the GPU
+0cb63d8ea3ba187584a83954e1056878a5a49995  1dad3956088227793f5464e72461f8294dd52e40  docs: record the clean PP/TG reference t/s table for the current binary
+50412ae3d7d84409320cf2f2172224513cbf5d56  3c91b2c9050b0f6596298213f1f3c91df5efc97e  docs: draft T-GPLR-51 - attack the EXPOSED transfer at 200k (copy tail + hiding robustness), not the bucket
+258d48eab9942360e3446ca41a00dcfc48cf5c2f  00c4de0b3b0e4b98e1f89112be15fd0c5731463f  docs: T-GPLR-51 A2 verdict - copy-source stays mmap at 200k; the copy tail is structural, not page-fault
+7bcac98b38eac36451a64072f9645b5527d6bee5  8c63eb535fcdeea720664023e6215b99ed4c8be3  docs: T-GPLR-51 A3/A4 verdict - copy-tail question closed (structural); async-feed redundant at 200k, 4 slots worse
+01d8918cca92f0d5989fffc1aeb569df06ba1876  9756d1bc4016d158f09be7b349433714c8a44222  docs: draft T-GPLR-52 - attribute shape-dependent per-copy staging cost; correct the 40-vs-160 premise
+96819727e76ccd9cd3d91bd649e04bc860750332  24ad93fed22d71a61ad9da2c4a53384e9036d4bc  tools: T-GPLR-51 default-confirmation arm (2 slots) + plan resplit tool
+b4ac4ff77accf2260004bc501836943ce159dfd3  877594d4006a8fdec3fef78dcc9abf9030f3aecc  docs: T-GPLR-51 DONE - 3 slots measured-optimal, default combo confirmed; first plan resplit updates the index
+233fddecc4549bc568b68c8f5e49a1157d5f97e3  2f11bf9ba5762dde012d16ba9efff2d9bc18e25f  docs: T-GPLR-52 A1 - H1 confirmed, the copy wait IS overlapped compute at long context
+76d0622655ec2bf995c6f59aad8c883d73150c57  d4faed4f852cd01182a673ecb5ccee3b892b74d6  docs: record the resplit archive-body hash in the manifest
+108b57ab92eb93305cc483396c8dd8427c69ad9c  bc462f439e4151a1ec7dacbc38a6e6922b2dde44  docs: T-GPLR-52 A2 - H2 falsified at the 50k discriminator; per-copy cost is not file-cache eviction
+6297349262bfbbb067463b2e112563b487f492e3  97b7977f1466ae3c4e15e554d715492c55e7cacf  tools: T-GPLR-52 AC1 re-audit - fix unfiltered copy stats in the pinned-arm runner
+9176116762e4bcb41deb00552cdef986519995a1  88dff2df861e846b4a08aded226832a7bb76f6fb  tools: T-GPLR-52 A3 - in-trace staging assertion + proven-active pinned arm runner
+7be8a7ce0abdbb9d9a1605ae725ca9bac2904ac1  54331225695f2b1203b9b1cc1a16a74de43f95e4  docs: T-GPLR-52 A3 - H3 falsified with in-trace proof; pinned engaged, no fallback (AC4 discharged)
+19656580ee9fb80f820b6d17f102d700fac4138b  59ba5ba87b38f76f923ae6d92a9c03436594625a  docs: T-GPLR-52 AC3 - copy_complete semantics documented; true-DMA timing exists (recon copy_gpu_ms), DMA is 1% of host cost
+c410d68b11246b97e7db52ac8207d920c5657edf  e293334110d47e4cfe1fa17b326d60eed81af935  docs: anomaly sweep recorded - 4/5 explained, pass-1 exposed gap open; recon gen off-by-one logged as hygiene task
+796da187e10b76f5066badc2d15a9d14862f0243  7c0536d8fc340e89c3d6dc5892985f2168d57200  docs: plan close-out resplit - T-37/T-52/T-54 blocks archived; resplit header rule and manifest
+65abf59a268cbe8fe66e7bb6dec639c60bd1c372  e19bfcfe063b99d3f4f4a3fa2fb55475bec8a199  tools: T-GPLR-53 instruments - gap/decay analyzers, embed-chunk checker, A3/A4 arm drivers and session
+880b908e897fbe2225badac257db690a2febd939  91af5802f4f982c5a9d4a2935bfbc193aac09083  tools: T-GPLR-54 A1/A2/A3 - ID-CHECK analyzer, logits checker, A3 verdict analyzer and session drivers
+9201101235e2e733f1b46314ac18947c703e381b  f16276b755a9668dc9d92891a8e7bfd03df4c104  tools: T-GPLR-56 A1 - acceptance-quantity Q checker (host-only, no GPU)
+38a245eaeb73100ee3f01621960816c41c28a412  257ba066ece0f66e9132c0b063db4c79cc52236b  tools: host-suite registrations for the T-GPLR-53/54/56 checkers and guards
+060b4bcec3d1db612bd4b9b58c5a952b1ca93d2d  43dc0a1207e7abc7b636144fa6a728d62f0501cd  docs: T-GPLR-53/54/56 records - plan blocks, env sections, currentstate entries
+f6d5b0158060fabe923f86263ddcf4d723dbf786  27c918d8e11e7f9a2a561b3f4b26e65d764b703f  nested: bump llama.cpp pin to 59073be2a (T-53/T-54/T-56 task-split series)
+cd21a8a55a410b238662d1e3c1cdee060e925ee5  0dbbede5cbbd48bff3a2d2ddcf0a96c6b9e828d6  docs: drop the trailing-whitespace line git diff --check flagged in the live T-53 block
+a3daf536c9a374cd985f14e2a9adfbd68419d2c6  068b63951dd219df6ac0fbd43e308724aeac411a  nested: bump llama.cpp pin for the whitespace fixup
+73f41cc126d4d26d4610a623c4626410d8afbee3  2e35a2e1bb47c1f4e678b8492ef6c133f5c39392  docs: record the T-GPLR-53/54/56 commit series and its mechanical verification
+cff912ca8197b9acab5c010aa863af856dcdc206  f4a9528f683d102392f5e7ad150c47a0d6a9728c  tools: arm-verdict writer refuses an unattested PASS (UNCERTIFIED at exit 10)
+3e59bc1a09c9c293b6bebf6226262ab9752a8e44  44712faa5810b7283c24cbaf32ef42e1ed0a1717  tools: provenance gate at the with-gpu-lock choke point; suite blocks fail on a missing checker
+68a7881d7d219bc6344d5717474b7a95bc13a762  7df957574ba20acd36b58375490ff8b7004e1a24  tools: bind suite results to a source revision (suite-revision/1)
+014a0f72391e5cd2fa5cdd0e6761ff720a1de88f  49ac83d55dce03628c23f7a0f291946cb2ff4522  tools: T-GPLR-55 A1 per-part TG timings guard + A1-ladder launcher with -CopySource
+a3e17369c0ef7cd4359a30df86aa6bcfabb5d7f9  d526df75866fba5fa46cd6b2d6622f4f89b8e81e  tools: offline predictor screening harness ported from the colibri predictor-funnel
+9ed70ff1d7867302e66bba4c987851f1d7e92d15  05d3b9d58d1e293dad9b69f8bae1054885ba561e  docs: predictor screening results - coact/markov-1 beat history at every budget; fusion dominates both axes
+0e91756fcbecbff2a9fcad563663e3266b9f83e0  322dce57e5039f4837d46cc95b1b88278c5ab86f  docs: enforcement, suite-revision, T-16 closure and T-55 retraction records
+b44370830cf10386a4493edabdd5c7453a82200c  a4c387586c372fe9f501d8eb143787e3789c1e26  tools: T-GPLR-16 revert guard + nested pin to the revert commit
+27b4de020a282cdf0aae424373b1cb1362aaa394  fc352ecb51439b86f7897e0b178ece201085af9a  tools: T-GPLR-53 A4 band settled as the per-chunk embed excess; the reporting fix lands (excess BAND, wall as relocation instrument with its ceiling)
+9f0b2fd696a35e0dc0edc07143f9e313584674b6  81c84b059f28100cb4606761b2cc8d09da4d9316  docs: restore the T-GPLR-53/54/56 Commit fields and the series record that 9e2f3ed dropped by committing a stale worktree copy of the shared docs
+c4ece1d604983ac60eb8c4ca0c37e43ff5473908  623890476a3e57a847efd050d282d216c200aff6  tools: T-GPLR-56 A3 - the paced-registration analyzer with its refusing selftest, the three-arm driver, the session launcher and the host-suite guard
+bf51acd1cdce7ed0fd1b5ddbce72656fbe7ae09a  ea9701f31abfd50474bb7a5b32f7fb916ba40c8d  nested: bump llama.cpp pin to d8d7253a7 (T-GPLR-56 A3 paced registration)
+84eebe354a2143bfe425cbae0bdbfb9924ac57f6  e67ae8e34f20feb1ddff2c08f845a4ed9407516a  docs: record the T-GPLR-53 settlement + T-56 A3 commit series and write its hashes into the plan Commit fields
+901b4b1c5a4b579a2be148527f671e349dc9a602  43c7a18ceec5a6ff9ee0cc433dbffbabde76aba5  tools: T-GPLR-58 bounding pass - the uncovered-margin instrument that identifies the row cache's retention model, plus its host guard
+4b972543b46592612c025eeb835a06f50eeb779d  8f701cb9725dd1a40716a708118d830c6e90eb26  tools: T-GPLR-58 A2 - the check-tg-predict verdict surface: the pre-registered quantities or a refusal, never a misleading number
+a91211213baaa1723c2b65a9f543659839a6041a  f6b8e04d389f9a5760528d48d5a836748d530d40  tools: T-GPLR-58 A1 - the port comparator holds the engine policy to the offline screen, row by row, against a reference that cannot drift
+6cd9b004bcb79087d60a3b5da369e5b04f9ac0df  8543a281cd45bb221e44360a975c133d1c59f478  nested: bump llama.cpp pin to 7480fb5b9 (T-GPLR-58 A0 speculative placement, A1 policy port + A2 datum)
+57301cd4e09520db4a0d047cd8a63239a634eabe  69a0ef3cd9f78a0945e079b4076e4feec180cc8e  docs: record the T-GPLR-58 A0/A1/A2 landing, the M7 restatement and the committed series hashes in the plan Commit field
+9929b954107455a36101eb87ec3f29376ecf7528  ab240f0c39842f15c0bb592422aa3cae17489d92  docs: correct the T-GPLR-58 Status line - A1 landed with its port comparator, so the holds are gated on the mode-2 wiring rather than on A1
+b8037cf93a79cf3822f8c8f054059ed3e79fd7a9  2b2ea872f11255e4f2fe6d9e3e0ecbf2d01b2703  tools: T-GPLR-58 mode 2 - the fill-room analyzer bounds the opportunity BEFORE a mutex hold is spent, so a low-gain arm is read against capacity rather than declared falsified
+b2d8fd9f375d6735ea9f90b05a0fbb7cea305389  1b9f819bc10bd7ffe70cdcfdfe274718b38046d3  tools: T-GPLR-58 mode 2 - the flag/refusal contract is now a guard, so a mis-declared arm leg fails host-side instead of burning a mutex window
+784c812d030c74551e1e236616530e9919da9d33  14588424e7fce8f650e829b7c38b40528b5dbf98  nested: bump llama.cpp pin to e3627d5f3 (T-GPLR-58 mode 2 - the engine consumes the A1 proposer, with its scripted arm fixture and the five runner refusals)
+1d6b066a3d786bcc30d4dfd7eeaeda3a55feca2f  40831e88cfef53a89924257240245ef0956dc2d5  docs: record the T-GPLR-58 mode-2 wiring, the fill-room bound it forced and the committed series hashes, and correct two stale claims the landing created
+95aa76e888258ea49ffb28ebd5a3e521f02aaf2a  af389f8118a59296a74aded4994a8ddc2c2b0541  docs: point the two superseded "mode 2 is still refused" clauses forward instead of leaving them to contradict the landing
+b122e7c148793e14f0c6545df39e0bf4f2d22d7e  1ca49b48192638abf99f223e5a620eb665017f33  tools: record T-GPLR-58 admission replay and cache evidence
+0943ac74f94de126a7bf80e05f2dae42cacd9c3e  007911fb79524c9227664c43b687d7a34dc8dd88  tools: harden semantic-QA checker CLI validation
+ea2a341bc99ef10754fb4a0d517ccc9768450c1d  695cf66a9aad59038a299cf228e826bfe1d8e69a  docs: close T-GPLR-58 commit records
+f51f37ef4df28de086fee6866e1ea1d7c966c9c0  2f207a4dc8e50a90e9d53bf8a6b9afdd395e48b4  tools: record T-GPLR-58 A4 capacity-bound predictor evidence
+cc37cad46a6974b3d1cd3e12bf9a755d527df071  f46706887e0608386a80163bd77aec268190890a  docs: record T-GPLR-58 A4 evidence commit
+4aa3bd3d6023b3b650f62676467d4d900ba75636  1a07a2aea83f3801242de9a730c4ff6c6b6b7b09  docs: split current state before size guard threshold
+099aec794384e4d1c6c781ff55ec87c211a222fd  fc5e74b7a54829d34d560af2a9bbe3c20b741cff  research: close startup-cost and predictor gates
+6dd4bf2752fff08b6515da898b7c559b9dc71bb7  c77755ebe5ef90cfdeb81cb7f4160906e5af1d10  docs: record closure commit identities
+97d1a01df2e95139150bf3130865c294e70fb13b  bc3e2361a08940ffe847b52c00f5314f397b600a  research: close the D1 MTP gate on runtime evidence
+829328572a4a1ffae133f00e000d951039cdfec3  dfcf4d37c201ff81edb5cb418b0bae8c81eb4a22  docs: record the completed D1 gate commits
+4c02940eecda66aeff31a3d709b73388fe6e39fb  d7e2d74a56ec3d932b0e001fd0091e4d7bc38691  research: close D1 adversarial validation gaps
+c79c64eeeb5ea4e8eed72fe98bcd12d0aeb342d2  175d80daaefb521bb0fe11c3e49fa198b5355e57  docs: resplit currentstate, verified
+6979e889348232ac932135eb2dc76df58c78c119  61e9fe7539c19559ceccae72005404141cfd5560  docs(agents): correct Q8_0 KV size statement; record measured gotchas
+83a6d6bf73e079c9dbcc00e00ac42cdda2deddfa  871be105cba8efcbec2c484f5873a015dc81be54  gitignore: ignore tool-managed freebuff worktrees
+027c314a549aa4da86718a64896706d15eb835f9  e61bde91eb950074cbd1b8ee89b9664bed57a18d  docs: T-GPLR SDD and plan updates, owner summary, T-GPLR-71 handover, expert-staging plans
+b9e9c8c3ef85b9d7e1d6414a4c58a1178a9f77e3  d14329f9c9d191bc92dc1d9ca8ec278dd813fc78  tools: AllowBusy forwarding, splat fix, Windows PowerShell exit-code refusal; T-GPLR-61/62/82 scripts
+34502482c267d2445cdcf85f4afd81e6f8733b9b  d3d98b6216be36520f9da8efa5541bad97e7178f  research: pin vendored llama.cpp at ecc6ca64b
+81b81b6ff09a03838bcf1916453223c245cb1d8c  8fab2e731dda3f19b627cb0f8816ebb9dc0ba9dd  docs: optimizaionV1 plan rev 3 and PP sweep results (D7, 27 arms)
+ea0899ab91dbe8c503400a8f8b95b61504a55724  c5caf76d88371e474779859b41c00b2a0816ef51  AGENTS: explicit autonomous mode (owner instruction)
+395a03b22d14d49c57388fbc7a2dcf63d0eed85c  ad860801fd807692eb2a1dfd02364dcefcec7aac  research: T-GPLR-82 checkpoint (pin 8eb6ea378, a2dev3 attribution, handoff, run tools, op-rows guard)
+faee7133d60396e6aa00493176b01577d7e573c7  5830fb92963f6c26acf3808a06de3a406923b9eb  tools+docs: TG beat-stock plan, spec-driven arm runner, E1-E7 results (S3 stale slab and persistent-graph allocation overlap found)
+07dc9c2591f5db31f0cb19e953d41b737485b51f  1953ea078617c82b7fed042b4cad13448150d0d2  docs+tools: agent findings, E8/E9 results, hybrid strategy decision, paired AER driver
+95751d767d3205e7db77ce01c66da0fc8c2f4522  edb0da8122f5af69f8c94617cff755d339a6c76d  docs: E10 measured AER hybrid 1.8-2.2x stock at the 8GB/262k shape; record hybrid port status (build pending)
+f5717e3d2e18dfa75ecd625a9fee86adcf5258c4  43c05ccec62f97e166166d974fd1b2573d244e3e  docs: hybrid TG smoke (E12) runs end to end inside LM after the register-once fix
+86329fed5cf0602b3afadfd851897d1a6eaf5d0e  c2965b58e46d5e983cd9a1ee32e7669e0d8a4675  docs: E13 LM-hosted hybrid QA PASS at 35-37.5 tok/s; the 2x AER result did not survive the port (open)
+202ee70ecd0a63b47f29302d2d37a05a534f166f  3d22a9812428a35dc209e1cbbc0490abc46e91af  docs+tools: E15 shows the 2x is engine, not prompt or llama threads; prompt-file support in the paired driver
+7a1b28e0471ffccd326a63dfeaa70703ad9a3153  3db5bec5231598310bc443328dc9bc8107230494  docs+tools: E16 confirms the LM hybrid loss is the full-context attention pin (65.7 vs 35.0 tok/s with kv-graph-pad); E18 3-rep 8GB result; VRAM polling in run-tg-arms
+e957ca59056097c327f87e85eaa3f69aca475e01  211557ae8cf2be96d86f79de06245a2856ed7c0e  docs: 8GB result table and owner summary; hybrid C14 + kv-pad = 63.3 tok/s vs stock 35.1 (same session), fits 8067 MiB
+ca5b5b1020aab85eadca29fd4f7a15b4888ff97e  888992827e910951931fcf6eb24f0805c8767e50  docs: correct the LM result table: bf16 default prefill activations cause degenerate output; f32 gives a valid 8GB point at 63.6 tok/s (8071 MiB, QA PASS, deterministic)
+71a0a0ee41950d26d63d19a1e48061ab86561ee4  15c2995f9b1a60bd83a2e7ae43954b297c28f681  docs: final 512-token comparison: hybrid C14+kv-pad+f32 63.6 tok/s vs stock 36.3 (1.75x), 8071 MiB; record the TG start re-decode caveat
+b6172ea7d5761dd3f1b72ecdf2323c3599d6b478  a876a4131c4c511c88227c45f743bfce02952673  docs: E30 first-token check; correct the stock token-1 claim
+b5f889a7ba4414e38ddceed84734075cc5377309  521f42de87d6353ae4c4f2d74b03792dcc57f7ca  docs+tools: G-TG8 certified results; LM hybrid decode 1.65x stock within 8071 MiB
+8ad4235da370c27eb61ddc4602a0278e8e874688  e779f212659e8488b638284e3987477725f046fd  docs: record the G-TG8 commit hash and the nested-patch pointer in the plan
+4a231b68e4b2923caa0ebf7cc5a28d2d3fbdae83  06c5526ee5abaf9f0d24b025211ecec1b484d0fc  docs+tools: G2 decode-phase cache resize results, llama-server pairing, G3 contract and checkers
+3c0009581288c6d5c2a4584e3d2e382b2380fe8e  84ba7d366ae8a80b6eb52781df0a31aeb7fabccf  docs+tools: G3-G7 results; lazy KV cache C82 reaches 2.7-2.9x stock; pad-boundary deadlock root-caused and fixed
+1cfb5215670b154799b63271a5d133f746fb681b  208590f8954b95370024379df1d56d52ceabd40f  docs: record the commit of the G3-G7 results and the 24k auto-sizing point
+a0f4d79f4e45ca50101e80a8806400952b5df9aa  b825335883c40ec8ac13f9fde8c1e80062c94c27  docs: 2048-token soak on the final build (6 runs, 48 pad boundaries, 0 failures)
+c0d58ad4ab5695e81f60ca50be6169eb88fb7bdb  0c7683460fb87597e6cb1c310757f50481f59a8f  docs+tools: G8-G18 lean host leg, predictive cache prefetch, stall root cause; final configuration 3.35x stock under the keep-free definition
+90b2b7bf0709bfb082fa7425a5683ddd1d85445e  d63efe70f3a0ce4e12d8a9c30d202f59bc701da1  docs+tools: G19-G22 deep-fill validation, GQA8 decode attention, dedicated-GPU prefill recipe, short-prompt study (final build g40)
+a08cd9c91be357c0d5a06f5edfb7017d6993c872  e964ceeaca543505a1977139ef68bc24409f149f  docs: record commit dd212e2 in the current-state entry and the plan status
+3d6070c6ec3ca2b7e771e16500f273e4e25d87e5  1520d1fc7c58d56a9106277528c103eaf2a52a9f  docs+tools: G23 paced bank copies, the CPU/GPU interleave and the stock graph path built and measured (build g44)
+ffc1c61bdb8c82030530f234eb7ad56f115f6fb5  941e25ee84f2da8367ccacdf3c3a1584360a992b  docs: record commit 32a2389 in the G23 current-state entry and the plan status
+8aef749d86add14f256f2647b80e0a7fe2f79950  b34efc6e389eb9604991d2701c14101d399077db  docs+tools: G23 addendum -- the slow CPU-only path is the PCIe link downshifting while the GPU idles (build g45, --gpu-keepalive)
+779ff3ab906e54d2b4549d6690181186a9b1fc49  dbb7ffe60d9c68aea1e2ea028e206df9e940486e  docs: record commit 90c7fee (G23 addendum) in the current state and the plan status
+8b3c28e5d30b928f8f18720c184ba93d6ed6b986  4b0ec3d2432f02d09213d009eaaac9be1f49c5da  docs: mark D80 superseded by D85-D86
+eead3909b9a29fc3f6800ca711985ccb5d28ce3a  b7066699f877cf5c0df6f666b7d27f1ca32973ec  docs: list the untested flag combinations of G23
+af6ed2d871dadc238286e460d1ebfe6ed8f5f18c  51953fbb2ae4ac4adc4beaa17eb45c667a925380  docs+tools: G24-G29 strict whole-run TG verification, segmented prefill, sampled decoding (builds g45, g47)
+3e1749b81f908efc5e030c43d621f5979b17b844  2064175105862982d35db34ae917a261dca5bf3d  docs: record commit d676202 in the plan status and resume checklist
+843023b6022704018c7e73ba7638ce94b5658679  1074308a57bfba0dadd56ee9a96c82d40f1f0571  llama-server integration G31-G42: hybrid decode, layer-major prefill, fused prompt batches, idle preparation
+56a6bdd3bb0334d3bc466e5dc86feb65d4b4c54d  866156b21dece20f258456642108e62ccb5e39e8  docs: record commits cb20819 / f0a247e69 and the keeper binaries for G42
+6dae153d4a6e7568db02b6012dbf97e878ef493e  1dc0bba7735501940ce404eb1a185403c47d9eb3  Vendor llama.cpp base 36f0ae09 in place of the nested gitlink
+d808a6f67f7ff5be1ecf05bb82369d940530383d  b8b3f34e18c4b4f48dbec1d676968e6ff46df7ed  layer-streaming: revert T-GPLR-16 option (a) - drop forced GGML_OP_OFFLOAD_MIN_BATCH=1 under --handoff-partial
+c6089e89df2d1a466bc46761e66664f806acf070  d750465f2eaf550ce5222b34d9577e8b2013ca0b  layer-streaming: T-GPLR-56 A3 - paced span registration behind three default-off flags (--pp-span-pace, --pp-span-pace-ahead, --pp-register-site) plus its fixture generator
+e214c07e974bff3175412aa37be50bd03eb7c223  286a967b51f29ab7a1bf1859b492247dc66a7d18  layer-streaming: T-GPLR-58 A0 - speculative TG expert-row placement behind a default-off mode, its host fixture test and the runner flag surface
+6e74f255f407dbc454980295b760370cd20716f1  88dc7b90bfc4f7f46068525f32b3d4b4a9044b3b  layer-streaming: T-GPLR-58 A1 - the proposer families, the count-matched null and the speculative planner as pure functions, plus the port dump the comparator reads
+8c704fa34451f408a5e8ebddc30bb2e8788fc4c1  9f945e830cd8eccda511300db30639356e66bdbd  layer-streaming: T-GPLR-58 mode 2 - the engine CONSUMES the A1 proposer, so the pre-authorized arm holds are no longer gated on an unbuilt piece
+6d06f474b68313af760d974d880679d830d1982d  848b00576dccaad953c5a0ffbfc4537a4dafa5ba  layer-streaming: make T-GPLR-58 telemetry replayable
+3b926cf5cfa270df03fb7f900ea04d9268ab7b3c  55966a12a195a061f0c603dfec52e980f4d4b681  layer-streaming: separate pool policy and validation state
+493d7b2fb5e459a3d05e3f10b98a4c7319fdbd38  767e0b8a6746beef8404c576a22773ca9cbf867a  layer-streaming: measure MTP proposed-token routing value
+0a029cd59a7bbdc7420313b23aa7e92b106ed901  5fe54a05e7fbcf19dd7860b70965f2846bf1c5e6  layer-streaming: harden D1 observation lifecycle
+0388614895f447dfce2d664cc30bbae8d9260c4c  ed23a29fcfd28902807c2dd04938169219f9afac  layer-streaming: refuse row-set coverage gaps instead of asserting
+8003c9ac8cbcf76cc8f2c9e5e089adc5d0423e57  20ea85c2bff776fb998a5da628d1bc70350660db  layer-streaming: address a narrow expert window by position, not by bank id
+7dc84a3c4ff210d5295a778110347206039d63db  b83bbaf85bdd3cc451c05cdb5abf7c64fa35d8d7  layer-streaming: prove the staged window by bytes, or refuse to answer
+16d85f14f9410dd21d6d0618a20e00ef3180eb82  ae0eccde34317069e82e240f67d2ba23a2edbb81  layer-streaming: re-derive the TG graphs after the compact window replaces the bundle
+c33bff9a6816a00c7cc5615161198903e6e2e53b  d90bfefee85ab4cd89322193c8093b7cdd69a2ee  layer-streaming: restore rowset_init.slot_bytes, drop the S2 set-miss dump
+7469ec5c134fd15f537206b9a5c4f9c77e85374e  0df6ad7d2c0883f2e34f3e61e197fe757ca31b72  layer-streaming: give the graph_builds allowance one owner, not two
+7227189b214b063b8688064a7cb69efb43fc2b45  538982ed02941d0e5661f8b55969f3f0c3e5549f  layer-streaming: derive the auto handoff decision from the schedule
+d1f015ef2df8b2461fc81461e85157cd528722c3  95c500e9aead51b5c622038bcead57e3ce9f8d88  layer-streaming: name the TG-schedulable predicate both handoff sites consult
+d546818429d31aaca19da2abd7fa7a86df083c93  7d14ee761ceacf9f1830b285e6309f20bd7546f9  layer-streaming: pin the handoff assertion, record tg_tokens, dedup the slot reduction
+0c0014601abfae7b2c61837659e0069d0878cd7b  d327301b63822d76e9efdb5d38368b9c2050f466  layer-streaming: T-GPLR-66 alloc_spill, T-GPLR-71 TG view, T-GPLR-61/82 scaffolding (default off)
+f75e6fb8189bfcb1c18275b096b74f0a29ee8da6  fc55e22d888a77cca06073446ebaa344fedf0d06  ggml-cuda: FAFIX causal-GQA opt-in gate (default off)
+963fc83c79d7e235750f81c8b19fc8872cfbd2f4  4d0b03171e29e36e23219fa57d43d02062f790c2  layer-streaming: whitespace only (trailing blank in llama-graph.cpp, EOF blank in main.cpp)
+0f3bb7c481da31b7c0fed39bb10132c444d69583  a6ccaed2263e1a3278c8f5f0bdec502c02934077  layer-streaming: T-GPLR-82 device-tail diagnostic builds again; S3 decoupling off in that mode (default off)
+467fef015f2ee6ff403ea221942b7dd7dec1e9e4  8f9e383b82012bd76e9dd688d3f55286b7e83d99  layer-streaming: fix S3 stale slab and persistent-graph allocation overlap with CPU split; guards and diagnostics (default off)
+de1cbc5de902dbf0ebf50d3b1323ff3ecdb1ba40  4aa6087e02cdfb9d8ac8be71427daead4fb845d0  layer-streaming: port AER hybrid MoE decode (LLAMA_MOE_HYBRID) as --tg-hybrid; port not yet compiled
+426703d79f33c46b5f4903015e2f873be435722c  a8262cb8c1dbee85d7a4a8404ab3fedaf3fbb3af  layer-streaming: let register-once accept spans already pinned by the hybrid engine
+cfa2fc4ab4d3e1302b3b56d6568b2c208ab493e4  0f267babd1732ee5dadc1165040351ca2c0e8f75  llama-server: hybrid MoE decode, layer-major prefill, fused prompt batches and idle preparation (G31-G42)
+9c2c4e556665b47099c0017712ad07aa9e776e65  415d50ee5716d4f343142c716b531a9f39017b90  gitignore: keep local archive and release folders out of git
+2a7d585d8de1df5a444473cf468c4de2a05298f9  b6d15ed1e5900b8a5de4f5bb1ffe02fce8d32244  docs: add 262k-context llama-server base run notes
+f605da7dc79cfa1c1454055234007513c933470b  0167ef7b6dd36922b7734ced92d1687bee7107f3  third_party: record how the vendored llama.cpp maps to the old fork
+c5a9bc3ec5302cc22a0ad8b90544ebe58720c39c  20ad6f8f173d8f80409eb72fdf3dc3c3b6191fa3  tools: let the provenance gate read a vendored llama.cpp subtree
+97f141d5f490817b50c43e85598acf2f1db105d2  035aaac3d2b3dbfcbcac4f55dc4f2602008d02b4  third_party: point README at rewritten commit ids
+a1e2df6fe53a378094f1a012ceb9159c4273c878  da0cda08b7cabbb99d5f073663ca76ff89071323  third_party: update commit ids after scrubbing machine name and username
+3c2f2166839e4768b3f68cb4583ad8823a2a9b5e  10e41328bc58be8d9a2552f428c83fec38d5ff23  docs: add main guide, experiment ledger and history index
+78cd5233d7e4b7fddc4ea500cff16a992233222e  5375e7695ca062208413820d67ea7ee58d3684c9  docs: index every file under docs/plans
+fe84b44c6b6378a83a2819270cda51ff9ea303b3  2db6761442a5cfc156ae129be12766ee0546a3d0  docs: record deletion of the outer backup bundle
+eff0683f3f6913917b62b24d59451c7b7f473aac  0cdb2378775e5c94e14c6e0eadb8425b9e67afed  Fix garbage output of hybrid MoE decode with bf16 expert banks (Q8_K_XL)
+b47aef087be801fd09bf3ae020cbae577fc6426f  886ece33b518347211b7afbf3ec29ac88c917445  docs: drop a city name from the sub-agent limits note in AGENTS.md
+0c161acc5ce3b26be61afc9275c878051e27c795  64d58f956401cc470c627ead770406ea6e1dd91b  third_party: build the CUDA backend and layer streaming with GCC and CUDA 12.8
+a5125807a98e88325f9f745c846b7311f2abee85  36a6fe47c927a6d8f14b0210c78898279859bbb7  third_party: fix causal attention on GPUs without tensor cores and speed up Pascal prefill
+408a1f73499ee3ac6849d19d822214d54d5e5edb  e30cba146ade932eb50777afbad96db2d0c45e06  docs: record the Linux build, the causal attention fix and the GTX 1070 prefill study
+c4631564e8c851994738aae8bf5e44b40b00d7ca  1ee29f3fb4d532d33cb6590772d394e359bbadf9  Merge remote-tracking branch 'origin/main' into claude/qwen-model-output-quality-b662dd
+4fbb3e617898e26e4a0efb1d8d95664b03c2250b  0a0c9eabe3219799a40fc0019cf31896d7dbb93f  docs: remove a pasted UI breadcrumb that carried a first name
