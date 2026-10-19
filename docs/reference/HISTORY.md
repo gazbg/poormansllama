@@ -25,7 +25,7 @@ The experiment outcomes themselves are in [LEDGER.md](LEDGER.md).
 
 | File | Contents | Verified | Contains the old strings |
 |---|---|---|---|
-| `source-repos/qwen38GZI-all-refs.bundle` (16 MB) | All refs of the main repo, including the 23 agent checkpoint refs | `git bundle verify` okay | Yes: 20 commits in its history mention the machine name or username. Pre-scrub history |
+| `source-repos/qwen38GZI-all-refs.bundle` (16 MB) | Deleted in this session, at your request. It held all refs of the main repo, the 23 agent checkpoint refs, and the pre-scrub history | Verified before deletion | Yes: 20 commits mentioned the machine name or username |
 | `source-repos/aer-llama-nested-all-refs.bundle` (390 MB) | Nested fork of the AER work, all refs and tags | `git bundle verify` okay | No hits in its 15 fork commits. The rest is public upstream history |
 | `source-repos/freebuff-5e3cb7b5-llama-nested-all-refs.bundle` (390 MB) | Nested fork, MTP predictor work | `git bundle verify` okay | No hits in its 5 fork commits |
 | `source-repos/freebuff-b78d8fc7-llama-nested-all-refs.bundle` (390 MB) | Nested fork, activation trace work | `git bundle verify` okay | No hits in its 1 fork commit |
@@ -35,17 +35,25 @@ The experiment outcomes themselves are in [LEDGER.md](LEDGER.md).
 | `old-build-evidence/` | Text and telemetry from the old build folders | Copied with `robocopy`, counts checked | Yes: the username appears in logs (170 files) |
 | `wip-hybrid-mode-probe/` | Untracked files of one worktree | Copied | No hits in a text search |
 
-Two backups were deleted at your request in this session: the bundles
-`pre-identity-rewrite.bundle` and `pre-scrub.bundle`, which held the pre-scrub
-history. The outer bundle above is the one still holding the old strings.
+Three bundles were deleted at your request in this session:
+`pre-identity-rewrite.bundle`, `pre-scrub.bundle` and `qwen38GZI-all-refs.bundle`.
+The first two held the history before the identity and scrub rewrites. The third
+held the outer repo's full history, including the 23 agent checkpoint refs.
+
+The old outer commit ids that the older records cite (for example `cb20819` and
+`d676202`) no longer resolve anywhere on this machine. The text files
+`pre-identity-rewrite-commits.txt` and `pre-scrub-commits.txt` still record each
+old id with its subject, so the mapping can be read, but the commits cannot be
+checked out.
 
 ### Restoring from a bundle
 
-```bash
-git clone archive/source-repos/qwen38GZI-all-refs.bundle restored-main
-```
+The nested fork bundles remain. Each restores a retired llama.cpp fork with its
+upstream history:
 
-This restores all refs as a clone. Use it to inspect the pre-scrub history.
+```bash
+git clone archive/source-repos/aer-llama-nested-all-refs.bundle restored-aer-fork
+```
 
 ## 3. Corrections to earlier reports
 
