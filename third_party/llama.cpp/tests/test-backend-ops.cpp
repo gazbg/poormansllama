@@ -9871,6 +9871,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, 64));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 128, 32, false, false, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, 64));
+    // causal window op at the Qwen3.6 shape (head size 256, GQA 8) as used by the layer-major prefill, with an explicit-mask control
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, false, false, 0, 0, GGML_PREC_F32,
+            type_KV, type_KV, {0, 1, 2, 3}, true, 384));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
@@ -10271,6 +10277,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // Qwen3.6-35B-A3B layer-major prefill chunk: 2048 queries at depth kv - 2048, GQA 8, head size 256, causal window op
+    for (int kv : { 2048, 10240, 34816, 67584 }) {
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 2048, false, false, 0, 0, GGML_PREC_F32,
+                type_KV, type_KV, {0, 1, 2, 3}, true, kv - 2048));
+        }
+    }
+
+    // Qwen3.6-35B-A3B layer-major prefill chunk (2048 tokens): routed experts (256 experts, 8 used, expert size 512) and dense Q8_0 projections
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, 2048, 2048)); // gate / up
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, 2048,  512)); // down
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 2048, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 2048, 4096, {1, 1}, {1, 1}));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
