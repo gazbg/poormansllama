@@ -306,15 +306,19 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
     int64_t sched_est = S.sched_est > 0 ? (int64_t) S.sched_est : (int64_t) ((double) P.ubatch/2048.0*560.0*1048576.0) + (int64_t) 96*1048576;
     const bool dense = model.arch == LLM_ARCH_QWEN35;
     if (dense) {
-        // a dense layer's pieces hold the FFN activations (gate, up and their product: 3 x n_ff floats per token), the widest projection output pair and a few residual-stream copies; measured
-        // 599 MiB of footprint at a chunk of 2048 tokens (the formula gives 824 MiB: the first pass is not allowed to guess low, the next ones use what this one measured)
+        // a dense layer's pieces hold the FFN activations (gate, up and their product: 3 x n_ff floats per token), the widest projection output pair and a few residual-stream copies.
+        // The formula bounds the footprint from above; measured on Qwen3.8-27B (all samples of 12 logs): 63 MiB at 256 tokens, 125-126 at 512, 244-304 at 1024, 282-599 at 2048, 1108 at 4096, i.e.
+        // at most 0.29 MiB per token against the formula's 0.37. The first pass (nothing measured yet) asks for 0.8 x the formula + 16 MiB, which is above every one of those samples (the
+        // 160 MiB of margin sits on top); the next ones use what the pass really took. At 1.0 x + 64 MiB a card with ~640 MiB to spare never ran a single pass at chunk 1024.
         const int64_t per_tok = 4*(3*(int64_t) model.hparams.n_ff(0) + 2*(int64_t) std::max<int64_t>(2*model.hparams.n_head(0)*model.hparams.n_embd_head_k(0), (int64_t) model.hparams.ssm_d_inner + 2*model.hparams.ssm_n_group*model.hparams.ssm_d_state) + 4*(int64_t) model.hparams.n_embd);
-        sched_est = per_tok*(int64_t) wmax + (int64_t) 64*1048576;
+        sched_est = (int64_t) (0.8*(double) per_tok*(double) wmax) + (int64_t) 16*1048576;
     }
-    // G40: the scheduler's buffer is not all a pass costs (CUDA pools, graph temporaries): ask for what the last pass really took, scaled to this plan's widest chunk
+    // G40: the scheduler's buffer is not all a pass costs (CUDA pools, graph temporaries): ask for what the last pass really took, scaled to this plan's widest chunk.
+    // The footprint is ~0.25 MiB per token of the widest chunk plus a fixed ~8 MiB (measured: 4 tokens 8 MiB, 256 -> 63, 512 -> 125, 1024 -> 246, 2048 -> 525, 4096 -> 1108), so the scale goes both
+    // ways (a narrower pass needs less) and carries its own fixed term; only passes of >= 256 tokens calibrate it (see lm_release)
     if (S.var_meas > 0 && S.var_w > 0) {
-        const double scale = std::max(1.0, (double) wmax/(double) S.var_w);
-        const int64_t meas = (int64_t) ((double) S.var_meas*scale) + (int64_t) 32*1048576;
+        const double scale = (double) wmax/(double) S.var_w;
+        const int64_t meas = (int64_t) ((double) S.var_meas*scale) + (int64_t) 16*1048576 + (int64_t) 32*1048576;
         sched_est = dense ? meas : std::max(sched_est, meas);
     }
     const int64_t need = slot_total + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
@@ -381,7 +385,8 @@ void llama_context::lm_release() {
     // G40: what this pass really took on the device besides the slot window and the slab (the next pass asks for it)
     if (S.live && S.free_pre > 0) {
         const int64_t var = S.free_pre - lm_dev_free() - S.slot_total - 2*(int64_t) S.slab_half;
-        if (var > 0) {
+        // a pass of a few tokens (the 4-token tail behind a checkpoint) measures only the fixed cost; scaled by the width ratio it asked for 2 GB and starved the next pass (found 2026-10-20)
+        if (var > 0 && S.cur_w >= 256) {
             S.var_meas = var;
             S.var_w    = S.cur_w;
         }
