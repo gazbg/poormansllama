@@ -1,2 +1,3 @@
 # unified-diff files carry blank context lines that look like trailing whitespace
 docs/plans/*.patch -whitespace
+tools/build/*.sh text eol=lf
