@@ -2999,6 +2999,7 @@ llm_graph_params llama_context::graph_params(
 
 #ifdef LLAMA_LAYER_STREAMING
     p.layer_streaming = (layer_streaming != nullptr && layer_streaming->tg_stock && layer_streaming->phase == 1) ? nullptr : layer_streaming;
+    p.dstream = dstream.get();
 #endif
 
     return p;

@@ -1442,6 +1442,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ubatch           (params.ubatch),
     layer_streaming  (params.layer_streaming),
     lm               (params.lm),
+    dstream          (params.dstream),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),

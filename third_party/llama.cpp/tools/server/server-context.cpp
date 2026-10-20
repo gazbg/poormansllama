@@ -40,6 +40,62 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// --lm-prefill-host-layers: "N" = layers [0, N), or a comma list of layers and ranges "a-b" (inclusive); the result is sorted and without duplicates
+static bool lm_parse_layer_spec(const std::string & spec, std::vector<int> & out, std::string & err) {
+    out.clear();
+    auto to_int = [&](const std::string & t, int & v) -> bool {
+        if (t.empty() || t.size() > 5 || t.find_first_not_of("0123456789") != std::string::npos) {
+            err = "'" + t + "' is not a layer number";
+            return false;
+        }
+        v = std::stoi(t);
+        return true;
+    };
+    if (spec.find_first_of(",-") == std::string::npos) {
+        int n = 0;
+        if (!to_int(spec, n)) {
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            out.push_back(i);
+        }
+    } else {
+        size_t pos = 0;
+        while (pos <= spec.size()) {
+            size_t end = spec.find(',', pos);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            const std::string item = spec.substr(pos, end - pos);
+            const size_t dash = item.find('-');
+            int a = 0, b = 0;
+            if (dash == std::string::npos) {
+                if (!to_int(item, a)) {
+                    return false;
+                }
+                b = a;
+            } else if (!to_int(item.substr(0, dash), a) || !to_int(item.substr(dash + 1), b)) {
+                return false;
+            }
+            if (b < a) {
+                err = "the range '" + item + "' is empty";
+                return false;
+            }
+            for (int i = a; i <= b; ++i) {
+                out.push_back(i);
+            }
+            pos = end + 1;
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    if (out.empty()) {
+        err = "no layers";
+        return false;
+    }
+    return true;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1179,6 +1235,35 @@ private:
             SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
         }
 
+        if (!params_base.lm_prefill_host_layers.empty()) {
+            // dense models: the host layers are placed by one tensor override per list (a layer is all on the device or all in host memory), every layer stays an offloaded layer so that its KV cache
+            // and recurrent state are on the device
+            std::vector<int> host_layers;
+            std::string      perr;
+            if (!lm_parse_layer_spec(params_base.lm_prefill_host_layers, host_layers, perr)) {
+                SRV_ERR("--lm-prefill-host-layers: %s\n", perr.c_str());
+                return false;
+            }
+            static std::string host_pattern;     // the override keeps the pointer: it must outlive the model load
+            host_pattern = "blk\\.(?:";
+            for (size_t k = 0; k < host_layers.size(); ++k) {
+                host_pattern += (k > 0 ? "|" : "") + std::to_string(host_layers[k]);
+            }
+            host_pattern += ")\\.";
+            auto & ov = params_base.tensor_buft_overrides;
+            while (!ov.empty() && ov.back().pattern == nullptr) {
+                ov.pop_back();
+            }
+            ov.push_back({ host_pattern.c_str(), ggml_backend_cpu_buffer_type() });
+            while (ov.size() < llama_max_tensor_buft_overrides()) {
+                ov.push_back({ nullptr, nullptr });
+            }
+            if (params_base.n_gpu_layers == -1) {
+                params_base.n_gpu_layers = -2;
+            }
+            params_base.fit_params = false;
+            SRV_INF("lm-prefill: %zu decoder layers in host memory (%s), the others on the device, fit step off\n", host_layers.size(), params_base.lm_prefill_host_layers.c_str());
+        }
         if (params_base.lm_prefill) {
             if (!llama_hybrid_available()) {
                 SRV_ERR("%s", "--lm-prefill needs a build with LLAMA_LAYER_STREAMING (CUDA)\n");
@@ -1216,6 +1301,15 @@ private:
                 SRV_INF("lm-prefill: %s%s; prompts with >= %d tokens left go in one batch, checkpoints taken inside the pass; idle preparation of the pass: %s\n",
                         params_base.lm_prefill_fuse ? "fused prompt batches" : "no fused batches", params_base.lm_prefill_canonical ? " (canonical chunks)" : "",
                         params_base.lm_prefill_fuse_min, params_base.lm_prefill_prearm == 0 ? "off" : params_base.lm_prefill_prearm == 1 ? "always" : "auto");
+            }
+            if (params_base.lm_prefill_attn_int8) {
+                // read once by ggml-cuda at the first flash-attention call, i.e. during the model load below
+#if defined(_WIN32)
+                _putenv_s("LLAMA_FATTN_TILE_Q8QK", "1");
+#else
+                setenv("LLAMA_FATTN_TILE_Q8QK", "1", 1);
+#endif
+                SRV_INF("%s", "lm-prefill: int8 Q.K^T in the flash attention (approximation, see --lm-prefill-attn-int8)\n");
             }
             // G32: the pass's flash attention takes the same (GQA-packed) kernel variant as the ordinary path, which makes it equal to the ordinary path at the same chunk shape; ggml-cuda reads this once at the first
             // flash-attention call, i.e. during the model load below (FAFIX_CAUSAL_GQA=0 in the environment keeps the old variant)
@@ -1258,6 +1352,23 @@ private:
             }
             SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\n",
                     lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+        }
+
+        if (!params_base.lm_decode_stream.empty()) {
+            std::vector<int> ds_layers;
+            std::string      perr;
+            if (!lm_parse_layer_spec(params_base.lm_decode_stream, ds_layers, perr)) {
+                SRV_ERR("--lm-decode-stream: %s\n", perr.c_str());
+                return false;
+            }
+            std::vector<int32_t> ds32(ds_layers.begin(), ds_layers.end());
+            llama_dense_stream_params dp = { ds32.data(), (int32_t) ds32.size(), params_base.lm_decode_slots, 0 };
+            char err[512] = { 0 };
+            if (!llama_dense_stream_enable(ctx_tgt, &dp, err, sizeof(err))) {
+                SRV_ERR("--lm-decode-stream: %s\n", err);
+                return false;
+            }
+            SRV_INF("lm-decode-stream: %zu layers (%s) are computed on the device in decode steps from a ring of %d slots\n", ds32.size(), params_base.lm_decode_stream.c_str(), params_base.lm_decode_slots);
         }
 
         if (params_base.hybrid_moe) {

@@ -8,6 +8,10 @@
 // by the ordinary graph machinery when it is launched (llm_graph_lm in llama-graph.h): the positions, the KV slots, the recurrent state and the attention window of a chunk therefore come from
 // the chunk's own memory context, for any batch size and any starting position. The slot protocol (copy stream, events, async feed of the next bank) is the runner's (llama_layer_streaming).
 //
+// Two architectures: the Qwen3.5/3.6 MoE models (the streamed package is the routed-expert bank of a layer; everything else is device resident) and the dense Qwen3.5/3.8 models (the streamed package
+// is the WHOLE decoder layer: attention or Gated DeltaNet block, FFN and norms; a layer is either entirely on the device or entirely in host memory). The KV cache and the recurrent state of a dense
+// model must be on the device for every layer, whatever the placement of its weights (-ngl 99 with the host layers placed by tensor overrides).
+//
 // What it does NOT do (the batch then takes the ordinary decode path): several sequences in one batch, embeddings / backend samplers / MTP, logits for other than the last token, a KV cache whose
 // cells are not laid out cell == position (the implicit causal mask of the flash attention kernel needs that), a recurrent-state snapshot mode (n_rs_seq).
 
@@ -25,6 +29,7 @@
 #include "llama-memory-recurrent.h"
 #include "llama-model.h"
 #include "llama-lm-prefill.h"
+#include "llama-dense-stream.h"
 #include "llama-io.h"
 
 #include "ggml-backend.h"
@@ -299,16 +304,40 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
     }
     const int64_t slot_total = (int64_t) (slot_bytes + 4096) * P.n_slots;
     int64_t sched_est = S.sched_est > 0 ? (int64_t) S.sched_est : (int64_t) ((double) P.ubatch/2048.0*560.0*1048576.0) + (int64_t) 96*1048576;
+    const bool dense = model.arch == LLM_ARCH_QWEN35;
+    if (dense) {
+        // a dense layer's pieces hold the FFN activations (gate, up and their product: 3 x n_ff floats per token), the widest projection output pair and a few residual-stream copies; measured
+        // 599 MiB of footprint at a chunk of 2048 tokens (the formula gives 824 MiB: the first pass is not allowed to guess low, the next ones use what this one measured)
+        const int64_t per_tok = 4*(3*(int64_t) model.hparams.n_ff(0) + 2*(int64_t) std::max<int64_t>(2*model.hparams.n_head(0)*model.hparams.n_embd_head_k(0), (int64_t) model.hparams.ssm_d_inner + 2*model.hparams.ssm_n_group*model.hparams.ssm_d_state) + 4*(int64_t) model.hparams.n_embd);
+        sched_est = per_tok*(int64_t) wmax + (int64_t) 64*1048576;
+    }
     // G40: the scheduler's buffer is not all a pass costs (CUDA pools, graph temporaries): ask for what the last pass really took, scaled to this plan's widest chunk
     if (S.var_meas > 0 && S.var_w > 0) {
         const double scale = std::max(1.0, (double) wmax/(double) S.var_w);
-        sched_est = std::max(sched_est, (int64_t) ((double) S.var_meas*scale) + (int64_t) 32*1048576);
+        const int64_t meas = (int64_t) ((double) S.var_meas*scale) + (int64_t) 32*1048576;
+        sched_est = dense ? meas : std::max(sched_est, meas);
     }
     const int64_t need = slot_total + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
 
     if (llama_lm_vram_hook != nullptr && !llama_lm_vram_hook(this, need, 1)) {
         LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\n", __func__, (double) need/1048576.0);
         return false;
+    }
+    if (llama_lm_vram_hook == nullptr) {
+        // no expert cache to shrink (dense models, MoE without the hybrid engine): the room has to exist already. A pass that runs out of device memory half way has changed the cache, and the
+        // allocator of ggml does not survive a failed reservation, so the check is made BEFORE anything is touched
+        const int64_t margin = (int64_t) 96*1048576;
+        const int64_t held   = dstream ? (int64_t) dstream->held_bytes() : 0;     // the decode ring of slots gives its memory back for the pass
+        const int64_t free_b = lm_dev_free() + held;
+        if (free_b < need + margin) {
+            LLAMA_LOG_WARN("%s: lm-prefill: %.0f MiB of device memory are free, the pass needs %.0f MiB (slot window %.0f + slab %.0f + compute buffer %.0f + margin %.0f); this batch takes the ordinary path\n",
+                           __func__, (double) free_b/1048576.0, (double) (need + margin)/1048576.0, (double) slot_total/1048576.0, 2*(double) half/1048576.0, (double) sched_est/1048576.0, (double) (margin + 64*1048576)/1048576.0);
+            return false;
+        }
+    }
+    if (dstream && dstream->held_bytes() > 0) {
+        dstream->suspend();
+        gf_res_prev->reset();     // a graph built while the ring is away has no markers and must not be reused after it is back
     }
     S.free_pre   = lm_dev_free();
     S.slot_total = slot_total;
@@ -384,6 +413,12 @@ void llama_context::lm_release() {
     S.armed = false;
     S.armed_batch = false;
 
+    if (dstream && dstream->is_suspended()) {
+        if (!dstream->resume()) {
+            LLAMA_LOG_ERROR("%s: dense-stream: could not take the ring of slots back from the pass\n", __func__);
+        }
+        gf_res_prev->reset();
+    }
     const int64_t t_r1 = ggml_time_us();
     if (S.vram_hooked && llama_lm_vram_hook != nullptr) {
         llama_lm_vram_hook(this, 0, 0);
@@ -1069,8 +1104,9 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
         err = "already enabled";
         return false;
     }
-    if (model.arch != LLM_ARCH_QWEN35MOE) {
-        err = "the layer-major prefill supports the Qwen3.5/3.6 MoE architecture only";
+    const bool dense = model.arch == LLM_ARCH_QWEN35;
+    if (model.arch != LLM_ARCH_QWEN35MOE && !dense) {
+        err = "the layer-major prefill supports the Qwen3.5/3.6 MoE and the dense Qwen3.5/3.8 architectures only";
         return false;
     }
     auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
@@ -1103,7 +1139,7 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
     // which layers stream their routed experts from the host, which already have them on the device
     S->native.assign((size_t) S->n_layer, 0);
     std::vector<int> native_list, streamed_list;
-    for (int il = 0; il < S->n_layer; ++il) {
+    for (int il = 0; il < S->n_layer && !dense; ++il) {
         const llama_layer & ly = model.layers[il];
         if (ly.attn_norm == nullptr || ly.attn_norm->buffer == nullptr || ggml_backend_buffer_is_host(ly.attn_norm->buffer)) {
             err = "layer " + std::to_string(il) + " is not offloaded to the device (its attention weights are on the host): the layer-major pass computes everything but the routed experts on the device";
@@ -1121,9 +1157,24 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
             native_list.push_back(il);
         }
     }
-    if (streamed_list.empty()) {
+    if (streamed_list.empty() && !dense) {
         err = "every routed-expert bank is already on the device: there is nothing to stream";
         return false;
+    }
+
+    if (dense) {
+        // the KV cache and the recurrent state are the model context's and stay on the device for every layer: a layer whose weights are streamed computes its attention on the device
+        // (a KV buffer in host memory would put the flash attention on the CPU and copy the whole cache every chunk)
+        for (const auto & kv : memory->memory_breakdown()) {
+            if (kv.second > 0 && ggml_backend_buft_is_host(kv.first)) {
+                err = "the KV cache / recurrent state has " + std::to_string(kv.second/1048576) + " MiB in host memory (" + ggml_backend_buft_name(kv.first) +
+                      "): the layer-major pass of a dense model needs them on the device for every layer (use -ngl 99 and place the host layers with tensor overrides, not with a smaller -ngl; no --no-kv-offload)";
+                return false;
+            }
+        }
+        if (model.output == nullptr || model.output->buffer == nullptr || ggml_backend_buffer_is_host(model.output->buffer)) {
+            LLAMA_LOG_WARN("%s: lm-prefill: the output projection is in host memory: the head of every pass runs on the CPU\n", __func__);
+        }
     }
 
     S->ls.reset(new llama_layer_streaming());
@@ -1131,6 +1182,38 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
     if (!ls.init(model, p.n_slots, p.device, nullptr, 64, 256, LLAMA_PP_SCHEDULE_BATCH_MAJOR, 0, false, 10, false, false, S->act_type, 1, true, false)) {
         err = "layer streaming init failed: " + ls.error_msg;
         return false;
+    }
+
+    if (dense) {
+        // a dense layer is streamed as a whole: its package (attention or recurrent block, FFN, norms) is either entirely on the device (native: no slot, no copy) or entirely in host memory
+        for (int il = 0; il < S->n_layer; ++il) {
+            size_t n_dev = 0, n_host = 0;
+            for (const auto & m : ls.pkg_cache[(size_t) il].members) {
+                if (m.src == nullptr || m.src->buffer == nullptr) {
+                    continue;
+                }
+                (ggml_backend_buffer_is_host(m.src->buffer) ? n_host : n_dev)++;
+            }
+            if (n_dev > 0 && n_host > 0) {
+                err = "layer " + std::to_string(il) + " has " + std::to_string(n_dev) + " weight tensors on the device and " + std::to_string(n_host) +
+                      " in host memory: the layer-major pass streams a dense layer as a whole (place all of its tensors with one tensor override)";
+                return false;
+            }
+            if (n_dev + n_host == 0) {
+                err = "layer " + std::to_string(il) + " has no weight tensors";
+                return false;
+            }
+            if (n_host == 0) {
+                S->native[(size_t) il] = 1;
+                native_list.push_back(il);
+            } else {
+                streamed_list.push_back(il);
+            }
+        }
+        if (streamed_list.empty()) {
+            err = "every layer is already on the device: there is nothing to stream";
+            return false;
+        }
     }
     if (!native_list.empty() && !ls.set_pp_cpu_layers(native_list)) {
         err = "layer streaming: " + ls.error_msg;
@@ -1153,8 +1236,8 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
     // the window is held only while a pass runs
     ls.lm_release_slots();
 
-    LLAMA_LOG_INFO("%s: lm-prefill: %zu streamed layers, %zu with their experts on the device, %d slots, chunks of %d tokens, segments of %d tokens, %s slab, from batches of %d tokens (%.1f MiB page-locked here, %.0f ms)\n",
-                   __func__, streamed_list.size(), native_list.size(), p.n_slots, p.ubatch, p.segment, p.act_bf16 ? "bf16" : "f32", p.min_tokens, (double) reg_bytes/1048576.0, reg_us/1e3);
+    LLAMA_LOG_INFO("%s: lm-prefill: %s: %zu streamed layers, %zu with their %s on the device, %d slots, chunks of %d tokens, segments of %d tokens, %s slab, from batches of %d tokens (%.1f MiB page-locked here, %.0f ms)\n",
+                   __func__, dense ? "dense" : "MoE", streamed_list.size(), native_list.size(), dense ? "weights" : "experts", p.n_slots, p.ubatch, p.segment, p.act_bf16 ? "bf16" : "f32", p.min_tokens, (double) reg_bytes/1048576.0, reg_us/1e3);
 
     lm_state = std::move(S);
     if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {

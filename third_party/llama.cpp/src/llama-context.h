@@ -24,6 +24,9 @@ struct llama_layer_streaming;
 struct llama_lm_prefill_params;
 struct llama_lm_state;
 struct llama_lm_state_deleter { void operator()(llama_lm_state * s) const; };
+struct llama_dense_stream;
+struct llama_dense_stream_deleter { void operator()(llama_dense_stream * s) const; };
+struct llama_dense_stream_params;
 
 // what decode() decided about a batch: taken by the layer-major pass or not
 struct llama_lm_plan {
@@ -337,6 +340,12 @@ public:
     bool lm_prefill_enable(const llama_lm_prefill_params & p, std::string & err);
     void lm_prefill_disable();
     bool lm_prefill_is_enabled() const { return lm_state != nullptr; }
+
+    // dense decode streaming (llama-dense-stream.cpp)
+    bool dense_stream_enable(const llama_dense_stream_params & p, std::string & err);
+    void dense_stream_disable();
+    bool dense_stream_is_enabled() const { return dstream != nullptr; }
+    void dense_stream_stats(int64_t * v6) const;
     llama_lm_plan lm_make_plan(const llama_batch & b) const;
     void lm_note(const llama_batch & b, const llama_lm_plan & pl) const;   // LLAMA_LM_LOG=1: why a big enough batch was not taken
     bool lm_acquire(const llama_lm_plan & pl);   // false: nothing is held, the batch takes the ordinary path
@@ -482,6 +491,7 @@ private:
 
     // G32: the server's layer-major prefill; declared last so it is destroyed before the backends and the memory it works on
     std::unique_ptr<llama_lm_state, llama_lm_state_deleter> lm_state;
+    std::unique_ptr<llama_dense_stream, llama_dense_stream_deleter> dstream;
 #endif
 
     // host buffer for the model output (logits and embeddings)

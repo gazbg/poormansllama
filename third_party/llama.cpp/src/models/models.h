@@ -2198,6 +2198,9 @@ struct llama_model_qwen35 : public llama_model_base {
 #ifdef LLAMA_LAYER_STREAMING
         // build one cgraph per piece: embed, one per decoder layer, output
         void build_streaming_graphs();
+
+        // G32 for the dense architecture: ONE piece of a layer-major prefill pass, per launch (params.lm; llama-lm-prefill.cpp)
+        void build_lm_graph();
 #endif
 
         ggml_tensor * build_layer_attn(

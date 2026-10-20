@@ -10292,6 +10292,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 2048, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 2048, 4096, {1, 1}, {1, 1}));
 
+    // Qwen3.8-27B (dense, UD-IQ3_XXS) layer-major prefill chunk (2048 tokens): the FFN (n_ff 17408, n_embd 5120) and the projections of the layers, as the quantisation of the file has them
+    for (ggml_type type : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S }) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, 2048,  5120, {1, 1}, {1, 1})); // ffn gate / up
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, 2048, 17408, {1, 1}, {1, 1})); // ffn down
+    }
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {     // references: the plain Q8_0-layout kernels (what the dequantising ones are measured against)
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, 2048,  5120, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 10240, 2048,  5120, {1, 1}, {1, 1})); // gated delta net qkv
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 6144, 2048,  5120, {1, 1}, {1, 1})); // gated delta net gate
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  5120, 2048,  6144, {1, 1}, {1, 1})); // gated delta net out
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 12288, 2048,  5120, {1, 1}, {1, 1})); // attention q (with gate)
+
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
