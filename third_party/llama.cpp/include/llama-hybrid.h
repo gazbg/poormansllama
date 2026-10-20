@@ -73,6 +73,21 @@ LLAMA_API void    llama_lm_prefill_disarm(struct llama_context * ctx);
 LLAMA_API bool    llama_lm_prefill_armed(const struct llama_context * ctx);
 LLAMA_API int64_t llama_lm_prefill_n_pass(const struct llama_context * ctx);
 
+// Dense decode streaming (dense Qwen3.5/3.8 only, CUDA): the listed layers (ascending; their weights are in host memory, for example placed with --lm-prefill-host-layers) are computed ON THE DEVICE during decode
+// (batches of fewer than 32 tokens) from n_slots VRAM slots that a copy stream refills while the CPU computes the other host layers. The number of layers must be a multiple of n_slots (or not exceed it).
+// Call after the context exists. false + err: not enabled.
+struct llama_dense_stream_params {
+    const int32_t * layers;     // the streamed decoder layers, ascending
+    int32_t         n_layers;
+    int32_t         n_slots;    // slots in the VRAM ring (2 or 3)
+    int32_t         device;     // CUDA device index (0)
+};
+LLAMA_API bool llama_dense_stream_enable(struct llama_context * ctx, const struct llama_dense_stream_params * p, char * err, size_t err_len);
+LLAMA_API void llama_dense_stream_disable(struct llama_context * ctx);
+LLAMA_API bool llama_dense_stream_active(const struct llama_context * ctx);
+// waits, dones, recoveries (a wait that found another layer in the slot), copies queued, bytes queued, microseconds spent queueing
+LLAMA_API void llama_dense_stream_stats(const struct llama_context * ctx, int64_t * v6);
+
 // Stop the helper threads and the callbacks of this API; call before the context is freed.
 LLAMA_API void llama_hybrid_shutdown(void);
 

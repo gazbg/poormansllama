@@ -3013,6 +3013,15 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// dense decode streaming: the function registered by ggml_backend_cuda_set_stream_mark and its user pointer
+static ggml_backend_cuda_stream_mark_fn g_stream_mark_fn   = nullptr;
+static void *                           g_stream_mark_user = nullptr;
+
+void ggml_backend_cuda_set_stream_mark(ggml_backend_cuda_stream_mark_fn fn, void * user) {
+    g_stream_mark_user = user;
+    g_stream_mark_fn   = fn;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     // T-GPLR-16 probe: env-guarded capture disable to bisect the partial-handoff
@@ -3026,6 +3035,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        if ((node->flags & GGML_TENSOR_FLAG_STREAM_MARK) != 0 && g_stream_mark_fn != nullptr) {
+            return false;   // the mark function enqueues events and copies that a captured graph would freeze
+        }
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
@@ -4625,7 +4638,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const bool stream_mark = (node->flags & GGML_TENSOR_FLAG_STREAM_MARK) != 0 && g_stream_mark_fn != nullptr;
+                if (stream_mark) {
+                    g_stream_mark_fn(g_stream_mark_user, node, 0);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (g_stream_mark_fn != nullptr) {
+                    for (int k = 1; k <= nodes_to_skip; ++k) {
+                        GGML_ASSERT((cgraph->nodes[i + k]->flags & GGML_TENSOR_FLAG_STREAM_MARK) == 0 && "a stream-mark node was fused into a chain");
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4635,6 +4659,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     i += nodes_to_skip;
+                    if (stream_mark) {
+                        g_stream_mark_fn(g_stream_mark_user, node, 1);
+                    }
                     continue;
                 }
 #ifndef NDEBUG
@@ -4668,6 +4695,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (stream_mark) {
+                    g_stream_mark_fn(g_stream_mark_user, node, 1);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

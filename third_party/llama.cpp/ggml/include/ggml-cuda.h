@@ -59,6 +59,12 @@ GGML_BACKEND_API void ggml_backend_cuda_aux_synchronize(ggml_backend_t backend);
 // loudly rather than silently fall back to the copy hop. Measured on this box
 // (tools/gplr37-mmapreg-probe.cu): registration 0.16 ms per 452 MiB window and
 // the DMA then runs at 14.44 GB/s, the pinned ceiling.
+// Dense decode streaming (private fork): the CUDA backend calls fn(user, node, phase) for every node flagged GGML_TENSOR_FLAG_STREAM_MARK that it launches, phase 0 right
+// before the node's kernel is launched and phase 1 right after. The function runs on the thread that computes the graph and may only ENQUEUE work (CUDA events, async copies).
+// A marked node is never fused into a chain (the backend aborts if it would be). Without a registered function the flag does nothing. CUDA graphs are not used for a graph that has marked nodes.
+typedef void (*ggml_backend_cuda_stream_mark_fn)(void * user, const struct ggml_tensor * node, int phase);
+GGML_BACKEND_API void ggml_backend_cuda_set_stream_mark(ggml_backend_cuda_stream_mark_fn fn, void * user);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_range(const void * ptr, size_t nbytes, char * err, size_t err_len);
 GGML_BACKEND_API bool ggml_backend_cuda_unregister_host_range(const void * ptr);
 

@@ -1765,13 +1765,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_HYBRID_MOE_SEED").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill"},
-        "layer-major prefill (private fork, CUDA, Qwen3.5/3.6 MoE): a prompt batch of --lm-prefill-min tokens or more runs layer by layer, every routed-expert bank is copied from the host ONCE into a VRAM slot window while "
+        "layer-major prefill (private fork, CUDA, Qwen3.5/3.6 MoE and dense Qwen3.5/3.8): a prompt batch of --lm-prefill-min tokens or more runs layer by layer, every routed-expert bank is copied from the host ONCE into a VRAM slot window while "
         "all chunks of the batch go through the layer (the ordinary path copies all banks once per ubatch). Works with --hybrid-moe (hybrid decode) and without it (stock decode of the placement given by -ncmoe/-cmoe/the fit step: the layers whose experts are on the host stream, the others compute in place). "
         "Takes -b 16384 unless -b is given",
         [](common_params & params) {
             params.lm_prefill = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-host-layers"}, "SPEC",
+        "dense models (Qwen3.5/3.8): the decoder layers whose weights stay in host memory (with --lm-prefill: page-locked once and copied into the VRAM slot window one layer at a time during the layer-major pass; without it the ordinary path computes them on the CPU / offloads them per ubatch). "
+        "SPEC is a count N (the first N layers) or a list of layers and ranges such as 0-21,30. The other layers stay on the device; KV cache and recurrent state of every layer are on the device. "
+        "Sets -ngl to all layers unless -ngl is given and turns the fit step off. Without it the placement is whatever -ngl / --override-tensor say, and the pass refuses a layer that is split between the device and the host",
+        [](common_params & params, const std::string & value) {
+            params.lm_prefill_host_layers = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_HOST_LAYERS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-decode-stream"}, "SPEC",
+        "dense models (Qwen3.5/3.8) with --lm-prefill-host-layers: the decoder layers (a subset of the host layers; a count N = the first N of them is not accepted, give layers or ranges such as 3,7,11 or 0-20) that a decode step computes ON THE DEVICE "
+        "from a ring of VRAM slots, which a copy stream refills while the CPU computes the other host layers. The number of layers must be a multiple of --lm-decode-slots. tools/dense_plan.py proposes a plan for the card and the model",
+        [](common_params & params, const std::string & value) {
+            params.lm_decode_stream = value;
+        }
+    ).set_env("LLAMA_ARG_LM_DECODE_STREAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-decode-slots"}, "N",
+        "slots in the --lm-decode-stream ring (default: 2; 3 gives the copy stream more slack)",
+        [](common_params & params, int value) {
+            params.lm_decode_slots = value;
+        }
+    ).set_env("LLAMA_ARG_LM_DECODE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-min"}, "N",
         "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024)",
@@ -1807,6 +1831,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.lm_prefill_bf16 = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_BF16").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-attn-int8"},
+        "with --lm-prefill: the flash attention of the pass computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal): the attention kernel is ~1.7x faster, "
+        "which matters at depth (22% of an 18k-token pass of the dense Qwen3.8-27B). An APPROXIMATION of the FP32 kernel (Q is quantised to int8 per 32 values, as the decode kernel already does): "
+        "first-token KL against the exact pass is reported in docs/plans/dense-qwen38-iq3-residency.md. Same as LLAMA_FATTN_TILE_Q8QK=1",
+        [](common_params & params) {
+            params.lm_prefill_attn_int8 = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_ATTN_INT8").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-batch"}, "N",
         "logical batch size (-b) used with --lm-prefill when -b is not given (default: 16384)",

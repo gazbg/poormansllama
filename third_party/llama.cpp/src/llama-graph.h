@@ -738,6 +738,7 @@ class llm_graph_result;
 // experimental layer-streaming mode (see llama-layer-streaming.h); nullptr in
 // the default path
 struct llama_layer_streaming;
+struct llama_dense_stream;
 
 // G32: one piece of a layer-major prefill pass, built per launch by llama-lm-prefill.cpp (nullptr in every other path).
 //   kind 0: embed the ubatch's tokens into act_out
@@ -806,6 +807,9 @@ struct llm_graph_params {
 
     // G32: when set, the graph is ONE piece of a layer-major prefill pass (see llm_graph_lm). The LAST member, so the positional initialisers of llm_graph_params stay valid.
     const llm_graph_lm * lm = nullptr;
+
+    // dense decode streaming (llama-dense-stream.h): nullptr unless the context has it. After `lm` and still last, so the positional initialisers stay valid.
+    const llama_dense_stream * dstream = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -986,6 +990,7 @@ struct llm_graph_context {
     const llama_ubatch  & ubatch;
     const llama_layer_streaming * layer_streaming;
     const llm_graph_lm *          lm;
+    const llama_dense_stream *    dstream;
 
     const int64_t n_embd;
     const int64_t n_layer;

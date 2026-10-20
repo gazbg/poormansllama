@@ -4,6 +4,7 @@
 
 #ifdef LLAMA_LAYER_STREAMING
 #include "llama-layer-streaming.h"
+#include "llama-dense-stream.h"
 #endif
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -141,8 +142,18 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
 
 const llama_layer & llama_model_qwen35::graph::layer(int il) const {
 #ifdef LLAMA_LAYER_STREAMING
+    if (lm != nullptr && lm->layer != nullptr) {
+        return *lm->layer;
+    }
     if (ls != nullptr) {
         return ls->slot_layer(il);
+    }
+    // dense decode streaming: in a graph of fewer than 32 tokens (a decode step, a short batch: the ones the scheduler does not offload per op) a streamed layer reads its slot-bound weights
+    if (dstream != nullptr && n_tokens < 32) {
+        const int k = dstream->index_of(il);
+        if (k >= 0) {
+            return dstream->bundle(k);
+        }
     }
 #endif
     return model.layers[il];
@@ -154,6 +165,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ls = const_cast<llama_layer_streaming *>(params.layer_streaming);
     if (ls != nullptr) {
         build_streaming_graphs();
+        return;
+    }
+    if (params.lm != nullptr) {
+        build_lm_graph();
         return;
     }
 #endif
@@ -180,6 +195,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
+
+        // dense decode streaming: the first kernel that reads a streamed layer's weights waits for the copy of the slot (and the last one frees the slot for the next copy)
+        int ds_k = -1;
+#ifdef LLAMA_LAYER_STREAMING
+        if (dstream != nullptr && n_tokens < 32) {
+            ds_k = dstream->index_of(il);
+            if (ds_k >= 0) {
+                inpL = dstream->mark(ctx0, sched, inpL, 0, ds_k);
+            }
+        }
+#endif
 
         ggml_tensor * inpSA = inpL;
 
@@ -224,6 +250,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+#ifdef LLAMA_LAYER_STREAMING
+        if (ds_k >= 0) {
+            cur = dstream->mark(ctx0, sched, cur, 1, ds_k);
+        }
+#endif
+
         // Input for next layer
         inpL = cur;
     }
@@ -251,6 +283,97 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 }
 
 #ifdef LLAMA_LAYER_STREAMING
+
+// G32 for the dense architecture: ONE piece of a layer-major prefill pass, built per launch (llama-lm-prefill.cpp), see llm_graph_lm. The pieces hand the hidden state to each other through the
+// pass's slab. A dense layer's weights are ALL in `lm->layer` (the model's own device-resident layer, or the slot bundle the layer was staged into), the KV cache and the recurrent state are the
+// model context's. Every INPUT tensor of the piece is pulled into the graph at the end, because a piece of one layer type never reads the inputs of the other type (an unallocated input would
+// crash set_inputs).
+void llama_model_qwen35::graph::build_lm_graph() {
+    GGML_ASSERT(lm != nullptr);
+
+    const int64_t n_embd_io = hparams.n_embd_inp();
+    const bool    slab_bf16 = (lm->act_type == GGML_TYPE_BF16);
+
+    auto act = [&](void * addr, int64_t rows) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx0, lm->act_type, n_embd_io, rows);
+        ggml_set_name(t, "lm_act");
+        ggml_backend_tensor_alloc(lm->act_buf, t, addr);
+        return t;
+    };
+
+    ggml_tensor * cur;
+
+    if (lm->kind == 0) {
+        cur = build_inp_embd(model.tok_embd);
+        cb(cur, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else if (lm->kind == 1) {
+        const int il = lm->il;
+
+        int sections[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+        auto * inp = build_inp_mem_hybrid();
+
+        ggml_tensor * inp_pos = build_inp_pos();
+
+        ggml_tensor * inpSA = act(lm->act_in, n_tokens);
+        if (slab_bf16) {
+            inpSA = ggml_cast(ctx0, inpSA, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(inpSA, layer(il).attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "attn_norm", il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        if (hparams.is_recr(il)) {
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else {
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+        }
+
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "attn_residual", il);
+
+        ggml_tensor * ffn_residual = cur;
+
+        ggml_tensor * attn_post_norm = build_norm(cur, layer(il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(attn_post_norm, "attn_post_norm", il);
+
+        cur = build_layer_ffn(attn_post_norm, il);
+        cb(cur, "ffn_out", il);
+
+        cur = ggml_add(ctx0, cur, ffn_residual);
+        cb(cur, "post_ffn", il);
+
+        cur = build_cvec(cur, il);
+        cb(cur, "l_out", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, act(lm->act_out, n_tokens)));
+    } else {
+        cur = act(lm->act_in, 1);
+        if (slab_bf16) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx0); t != nullptr; t = ggml_get_next_tensor(ctx0, t)) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+}
 
 // Build one cgraph per piece: embed, one per logical decoder layer, output.
 // Layer graphs read the persistent activation pair act[il&1] and write

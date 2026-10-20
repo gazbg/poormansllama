@@ -71,6 +71,8 @@ endif()
 target_sources(llama PRIVATE llama-hybrid-api.cpp)
 # G32: the layer-major prefill of the server (stubs when LLAMA_LAYER_STREAMING is off)
 target_sources(llama PRIVATE llama-lm-prefill.cpp)
+# dense decode streaming: the streamed layers of a dense model are computed on the device from a ring of VRAM slots (stubs when LLAMA_LAYER_STREAMING is off)
+target_sources(llama PRIVATE llama-dense-stream.cpp)
 
 # private research: experimental CUDA-only layer streaming (default OFF)
 if (LLAMA_LAYER_STREAMING)

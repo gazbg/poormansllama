@@ -629,11 +629,15 @@ struct common_params {
 
     // G32 (private fork, CUDA): layer-major prefill. A prompt batch of >= lm_prefill_min tokens runs layer by layer: every expert bank is copied from the host once while all chunks of the batch go through the layer.
     bool        lm_prefill         = false;
+    std::string lm_decode_stream;             // dense models: decoder layers (a subset of lm_prefill_host_layers) that decode steps compute on the device from a ring of VRAM slots; empty = off
+    int32_t     lm_decode_slots    = 2;       // slots in that ring
+    std::string lm_prefill_host_layers;       // dense models: decoder layers whose weights stay in host memory and stream through the slot window ("N" = the first N layers, or ranges "0-21,30"); empty = placement as given by -ngl / -ot
     int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
     bool        lm_prefill_bf16    = false;   // bf16 activation slab
+    bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 K cache, GPU without fast FP16)
     int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
     bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
     int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule

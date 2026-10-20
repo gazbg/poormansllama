@@ -122,7 +122,10 @@ uses for q8_0 K. V and PV stay FP32.
 `mmq-config-pascal.cuh` gives Q8_0 a 128-row tile at J=64 (default on Pascal).
 Dense Q8_0 matmul 3.84 to 3.10 ms (24% faster); model outputs bit-identical.
 Q4_K and Q5_K keep the 64-row tile because the MoE matmuls were 14 to 16% slower
-with 128 rows.
+with 128 rows. The same tile is now also set for IQ3_XXS, IQ3_S and IQ4_XS (the
+quantisations of the dense Qwen3.8-27B IQ3_XXS file): 25 to 30% faster
+(8.2 to 9.2 -> 10.4 to 11.6 TFLOPS at 2,048 tokens, section 7); the stock path's
+first-token logprobs and greedy text are bit-identical to the old tile.
 
 ### 3.6 Layer-major threshold and canonical chunks
 
@@ -177,3 +180,73 @@ $T perf -o MUL_MAT_ID -b CUDA0 -p 'n_mats=256,n_used=8'
 
 The perf cases for this model's attention and matmul shapes, and the causal cases
 at head size 256, were added to `tests/test-backend-ops.cpp`.
+
+## 7. Dense Qwen3.8-27B (UD-IQ3_XXS) on the 8 GiB card
+
+`Qwen3.8-27B-UD-IQ3_XXS.gguf` (11.9 GB, architecture `qwen35`, 64 layers, 16 of them full attention
+and 48 Gated DeltaNet, 155 MiB per layer, no routed experts) is larger than the card. The layer-major
+prefill and a streamed decode were extended to it on 2026-10-19 (plan and contract:
+`docs/plans/dense-qwen38-iq3-residency.md`; scripts: `tools/dense/`). All numbers are one session on this machine,
+`-ctk q8_0 -ctv q8_0 -fa on -np 1 -t 4`, one GPU, greedy, needle prompts.
+
+### 7.1 Run it
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $REPO/build/llama-cuda/bin/llama-server \
+  -m $MODELS/Qwen3.8-27B-UD-IQ3_XXS.gguf --host 127.0.0.1 --port 8099 \
+  -dev CUDA0 -sm none -mg 0 -c 16384 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 4 -ub 512 \
+  --lm-prefill-host-layers 0-30 \
+  --lm-decode-stream 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 --lm-decode-slots 2 \
+  --lm-prefill --lm-prefill-fuse --lm-prefill-ubatch 1024 --lm-prefill-segment 2048 --lm-prefill-attn-int8
+```
+
+- `--lm-prefill-host-layers 0-30`: 31 layers stay in host memory (page-locked), 33 are resident. The KV cache and the
+  recurrent state of all layers are on the device. The server refuses loudly when a layer is split or the KV is on the host.
+- `--lm-decode-stream`: 16 of the host layers are computed on the device in decode steps from a ring of 2 slots that a copy
+  stream refills while the CPU computes the other 15 host layers. The count must be a multiple of the slots.
+- `python3 -I tools/dense_plan.py --ctx 16384 --pass-mib 450` proposes the three lists for the card, the context and the room
+  the prefill pass wants (its cost model matched the measured decode within 2 to 6%).
+- The pass declines (and says why) when the free memory does not cover it; the ordinary path then takes the batch.
+- `--lm-prefill-attn-int8` is the int8 attention approximation (section 3.4): +9% prefill at 16k tokens (1.19x the best stock
+  arm; 1.08x without it). Validated with the f32 slab (continuation rule 8/8, first-token KL at the noise floor of any numerical
+  change). Do NOT combine it with `--lm-prefill-bf16`: that pair failed the continuation rule on 1 of 8 prompts. A segment of 2,048
+  with the f32 slab uses the same memory as 4,096 with bf16.
+
+### 7.2 What was measured
+
+| What | Result |
+|---|---|
+| IQ3_XXS / IQ3_S / IQ4_XS matmul, 2,048 tokens | 8.2 to 9.2 -> 10.4 to 11.6 TFLOPS (+25 to 30%), stock-path outputs bit-identical |
+| Cold prefill, best stock (`-ngl 36 -ub 2048`) | 145.6 / 140.6 / 128.2 tok/s at 3.7k / 10k / 18k tokens |
+| Cold prefill, layer-major pass, exact attention | 170.5 / 159.0 / 138.9 tok/s (1.17x / 1.13x / 1.08x) |
+| Same with `--lm-prefill-attn-int8`, f32 slab | 1.18x at 3.7k, **1.19x at 15.7k** (161.1 against 135.6 tok/s, A-B-B-A) |
+| Pass with 26, 16, 6 layers resident | 170.5, 170.0, 168.1 tok/s at 3.7k; peak VRAM 7.0, 5.5, 3.9 GB |
+| Decode, stock default placement, `-c 16384` (36 of 66 layers on the GPU) | 1.62 tok/s (6.8 GB) |
+| Decode, stock default placement, `-c 262144` (the native maximum; 14 of 66 layers on the GPU, 7.1 GB of KV in host memory) | 1.03 tok/s (6.7 GB) |
+| Decode, same VRAM, 20 of 37 host layers streamed (`-c 16384`) | 1.94 tok/s (1.20x the default placement) |
+| Decode, 16 of 31 host layers streamed, 2 slots (`-c 16384`) | 2.35 tok/s, 7.3 GB (1.45x the default placement) |
+| Decode, owner's plan: only the 16 attention layers on the GPU, nothing resident | 1.03 tok/s at 2.2 GB |
+| Combined command above | prefill 172 / 165 tok/s at 3.7k / 10k, decode 2.34 / 2.32 tok/s, peak 7.7 GB |
+
+Streamed layers give bit-identical tokens and logprobs to the same layers resident (8 prompts). The pass matches the ordinary
+path at an equal chunk shape (first-token logprob within 0.0015, 8 prompts).
+
+### 7.3 Why it is like this
+
+- The pass is GPU-compute bound, not copy bound: the weight copies are hidden (25 ms of slot waits in a 21 s pass). At 18k tokens
+  the GPU kernel time is the same for the pass and for the stock path (123 s against 124 s); the pass only removes about 14 s of copy
+  stalls, so its advantage over stock shrinks with depth (1.17x -> 1.08x). Attention is 22% of the pass at 18k tokens and grows
+  with depth (`--lm-prefill-attn-int8` makes it faster, section 3.4). The bound is (K + C) / K with K the GPU kernel time both paths
+  share and C the stock path's copy stalls, so no schedule beats about 1.1x at depth with exact kernels.
+- Decode is CPU bound: one CPU layer costs 16.5 ms (IQ3 dequantisation on 4 cores, 9 GB/s), a streamed layer costs 25 ms of PCIe
+  Gen3 x8 (6.45 GB/s) but overlaps the CPU layers, so CPU and PCIe work together: `T = max(base + C*c*1.15 + (R+S)*g, S*d)`.
+- The owner's idea (only the full-attention layers on the GPU) is not lighter: the FFN is two thirds of every layer, an attention
+  layer is as big as a DeltaNet layer. It frees VRAM (about 170k tokens of q8_0 KV fit beside it) but the CPU then computes 48
+  layers: 1.03 tok/s.
+
+### 7.4 Limits
+
+- One model and quantisation, `-np 1`, contexts up to 20k tokens in the benchmarks, prompts up to 18k tokens. No perplexity.
+- The CPU is the decode ceiling. The same model decodes at 0.85 tok/s on the CPU alone.
+- The decode ring uses the markers in the ordinary decode graph; CUDA graphs are not used for those graphs (they are off on Pascal anyway).
+- A graph of 32 or more tokens does not use the ring (the scheduler offloads per op there).
