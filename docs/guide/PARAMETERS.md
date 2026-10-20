@@ -64,12 +64,30 @@ Acts on prompt batches of at least `--lm-prefill-min` tokens. Works with and wit
 | `--lm-prefill-segment N` | `16384` | Tokens per activation-slab segment. Must be a multiple of the chunk. A longer batch repeats the layer sweep per segment. G42 uses `32768` |
 | `--lm-prefill-slots N` | `2` | Layer slots in the VRAM window. Two lets the next bank copy while the current layer computes |
 | `--lm-prefill-batch N` | `16384` | Logical batch when `-b` is not given |
-| `--lm-prefill-bf16` | off | Activations in bf16, half the slab. Not validated against f32. Do not use for claims |
+| `--lm-prefill-bf16` | off | Activations in bf16, half the slab. Not validated against f32 for the MoE model; for the dense Qwen3.8 see the KL study in `docs/plans/dense-qwen38-iq3-residency.md`. Do not use for claims elsewhere |
+| `--lm-prefill-attn-int8` | off | The pass's flash attention computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal). About 1.7x faster attention, 22% of an 18k-token pass of the dense Qwen3.8-27B. An APPROXIMATION (Q quantised to int8 per 32 values, as the decode kernel does). Use with the f32 slab (without `--lm-prefill-bf16`): the pair failed the continuation rule on 1 of 8 prompts. Same as `LLAMA_FATTN_TILE_Q8QK=1` |
 | `--lm-prefill-ckpt-chunk N` | `0` | The last `N + 4` tokens go in a separate chunk, so a checkpoint exists `N + 4` tokens before the end. `0` uses the stock rule (`4 + ubatch`). A chunk of 24 runs on the CPU in about 0.3 s. A chunk of 512 copies every bank, about 1.3 s. The cost is a shallower rollback |
 | `--lm-prefill-canonical` | off | A cache hit equals a fresh run bit for bit. Checkpoints only at multiples of `--lm-prefill-ubatch`. A continuation resumes from the newest checkpoint before the common prefix. Costs up to one chunk more prefill per follow-up. Needs `-b` to be a multiple of the chunk size and context checkpoints enabled |
 | `--lm-prefill-fuse` | off | With `-np 1`: the rest of a prompt goes in one batch instead of being cut at checkpoints. Checkpoints are still stored. Saves the second and third bank streams, about 1.3 s each |
 | `--lm-prefill-fuse-min N` | `700` | Fewest prompt tokens left after a cache hit that `--lm-prefill-fuse` sends whole |
 | `--lm-prefill-prearm MODE` | `off` | With `-np 1`, prepare the next pass while the slots are idle. `off`, `always`, or `auto` (when at least 3 of the last 4 requests used the pass). An unused preparation costs a cache regrow of about 0.4 s |
+
+### 4.1 Dense models (Qwen3.5 / Qwen3.8, no routed experts)
+
+The pass also takes the dense architecture. A streamed package is the WHOLE decoder layer, so
+the placement is by layer: a layer is entirely on the device (no slot, no copy) or entirely
+in host memory (copied once per pass into a slot). The KV cache and the recurrent state of every
+layer stay on the device. The server refuses loudly when that does not hold. See
+[LINUX-PASCAL.md](LINUX-PASCAL.md) section 7 and `docs/plans/dense-qwen38-iq3-residency.md`.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--lm-prefill-host-layers SPEC` | off | The layers whose weights stay in host memory (page-locked once). `SPEC` is a count `N` (the first `N` layers) or layers and ranges such as `0-30,34`. Sets `-ngl` to all layers unless given and turns the fit step off. Works without `--lm-prefill` too (the ordinary path then computes or offloads them) |
+| `--lm-decode-stream SPEC` | off | Layers (a subset of the host layers, given as layers and ranges) that a DECODE step computes on the device from a ring of VRAM slots, which a copy stream refills while the CPU computes the other host layers. Their number must be a multiple of `--lm-decode-slots`. `tools/dense_plan.py` proposes a plan for the card |
+| `--lm-decode-slots N` | `2` | Slots of that ring. Three give the copy stream more slack |
+
+The ring and the prefill pass share the VRAM in time: the ring frees its slots while a pass runs
+and takes them back (reloading its first layers, about 50 ms) when the pass ends.
 
 ## 5. Environment variables for the engine
 
