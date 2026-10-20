@@ -1,0 +1,321 @@
+<title>Decode Token Timeline</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one narrow reading column; the two timelines are wide diagrams that scroll sideways on a phone.
+   Palette: one hue per physical unit (copy engine, GPU, CPU, blocked wait) on a cool grey ground. */
+:root {
+  --bg: #f3f5f8; --panel: #ffffff; --fg: #141a22; --muted: #566070; --grid: #dde2ea; --line: #c7ced9;
+  --copy: #2468d8; --copy2: #6f9fea; --gpu: #1f9a57; --gpu-soft: #8fd1ad; --cpu: #d9822b; --wait: #d6334b;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d1117; --panel: #151b24; --fg: #e5e9f0; --muted: #8e99aa; --grid: #232c38; --line: #33404f;
+  --copy: #3a7bea; --copy2: #2b5fb3; --gpu: #45c27c; --gpu-soft: #1f5a3d; --cpu: #c9701a; --wait: #ff6b80; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0d1117; --panel: #151b24; --fg: #e5e9f0; --muted: #8e99aa; --grid: #232c38; --line: #33404f;
+  --copy: #3a7bea; --copy2: #2b5fb3; --gpu: #45c27c; --gpu-soft: #1f5a3d; --cpu: #c9701a; --wait: #ff6b80; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+h1 { font-size: 28px; line-height: 1.15; font-weight: 600; margin: 0 0 6px; text-wrap: balance; }
+h2 { font-size: 17px; font-weight: 600; margin: 0 0 4px; text-wrap: balance; }
+p { margin: 0; max-width: 68ch; }
+.sub { color: var(--muted); max-width: 72ch; }
+.mono { font-family: var(--mono); font-feature-settings: "zero" 1; font-variant-numeric: tabular-nums; }
+section { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px; min-width: 0; }
+.scroll { overflow-x: auto; }
+.scroll svg { display: block; min-width: 760px; width: 100%; height: auto; }
+svg text { font-family: var(--mono); fill: var(--muted); font-size: 11px; }
+svg .lbl { fill: var(--fg); }
+svg .on { fill: #fff; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.ctl { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.ctl input[type=range] { flex: 1 1 260px; accent-color: var(--copy); min-width: 0; }
+.ctl input:focus-visible { outline: 2px solid var(--copy); outline-offset: 2px; }
+ol.steps { margin: 0; padding-left: 22px; display: grid; gap: 4px; max-width: 78ch; }
+ol.steps li::marker { font-family: var(--mono); color: var(--muted); }
+.bars { display: grid; gap: 10px; }
+.bar { display: grid; grid-template-columns: minmax(150px, 230px) 1fr; gap: 6px 14px; align-items: center; }
+.bar .name { font-size: 13px; }
+.bar .track { position: relative; height: 22px; background: var(--grid); border-radius: 3px; }
+.bar .fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; }
+.bar .val { position: absolute; right: 8px; top: 2px; font: 12px var(--mono); color: var(--fg); }
+.bar .fill + .val { mix-blend-mode: normal; }
+.stack { display: flex; height: 26px; border-radius: 3px; overflow: hidden; background: var(--grid); }
+.stack span { display: block; height: 100%; }
+.cap { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child, th:last-child, td:last-child { text-align: left; }
+th { font-weight: 500; color: var(--muted); }
+tr.hit td { font-weight: 600; }
+.note { font-size: 13px; color: var(--muted); display: grid; gap: 4px; max-width: 80ch; }
+@media (max-width: 560px) { h1 { font-size: 23px; } .bar { grid-template-columns: 1fr; } }
+</style>
+
+<main>
+  <header>
+    <h1>Decode token timeline</h1>
+    <p class="sub">One generated token of Qwen3.8-27B (IQ3_XXS) on the GTX 1070, with 32 of the 64 layers streamed through two VRAM slots and the other 32 computed by the CPU. Every bar is a real interval from an <span class="mono">nsys</span> capture of your sanity-check command: <span class="mono">806 ms</span> per token, <span class="mono">1.24 tok/s</span>.</p>
+  </header>
+
+  <section>
+    <div>
+      <h2>Four things run at once</h2>
+      <p class="sub">Each unit is busy for a different share of the same 806 ms. They add up to about two seconds of work, so they overlap.</p>
+    </div>
+    <div class="panel"><div class="bars" id="bars"></div></div>
+  </section>
+
+  <section>
+    <div>
+      <h2>A few layers up close</h2>
+      <p class="sub">Drag the slider to move the window along the token. The weights of the next streamed layer are always in flight on the copy lane while the GPU and the CPU take turns on the layers before it.</p>
+    </div>
+    <div class="panel">
+      <div class="ctl"><label for="w0">Window start</label><input type="range" id="w0" min="0" max="700" step="1" value="0"><span class="mono" id="w0v">0 – 110 ms</span></div>
+      <div class="scroll" style="margin-top:8px"><svg id="zoom" viewBox="0 0 1000 318" role="img" aria-label="Timeline of copy engine, GPU, CPU and hand-offs over 110 milliseconds of one decode token"></svg></div>
+      <div class="legend" id="legend" style="margin-top:10px"></div>
+    </div>
+    <ol class="steps" id="steps"></ol>
+  </section>
+
+  <section>
+    <div>
+      <h2>The whole token</h2>
+      <p class="sub">32 cycles of the same pattern. The shaded band is the window above.</p>
+    </div>
+    <div class="panel"><div class="scroll"><svg id="over" viewBox="0 0 1000 138" role="img" aria-label="Overview of all lanes over the full 806 millisecond token"></svg></div></div>
+  </section>
+
+  <section>
+    <div>
+      <h2>Two chains that each fill the whole token</h2>
+      <p class="sub">The copy lane is one chain: 32 packages, one after another. The compute is another chain: GPU layer, hand-off, CPU layer, hand-off, next GPU layer, because each layer needs the output of the one before it. Both come to 806 ms here, so moving work from one to the other only moves the limit to the other side.</p>
+    </div>
+    <div class="panel" style="display:grid; gap:16px">
+      <div>
+        <div class="name" style="font-size:13px; margin-bottom:6px">Copy chain: 32 weight packages of 155 MiB at 6.46 GB/s</div>
+        <div class="stack" id="stack-copy"></div>
+      </div>
+      <div>
+        <div class="name" style="font-size:13px; margin-bottom:6px">Compute chain: host layers, GPU layers, everything else</div>
+        <div class="stack" id="stack-chain"></div>
+        <div class="cap" id="chain-cap"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div>
+      <h2>Moving layers between the two chains</h2>
+      <p class="sub">Streaming fewer layers shortens the copy chain (25 ms per layer) and lengthens the compute chain (about 20 ms per layer). The measured token speed follows whichever chain is longer.</p>
+    </div>
+    <div class="panel scroll">
+      <table>
+        <thead><tr><th>Streamed layers</th><th>Copy chain</th><th>Compute chain</th><th>Predicted</th><th>Measured, two runs</th><th>Longer chain</th></tr></thead>
+        <tbody class="mono">
+          <tr><td>24</td><td>605 ms</td><td>890 ms</td><td>1.12 tok/s</td><td>1.148 · 1.145</td><td>compute</td></tr>
+          <tr><td>28</td><td>706 ms</td><td>810 ms</td><td>1.23 tok/s</td><td>1.236 · 1.233</td><td>compute</td></tr>
+          <tr class="hit"><td>30</td><td>756 ms</td><td>770 ms</td><td>1.30 tok/s</td><td>1.286 · 1.291</td><td>about equal</td></tr>
+          <tr><td>32 (yours)</td><td>806 ms</td><td>806 ms</td><td>1.24 tok/s</td><td>1.240 · 1.240</td><td>both</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <span>Compute-chain figures are a fit (20 ms per host layer plus 90 ms fixed, from the 24 and 28 runs), except the 32-layer one, which is read from the capture: the fit would say 730 ms, but the host layers stretch to 22.9 ms when the copy engine never pauses. The 30-layer run was predicted before it was measured and landed within 1%. About 30 streamed layers is the best this scheme reaches, +4% over 32.</span>
+      <span>Measured: 64 greedy tokens after a 670-token prompt, two requests per setting, after a warm-up, no profiler attached. The 32-layer run in this table streamed the odd layers; the capture above streamed the even ones, which have the same size to within 0.5%.</span>
+    </div>
+  </section>
+
+  <section class="note">
+    <span><b>How the lanes were built.</b> Copy lane: host-to-GPU copies over 1 MiB, six per layer package (11.5, 15.9, 32.5, 36.5, 36.5 and 21.5 MiB). GPU lane: kernels closer than 0.5 ms merged; a cluster of 20 or more kernels is a streamed layer, smaller clusters are the few small operations between layers. CPU lane: the time between the activation copy to the host and the copy back (20,480 bytes each), which is when the host layer runs; it is not a CPU profile. Blocked lane: the main thread inside <span class="mono">cudaStreamSynchronize</span> or <span class="mono">cudaEventSynchronize</span> for more than 0.2 ms.</span>
+    <span><b>Not shown.</b> Which layer each package and burst belongs to is inferred from order (the n-th burst after a token boundary is layer 2n); nsys has no layer labels here. One token (the fourth from the end of the capture) is drawn; the other 47 look alike.</span>
+    <span>Source: <span class="mono">build/dense/tg-diag.nsys-rep</span>, extracted by <span class="mono">tools/dense/timeline-data.py</span>; balance runs by <span class="mono">tools/dense/tg-balance.sh</span>.</span>
+  </section>
+</main>
+
+<script>
+const D = /*DATA*/null;
+const NS = "http://www.w3.org/2000/svg";
+const T = D.stats.token_ms;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const el = (tag, attrs, parent, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; if (parent) parent.appendChild(e); return e; };
+const f1 = v => v.toFixed(1);
+
+// packages carry their layer; the first is the tail of the previous token's last copy, the last belongs to the next token
+D.packages.forEach((p, i) => { p.name = i === 0 ? "L0 (tail)" : (i === D.packages.length - 1 ? "L0 next token" : "L" + p.layer); p.slot = i === 0 ? 0 : ((p.layer == null ? 0 : p.layer / 2) % 2); });
+
+// ---------- bars: busy share of each unit
+(function () {
+  const rows = [
+    ["PCIe copy engine, weights to GPU", D.stats.copy_busy_ms, "var(--copy)"],
+    ["CPU running host layers", D.stats.cpu_layer_ms, "var(--cpu)"],
+    ["Main thread blocked in a CUDA wait", D.stats.sync_ms, "var(--wait)"],
+    ["GPU running kernels", D.stats.gpu_all_ms, "var(--gpu)"],
+  ];
+  const box = document.getElementById("bars");
+  rows.forEach(r => {
+    const d = document.createElement("div"); d.className = "bar";
+    d.innerHTML = `<div class="name">${r[0]}</div><div class="track"><div class="fill" style="width:${100 * r[1] / T}%;background:${r[2]}"></div><div class="val" style="color:${r[1] / T > 0.85 ? '#fff' : 'var(--fg)'}">${Math.round(r[1])} ms · ${(100 * r[1] / T).toFixed(0)}%</div></div>`;
+    box.appendChild(d);
+  });
+  const sum = D.stats.copy_busy_ms + D.stats.cpu_layer_ms + D.stats.gpu_all_ms;
+  const c = document.createElement("div"); c.className = "cap";
+  c.textContent = `Copy + CPU + GPU = ${Math.round(sum)} ms of work inside ${Math.round(T)} ms of wall clock: about ${(sum / T).toFixed(1)}x overlap. The blocked wait is the main thread idling, not extra work.`;
+  box.appendChild(c);
+})();
+
+// ---------- legend
+document.getElementById("legend").innerHTML =
+  `<span><i style="background:var(--copy)"></i>weights in flight (slot A)</span><span><i style="background:var(--copy2)"></i>weights in flight (slot B)</span>` +
+  `<span><i style="background:var(--gpu)"></i>GPU layer</span><span><i style="background:var(--gpu-soft)"></i>small GPU ops</span>` +
+  `<span><i style="background:var(--cpu)"></i>host layer on the CPU</span><span><i style="background:var(--wait)"></i>main thread blocked</span>` +
+  `<span><b class="mono" style="color:var(--gpu)">▼</b> <b class="mono" style="color:var(--cpu)">▲</b> activation hand-off GPU→CPU / CPU→GPU</span>`;
+
+// ---------- generic lane drawing
+function lanes(svg, win, plot, L, opt) {
+  svg.innerHTML = "";
+  const [w0, w1] = win, [x0, x1] = plot;
+  const X = t => x0 + (t - w0) / (w1 - w0) * (x1 - x0);
+  const inWin = (s, e) => e > w0 && s < w1;
+  const cl = (s, e) => [Math.max(s, w0), Math.min(e, w1)];
+  const rect = (s, e, y, h, fill, o = {}) => { const [a, b] = cl(s, e); const r = el("rect", { x: X(a), y, width: Math.max(0.8, X(b) - X(a)), height: h, fill, ...(o.attr || {}) }, svg); if (o.tip) el("title", {}, r, o.tip); return r; };
+  // axis + grid
+  const step = opt.tick;
+  for (let t = Math.ceil(w0 / step) * step; t <= w1 + 1e-6; t += step) {
+    el("line", { x1: X(t), x2: X(t), y1: opt.axisY + 4, y2: L.bottom, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: X(t), y: opt.axisY, "text-anchor": "middle" }, svg, String(Math.round(t)));
+  }
+  el("text", { x: x1, y: opt.axisY - 12, "text-anchor": "end" }, svg, "ms from the start of the token");
+  // lane labels
+  L.items.forEach(l => { l.names.forEach((n, i) => el("text", { x: 8, y: l.y + 14 + i * 13, class: "lbl" }, svg, n)); });
+  const Y = k => L.items.find(l => l.id === k);
+  const cy = Y("copy"), gy = Y("gpu"), py = Y("cpu"), sy = Y("sync"), hy = Y("hops");
+  // copy packages
+  D.packages.forEach(p => {
+    if (!inWin(p.s, p.e)) return;
+    const fill = p.slot ? "var(--copy2)" : "var(--copy)";
+    if (opt.parts) p.parts.forEach(q => { if (inWin(q[0], q[1])) rect(q[0], q[1], cy.y, cy.h, fill, { attr: { stroke: css("--panel"), "stroke-width": 1.2 }, tip: `${p.name}: ${q[2]} MiB, ${f1(q[1] - q[0])} ms` }); });
+    else rect(p.s, p.e, cy.y, cy.h, fill, { attr: { stroke: css("--panel"), "stroke-width": 1 }, tip: `${p.name}: ${p.mib} MiB, ${f1(p.e - p.s)} ms` });
+    const [a, b] = cl(p.s, p.e);
+    if (opt.pkgLabel && X(b) - X(a) > 120) el("text", { x: (X(a) + X(b)) / 2, y: cy.y + cy.h / 2 + 4, "text-anchor": "middle", class: "on" }, svg, `${p.name} weights · ${f1(p.e - p.s)} ms`);
+    if (opt.pkgShort && X(b) - X(a) > 22) el("text", { x: (X(a) + X(b)) / 2, y: cy.y + cy.h / 2 + 4, "text-anchor": "middle", class: "on" }, svg, p.name === "L0 (tail)" ? "" : p.name.replace("L0 next token", "L0"));
+    if (opt.landing && p.e > w0 && p.e < w1) el("line", { x1: X(p.e), x2: X(p.e), y1: cy.y + cy.h, y2: L.bottom, stroke: css("--copy"), "stroke-width": 1, "stroke-dasharray": "2 3", opacity: 0.8 }, svg);
+  });
+  // GPU
+  D.gpu.forEach(g => {
+    if (!inWin(g.s, g.e)) return;
+    if (g.kind === "layer") {
+      rect(g.s, g.e, gy.y, gy.h, "var(--gpu)", { tip: `GPU layer L${g.layer}: ${g.k} kernels, ${f1(g.e - g.s)} ms` });
+      if (opt.gpuLabel) el("text", { x: X(Math.max(g.s, w0)) + (X(Math.min(g.e, w1)) - X(Math.max(g.s, w0))) / 2, y: gy.y - 4, "text-anchor": "middle", class: "lbl" }, svg, "L" + g.layer);
+    } else rect(g.s, g.e, gy.y + gy.h * 0.3, gy.h * 0.4, "var(--gpu-soft)", { tip: `small GPU ops: ${g.k} kernels` });
+  });
+  // CPU
+  D.cpu.forEach(c => {
+    if (!inWin(c.s, c.e)) return;
+    rect(c.s, c.e, py.y, py.h, "var(--cpu)", { attr: { stroke: css("--panel"), "stroke-width": 1 }, tip: `host layer L${c.layer}: ${f1(c.e - c.s)} ms between the two hand-offs` });
+    const [a, b] = cl(c.s, c.e);
+    if (opt.cpuLabel && X(b) - X(a) > 90) el("text", { x: (X(a) + X(b)) / 2, y: py.y + py.h / 2 + 4, "text-anchor": "middle", class: "on" }, svg, `host layer L${c.layer} · ${f1(c.e - c.s)} ms`);
+    if (opt.cpuShort && X(b) - X(a) > 16) el("text", { x: (X(a) + X(b)) / 2, y: py.y + py.h / 2 + 4, "text-anchor": "middle", class: "on" }, svg, "L" + c.layer);
+  });
+  // blocked
+  D.sync.forEach(s => { if (inWin(s.s, s.e)) rect(s.s, s.e, sy.y, sy.h, "var(--wait)", { tip: `main thread blocked ${f1(s.e - s.s)} ms` }); });
+  // hops
+  if (hy) D.hops.forEach(h => {
+    if (!inWin(h.s, h.e)) return;
+    const x = X(h.s), up = h.dir === "up", m = hy.y + hy.h / 2;
+    el("path", { d: up ? `M${x - 3.5} ${m + 4} L${x + 3.5} ${m + 4} L${x} ${m - 4} Z` : `M${x - 3.5} ${m - 4} L${x + 3.5} ${m - 4} L${x} ${m + 4} Z`, fill: up ? "var(--cpu)" : "var(--gpu)" }, svg).appendChild(Object.assign(document.createElementNS(NS, "title"), { textContent: (up ? "CPU→GPU" : "GPU→CPU") + " activation, 20,480 B" }));
+  });
+  return { X };
+}
+
+// ---------- zoom
+const WZ = 110;
+const zl = { bottom: 300, items: [
+  { id: "copy", y: 50, h: 52, names: ["PCIe copy engine", "weights → GPU"] },
+  { id: "gpu", y: 120, h: 34, names: ["GPU", "kernels"] },
+  { id: "cpu", y: 172, h: 52, names: ["CPU threads", "host layers"] },
+  { id: "sync", y: 240, h: 20, names: ["Main thread", "blocked in sync"] },
+  { id: "hops", y: 276, h: 18, names: ["Hand-offs", "20 KB activations"] },
+] };
+function drawZoom(w0) {
+  const svg = document.getElementById("zoom");
+  const { X } = lanes(svg, [w0, w0 + WZ], [150, 992], zl, { tick: 10, axisY: 30, parts: true, pkgLabel: true, gpuLabel: true, cpuLabel: true, landing: true });
+  // chain arrows: GPU burst -> host layer -> next GPU burst
+  const layers = D.gpu.filter(g => g.kind === "layer");
+  const mk = el("defs", {}, svg); const m = el("marker", { id: "ah", viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 7, markerHeight: 7, orient: "auto" }, mk); el("path", { d: "M0 0 L8 4 L0 8 Z", fill: css("--fg") }, m);
+  const arrow = (xa, ya, xb, yb) => el("path", { d: `M${xa} ${ya} C${xa} ${(ya + yb) / 2} ${xb} ${(ya + yb) / 2} ${xb} ${yb}`, fill: "none", stroke: css("--fg"), "stroke-width": 1, "stroke-dasharray": "3 2", opacity: 0.75, "marker-end": "url(#ah)" }, svg);
+  const marks = [];
+  layers.forEach((g, i) => {
+    const c = D.cpu.find(c => c.layer === g.layer + 1); if (!c) return;
+    const nx = layers[i + 1];
+    if (g.e > w0 && c.s < w0 + WZ) arrow(X(Math.max(g.e, w0)), zl.items[1].y + zl.items[1].h, X(Math.max(c.s, w0)) + 2, zl.items[2].y);
+    if (nx && c.e > w0 && nx.s < w0 + WZ) arrow(X(Math.min(c.e, w0 + WZ)) - 2, zl.items[2].y, X(Math.min(nx.s, w0 + WZ)), zl.items[1].y + zl.items[1].h);
+  });
+  // numbered markers on the first complete cycle in the window
+  const g0 = layers.find(g => g.s >= w0 && layers.indexOf(g) + 1 < layers.length && layers[layers.indexOf(g) + 1].e <= w0 + WZ + 4);
+  if (g0) {
+    const i0 = layers.indexOf(g0), g1 = layers[i0 + 1], c0 = D.cpu.find(c => c.layer === g0.layer + 1);
+    const pk = D.packages.find(p => p.layer === g1.layer);
+    const badge = (n, x, y) => { el("circle", { cx: x, cy: y, r: 8, fill: css("--fg") }, svg); el("text", { x, y: y + 4, "text-anchor": "middle", style: "fill:" + css("--panel") + ";font-weight:600" }, svg, String(n)); };
+    if (pk) badge(1, X(Math.max(pk.s, w0)) + 12, 40);
+    badge(2, X((g0.s + g0.e) / 2), 108);
+    if (c0) { badge(3, X(c0.s) + 12, 166); badge(4, X((c0.s + c0.e) / 2), 166); badge(5, X(c0.e) - 12, 166); }
+    badge(6, X(g1.e) + 12, 108);
+    window.__cycle = { l0: g0.layer, l1: c0 ? c0.layer : null, l2: g1.layer, pk, g0, g1, c0 };
+    updateSteps();
+  } else { window.__cycle = null; updateSteps(); }
+  document.getElementById("w0v").textContent = `${Math.round(w0)} – ${Math.round(w0 + WZ)} ms`;
+}
+function updateSteps() {
+  const c = window.__cycle, ol = document.getElementById("steps");
+  if (!c) { ol.innerHTML = "<li>Move the slider so that a full GPU, CPU, GPU cycle is inside the window to see it described.</li>"; return; }
+  const k = c.pk ? f1(c.pk.e - c.pk.s) : "25";
+  ol.innerHTML =
+    `<li>The copy engine streams the 155 MiB weight package of layer ${c.l2} (six tensors back to back, ${k} ms). It starts the moment the previous package lands and never waits for the GPU or the CPU.</li>` +
+    `<li>Meanwhile the GPU runs layer ${c.l0}: ${c.g0.k} kernels in ${f1(c.g0.e - c.g0.s)} ms.</li>` +
+    `<li>It hands the 20 KB activation down to the host (▼).</li>` +
+    `<li>The CPU computes layer ${c.l1} from the weights it already holds in RAM: ${c.c0 ? f1(c.c0.e - c.c0.s) : "about 21"} ms, the longest step of the cycle.</li>` +
+    `<li>It hands the result back up to the GPU (▲).</li>` +
+    `<li>The GPU runs layer ${c.l2} as its weights finish landing. The dotted line is the moment the last tensor arrives: the layer ends ${c.pk ? f1(Math.abs(c.g1.e - c.pk.e)) : "0.3"} ms after it, so this layer is waiting on the copy, not the other way round. The cycle repeats with layer ${c.l2 + 1} on the CPU.</li>`;
+}
+const slider = document.getElementById("w0");
+slider.max = String(Math.floor(T - WZ));
+slider.addEventListener("input", () => { drawZoom(+slider.value); drawOver(+slider.value); });
+
+// ---------- overview
+const ol = { bottom: 128, items: [
+  { id: "copy", y: 36, h: 22, names: ["Copy engine"] },
+  { id: "gpu", y: 66, h: 14, names: ["GPU"] },
+  { id: "cpu", y: 88, h: 22, names: ["CPU layers"] },
+  { id: "sync", y: 116, h: 10, names: ["Blocked"] },
+] };
+function drawOver(w0) {
+  const svg = document.getElementById("over");
+  const { X } = lanes(svg, [0, T], [90, 992], ol, { tick: 100, axisY: 22, pkgShort: true, cpuShort: false });
+  const r = el("rect", { x: X(w0), y: 28, width: X(w0 + WZ) - X(w0), height: 100, fill: css("--fg"), opacity: 0.12, stroke: css("--fg"), "stroke-width": 1 }, svg);
+  el("title", {}, r, "window shown above");
+}
+
+// ---------- stacked chains
+(function () {
+  const st = document.getElementById("stack-copy"); const n = D.packages.length;
+  const unit = D.stats.package_period_ms;
+  st.innerHTML = `<span style="width:100%;background:linear-gradient(90deg,var(--copy) 0 50%,var(--copy2) 50% 100%);background-size:6.25% 100%;display:flex;align-items:center;justify-content:center;color:#fff;font:12px var(--mono)">32 packages × ${unit.toFixed(1)} ms = ${Math.round(32 * unit)} ms</span>`;
+  const host = D.stats.cpu_layer_ms, gpu = D.stats.gpu_layer_ms, rest = Math.max(0, T - host - gpu);
+  const part = (v, bg, t) => `<span style="width:${100 * v / T}%;background:${bg};display:flex;align-items:center;justify-content:center;color:#fff;font:12px var(--mono);white-space:nowrap;overflow:hidden">${t}</span>`;
+  document.getElementById("stack-chain").innerHTML = part(host, "var(--cpu)", `32 host layers ${Math.round(host)} ms`) + part(gpu, "var(--gpu)", "") + part(rest, "var(--grid)", "");
+  document.getElementById("chain-cap").textContent = `Host layers ${Math.round(host)} ms (${(host / 32).toFixed(1)} ms each, hand-offs included) + 32 GPU layers ${Math.round(gpu)} ms (${(gpu / 32).toFixed(1)} ms each) + ${Math.round(rest)} ms for the output head, logits copy and gaps = ${Math.round(T)} ms. A host layer measured on its own took 16.5 ms earlier, and the fit below gives about 20 ms when the copy engine is busy 70 to 87% of the time. That rise fits the CPU and the copy engine sharing the host's memory bandwidth; I have not measured that directly.`;
+})();
+
+drawZoom(0); drawOver(0);
+// redraw when the theme changes so the colours read from CSS stay right
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => { drawZoom(+slider.value); drawOver(+slider.value); });
+new MutationObserver(() => { drawZoom(+slider.value); drawOver(+slider.value); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+</script>

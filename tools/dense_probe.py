@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--n-probs", type=int, default=0, help="top-N token probabilities for every generated token")
     ap.add_argument("--cache", action="store_true", help="let the server reuse a cached prefix (default: cold)")
     ap.add_argument("--ignore-eos", action="store_true", help="generate n-predict tokens whatever the model says (decode speed)")
+    ap.add_argument("--sampled", action="store_true", help="the owner's sampling settings (temp 1.0, top-p 0.95, top-k 20, min-p 0) instead of greedy")
     ap.add_argument("--prompt-file", help="use this text instead of the repo text (the question is NOT added)")
     ap.add_argument("--out")
     ap.add_argument("--label", default="")
@@ -65,6 +66,8 @@ def main():
 
     prompt = open(a.prompt_file, encoding="utf-8").read() if a.prompt_file else build_prompt(a.chars, a.depth)
     body = {"prompt": prompt, "n_predict": a.n_predict, "temperature": 0, "cache_prompt": a.cache, "ignore_eos": a.ignore_eos}
+    if a.sampled:
+        body.update({"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0})
     if a.n_probs:
         body["n_probs"] = a.n_probs
     d = post(a.port, body)

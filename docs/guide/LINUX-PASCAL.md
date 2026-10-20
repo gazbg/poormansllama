@@ -221,8 +221,10 @@ CUDA_VISIBLE_DEVICES=0 $REPO/build/llama-cuda/bin/llama-server \
 | Cold prefill, layer-major pass, exact attention | 170.5 / 159.0 / 138.9 tok/s (1.17x / 1.13x / 1.08x) |
 | Same with `--lm-prefill-attn-int8`, f32 slab | 1.18x at 3.7k, **1.19x at 15.7k** (161.1 against 135.6 tok/s, A-B-B-A) |
 | Pass with 26, 16, 6 layers resident | 170.5, 170.0, 168.1 tok/s at 3.7k; peak VRAM 7.0, 5.5, 3.9 GB |
-| Decode, stock split, 29 resident layers | 1.45 tok/s (6.4 GB) |
-| Decode, same VRAM, 20 of 37 host layers streamed | 1.94 tok/s (1.34x) |
+| Decode, stock default placement, `-c 16384` (36 of 66 layers on the GPU) | 1.62 tok/s (6.8 GB) |
+| Decode, stock default placement, `-c 262144` (the native maximum; 14 of 66 layers on the GPU, 7.1 GB of KV in host memory) | 1.03 tok/s (6.7 GB) |
+| Decode, same VRAM, 20 of 37 host layers streamed (`-c 16384`) | 1.94 tok/s (1.20x the default placement) |
+| Decode, 16 of 31 host layers streamed, 2 slots (`-c 16384`) | 2.35 tok/s, 7.3 GB (1.45x the default placement) |
 | Decode, owner's plan: only the 16 attention layers on the GPU, nothing resident | 1.03 tok/s at 2.2 GB |
 | Combined command above | prefill 172 / 165 tok/s at 3.7k / 10k, decode 2.34 / 2.32 tok/s, peak 7.7 GB |
 
