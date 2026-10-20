@@ -24,7 +24,7 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
-## 2026-10-19/20 (DENSE-1: the layer-residency optimizations for the DENSE Qwen3.8-27B UD-IQ3_XXS on an 8 GiB GTX 1070; one GPU only; no provenance gate, no GPU mutex, nothing certified; the agent's own autonomous acceptance of its own contract, NOT owner approval; nothing committed)
+## 2026-10-19/20 (DENSE-1: the layer-residency optimizations for the DENSE Qwen3.8-27B UD-IQ3_XXS on an 8 GiB GTX 1070; one GPU only; no provenance gate, no GPU mutex, nothing certified; the agent's own autonomous acceptance of its own contract, NOT owner approval; committed locally on branch `dense-qwen38-iq3`)
 
 **Asked.** `/goal`: support the dense model `Qwen3.8-27B-UD-IQ3_XXS.gguf` in the new optimizations; the prefill ones should carry over; experiment with loading only the full-attention layers into VRAM (2 slots) for decode and computing the rest on the CPU, or another load schedule that maximises the compute. Plan, contract DQ-1..6, decisions D1..D8 and all numbers: [docs/plans/dense-qwen38-iq3-residency.md](plans/dense-qwen38-iq3-residency.md); user-facing: [docs/guide/LINUX-PASCAL.md](guide/LINUX-PASCAL.md) section 7, [docs/guide/PARAMETERS.md](guide/PARAMETERS.md) 4.1; scripts `tools/dense/`, `tools/dense_probe.py`, `tools/dense_equiv.py`, `tools/dense_multiturn.py`, `tools/dense_plan.py`.
 
@@ -34,7 +34,7 @@ risk tail.
 
 **Known gaps.** One model and quantisation, `-np 1`, prompts up to 18k tokens, no perplexity; no perplexity (the server cannot score prompt tokens); quality evidence is the 8-prompt continuation rule and the 24-prompt first-token KL; the pass is kernel-bound (MMQ at ~11 TFLOPS of ~27 dp4a peak, attention 22% at 18k); decode is bound by the CPU (0.85 tok/s on the CPU alone) and by PCIe Gen3 x8 (6.45 GB/s) for the ring; MTP/speculation (the file has a NextN block, unused) would add to decode and was not tried; `-np > 1`, the Q6_K_XL file, other GPUs not tested.
 
-Commits: none. Raw logs in the git-ignored `build/dense/`.
+Commits (local, branch `dense-qwen38-iq3`, not pushed): `482d128` (vendored code), `3da0abf` (docs and tools), plus an index commit. Raw logs in the git-ignored `build/dense/`.
 
 ## 2026-10-19 (history rewrite of the public repository: author and committer identities replaced by the GitHub noreply address, three personal strings removed from three documents; `main` and the working branch force-pushed; host-only, no GPU)
 

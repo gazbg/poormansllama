@@ -2,6 +2,8 @@
 
 **Authority:** owner `/goal` (2026-10-19): "implement support for model `~/models/qwen38/Qwen3.8-27B-UD-IQ3_XXS.gguf` for the new optimizations. I assume only the prompt prefill optimizations will work as this is not an MoE model. However every 4th layer is full attention starting from layer 4, maybe you can experiment for decode to load only these in the VRAM in the same manner as prefill, maybe have 2 slots and load only these there, the rest compute on the CPU. Or depending on the compute time we can have a different scheduling / load strategy to maximize the compute."
 
+**Commits.** Local branch `dense-qwen38-iq3` (from `main` 408a1f7), not pushed: `482d128` the vendored code, `3da0abf` plan/docs/tools, then the index row.
+
 **Binding rules.** AGENTS.md (charter: PP first, VRAM second, hold when VRAM is crowded; invariants; default llama.cpp behaviour unchanged when the options are off; honest gates; owner summary). Decisions below are the agent's own, recorded here; nothing in this file is owner approval. No push, no PR. The shared-GPU mutex of AGENTS.md is a Windows named mutex; this Linux box has two GTX 1070 and every run is pinned to ONE of them (`CUDA_VISIBLE_DEVICES=0`, `-dev CUDA0 -sm none -mg 0`, owner memory note), one GPU job at a time.
 
 ## Vehicle and facts (measured 2026-10-19, this machine)
