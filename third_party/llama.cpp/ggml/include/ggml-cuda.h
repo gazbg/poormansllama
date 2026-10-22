@@ -126,6 +126,10 @@ GGML_BACKEND_API bool ggml_backend_cuda_event_ready(ggml_backend_event_t event);
 // hand the auxiliary stream's queued work to the GPU now (cudaStreamQuery): under WDDM the driver
 // batches submissions and would otherwise start them only at the next synchronizing call
 GGML_BACKEND_API void ggml_backend_cuda_aux_flush(ggml_backend_t backend);
+// small host-to-device buffer copies (<= 256 KiB, the activation hops of CPU layers) as a kernel reading pinned memory instead of a copy-engine copy
+GGML_BACKEND_API void ggml_backend_cuda_set_hop_kernel(bool on);
+// flash attention with a quantized K/V cache: convert K and V to f16 one KV head at a time (scratch / n_head_kv). Default: LLAMA_FATTN_HEAD_TILE=1. Call before the first context is created (the reserve sizes the scratch)
+GGML_BACKEND_API void ggml_backend_cuda_set_fattn_head_tile(bool on);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 

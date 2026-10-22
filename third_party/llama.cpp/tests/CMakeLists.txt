@@ -390,6 +390,10 @@ if (LLAMA_LAYER_STREAMING)
     llama_build_and_test(test-layer-streaming-host-mem.cpp)
     target_compile_definitions(test-layer-streaming-host-mem PRIVATE LLAMA_LAYER_STREAMING)
 
+    # G-DYN: host-only test of the dense decode ring planner and the resident split (include/llama-dense-plan.h):
+    # header-only arithmetic, no CUDA, no model, no ggml.
+    llama_build_and_test(test-dense-ring-plan.cpp)
+
     # T-GPLR-58 A0: host-only proof of the speculative TG expert-row placement
     # RULES (llama_ls_spec_*), driven by a scripted proposal sequence: a
     # PENDING row is never a hit and is never evicted, an admission is refused

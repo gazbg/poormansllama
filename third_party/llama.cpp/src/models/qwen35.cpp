@@ -154,6 +154,9 @@ const llama_layer & llama_model_qwen35::graph::layer(int il) const {
         if (k >= 0) {
             return dstream->bundle(k);
         }
+        if (const llama_layer * ded = dstream->dedicated(il)) {
+            return *ded;       // a host layer with a slot of its own: computed on the device like a resident layer
+        }
     }
 #endif
     return model.layers[il];

@@ -543,6 +543,109 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Head-tiled f16 scratch (G-TILE, opt-in: LLAMA_FATTN_HEAD_TILE=1, server flag --fattn-head-tile).
+// The TILE and MMA kernels read K and V as f16. For a quantized K or V cache the op reserves (get_alloc_size) and fills (launch_fattn) a full f16 copy of the layer's K and V,
+// 4 KiB per context token for a 4-head, head size 256 model: 1 GiB at 262,144 tokens, in every context that has a flash attention node. The KV heads are independent attention problems
+// (each with gqa_ratio query heads), so they are run one after the other on strided views of Q, K, V: the scratch is that of ONE KV head (1/n_head_kv of the size), the arithmetic of a head
+// is the one of the untiled launch (no merging of partial softmax results is needed). The kernel indexes its output by the number of heads of the launch, so a head writes a compact
+// [token][gqa heads][DV] scratch that one 2D copy places into the real output.
+static int g_fattn_head_tile = -1;      // -1: the environment variable decides
+
+void ggml_backend_cuda_set_fattn_head_tile(bool on) {
+    g_fattn_head_tile = on ? 1 : 0;
+}
+
+static bool ggml_cuda_fattn_head_tile_enabled() {
+    static const bool env = [] { const char * e = getenv("LLAMA_FATTN_HEAD_TILE"); return e != nullptr && e[0] == '1'; }();
+    return g_fattn_head_tile >= 0 ? g_fattn_head_tile != 0 : env;
+}
+
+static bool ggml_cuda_fattn_head_tile_applies(const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_head_tile_enabled() || (kernel != BEST_FATTN_KERNEL_TILE && kernel != BEST_FATTN_KERNEL_MMA_F16)) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->ne[2] < 2 || Q->ne[2] % K->ne[2] != 0 || dst->src[4] != nullptr) {   // sinks are per query head: not tiled
+        return false;
+    }
+    if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {                  // nothing to convert
+        return false;
+    }
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f) {                                                      // ALiBi: the slope depends on the index of the query head, which restarts at 0 in a per-KV-head launch
+        return false;
+    }
+    if (V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs))) {   // V is a view of K (MLA): one shared copy
+        return false;
+    }
+    return dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float) && dst->nb[1] == dst->ne[0]*sizeof(float) && dst->nb[2] == dst->ne[1]*dst->nb[1];
+}
+
+struct ggml_cuda_fattn_head_views {
+    ggml_tensor q, k, v, o;
+};
+
+// the views of KV head h: Q, K, V of that head and the compact output tensor placed at o_data
+static void ggml_cuda_fattn_head_tile_views(const ggml_tensor * dst, const int64_t h, void * o_data, ggml_cuda_fattn_head_views & w) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int64_t gqa = Q->ne[2] / K->ne[2];
+
+    w.q = *Q;
+    w.q.ne[2] = gqa;
+    w.q.data  = (char *) Q->data + h*gqa*Q->nb[2];
+    w.k = *K;
+    w.k.ne[2] = 1;
+    w.k.data  = (char *) K->data + h*K->nb[2];
+    w.v = *V;
+    w.v.ne[2] = 1;
+    w.v.data  = (char *) V->data + h*V->nb[2];
+
+    w.o = *dst;
+    w.o.ne[1] = gqa;
+    w.o.nb[1] = dst->nb[1];
+    w.o.nb[2] = gqa*dst->nb[1];
+    w.o.nb[3] = dst->ne[2]*w.o.nb[2];
+    w.o.data  = o_data;
+    w.o.src[0] = &w.q;
+    w.o.src[1] = &w.k;
+    w.o.src[2] = &w.v;                         // src[3] (the mask) is shared by all heads
+}
+
+static void ggml_cuda_flash_attn_ext_head_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const best_fattn_kernel kernel) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int64_t n_kv_heads = K->ne[2];
+    const int64_t gqa        = Q->ne[2] / K->ne[2];
+
+    char * o_data = (char *) GGML_PAD((uintptr_t) dst->data + ggml_nbytes(dst), 128);     // reserved by get_alloc_size, behind the output
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: head-tiled f16 conversion of K/V (%s/%s): %d KV heads x %d query heads, %d queries, %s kernel\n", __func__, ggml_type_name(K->type), ggml_type_name(dst->src[2]->type),
+                      (int) n_kv_heads, (int) gqa, (int) Q->ne[1], kernel == BEST_FATTN_KERNEL_TILE ? "tile" : "mma_f16");
+    }
+
+    ggml_cuda_fattn_head_views w;
+    for (int64_t h = 0; h < n_kv_heads; ++h) {
+        ggml_cuda_fattn_head_tile_views(dst, h, o_data, w);
+        if (kernel == BEST_FATTN_KERNEL_TILE) {
+            ggml_cuda_flash_attn_ext_tile(ctx, &w.o);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, &w.o);
+        }
+        for (int64_t s = 0; s < dst->ne[3]; ++s) {
+            CUDA_CHECK(cudaMemcpy2DAsync((char *) dst->data + s*dst->nb[3] + h*gqa*dst->nb[1], dst->nb[2],
+                                         o_data + s*w.o.nb[3], w.o.nb[2], gqa*dst->nb[1], dst->ne[2], cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -571,6 +674,22 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    if (ggml_cuda_fattn_head_tile_applies(kernel, dst)) {
+        // behind the output: the compact output of one KV head, then the f16 copies of K and V of ONE head
+        ggml_cuda_fattn_head_views w;
+        void * o_data = (void *) GGML_PAD((uintptr_t) dst->data + ggml_nbytes(dst), 128);
+        ggml_cuda_fattn_head_tile_views(dst, 0, o_data, w);
+        const ggml_cuda_flash_attn_ext_f16_extra_data tiled = ggml_cuda_flash_attn_ext_get_f16_extra_data(&w.o, need_f16_K, need_f16_V);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            const ggml_cuda_flash_attn_ext_f16_extra_data whole = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+            GGML_LOG_INFO("%s: head-tiled f16 scratch of K/V (%s/%s), %d KV heads: %.2f MiB instead of %.2f MiB per flash attention node\n", __func__, ggml_type_name(K->type), ggml_type_name(V->type), (int) K->ne[2],
+                          (double) (tiled.end - (uintptr_t) dst->data - ggml_nbytes(dst)) / 1048576.0, (double) (whole.end - (uintptr_t) dst->data - ggml_nbytes(dst)) / 1048576.0);
+        }
+        return tiled.end - (uintptr_t) dst->data;
+    }
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
@@ -579,7 +698,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (ggml_cuda_fattn_head_tile_applies(best, dst)) {
+        ggml_cuda_flash_attn_ext_head_tiled(ctx, dst, best);
+        return;
+    }
+    switch (best) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

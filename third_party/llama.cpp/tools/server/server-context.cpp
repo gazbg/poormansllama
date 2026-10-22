@@ -12,6 +12,8 @@
 #include "fit.h"
 #include "llama.h"
 #include "llama-hybrid.h"
+#include "llama-dense-plan.h"
+#include "gguf.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -94,6 +96,77 @@ static bool lm_parse_layer_spec(const std::string & spec, std::vector<int> & out
         return false;
     }
     return true;
+}
+
+// the decoder layer count of a GGUF file without loading the model (the placement of the layers is decided before the load): block_count minus the NextN / MTP layers
+static int lm_gguf_n_decoder_layers(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        return -1;
+    }
+    int n = -1;
+    const int64_t ia = gguf_find_key(g, "general.architecture");
+    if (ia >= 0) {
+        const std::string arch = gguf_get_val_str(g, ia);
+        const int64_t ib = gguf_find_key(g, (arch + ".block_count").c_str());
+        if (ib >= 0) {
+            n = (int) gguf_get_val_u32(g, ib);
+            const int64_t ic = gguf_find_key(g, (arch + ".nextn_predict_layers").c_str());
+            if (ic >= 0) {
+                n -= (int) gguf_get_val_u32(g, ic);
+            }
+        }
+    }
+    gguf_free(g);
+    return n;
+}
+
+// --lm-evict-layers N: which N of the resident layers become evictable: spread evenly over the resident ones, never the last layer
+static std::vector<int> lm_pick_evict(const std::vector<int> & resident, int n_evict, int n_layer) {
+    std::vector<int> pool = resident;
+    if (!pool.empty() && pool.back() == n_layer - 1) {
+        pool.pop_back();
+    }
+    n_evict = std::min<int>(n_evict, (int) pool.size());
+    std::vector<int> out;
+    for (int i = 0; i < n_evict; ++i) {
+        out.push_back(pool[(size_t) (((int64_t) (2*i + 1) * (int64_t) pool.size()) / (2*(int64_t) n_evict))]);
+    }
+    return out;
+}
+
+// --lm-decode-stream lookahead:L | spaced:L : the ring layers by the owner's formula (2026-10-21). The first n_slots host layers fill the ring. Looking forward over the host layers, the ones that are already ring
+// layers (on the device) and the ones that are not host layers at all (resident on the device) cost the CPU nothing and do not count; the host layers the CPU computes count, and after L of them the next host layer
+// goes into the ring. lookahead: the count starts at the layer that just ended (the freed slot gets the layer after L CPU layers; the windows of the slots overlap, so the ring is dense: about 2 ring layers per
+// L CPU layers). spaced: the count starts at the previous ring layer, so two consecutive ring layers have exactly L CPU layers between them (one copy per L CPU layers: the copy engine is one for both slots).
+// Stops when the host list runs out; the ring must close at the end of a token, so the count is cut to a multiple of the slots (the cut layers are plain CPU layers).
+static std::vector<int> lm_lookahead_plan(const std::vector<int> & host, int n_slots, int lookahead, bool spaced) {
+    std::vector<int> ring;
+    for (size_t i = 0; i < host.size() && (int) i < n_slots; ++i) {
+        ring.push_back(host[i]);
+    }
+    for (size_t r = spaced ? ring.size() - 1 : 0; r < ring.size(); ++r) {
+        const int from = spaced ? ring.back() : ring[r];
+        int next = -1;
+        int cpu  = 0;
+        for (int il : host) {
+            if (il <= from || std::find(ring.begin(), ring.end(), il) != ring.end()) {
+                continue;
+            }
+            if (cpu == lookahead) {
+                next = il;
+                break;
+            }
+            cpu++;
+        }
+        if (next < 0 || next <= ring.back()) {
+            break;
+        }
+        ring.push_back(next);
+    }
+    ring.resize(ring.size() / (size_t) std::max(1, n_slots) * (size_t) std::max(1, n_slots));
+    return ring;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -567,6 +640,8 @@ struct server_slot {
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
+
+            common_speculative_release(spec, id);
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -1066,6 +1141,17 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        if (params_base.speculative.draft.mtp_defer) {
+            if (!spec_mtp) {
+                SRV_ERR("%s", "--spec-mtp-defer needs --spec-type draft-mtp\n");
+                return false;
+            }
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("--spec-mtp-defer needs -np 1 (got -np %d)\n", params_base.n_parallel);
+                return false;
+            }
+        }
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1235,6 +1321,63 @@ private:
             SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
         }
 
+        // --lm-decode-stream off | none: no decode ring (also when --lm-resident-layers would start the dynamic one)
+        const bool ds_off = params_base.lm_decode_stream == "off" || params_base.lm_decode_stream == "none";
+        if (ds_off) {
+            params_base.lm_decode_stream.clear();
+        }
+        std::vector<int32_t> lm_evict_soft;       // --lm-evict-layers: the resident layers that live in host memory and get a dedicated slot
+        if (params_base.lm_evict_layers > 0 && (params_base.lm_resident_layers <= 0 || ds_off)) {
+            SRV_ERR("%s", "--lm-evict-layers needs --lm-resident-layers and a decode ring (not --lm-decode-stream off): the evictable layers are computed from slots of that ring's stream\n");
+            return false;
+        }
+
+        if (params_base.lm_resident_layers > 0) {
+            // G-DYN: the count of layers that stay in VRAM; spread evenly, end-aligned. The host list is the complement and takes the place of --lm-prefill-host-layers (an explicit list wins)
+            if (!params_base.lm_prefill_host_layers.empty()) {
+                SRV_WRN("--lm-resident-layers %d is ignored: --lm-prefill-host-layers is given\n", params_base.lm_resident_layers);
+            } else {
+                const int n_layer = lm_gguf_n_decoder_layers(params_base.model.path);
+                if (n_layer <= 0) {
+                    SRV_ERR("--lm-resident-layers: cannot read the layer count of '%s'\n", params_base.model.path.c_str());
+                    return false;
+                }
+                const std::vector<int> resident = llama_dense_plan::resident_layers(n_layer, params_base.lm_resident_layers);
+                const std::vector<int> host     = llama_dense_plan::host_layers(n_layer, resident);
+                if (host.empty()) {
+                    SRV_WRN("--lm-resident-layers %d: every one of the %d layers is resident, nothing is placed on the host\n", params_base.lm_resident_layers, n_layer);
+                } else {
+                    std::string res_list, host_list;
+                    for (int il : resident) {
+                        res_list += (res_list.empty() ? "" : ",") + std::to_string(il);
+                    }
+                    // --lm-evict-layers N: N of the resident layers are loaded in HOST memory and get a VRAM slot of their own for decode (computed on the device like resident layers); the layer-major pass releases
+                    // the slots and streams those layers like any host layer, the first decode step fills the slots again. The placement list is then the host layers plus these.
+                    std::vector<int> placement = host;
+                    if (params_base.lm_evict_layers > 0) {
+                        lm_evict_soft = lm_pick_evict(resident, params_base.lm_evict_layers, n_layer);
+                        std::string soft_list;
+                        for (int il : lm_evict_soft) {
+                            soft_list += (soft_list.empty() ? "" : ",") + std::to_string(il);
+                            placement.push_back(il);
+                        }
+                        std::sort(placement.begin(), placement.end());
+                        SRV_INF("lm-evict-layers: %zu of the resident layers (%s) are loaded in host memory and get a dedicated VRAM slot; the layer-major pass frees the slots, the first decode step fills them again\n", lm_evict_soft.size(), soft_list.c_str());
+                    }
+                    for (int il : placement) {
+                        host_list += (host_list.empty() ? "" : ",") + std::to_string(il);
+                    }
+                    params_base.lm_prefill_host_layers = host_list;
+                    SRV_INF("lm-resident-layers: %zu of %d layers resident in VRAM (%s), %zu on the host\n", resident.size(), n_layer, res_list.c_str(), host.size());
+                    if (params_base.lm_decode_stream.empty() && !ds_off) {
+                        // the layers that are not resident are the CPU's; the dynamic ring puts some of them on the device during decode (--lm-decode-stream off to keep them all on the CPU)
+                        params_base.lm_decode_stream = "dynamic";
+                        SRV_INF("%s", "lm-resident-layers: --lm-decode-stream dynamic is on (the ring of the host layers is chosen from measured statistics)\n");
+                    }
+                }
+            }
+        }
+
         if (!params_base.lm_prefill_host_layers.empty()) {
             // dense models: the host layers are placed by one tensor override per list (a layer is all on the device or all in host memory), every layer stays an offloaded layer so that its KV cache
             // and recurrent state are on the device
@@ -1302,6 +1445,11 @@ private:
                         params_base.lm_prefill_fuse ? "fused prompt batches" : "no fused batches", params_base.lm_prefill_canonical ? " (canonical chunks)" : "",
                         params_base.lm_prefill_fuse_min, params_base.lm_prefill_prearm == 0 ? "off" : params_base.lm_prefill_prearm == 1 ? "always" : "auto");
             }
+            if (params_base.fattn_head_tile) {
+                // a setter, not the environment: ggml-cuda sizes the scratch at the reserve of the first context, below
+                llama_fattn_head_tile(true);
+                SRV_INF("%s", "fattn: quantized K/V converted to f16 one KV head at a time (see --fattn-head-tile)\n");
+            }
             if (params_base.lm_prefill_attn_int8) {
                 // read once by ggml-cuda at the first flash-attention call, i.e. during the model load below
 #if defined(_WIN32)
@@ -1357,18 +1505,67 @@ private:
         if (!params_base.lm_decode_stream.empty()) {
             std::vector<int> ds_layers;
             std::string      perr;
-            if (!lm_parse_layer_spec(params_base.lm_decode_stream, ds_layers, perr)) {
+            const bool ds_spaced  = params_base.lm_decode_stream.rfind("spaced:", 0) == 0;
+            const bool ds_dynamic = params_base.lm_decode_stream.rfind("dynamic", 0) == 0;
+            int        ds_pct     = 95;
+            std::vector<int32_t> ds_host32;
+            if (ds_dynamic) {
+                // G-DYN: every host layer is a candidate ring layer, the statistics of the previous decode steps choose the ring (dynamic or dynamic:P, P = percentile 50..99)
+                std::vector<int> host_layers;
+                if (params_base.lm_decode_stream.size() > 7) {
+                    const std::string num = params_base.lm_decode_stream.size() > 8 && params_base.lm_decode_stream[7] == ':' ? params_base.lm_decode_stream.substr(8) : std::string("x");
+                    if (num.empty() || num.size() > 2 || num.find_first_not_of("0123456789") != std::string::npos || std::stoi(num) < 50 || std::stoi(num) > 99) {
+                        SRV_ERR("--lm-decode-stream: '%s' is not dynamic or dynamic:P with P in 50..99\n", params_base.lm_decode_stream.c_str());
+                        return false;
+                    }
+                    ds_pct = std::stoi(num);
+                }
+                if (params_base.lm_prefill_host_layers.empty() || !lm_parse_layer_spec(params_base.lm_prefill_host_layers, host_layers, perr)) {
+                    SRV_ERR("--lm-decode-stream dynamic needs --lm-prefill-host-layers or --lm-resident-layers (%s)\n", perr.c_str());
+                    return false;
+                }
+                for (int il : host_layers) {
+                    if (std::find(lm_evict_soft.begin(), lm_evict_soft.end(), il) == lm_evict_soft.end()) {
+                        ds_host32.push_back(il);      // the evictable layers have a slot of their own: not ring candidates
+                    }
+                }
+            } else if (ds_spaced || params_base.lm_decode_stream.rfind("lookahead:", 0) == 0) {
+                std::vector<int> host_layers;
+                const std::string num = params_base.lm_decode_stream.substr(params_base.lm_decode_stream.find(':') + 1);
+                if (num.empty() || num.size() > 2 || num.find_first_not_of("0123456789") != std::string::npos) {
+                    SRV_ERR("--lm-decode-stream: '%s' is not lookahead:L or spaced:L with L the number of CPU layers to count\n", params_base.lm_decode_stream.c_str());
+                    return false;
+                }
+                if (params_base.lm_prefill_host_layers.empty() || !lm_parse_layer_spec(params_base.lm_prefill_host_layers, host_layers, perr)) {
+                    SRV_ERR("--lm-decode-stream lookahead:L / spaced:L needs --lm-prefill-host-layers (%s)\n", perr.c_str());
+                    return false;
+                }
+                ds_layers = lm_lookahead_plan(host_layers, params_base.lm_decode_slots, std::stoi(num), ds_spaced);
+                if (ds_layers.empty()) {
+                    SRV_ERR("%s", "--lm-decode-stream lookahead: the host layers give no ring\n");
+                    return false;
+                }
+                std::string list;
+                for (int il : ds_layers) {
+                    list += (list.empty() ? "" : ",") + std::to_string(il);
+                }
+                SRV_INF("lm-decode-stream: %s %s -> ring layers %s (%zu of %zu host layers, the other %zu are computed by the CPU)\n", ds_spaced ? "spaced" : "lookahead", num.c_str(), list.c_str(), ds_layers.size(), host_layers.size(), host_layers.size() - ds_layers.size());
+            } else if (!lm_parse_layer_spec(params_base.lm_decode_stream, ds_layers, perr)) {
                 SRV_ERR("--lm-decode-stream: %s\n", perr.c_str());
                 return false;
             }
             std::vector<int32_t> ds32(ds_layers.begin(), ds_layers.end());
-            llama_dense_stream_params dp = { ds32.data(), (int32_t) ds32.size(), params_base.lm_decode_slots, 0 };
+            llama_dense_stream_params dp = { ds32.data(), (int32_t) ds32.size(), params_base.lm_decode_slots, 0, ds_host32.data(), (int32_t) ds_host32.size(), ds_dynamic ? 1 : 0, ds_pct, lm_evict_soft.data(), (int32_t) lm_evict_soft.size() };
             char err[512] = { 0 };
             if (!llama_dense_stream_enable(ctx_tgt, &dp, err, sizeof(err))) {
                 SRV_ERR("--lm-decode-stream: %s\n", err);
                 return false;
             }
-            SRV_INF("lm-decode-stream: %zu layers (%s) are computed on the device in decode steps from a ring of %d slots\n", ds32.size(), params_base.lm_decode_stream.c_str(), params_base.lm_decode_slots);
+            if (ds_dynamic) {
+                SRV_INF("lm-decode-stream: dynamic ring over %zu host layers (p%d), from a ring of %d slots; the first plan is made from priors, the statistics of the decode steps refine it\n", ds_host32.size(), ds_pct, params_base.lm_decode_slots);
+            } else {
+                SRV_INF("lm-decode-stream: %zu layers (%s) are computed on the device in decode steps from a ring of %d slots\n", ds32.size(), params_base.lm_decode_stream.c_str(), params_base.lm_decode_slots);
+            }
         }
 
         if (params_base.hybrid_moe) {

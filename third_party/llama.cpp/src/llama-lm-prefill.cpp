@@ -13,7 +13,7 @@
 // model must be on the device for every layer, whatever the placement of its weights (-ngl 99 with the host layers placed by tensor overrides).
 //
 // What it does NOT do (the batch then takes the ordinary decode path): several sequences in one batch, embeddings / backend samplers / MTP, logits for other than the last token, a KV cache whose
-// cells are not laid out cell == position (the implicit causal mask of the flash attention kernel needs that), a recurrent-state snapshot mode (n_rs_seq).
+// cells are not laid out cell == position (the implicit causal mask of the flash attention kernel needs that). A context with rollback snapshots (n_rs_seq > 0, MTP) is run in the plain mode.
 
 #include "llama-hybrid.h"
 
@@ -122,8 +122,12 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         pl.why = "the batch carries embeddings";
         return pl;
     }
-    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn || cparams.n_rs_seq != 0) {
-        pl.why = "the context asks for embeddings / backend sampling / recurrent snapshots, or has no causal flash attention";
+    bool layer_inp = false;
+    for (const bool e : cparams.embeddings_layer_inp) {
+        layer_inp = layer_inp || e;
+    }
+    if (cparams.embeddings || cparams.embeddings_nextn || layer_inp || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn) {
+        pl.why = "the context asks for embeddings / backend sampling, or has no causal flash attention";
         return pl;
     }
     if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || layer_streaming != nullptr) {
@@ -155,6 +159,12 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
     if (mh == nullptr) {
         pl.why = "no hybrid memory";
+        return pl;
+    }
+
+    // rollback snapshots (MTP): the pass runs in the plain mode (see lm_run), so the state of the seq must stand in the plain plane
+    if (cparams.n_rs_seq != 0 && mh->get_mem_recr()->rs_idx[seq] != 0) {
+        pl.why = "a recurrent rollback is pending";
         return pl;
     }
 
@@ -477,6 +487,17 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         LLAMA_LOG_WARN("%s: lm-prefill: LLAMA_LM_FAIL_RUN=1: declining the batch\n", __func__);
         return 1;
     }
+
+    // A context with rollback snapshots (MTP, n_rs_seq > 0) keeps the state in (1 + n_rs_seq) planes and builds the snapshot-writing graph. The pass writes plane 0 with the plain graph
+    // and splits its chunks without the keep-tail rule, so the graphs and the memory see n_rs_seq == 0 until the pass is over (the plan checked that the seq stands in plane 0).
+    struct rs_plain_t {
+        uint32_t * cp;
+        uint32_t * mem;
+        uint32_t   cp0;
+        uint32_t   mem0;
+        rs_plain_t(uint32_t * cp, uint32_t * mem) : cp(cp), mem(mem), cp0(*cp), mem0(*mem) { *cp = 0; *mem = 0; }
+        ~rs_plain_t() { *cp = cp0; *mem = mem0; }
+    } rs_plain { &cparams.n_rs_seq, &static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr()->n_rs_seq };
 
     // the outputs the ordinary decode would reserve (and reset), before anything is changed
     if (output_reserve(n_outputs_all) < n_outputs_all || (n_outputs_all > 0 && logits.data == nullptr)) {

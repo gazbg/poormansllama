@@ -1392,7 +1392,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 #endif
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+#ifdef LLAMA_LAYER_STREAMING
+    // dense decode ring (G-DYN): a decode step closes the statistics of the previous one and, with a dynamic plan, may change the ring layers: the graph binds them at build time, so it is built again
+    bool ds_rebuild = false;
+    if (dstream != nullptr && gtype == LLM_GRAPH_TYPE_DEFAULT && ubatch.n_tokens < 32) {
+        ds_rebuild = dense_stream_begin_pass();
+    }
+#else
+    const bool ds_rebuild = false;
+#endif
+
+    if (!ds_rebuild && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

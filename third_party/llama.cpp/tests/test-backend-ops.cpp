@@ -7064,7 +7064,9 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // GGML_TEST_FA_NMSE=1e-12 makes every case report its NMSE (to compare two kernel paths case by case, e.g. LLAMA_FATTN_HEAD_TILE on and off)
+        const char * e = getenv("GGML_TEST_FA_NMSE");
+        return e ? atof(e) : 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
