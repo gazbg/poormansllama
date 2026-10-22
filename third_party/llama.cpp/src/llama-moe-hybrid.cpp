@@ -25,9 +25,14 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 // defined in ggml/src/ggml-cuda/moe-hybrid.cu (not in ggml-cuda.h: every CUDA translation unit includes that header)
 extern "C" {
@@ -105,6 +110,41 @@ static double moe_hybrid_us(moe_clock::time_point t0) {
 static int moe_hybrid_env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v && *v ? atoi(v) : def;
+}
+
+// The default size of the expert team. The workers busy-spin, so more of them than the physical cores the process may use makes them preempt each other and the decoding, engine and
+// driver threads for a whole scheduler timeslice (2.4-3.7 ms in the stall log): on a 4-core CPU the flat default of 8 gave 6-8 tok/s where 4 threads gave 30-33. 8 is the size the team
+// was tuned with (a machine with 8 or more physical cores keeps it). Linux only: elsewhere, or when the topology cannot be read, it stays 8.
+static int moe_hybrid_default_threads() {
+    int n = 8;
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        std::set<int> cores;   // the lowest logical CPU of each sibling group identifies the physical core
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (!CPU_ISSET(c, &allowed)) {
+                continue;
+            }
+            const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list";
+            FILE * f = fopen(path.c_str(), "r");
+            int first = -1;
+            const bool ok = f != nullptr && fscanf(f, "%d", &first) == 1 && first >= 0;
+            if (f != nullptr) {
+                fclose(f);
+            }
+            if (!ok) {
+                cores.clear();   // no usable topology: keep the old default
+                break;
+            }
+            cores.insert(first);
+        }
+        if (!cores.empty()) {
+            n = std::min(n, (int) cores.size());
+        }
+    }
+#endif // defined(__linux__)
+    return n;
 }
 
 struct moe_hybrid_pf_abort_ctx {
@@ -443,7 +483,10 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
 
     budget     = moe_hybrid_env_int("LLAMA_MOE_HYBRID_B", 16);
     lambda     = moe_hybrid_env_double("LLAMA_MOE_HYBRID_LAMBDA", 0.97);
-    n_threads  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_THREADS", 8);
+    n_threads  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_THREADS", moe_hybrid_default_threads());
+    if (const char * te = getenv("LLAMA_MOE_HYBRID_THREADS"); (te == nullptr || *te == '\0') && n_threads < 8) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: the expert team defaults to %d threads, the physical cores this process may use (LLAMA_MOE_HYBRID_THREADS overrides)\n", __func__, n_threads);
+    }
     cpu_first  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_FIRST", 0);
     cpu_stride = moe_hybrid_env_int("LLAMA_MOE_HYBRID_STRIDE", 2);
     poll       = moe_hybrid_env_int("LLAMA_MOE_HYBRID_POLL", 100);

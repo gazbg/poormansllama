@@ -642,7 +642,7 @@ struct common_params {
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
     bool        lm_prefill_bf16    = false;   // bf16 activation slab
     bool        fattn_head_tile = false; // LLAMA_FATTN_HEAD_TILE=1: the CUDA TILE / MMA flash attention converts a quantized K/V cache to f16 one KV head at a time (scratch / n_head_kv)
-    bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 K cache, GPU without fast FP16)
+    bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 or q4_0 K cache, GPU without fast FP16)
     int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
     bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
     int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule

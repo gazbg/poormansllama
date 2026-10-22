@@ -43,7 +43,7 @@ These are stock llama.cpp flags. The values below are the ones the record uses.
 | Flag | Default | Effect |
 |---|---|---|
 | `--hybrid-moe` | off | Expert banks stay on the host. A VRAM cache serves most experts. Sets the engine environment variables you did not set, turns `--fit` off, takes `-ub 2048` unless `-ub` is given, and for `-np > 1` takes the unified KV cache unless `-kvu` or `-no-kvu` is given |
-| `--hybrid-moe-slots N` | `-1` | Expert-cache slots per layer. `-1` sizes the cache to the `-fitt` margin. The G42 start log showed 54 of 256 experts |
+| `--hybrid-moe-slots N` | `-1` | Expert-cache slots per layer. `-1` sizes the cache to the `-fitt` margin. With `--spec-type draft-mtp` (or a draft model) the server first adds the speculative context's estimated memory to that margin, because the first sizing runs before the context exists, then takes it out again and sizes the cache once more when the context is allocated (log: `the speculative context is allocated, its N MiB leave the margin`). Before 2026-10-22 it stayed in the margin, which counted it twice: the MoE cache held 28 instead of 41 slots per layer on an 8 GiB card (5,813 against 6,759 MiB in use at idle). Decode with MTP rose by 10.5% on average (26.5 to 29.2 tok/s; Qwen3.6-35B-A3B Q4_K_M, `-c 262000`, q4_0 KV, 3 chat prompts x 2 rounds of 192 greedy tokens, order old-fixed-fixed-old, repeat-to-repeat spread 0.1 tok/s); all six cells were faster, by 4 to 15%. One machine, short generations, context up to about 4.9k tokens. The G42 start log showed 54 of 256 experts |
 | `--hybrid-moe-frozen` | off | Deterministic decode. Fixed cache of `--hybrid-moe-slots` slots (16 if unset), no promotions. A cache-hit continuation equals a fresh run. Decode is slower |
 | `--hybrid-moe-ubatch N` | `0` | Physical batch for the whole run when `-ub` is not given. `0` keeps the stock 512. Prefer `--hybrid-moe-prefill-ubatch` |
 | `--hybrid-moe-prefill-ubatch N` | `2048` | Physical batch while a large prompt batch runs under `--hybrid-moe`. `0` turns it off. G42 sets `0` because `--lm-prefill` takes the big batches |
@@ -121,8 +121,11 @@ Linux and Pascal (see [LINUX-PASCAL.md](LINUX-PASCAL.md)): `LLAMA_FATTN_TILE_Q8Q
 turns on int8 QK attention (a q8_0 K cache, head size 256, a GPU without fast FP16;
 off by default). `LLAMA_FATTN_TILE_Q8CFG` picks the block configuration of that
 kernel, 0 to 6, default 0. `LLAMA_MOE_HYBRID_LEAN_CPUS` lists the logical CPUs of
-the expert team, the last one for the engine thread; match it to the CPU's SMT
-layout.
+the expert team, the last one for the engine thread. The CPUs are pinned on Windows only; on
+Linux only the number of entries counts, as the team size. The team defaults to the physical
+cores the process may use, at most 8, on Linux (a flat 8 elsewhere); `LLAMA_MOE_HYBRID_THREADS`
+overrides it. A team larger than the physical cores made decode 4 to 5 times slower on an
+i7-4770K (LINUX-PASCAL.md section 3.2).
 
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
 tests fail without it, and the CMake cache keeps the value from configure time.

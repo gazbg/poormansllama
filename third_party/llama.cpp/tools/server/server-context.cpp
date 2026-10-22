@@ -1086,6 +1086,10 @@ private:
         return true;
     }
 
+    // G31: the bytes the speculative (MTP / draft) estimate added to params_base.fit_params_target, per device. They keep that context's memory free for hybrid_size_cache("start"),
+    // which runs before the context is created, and are taken out again once it exists (see load_model)
+    std::vector<size_t> spec_fit_added;
+
     // G31: size the hybrid MoE expert cache to the fit-target margin (between requests only)
     void hybrid_size_cache(const char * why) {
         if (!params_base.hybrid_moe || ctx_tgt == nullptr) {
@@ -1130,6 +1134,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        spec_fit_added.clear();
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1242,6 +1247,7 @@ private:
                         devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
+                    spec_fit_added.assign(params_base.fit_params_target.size(), 0);
                     size_t total = 0;
 
                     std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
@@ -1260,6 +1266,7 @@ private:
                                 SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
                                         bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
                                 params_base.fit_params_target[i] += bytes;
+                                spec_fit_added[i] += bytes;
                                 break;
                             }
                         }
@@ -1613,6 +1620,22 @@ private:
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
+
+            if (params_base.hybrid_moe && !spec_fit_added.empty()) {
+                // hybrid_size_cache("start") kept the memory of this context free: its estimate was part of the margin. The context is allocated now, so that memory is used, not free,
+                // and leaving it in the margin counts it twice (the expert cache then stays about the size of the estimate smaller than the margin asks for). Release it and size again.
+                size_t released = 0;
+                for (size_t i = 0; i < spec_fit_added.size() && i < params_base.fit_params_target.size(); ++i) {
+                    const size_t d = std::min(spec_fit_added[i], params_base.fit_params_target[i]);
+                    params_base.fit_params_target[i] -= d;
+                    released += d;
+                }
+                spec_fit_added.clear();
+                if (released > 0) {
+                    SRV_INF("hybrid-moe: the speculative context is allocated, its %.1f MiB leave the margin\n", released / (1024.0 * 1024.0));
+                    hybrid_size_cache("speculative context ready");
+                }
+            }
         }
 
         if (has_mmproj) {

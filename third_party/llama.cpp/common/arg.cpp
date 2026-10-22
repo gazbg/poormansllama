@@ -1855,7 +1855,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_BF16").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-attn-int8"},
-        "with --lm-prefill: the flash attention of the pass computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal): the attention kernel is ~1.7x faster, "
+        "with --lm-prefill: the flash attention of the pass computes Q.K^T with int8 dot products against the q8_0 or q4_0 K cache (head size 256, a GPU without fast FP16, such as Pascal): the attention kernel is ~1.7x faster, "
         "which matters at depth (22% of an 18k-token pass of the dense Qwen3.8-27B). An APPROXIMATION of the FP32 kernel (Q is quantised to int8 per 32 values, as the decode kernel already does): "
         "first-token KL against the exact pass is reported in docs/plans/dense-qwen38-iq3-residency.md. Same as LLAMA_FATTN_TILE_Q8QK=1",
         [](common_params & params) {
