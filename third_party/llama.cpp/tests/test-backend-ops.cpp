@@ -9874,7 +9874,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 128, 32, false, false, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, 64));
     // causal window op at the Qwen3.6 shape (head size 256, GQA 8) as used by the layer-major prefill, with an explicit-mask control
-    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, false, false, 0, 0, GGML_PREC_F32,
             type_KV, type_KV, {0, 1, 2, 3}, true, 384));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
