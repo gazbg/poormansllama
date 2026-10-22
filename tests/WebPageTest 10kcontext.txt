@@ -1,0 +1,1839 @@
+I am  asking for a web page with JavaScript that demonstrates how DFS (Depth-First Search) works. This is a common educational visualization task. I should create a single HTML file that includes embedded CSS and JS, which displays a graph and animates DFS traversal.
+
+I am procidign a think path what a good DFS visualization needs:
+
+Graph: A graph with nodes and edges (undirected or directed). It should be drawn on a canvas or SVG, or just absolutely positioned divs.
+
+DFS algorithm: A step-by-step version (using a stack, or a generator) so we can animate each step.
+
+Controls:
+
+Start/Pause/Resume
+Step forward
+Reset
+Speed adjustment
+Choose starting node (click a node to set the start)
+Or maybe a random graph generator
+Visualization:
+
+Color states: unvisited (white), discovered/being processed (in stack, e.g. yellow/orange), visited (green), current (red/blue highlight).
+Show the stack panel next to the graph.
+Show the visit order (DFS order).
+Show edges being traversed, and possibly also indicate back edges / tree edges.
+Explanation: Display a description of the current step, like "Visit node A" or "All neighbors of B visited, backtrack to A."
+
+Let me design it:
+
+SVG for the graph. Nodes are circles with labels. Edges are lines.
+
+Layout: a fixed sample graph with nice-looking positions, plus a "New Graph" random generator button (random positions within bounds, random edges ensuring connectivity).
+
+Adjacency list.
+
+Iterative DFS using an explicit stack to show the stack contents (easier to explain than recursion). Steps:
+
+Push start; mark as discovered.
+Loop: pop top... Actually, the typical iterative DFS: pop, if unvisited mark visited and record order, push neighbors in reverse order.
+But the classic recursive DFS has: discover (gray), then finish (black) when done. For educational purposes, showing a stack with nodes marked "in stack" and a final "visited" state is clearer.
+
+Let me go with a generator-based stepper:
+
+js
+
+function* dfsSteps(start) {
+  const visited = new Set();
+  const stack = [start];
+  // yield {action:'push', node:start}
+  while (stack.length) {
+    const node = stack[stack.length-1];
+    // peek top
+    if (!visited.has(node)) {
+      visited.add(node);
+      yield {action:'visit', node, stack: [...stack], visited:[...visited]};
+      // push unvisited neighbors in reverse order
+      const neighbors = adj[node].filter(n => !visited.has(n));
+      // push them
+      for (const n of neighbors.reverse()) {
+        stack.push(n);
+        yield {action:'push', node:n, stack:[...stack]};
+      }
+    } else {
+      // top already visited, pop (backtrack)
+      stack.pop();
+      yield {action:'pop', node, stack:[...stack]};
+    }
+  }
+}
+Hmm, but there's a subtle point: neighbors could be pushed even if they're already on the stack (discovered but not visited). Then when popped, if already visited, we pop it. This works and shows the "duplicate on stack" situation. For clarity, it might be better to only push unvisited neighbors, which is the standard iterative DFS. Duplicate pushes are also common. Let's only push unvisited ones, and mark visited when popped? No — it's better to mark visited when "processing" (popping).
+
+A simpler, clearer version (visit on pop):
+
+text
+
+stack = [start];
+while stack:
+  node = pop()
+  if not visited:
+    visited.add(node); record order
+    yield visit
+    push neighbors (unvisited)
+But then "in stack" nodes are the pending ones. Colors:
+
+Current (just visited): red / pulse
+Visited: green
+In stack: yellow
+Unvisited: gray/white
+Actually, a more faithful representation of recursive DFS would mark a node as "discovered" the moment it's first pushed, and as "finished" once all descendants are done. That's the classic white/gray/black coloring. Let's do that:
+
+White: unvisited
+Gray (in progress / on stack): discovered, being explored
+Black (finished): fully processed
+Steps:
+
+push(start): mark gray, yield "Pushed X — mark discovered".
+Peek top; find an unvisited neighbor; if found: push it (gray), yield "From X, exploring neighbor Y".
+If top has no more unvisited neighbors: pop, mark black (finished), yield "Backtrack: finished X".
+This is the cleanest representation of DFS. Track a "nextNeighborIndex" per node.
+
+Implementation with generator:
+
+js
+
+function* dfsSteps(start) {
+  const adj = state.adj;
+  const state = { color: {}, nextIdx: {} };
+  for (const n of nodes) state.color[n] = 0; // 0 white
+  const stack = [];
+  const order = [];
+  const push = (n) => {
+    stack.push(n);
+    state.color[n] = 1; // gray
+    state.nextIdx[n] = 0;
+    order.push(n); // discovery order
+    yield { type: 'push', node: n, stack: stack.slice(), msg: ... };
+  };
+  push(start);
+  while (stack.length) {
+    const top = stack[stack.length-1];
+    const neighbors = adj[top];
+    const idx = state.nextIdx[top];
+    if (idx < neighbors.length) {
+      const nb = neighbors[idx];
+      state.nextIdx[top]++;
+      if (state.color[nb] === 0) {
+        yield push(nb) ...
+      } else {
+        yield { type: 'skip', node: nb, from: top, ... } // edge to already-visited node
+      }
+    } else {
+      stack.pop();
+      state.color[top] = 2; // black
+      yield { type: 'pop', node: top, stack: stack.slice(), msg: 'Backtrack...' };
+    }
+  }
+  yield { type: 'done', ... };
+}
+Each yield contains a snapshot of the stack (for display), the color, the order, and which edge was just traversed (to highlight the edge being examined).
+
+For the "skip" case (edge to a gray/black node), briefly highlight the edge in a different color (e.g. purple/red for a back/cross edge).
+
+Controls:
+
+Play/Pause (toggle)
+Step (1 step forward)
+Reset
+Speed slider
+New graph (random)
+Click a node to choose start point (before starting, or anytime? Anytime is fine — clicking a node sets the start and resets).
+Display:
+
+Stack panel: vertical list of stack contents (top at top).
+Visit order panel: a sequence of chips.
+Log / current step message.
+Pseudocode panel with the current line highlighted — a nice touch! Let me add simple pseudocode with lines and highlight the relevant line per step type. That makes it educational.
+Pseudocode:
+
+text
+
+DFS(start):
+  push start onto stack, mark DISCOVERED
+  while stack not empty:
+    top ← peek stack
+    if top has unvisited neighbor v:
+      push v, mark DISCOVERED
+    else:
+      pop top, mark FINISHED
+  return visit order
+Lines:
+0: function DFS(start)
+1: mark start discovered; push start
+2: while stack is not empty:
+3: top = peek(stack)
+4: if top has an unvisited neighbor v:
+5: push v; mark v discovered
+6: else:
+7: pop top; mark top finished
+8: return discovery order
+
+Step → line mapping:
+
+push (initial): line 1
+push (neighbor): line 5 (maybe show 4 too)
+skip: line 4 (edge checked, target already visited)
+pop: line 7
+done: line 8
+Legend for colors: white=unvisited, yellow=discovered (in progress, on stack), green=finished.
+
+Graph generation: random graph: N nodes (e.g. 8-10), random positions with minimum distance, edges: first make a random spanning tree (guarantees connectivity), then add some extra random edges. Draw undirected.
+
+Also provide a default fixed graph so first render looks good.
+
+SVG rendering:
+
+Compute width/height; use viewBox 0 0 800 500.
+Edges as lines; highlight edges being examined with a class.
+Nodes: circle r=24, fill color by state, text label. Start node has a dashed ring or "START" label.
+Current node (stack top): thick stroke, pulse animation.
+Click handler on nodes.
+Animation loop: while playing, a timer (setInterval or recursive setTimeout with speed). Each tick: get next step from generator, apply to DOM. Speed slider maps to delay (e.g. 2000ms to 100ms).
+
+Stack panel: display stack top at top, highlight the top element. Show an arrow "top".
+
+Order panel: append chips in discovery order.
+
+Message box: description text, e.g.:
+
+"Start: mark A discovered, push A."
+"A's neighbor B is unvisited — push B, mark discovered."
+"A's neighbor C is already discovered/finished — skip edge A–C."
+"A has no more unvisited neighbors — pop A, mark finished. Backtrack to B."
+Also a small statistics line: number of visited / total.
+
+Layout:
+
+Header with title + subtitle.
+Main area: left = graph (SVG) + legend; right column = controls, stack, order, log, pseudocode.
+Responsive: stack vertically on narrow screens.
+Styling: dark theme, modern. Let's do a nice dark theme with subtle gradients. Font: system stack or Google Font? Use system font to avoid external dependencies (user might be offline). Single file, no dependencies.
+
+Let's write the code carefully.
+
+Data structures:
+
+js
+
+let graph = { nodes: [{id, x, y}], adj: {id: [ids]} };
+Default graph: let me hand-craft nice positions in an 800x520 viewBox.
+
+Nodes: A(100,120) B(260,60) C(260,200) D(440,100) E(440,260) F(620,60) G(620,200) H(160,360) I(440,420) J(640,360)?
+
+That's 10 nodes. Edges (undirected):
+A-B, A-C, A-H
+B-D, B-C?
+C-E, C-H
+D-E, D-F
+E-G, E-I
+F-G
+G-J, G-I
+H-I
+I-J
+
+Let me ensure connectivity: A-B-D-F-G-E-C-H-I-J — yes, connected.
+
+Adjacency list (order matters for DFS; keep sorted):
+A: B, C, H
+B: A, D
+C: A, E, H
+D: B, E, F
+E: C, D, G, I
+F: D, G
+G: E, F, I, J
+H: A, C, I
+I: E, G, H, J
+J: G, I
+
+Random generator:
+
+n = 7..10
+positions: rejection sampling: x in [60, 740], y in [60, 460], minimum distance 110 from existing nodes; try up to 200 times.
+labels: A, B, C, ...
+Edges: shuffle node indices; spanning tree: for i from 1..n-1, connect i to a random j < i (guarantees connectivity). Then extra edges: ~n*0.4 random pairs not already connected, ensuring no duplicates.
+Random edges: pick a random pair, add if not existing, up to extraCount = floor(n/2)+1 maybe.
+
+DFS generator as above. Edge highlight: on "push(neighbor v) from top", highlight edge top–v in tree-edge color (cyan/blue). On skip, briefly highlight edge in pink/red (back/cross edge). Edge highlight: set a class, then clear the previous highlight before applying the new one.
+
+State colors:
+
+Unvisited: fill #2a2f3a, stroke #555 (dark)
+Discovered: fill #f5b842 (amber)
+Finished: fill #34d399 (green)
+Current (stack top): additional glowing ring / animation.
+Start marker: small "start" tag or dashed outer ring.
+Pseudocode highlight mapping:
+
+pushStart → line index 1
+push → line 5
+skip → line 4
+pop → line 7
+done → line 8
+idle → none (or line 0)
+Controls behavior:
+
+playBtn toggles playing; label ▶ Play / ⏸ Pause.
+stepBtn: if generator is exhausted, do nothing (or restart? no — reset first). Step one step.
+resetBtn: reset to initial state (all white, stack empty, order empty, gen = fresh generator).
+newGraphBtn: generate a new random graph, reset.
+Speed slider: input range 1..10 → delay = 1400 - speed130 or so; show ms? Map: delay = 2000 * (11-speed)/10? Simpler: slider values 10..100, delay = 1100 - value10 → 100..1000ms. Let's do that: min=10 max=100 value=50 → delay=600ms.
+Click a node: set start, stop playing, reset.
+Also display "Start: A" and allow changing it.
+
+Auto-start option? Keep it simple: user clicks Play.
+
+Edge case: generator finished — on 'done' step, stop playing, mark done.
+
+Now let me write the DOM:
+
+html
+
+
+<header>
+  <h1>DFS Visualizer</h1>
+  <p>Depth-First Search ... click a node to choose the start, then play.</p>
+</header>
+<main>
+  <section class="graph-panel">
+    <svg id="graph"></svg>
+    <div class="legend">...</div>
+  </section>
+  <aside class="side">
+    <div class="card controls">buttons + slider</div>
+    <div class="card stack-card">
+      <h3>Stack <span id="stackEmptyNote"></span></h3>
+      <ol id="stackList"></ol>
+    </div>
+    <div class="card order-card">
+      <h3>Visit order</h3>
+      <div id="orderList"></div>
+    </div>
+    <div class="card code-card">
+      <h3>Pseudocode</h3>
+      <ol id="codeList">...</ol>
+    </div>
+    <div class="card log-card">
+      <h3>Step</h3>
+      <p id="stepMsg"></p>
+    </div>
+  </aside>
+</main>
+Render function:
+
+js
+
+function renderGraph() {
+  // build edges then nodes in svg
+}
+Store references: nodeEls[id] = {g, circle, text}, edgeEls[key] = line, where key = sorted pair "A|B".
+
+applyStep(step):
+
+Clear previous edge highlight
+Update color from step.color snapshot (or maintain our own map updated per step type — the generator can return the whole snapshot, that's simpler)
+Render stack list (top at top): iterate stack.slice().reverse()
+If step.orderChanged, append order chip
+Set message
+Highlight code line
+Highlight current top node: add class 'active'
+Highlight edge: step.edge = [a,b], step.edgeType = 'tree'|'back'
+Let the generator yield a complete snapshot object:
+
+js
+
+{
+  type, node, from,
+  stack: [...],
+  color: {...} (map id→0/1/2),
+  order: [...],
+  msg, line, edge:[a,b]|null, edgeType
+}
+Applying the snapshot is idempotent and simple.
+
+Now, timer:
+
+js
+
+let playing=false, timer=null, speedMs=600;
+function tick(){
+  const {value, done} = gen.next();
+  if(done){ stop(); return; }
+  apply(value);
+  if(value.type==='done'){ stop(); }
+}
+function play(){ playing=true; playBtn...; tick(); timer=setInterval(tick, speedMs); }
+Watch out for the first tick being immediate. On pause, clearInterval.
+
+Change speed while playing: restart the interval.
+
+Reset: clearInterval, playing=false, gen = makeDfsGen(start), reset all visual state (all white, empty stack, empty order, clear edge highlights, message "Ready — click ▶ Play...").
+
+Graph drawing details:
+
+Edge stroke #3a4152, width 2; tree edge highlight: stroke #38bdf8 width 4 + glow (filter or just width); back edge: #f472b6 dashed? Let's do: tree → cyan #22d3ee, back → #fb7185.
+
+Actually, should we keep "persisted" tree edges (edges used in the DFS tree) highlighted after traversal? That's a nice educational touch: DFS tree edges stay cyan, back edges stay faintly pink. Yes — let's persist them: when a push happens, add 'tree' class to that edge (persists), when a skip happens, add 'back' class (persists). Reset clears them.
+
+Node: circle r 22, text 14px bold, fill per state, stroke #0f1115? Use a stroke matching background for separation. Current node: pulse via CSS animation on r? SVG circle r can be animated via CSS in modern browsers (r is a presentation attribute now). Safer: use transform scale with transform-box: fill-box; transform-origin: center. Or animate stroke-width. Let's use CSS: .node.current circle { animation: pulse 1s infinite; } with keyframes scaling via transform. Use transform-box: fill-box; transform-origin: center; on the circle. Works in modern browsers.
+
+Start node: dashed circle r 30 around it, class 'start-ring'.
+
+Hover: node slightly brighter, cursor pointer, title tooltip "Click to make start".
+
+Legend items: 3 dots + labels; also a line sample for tree/back edges.
+
+Also add a "How it works" short paragraph? Maybe a collapsible <details> under the legend: "DFS dives as deep as possible before backtracking..." Keep it concise.
+
+Accessibility: buttons with aria-labels, fine.
+
+Let me now write out the pseudocode lines:
+
+text
+
+function dfs(start):
+  mark start discovered; push start
+  while stack is not empty:
+    top = peek(stack)
+    if top has an unvisited neighbor v:
+      mark v discovered; push v
+    else:
+      pop top; mark top finished
+  return discovery order
+That's 8 lines (index 0-7). Map:
+
+pushStart: 1
+push: 5
+skip: 4
+pop: 7
+done: 7? no: 7 is the return line index 7. Let me count lines: 0 function, 1 mark/push start, 2 while, 3 peek, 4 if, 5 push v, 6 else, 7 pop, 8 return. 9 lines, indices 0..8. Map: pushStart→1, push→5 (and 4), skip→4, pop→7, done→8.
+Message wording:
+
+pushStart: Start DFS at ${n}. Mark it discovered and push it onto the stack.
+push (v from top): ${top} has unvisited neighbor ${v} — go deeper: push ${v} and mark it discovered.
+skip: Edge ${top}–${v}: ${v} is already discovered/finished, so skip it.
+pop: ${top} has no unvisited neighbors left — pop it and mark it finished (backtrack${rest? ' to '+stack[stack.length-1]:''}).
+done: Stack is empty — DFS complete. Visit order: A, B, C…
+Also mention the stack size.
+
+Now let me write the full file. Aim for clean, well-commented, complete single file dfs-visualizer.html.
+
+Let me also think about "peek" step: do we yield a step for the peek itself? That adds many steps. Let's keep it minimal: peek is implicit; each loop iteration either pushes a neighbor, skips a neighbor, or pops. Hmm, the skip step happens per checked already-visited neighbor — that's good for education (shows why we check visited).
+
+One nuance: the "if top has an unvisited neighbor v" — the generator checks neighbors one at a time; if it finds an unvisited one, it pushes (that's the step). If all remaining are visited, it pops. A "skip" step for each visited neighbor encountered. Good.
+
+Now the code:
+
+js
+
+function makeDfsGen(start){
+  const adj = graph.adj;
+  const color = {}; // 0 unvisited 1 discovered 2 finished
+  const nextIdx = {};
+  const order = [];
+  const stack = [];
+  for (const n of graph.nodes) color[n.id] = 0;
+  return {
+    next(){
+      const snap = (type, extra={}) => ({
+        type,
+        stack: stack.slice(),
+        color: {...color},
+        order: order.slice(),
+        ...extra
+      });
+      // We need a stateful generator — better to write it as a function* with local state.
+    }
+  };
+}
+Generator functions are cleaner:
+
+js
+
+function* dfsGenerator(start) {
+  const color = {}, nextIdx = {}, order = [];
+  const stack = [];
+  for (const n of graph.nodes) { color[n.id] = 0; nextIdx[n.id] = 0; }
+  const snap = (type, extra = {}) => ({
+    type, stack: stack.slice(), color: {...color}, order: order.slice(),
+    ...extra
+  });
+  const doPush = (n, from) => {
+    stack.push(n); color[n] = 1; order.push(n);
+    return snap('push', { node: n, from, line: 5,
+      edge: from ? [from, n] : null,
+      msg: from
+        ? `${from} → ${n}: ${n} is unvisited, so push it and mark it discovered.`
+        : `Start at ${n}: mark it discovered and push it onto the stack.` });
+  };
+  // initial push
+  const first = doPush(start, null);
+  first.line = 1;
+  first.msg = `Start at ${start}: mark it discovered and push it onto the stack.`;
+  yield first;
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    const nbs = adj(top);
+    const i = nextIdx[top]++;
+    if (i < nbs.length) {
+      const v = nbs[i];
+      if (color[v] === 0) {
+        yield doPush(v, top);
+      } else {
+        yield snap('skip', { node: v, from: top, line: 4,
+          edge: [top, v],
+          msg: `Edge ${top}–${v}: ${v} is already ${color[v] === 1 ? 'discovered' : 'finished'}, so skip it.` });
+      }
+    } else {
+      stack.pop(); color[top] = 2;
+      const back = stack[stack.length - 1];
+      yield snap('pop', { node: top, line: 7,
+        msg: back ? `${top} has no unvisited neighbors left — pop it, mark it finished, and backtrack to ${back}.`
+                  : `${top} has no unvisited neighbors left — pop it and mark it finished.` });
+    }
+  }
+  yield snap('done', { line: 8, msg: `Stack is empty — DFS complete. Visit order: ${order.join(' → ')}.` });
+}
+adj(top) helper: graph.adj[top].
+
+Wait: nextIdx[top]++ — I'm incrementing even for skips, that's correct.
+
+Applying a step:
+
+js
+
+function applyStep(s) {
+  // edges: clear the temporary "checking" highlight; add persistent classes
+  clearChecking();
+  for (const id of graph.nodes) {
+    const c = s.color[id];
+    nodeEls[id].g.setAttribute('data-state', c === 0 ? 'unvisited' : c === 1 ? 'discovered' : 'finished');
+  }
+  // current = stack top
+  for (const id in nodeEls) nodeEls[id].g.classList.remove('current');
+  const top = s.stack[s.stack.length - 1];
+  if (top) nodeEls[top].g.classList.add('current');
+  // edge highlight
+  if (s.edge) {
+    const e = edgeEls[edgeKey(s.edge[0], s.edge[1])];
+    if (e) {
+      if (s.type === 'push') e.classList.add('tree');
+      else if (s.type === 'skip') e.classList.add('back');
+      e.classList.add('checking');
+    }
+  }
+  // stack list
+  renderStack(s.stack);
+  // order
+  renderOrder(s.order);
+  // message
+  stepMsg.textContent = s.msg;
+  // code line
+  highlightLine(s.line);
+  // counter
+  visitedCount.textContent = ...;
+  if (s.type === 'done') stop();
+}
+renderStack: build li items in reverse order (top first). Mark the first one as 'top'.
+
+renderOrder: chips; if order grew, animate the latest.
+
+Edge key: [a,b].sort().join('|').
+
+Graph SVG build:
+
+js
+
+function buildGraph() {
+  svg.innerHTML = '';
+  edgeEls = {}; nodeEls = {};
+  // edges
+  for each pair a<b in adj:
+    line x1..y2 class 'edge', id
+    store in edgeEls with key
+  // nodes
+  g class 'node', data-state='unvisited'
+    circle r=22
+    text
+  click handler → setStart(id)
+}
+Positions are within viewBox 800x520.
+
+Default graph:
+
+js
+
+const DEFAULT = {
+  nodes: [
+    ['A',100,140], ['B',270,70], ['C',280,230], ['D',460,110],
+    ['E',470,300], ['F',650,70], ['G',660,240], ['H',150,390],
+    ['I',450,450], ['J',670,420]
+  ],
+  edges: [
+    ['A','B'],['A','C'],['A','H'],['B','D'],['C','E'],['C','H'],
+    ['D','E'],['D','F'],['E','G'],['E','I'],['F','G'],['G','I'],
+    ['G','J'],['H','I'],['I','J']
+  ]
+};
+Check positions fit within 800x520 with margin 60: yes. Minimum distance: A(100,140)-C(280,230): dx180 dy90 → 201 OK. C(280,230)-E(470,300): 199 OK. E(470,300)-I(450,450): 152 OK. H(150,390)-I(450,450): 306 OK. G(660,240)-J(670,420): 180 OK. F(650,70)-G(660,240): 170 OK. D(460,110)-F(650,70): 193 OK. B(270,70)-D(460,110): 193 OK. A-B: (100,140)-(270,70): 186 OK. Good.
+
+Random graph:
+
+js
+
+function randomGraph() {
+  const n = 7 + Math.floor(Math.random()*4); // 7..10
+  const labels = 'ABCDEFGHIJ';
+  const nodes = [];
+  let guard = 0;
+  while (nodes.length < n && guard++ < 5000) {
+    const x = 70 + Math.random() * 660;
+    const y = 70 + Math.random() * 380;
+    if (nodes.every(p => (p[1]-x)**2 + (p[2]-y)**2 > 120**2)) nodes.push([labels[nodes.length], x|0, y|0]);
+  }
+  // if guard exhausted, just allow (rare)
+  // edges: spanning tree + extras
+  const edges = [];
+  const has = (a,b) => edges.some(([x,y]) => (x===a&&y===b)||(x===b&&y===a));
+  for (let i = 1; i < n; i++) {
+    const j = Math.floor(Math.random()*i);
+    edges.push([labels[i], labels[j]]);
+  }
+  const extra = Math.floor(n/2);
+  let added = 0, tries = 0;
+  while (added < extra && tries++ < 100) {
+    const a = Math.floor(Math.random()*n), b = Math.floor(Math.random()*n);
+    if (a===b || has(labels[a],labels[b])) continue;
+    edges.push([labels[a], labels[b]]); added++;
+  }
+  return { nodes, edges };
+}
+If we can't place enough nodes within the guard (small chance with 10 nodes in 660x380 at 120 spacing... area ~250k, each node needs ~ (12021.2)^2... roughly OK; guard 5000 is plenty).
+
+Build adjacency list:
+
+js
+
+function buildAdj(nodes, edges) {
+  const adj = {};
+  nodes.forEach(([id]) => adj[id] = []);
+  edges.forEach(([a,b]) => { adj[a].push(b); adj[b].push(a); });
+  // deterministic-ish order: keep insertion; fine
+  return adj;
+}
+For stable DFS, sort adjacency alphabetically: adj[id].sort().
+
+setStart(id): if playing, stop; state.start = id; reset().
+
+reset(): gen = dfsGenerator(start); render all white; empty stack; empty order; clear edge classes; message ready; reset counter; clear code highlight.
+
+Wait — reset should reset visuals to pre-start. gen is fresh; but the first yield (initial push) happens on the first tick/step. So after reset, the graph is all white with the start ring. Good.
+
+Timer with dynamic speed:
+
+js
+
+let timer = null, playing = false;
+function schedule() {
+  clearTimeout(timer);
+  if (!playing) return;
+  timer = setTimeout(() => {
+    step();
+    if (playing) schedule();
+  }, speedMs());
+}
+step(): const r = gen.next(); if (r.done) { stop(); return; } applyStep(r.value); if (r.value.type==='done') stop();
+
+play(): if gen is exhausted → reset first? If user hits play after completion, restart: if (isFinished) reset(). Then playing=true; update button; schedule() — but should we step immediately for snappiness? Do the first step immediately: step(); schedule();
+
+Actually careful: if we step immediately and that was the last step (a single-node graph? no, minimum is... a start node with no neighbors: steps: pushStart, pop, done = 3 steps, fine).
+
+stop(): playing=false; clearTimeout; button label to ▶ Play.
+
+Pause: stop().
+
+Step button: if (!playing) { step(); } (works even while paused). If finished → maybe flash message "Press Reset". Or auto-reset and step. Let me: if gen exhausted, reset() then step()? That's friendly. Hmm, but the done message gets replaced. Let's: if (genExhausted) { reset(); } then step(). Need to track exhausted flag: set to true when step() sees r.done.
+
+Simpler: keep finished boolean: set to true on 'done' step or r.done; reset sets to false.
+
+speedMs from slider: 1100 - value*10, value 10..100 → 100..1000. Default 50 → 600ms.
+
+Now CSS. Dark theme:
+
+css
+
+:root {
+  --bg: #0b0e14; --panel: #131826; --panel2:#0f1420; --border: #232b3d;
+  --text: #e6ebf4; --muted: #8b95ab;
+  --unvisited: #2b3346; --discovered: #f5b842; --finished: #34d399;
+  --accent: #38bdf8; --tree: #38bdf8; --back: #fb7185;
+}
+Body: gradient background, font stack.
+
+Layout:
+
+css
+
+main { display:grid; grid-template-columns: minmax(0,1fr) 340px; gap:16px; max-width:1200px; margin:0 auto; padding: 16px; }
+@media (max-width: 980px){ main{grid-template-columns:1fr} }
+Cards: background var(--panel), border, radius 14px, padding.
+
+Buttons: primary (Play) accent-filled; others ghost.
+
+Stack list: chips vertically; top item with accent border and "top" tag.
+
+Order chips: small pills; latest with animation (scale in).
+
+Code: monospace, lines as li with padding; .active line with accent background tint + left border.
+
+SVG: width 100%, height auto, background subtle grid? Add a faint dot pattern with CSS background on the container.
+
+Node pulse:
+
+css
+
+.node circle { transition: fill .25s, stroke .25s; }
+.node.current circle { animation: pulse 0.9s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+@keyframes pulse { 0%,100%{ transform: scale(1);} 50%{ transform: scale(1.18);} }
+Hmm, scaling the circle scales the ring too, fine.
+
+Text: fill #fff, font-weight 700, text-anchor middle, dominant-baseline central, pointer-events none.
+
+Edge classes:
+
+css
+
+.edge { stroke:#39415a; stroke-width:2; }
+.edge.tree { stroke: var(--tree); stroke-width:3.5; }
+.edge.back { stroke: var(--back); stroke-width:2.5; stroke-dasharray: 5 5; opacity:.85 }
+.edge.checking { filter: drop-shadow(0 0 4px rgba(56,189,248,.8)); }
+Start ring: dashed circle with class 'start-ring', stroke accent, r 30, no fill, maybe rotating animation (slow rotate — cute). Use transform-box fill-box.
+
+Legend: flex row of items with dot swatches and line swatches.
+
+Also a small info bar showing start node and visited count: maybe put it in the graph panel header: "Start: A · Visited: 3/10".
+
+Details/summary "How DFS works": 3 bullet points:
+
+DFS follows one path as deep as possible before backtracking.
+It uses a stack: push neighbors, pop the last one (LIFO).
+Each node is explored once; already-seen edges are skipped.
+Title: "DFS Visualizer — Depth-First Search".
+
+Let me now write the full file. Aim for clean, well-commented, complete single file dfs-visualizer.html.
+
+Also add keyboard shortcuts? Space = play/pause, S = step? Nice touch but adds complexity; let me add: space toggles play (preventDefault when not focused in an input), 'r' reset, 'n' new graph? Minimal: space and 's' for step. Include with a small hint. Careful: if button has focus, space triggers both click and handler → double toggle. Use e.preventDefault() and check target is body. Actually simpler: on keydown, if e.code==='Space' and target is body → toggle. Fine.
+
+Edge persistence: when a tree edge is found (push from a neighbor), add 'tree' class permanently (until reset). For skips, 'back'. These persist, so the user sees the DFS forest + back edges at the end.
+
+But note: 'checking' class is added to the current step's edge each step and cleared on next step; but if a tree edge is later 'checking' again? An edge is examined at most once per direction? In undirected: edge A-B: when top=A, neighbor B gets examined; when top=B, neighbor A also examined (skip). So an edge can be examined twice (once as tree, once as skip-back). Classes: on second skip, add 'back' class to a tree edge → conflict. Handle: in applyStep, if s.type==='push' → add 'tree' (remove 'back'); if skip → add 'back' only if not 'tree'? Semantically, the edge is a tree edge if it was used once; the reverse examination is just the skip. So: if edge already has 'tree', skip just highlights (no 'back' class). Otherwise add 'back'. Good.
+
+renderStack:
+
+js
+
+function renderStack(stack){
+  stackList.innerHTML = '';
+  if (!stack.length){ stackList.innerHTML = '<li class="empty">— empty —</li>'; return; }
+  [...stack].reverse().forEach((id, i) => {
+    const li = document.createElement('li');
+    li.className = i===0 ? 'top' : '';
+    li.textContent = id;
+    if (i===0) { const tag=document.createElement('span'); tag.textContent='top'; li.append(tag); }
+    stackList.appendChild(li);
+  });
+}
+CSS: stackList is column, items centered pill; .top has accent border + glow.
+
+renderOrder:
+
+js
+
+function renderOrder(order){
+  orderList.innerHTML = '';
+  order.forEach((id,i) => {
+    const s = document.createElement('span');
+    s.className = 'chip' + (i===order.length-1 ? ' new' : '');
+    s.textContent = id;
+    orderList.appendChild(s);
+    if (i < order.length-1){ const sep... }
+  });
+}
+Separator "→" between chips: append a span 'sep' with text '→' between chips.
+
+Message: also a colored dot indicator? Keep it text.
+
+Counter: ${s.order.length}/${graph.nodes.length} visited.
+
+Now, code line list — hardcode in HTML:
+
+html
+
+
+<ol class="code" id="codeList">
+  <li>function <b>dfs</b>(start):</li>
+  <li class="indent">mark start <span class="kw">discovered</span>; push start</li>
+  <li class="indent">while stack <span class="kw">not empty</span>:</li>
+  <li class="indent2">top = peek(stack)</li>
+  <li class="indent2">if top has an unvisited neighbor v:</li>
+  <li class="indent3">mark v <span class="kw">discovered</span>; push v</li>
+  <li class="indent2">else:</li>
+  <li class="indent3">pop top; mark top <span class="kw">finished</span></li>
+  <li>return discovery order</li>
+</ol>
+ol starts at 1; li index 0..8 matches the line numbers used. highlightLine(n): remove .active from all, add to nth (n null → none).
+
+Buttons row:
+
+html
+
+
+<div class="btns">
+  <button id="playBtn" class="primary">▶ Play</button>
+  <button id="stepBtn">Step</button>
+  <button id="resetBtn">Reset</button>
+  <button id="newBtn">New graph</button>
+</div>
+<label class="speed">Speed <input type="range" id="speed" min="10" max="100" value="55"> <span id="speedVal"></span></label>
+speedVal shows something like "×1.6"? Just show the delay ms: 600 ms. Or map to a friendly label: slow/fast. Show ms.
+
+speedMs = 1100 - value*10 → value 55 → 550ms.
+
+Let me also add a small "hint" line under the graph: "Tip: click any node to make it the start."
+
+Let me write the JS in full, carefully checking correctness.
+
+js
+
+const svg = document.getElementById('graph');
+const NS = 'http://www.w3.org/2000/svg';
+
+let graph = null;      // { nodes:[{id,x,y}], edges:[[a,b]], adj:{} }
+let nodeEls = {}, edgeEls = {};
+let gen = null, finished = false, playing = false, timer = null;
+let startId = 'A';
+
+function loadGraph(data) {
+  graph = {
+    nodes: data.nodes.map(([id,x,y]) => ({id,x,y})),
+    edges: data.edges.map(([a,b]) => [a,b]),
+  };
+  graph.adj = {};
+  graph.nodes.forEach(n => graph.adj[n.id] = []);
+  graph.edges.forEach(([a,b]) => { graph.adj[a].push(b); graph.adj[b].push(a); });
+  Object.values(graph.adj).forEach(list => list.sort());
+  if (!graph.nodes.find(n => n.id === startId)) startId = graph.nodes[0].id;
+  buildSvg();
+  reset();
+}
+buildSvg:
+
+js
+
+function buildSvg() {
+  svg.innerHTML = '';
+  nodeEls = {}; edgeEls = {};
+  const pos = Object.fromEntries(graph.nodes.map(n => [n.id, n]));
+  // edges
+  for (const [a,b] of graph.edges) {
+    const line = document.createElementNS(NS,'line');
+    line.setAttribute('x1',pos[a].x); ... class 'edge';
+    svg.appendChild(line);
+    edgeEls[key(a,b)] = line;
+  }
+  // nodes
+  for (const n of graph.nodes) {
+    const g = document.createElementNS(NS,'g');
+    g.setAttribute('class','node');
+    g.setAttribute('transform',`translate(${n.x},${n.y})`);
+    g.dataset.state = 'unvisited';
+    const c = document.createElementNS(NS,'circle');
+    c.setAttribute('r', 22);
+    const t = document.createElementNS(NS,'text');
+    t.textContent = n.id;
+    g.append(c, t);
+    g.addEventListener('click', () => { startId = n.id; stop(); reset(); });
+    const title = document.createElementNS(NS,'title');
+    title.textContent = 'Click to set as start';
+    g.prepend(title);
+    svg.appendChild(g);
+    nodeEls[n.id] = g;
+  }
+  drawStartRing();
+  updateMeta();
+}
+Start ring: a separate circle element positioned at the start node; recreate on start change:
+
+js
+
+let startRing = null;
+function drawStartRing() {
+  if (startRing) startRing.remove();
+  const n = posOf(startId);
+  startRing = document.createElementNS(NS,'circle');
+  startRing.setAttribute('cx', n.x); startRing.setAttribute('cy', n.y);
+  startRing.setAttribute('r', 30);
+  startRing.setAttribute('class','start-ring');
+  svg.insertBefore(startRing, svg.firstChild); // behind? or in front, either is fine
+}
+Insert before first child = behind edges? Edges are first added, so insertBefore(firstChild) puts ring behind edges — good (subtle).
+
+Hmm, but svg.innerHTML='' clears everything including the ring; then rebuild. drawStartRing is called after nodes are built. OK.
+
+reset():
+
+js
+
+function reset() {
+  stop();
+  finished = false;
+  gen = dfsGenerator(startId);
+  // visuals
+  for (const id in nodeEls) {
+    nodeEls[id].dataset.state = 'unvisited';
+    nodeEls[id].classList.remove('current');
+  }
+  for (const e of Object.values(edgeEls)) e.classList.remove('tree','back','checking');
+  startRing && drawStartRing();
+  renderStack([]);
+  renderOrder([]);
+  highlightLine(null);
+  stepMsg.textContent = `Ready. Start node is ${startId}. Press Play (or step through one move at a time).`;
+  updateMeta();
+}
+step():
+
+js
+
+function step() {
+  if (finished) return;
+  const r = gen.next();
+  if (r.done) { finished = true; stop(); return; }
+  applyStep(r.value);
+  if (r.value.type === 'done') { finished = true; stop(); }
+}
+play/pause:
+
+js
+
+function play() {
+  if (finished) reset();
+  playing = true;
+  playBtn.textContent = '⏸ Pause';
+  step();            // immediate first move
+  if (playing) schedule();
+}
+function stop() {
+  playing = false;
+  clearTimeout(timer); timer = null;
+  playBtn.textContent = '▶ Play';
+}
+function schedule() {
+  clearTimeout(timer);
+  if (!playing) return;
+  timer = setTimeout(() => { step(); if (playing) schedule(); }, speedMs());
+}
+applyStep as sketched. updateMeta: meta.textContent = \Start: <b>
+s
+t
+a
+r
+t
+I
+d
+<
+/
+b
+>
+⋅
+V
+i
+s
+i
+t
+e
+d
+:
+startId</b>⋅Visited:{visitedCount}/${total}`— need visitedCount from last snapshot; keep alastOrder` variable updated in applyStep; initial 0.
+
+Let me restructure: keep state = { visited: 0 }. In applyStep: state.visited = s.order.length; updateMeta();.
+
+applyStep:
+
+js
+
+function applyStep(s) {
+  // clear transient edge highlight
+  for (const e of Object.values(edgeEls)) e.classList.remove('checking');
+  // node colors
+  for (const n of graph.nodes) {
+    const c = s.color[n.id];
+    nodeEls[n.id].dataset.state = c===0?'unvisited':c===1?'discovered':'finished';
+    nodeEls[n.id].classList.remove('current');
+  }
+  const top = s.stack[s.stack.length-1];
+  if (top) nodeEls[top].classList.add('current');
+  // edges
+  if (s.edge) {
+    const e = edgeEls[key(s.edge[0], s.edge[1])];
+    if (e) {
+      e.classList.add('checking');
+      if (s.type === 'push') e.classList.add('tree');
+      else if (s.type === 'skip' && !e.classList.contains('tree')) e.classList.add('back');
+    }
+  }
+  renderStack(s.stack);
+  renderOrder(s.order);
+  highlightLine(s.line);
+  stepMsg.textContent = s.msg;
+  state.visited = s.order.length;
+  updateMeta();
+}
+Wait: 'checking' on a tree edge when re-examined in reverse direction (skip) — fine.
+
+Note: on a 'push' step, the edge is the one just traversed; marking it 'tree' is correct.
+
+Key function: const key = (a,b) => a < b ? a+'|'+b : b+'|'+a;
+
+Now HTML/CSS details. Let me write the final CSS carefully for polish:
+
+css
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh;
+  font-family: ui-sans-serif, system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background: radial-gradient(1200px 600px at 80% -10%, #16233f 0%, transparent 60%), var(--bg);
+  color: var(--text);
+}
+header { text-align:center; padding: 28px 16px 8px; }
+h1 { margin:0 0 6px; font-size: clamp(24px, 4vw, 34px); letter-spacing:.3px; }
+h1 .accent { color: var(--accent); }
+header p { margin:0 auto; max-width:640px; color:var(--muted); font-size:14.5px; line-height:1.5; }
+Graph panel:
+
+css
+
+.graph-card { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:12px; }
+.graph-head { display:flex; justify-content:space-between; align-items:center; padding:4px 6px 10px; color:var(--muted); font-size:13px; }
+#graph { width:100%; height:auto; display:block; border-radius:12px; background:
+  radial-gradient(circle at center, rgba(255,255,255,.02) 0%, transparent 70%), #0d1220; }
+Legend below.
+
+Side cards: .card { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:14px; } with h3 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); }
+
+Buttons:
+
+css
+
+.btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+button { ... padding:9px 10px; border-radius:10px; border:1px solid var(--border); background:#1a2233; color:var(--text); font-weight:600; cursor:pointer; font-size:14px; }
+button:hover { border-color:#3b4763; background:#202a40; }
+button.primary { grid-column:1/-1; background:linear-gradient(180deg,#38bdf8,#0ea5e9); color:#04121c; border:none; font-size:15px; }
+button.primary:hover { filter:brightness(1.1); }
+Speed row:
+
+css
+
+.speed { display:flex; align-items:center; gap:10px; margin-top:10px; font-size:13px; color:var(--muted); }
+input[type=range]{ flex:1; accent-color: var(--accent); }
+Stack list:
+
+css
+
+#stackList { list-style:none; margin:0; padding:0; display:flex; flex-direction:column-reverse; gap:6px; max-height:220px; overflow:auto; }
+Hmm, with column-reverse the last pushed appears on top and the top of the stack is visually last... Let me think: I want the stack top shown at the top. If I push in order [A,B,C], I want display order C (top), B, A. With flex-direction: column, append C, B, A (reverse array) → C on top. Then scroll: newest on top, fine. Use column and reverse in JS. Good, no need for column-reverse.
+
+css
+
+#stackList li {
+  display:flex; align-items:center; justify-content:center; position:relative;
+  width:44px; margin: 0 auto; padding:6px 0; border-radius:10px;
+  background:#1b2334; border:1px solid var(--border); font-weight:700;
+}
+#stackList li.top { border-color:var(--accent); box-shadow:0 0 10px rgba(56,189,248,.35); background:#14263a; }
+#stackList li.top span { position:absolute; right:-46px; font-size:10px; color:var(--accent); text-transform:uppercase; letter-spacing:.08em; }
+#stackList li.empty { color:var(--muted); font-weight:400; background:transparent; border-style:dashed; width:100%; max-width:120px; }
+Wait, the "top" tag positioned to the right outside of a 44px-wide item — needs container padding. Simpler: make the li full width and show label + top tag inline:
+
+css
+
+#stackList li { display:flex; align-items:center; gap:8px; padding:7px 10px; ... }
+#stackList li .lbl { font-weight:700; }
+#stackList li .tag { margin-left:auto; font-size:10px; color:var(--accent); text-transform:uppercase; letter-spacing:.1em; }
+Full-width row, node letter on the left, "TOP" tag on the right. Clearer. Let's do that.
+
+Order chips:
+
+css
+
+#orderList { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-height:34px; }
+.chip { background:#12271f; border:1px solid #1f4a37; color:#a7f3d0; font-weight:700; padding:4px 10px; border-radius:999px; font-size:13px; }
+.chip.new { animation: pop .3s ease; }
+@keyframes pop { 0%{ transform:scale(.4); } 60%{ transform:scale(1.15);} 100%{ transform:scale(1);} }
+.sep { color:var(--muted); font-size:12px; }
+#orderList .none { color:var(--muted); font-size:13px; }
+Code:
+
+css
+
+.code { list-style:none; margin:0; padding:0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12.5px; line-height:1.9; counter-reset: line; }
+.code li { padding:1px 8px 1px 34px; position:relative; border-left:3px solid transparent; white-space:pre; }
+.code li::before { counter-increment: line; content: counter(line); position:absolute; left:8px; color:#4a5570; }
+.code li.active { background:rgba(56,189,248,.12); border-left-color:var(--accent); color:#fff; }
+.code .kw { color:#7dd3fc; }
+.indent2 { padding-left:52px; }
+.indent3 { padding-left:70px; }
+Message:
+
+css
+
+#stepMsg { margin:0; min-height:64px; font-size:14px; line-height:1.5; }
+Legend:
+
+css
+
+.legend { display:flex; flex-wrap:wrap; gap:14px; padding:10px 6px 4px; font-size:12.5px; color:var(--muted); }
+.legend .item { display:flex; align-items:center; gap:6px; }
+.dot { width:14px; height:14px; border-radius:50%; display:inline-block; }
+.dot.unvisited { background:var(--unvisited); border:1px solid #46506b; }
+.dot.discovered { background:var(--discovered); }
+.dot.finished { background:var(--finished); }
+.line-swatch { width:22px; height:0; border-top:3px solid; display:inline-block; }
+.line-swatch.tree { border-color:var(--tree); }
+.line-swatch.back { border-color:var(--back); border-top-style:dashed; }
+SVG node CSS:
+
+css
+
+.node { cursor:pointer; }
+.node circle { fill:var(--unvisited); stroke:#4a5570; stroke-width:2; transition: fill .25s ease, stroke .25s ease; }
+.node text { fill:#e8edf7; font-size:15px; font-weight:700; text-anchor:middle; dominant-baseline:central; pointer-events:none; }
+.node[data-state="discovered"] circle { fill:var(--discovered); stroke:#b98524; }
+.node[data-state="finished"] circle { fill:var(--finished); stroke:#1f9d72; }
+.node.current circle { animation:pulse 1s ease-in-out infinite; transform-box:fill-box; transform-origin:center; }
+.node:hover circle { filter:brightness(1.15); }
+.start-ring { fill:none; stroke:var(--accent); stroke-width:2; stroke-dasharray:6 6; opacity:.9; animation:spin 12s linear infinite; transform-box:fill-box; transform-origin:center; }
+@keyframes spin { to { transform:rotate(360deg); } }
+@keyframes pulse { 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.15);} }
+Note: transform on circle inside translated g — transform-box fill-box should be fine.
+
+Edge CSS as above.
+
+Details box:
+
+css
+
+details { margin-top:8px; font-size:13px; color:var(--muted); }
+summary { cursor:pointer; color:#a9b4cc; font-weight:600; }
+details ul { margin:8px 0 4px; padding-left:18px; line-height:1.6; }
+Keyboard:
+
+js
+
+document.addEventListener('keydown', e => {
+  if (e.target !== document.body) return;
+  if (e.code === 'Space') { e.preventDefault(); playing ? stop() : play(); }
+  else if (e.key === 's' || e.key === 'S') { if (playing) stop(); step(); }
+  else if (e.key === 'r' || e.key === 'R') reset();
+  else if (e.key === 'n' || e.key === 'N') newGraph();
+});
+Buttons:
+
+js
+
+playBtn.onclick = () => playing ? stop() : play();
+stepBtn.onclick = () => { if (playing) stop(); if (finished) reset(); step(); };
+resetBtn.onclick = reset;
+newBtn.onclick = newGraph;
+speedInput.oninput = () => { speedVal.textContent = speedMs() + ' ms'; if (playing) schedule(); };
+newGraph(): loadGraph(randomGraph()); (reset startId if invalid — startId might be 'A' which always exists; keep).
+
+Init:
+
+js
+
+loadGraph(defaultGraph());
+speedVal...
+defaultGraph() returns the DEFAULT data.
+
+One more check: in dfsGenerator, adj — I referenced graph.adj. Make sure the generator uses the current graph: it's created after loadGraph, fine.
+
+Also, the initial push step: I build doPush(start,null) which returns a snap of type 'push' with from null; then override line and msg. In doPush, edge: from ? [from,n] : null — good, no edge for the first one.
+
+Let me check the skip message when color[v]===2: 'finished'. Good.
+
+Edge case: multiple components? Random graph is always connected (spanning tree). Default is connected. If user clicks a node... all same graph, connected. Fine — but DFS on a disconnected graph would only visit its own component; our generator handles that fine (stack empties, done). We can note in the "done" message if order.length < total: "Note: this only visits nodes reachable from the start." Let me add that to the done message.
+
+Also visited counter label: "Visited: X / N".
+
+Order panel with separator: in renderOrder, for i>0, prepend a separator before chip i.
+
+Also handle: while playing, user clicks a node → set start and reset (stop). Good.
+
+Also double-check renderOrder called each step rebuilds the DOM — fine for ≤10 chips.
+
+Potential issue: svg.innerHTML = '' on an SVG element — works in modern browsers. OK.
+
+nodeEls[id].dataset.state — dataset works on SVG elements in modern browsers. Yes.
+
+Now the title / header text:
+
+"Depth-First Search, animated" — h1: DFS <span class=accent>Visualizer</span>? Or "Depth-First Search (DFS) — Visualizer". Subtitle: "DFS dives down one branch as far as it can, then backtracks. Watch the stack grow and shrink, the nodes change color, and the discovery order build up. Click a node to choose where to start."
+
+Let me finalize the file. Also include a small footer? Not necessary.
+
+Also consider: should the "Step" button work while playing? I made it pause first — reasonable ("Step" pauses and advances one move).
+
+Let me now write it all out. Also, viewport meta, lang en.
+
+Re-check the pseudocode line mapping with the ol items (1-based display, 0-based array index):
+
+li[0]: function dfs(start):
+li[1]: mark start discovered; push start
+li[2]: while stack is not empty:
+li[3]: top = peek(stack)
+li[4]: if top has an unvisited neighbor v:
+li[5]: mark v discovered; push v
+li[6]: else:
+li[7]: pop top; mark top finished
+li[8]: return discovery order
+
+highlightLine(n): codeList.children[n]?.classList.add('active') after clearing. For push (neighbor) we could highlight both 4 and 5; let's just do 5, fine. For the initial push, line 1. Done → 8.
+
+In the skip step, the algorithm "checked" a neighbor that wasn't unvisited — highlight 4 (the if condition evaluated false → but then it should proceed to else/pop...). Well, it's illustrative, fine.
+
+Let me write the final HTML.
+
+Also: speed default value 55 → 550ms.
+
+speedMs(): 1100 - speedInput.value * 10.
+
+Let me write renderStack:
+
+js
+
+function renderStack(stack) {
+  stackList.innerHTML = '';
+  if (!stack.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'empty';
+    stackList.appendChild(li);
+    return;
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const li = document.createElement('li');
+    if (i === stack.length - 1) li.classList.add('top');
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = stack[i];
+    li.appendChild(lbl);
+    if (i === stack.length - 1) {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'top';
+      li.appendChild(tag);
+    }
+    stackList.appendChild(li);
+  }
+}
+OK.
+
+One more consideration — the graph SVG viewBox: "0 0 800 520". Node y max 450 + r 30 (ring) = 480 < 520 OK. y min 70 - 30 = 40 OK. x min 100-30=70 OK; max 670+30=700 <800 OK. Random: x in [70,730], ring extends 30 → max 760 OK, min 40 OK. y in [70,450] → 480 OK.
+
+Now let me write the full file. I'll be thorough and produce the complete, tested-in-my-head code.
+
+Also a minor: prevent text selection on fast clicks of buttons: user-select none on buttons.
+
+Also #graph height: aspect from viewBox; width 100% → height auto works with aspect-ratio? For an SVG with viewBox and width:100%, height:auto, modern browsers compute it from viewBox. Safer: set style="aspect-ratio: 800/520" on the svg, or leave default (default height 150px if not set?). SVG without height attribute: CSS height auto → uses intrinsic ratio from viewBox in modern browsers. To be safe, add height:auto; aspect-ratio: 800/520; in CSS.
+
+Also mobile: side panel below graph; stack/order fine.
+
+I think the code is robust. Let me write it.
+
+Also a minor: in play(), if finished, reset() — then step() immediately. Good.
+
+Potential double-step: play() → step() then schedule() → after delay step() again. Fine.
+
+Space key while playing: toggles stop. Good.
+
+Let me write the final answer: brief intro, the code block, short usage notes (save as .html, features list). Keep prose concise per instructions (detailed code, minimal fluff). Format: single HTML code block. No tool needed (no files, no time). get_info not needed.
+
+Let me write out the complete file text, verifying JS syntax as I go.
+
+Also: Object.fromEntries(graph.nodes.map(n => [n.id, n])) for pos.
+
+In buildSvg, I need to keep a reference to posOf for drawStartRing — make pos a module-level variable nodePos.
+
+Final code assembly:
+
+html
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFS Visualizer — Depth-First Search</title>
+<style>
+  :root {
+    --bg: #0b0e15;
+    --panel: #121826;
+    --border: #232c42;
+    --text: #e7ecf6;
+    --muted: #8b96ad;
+    --accent: #38bdf8;
+    --unvisited: #2b3346;
+    --discovered: #f5b842;
+    --finished: #34d399;
+    --tree: #38bdf8;
+    --back: #fb7185;
+  }
+  * { box-sizing: border-box; }
+  body { ... }
+  ...
+</style>
+</head>
+<body>
+<header>
+  <h1>DFS <span class="accent">Visualizer</span></h1>
+  <p>Depth-First Search dives down one branch as far as it can, then backtracks.
+     Watch the stack grow and shrink, nodes change color, and the discovery order build up.
+     <b>Click any node to make it the start.</b></p>
+</header>
+<main>
+  <section class="graph-card">
+    <div class="graph-head">
+      <span id="meta">Start: A · Visited: 0 / 10</span>
+      <span class="kbd-hint">Space play · S step · R reset · N new graph</span>
+    </div>
+    <svg id="graph" viewBox="0 0 800 520" role="img" aria-label="Graph for DFS traversal"></svg>
+    <div class="legend">
+      <span class="item"><span class="dot unvisited"></span>Unvisited</span>
+      <span class="item"><span class="dot discovered"></span>Discovered (on stack)</span>
+      <span class="item"><span class="dot finished"></span>Finished</span>
+      <span class="item"><span class="line-swatch tree"></span>DFS tree edge</span>
+      <span class="item"><span class="line-swatch back"></span>Skipped edge</span>
+    </div>
+    <details>
+      <summary>How DFS works</summary>
+      <ul>
+        <li>Keep a <b>stack</b>. Push the start node and mark it <i>discovered</i>.</li>
+        <li>Look at the top of the stack. If it has an unvisited neighbor, push that neighbor and mark it discovered (go deeper).</li>
+        <li>If every neighbor is already seen, pop the node and mark it <i>finished</i> (backtrack).</li>
+        <li>Stop when the stack is empty. The order nodes were first discovered is the DFS order.</li>
+      </ul>
+    </details>
+  </section>
+
+  <aside class="side">
+    <div class="card">
+      <h3>Controls</h3>
+      <div class="btns">
+        <button id="playBtn" class="primary">▶ Play</button>
+        <button id="stepBtn">Step</button>
+        <button id="resetBtn">Reset</button>
+        <button id="newBtn">New graph</button>
+      </div>
+      <label class="speed">Speed
+        <input type="range" id="speed" min="10" max="100" value="55">
+        <span id="speedVal">550 ms</span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h3>Stack <span class="sub">(top first)</span></h3>
+      <ul id="stackList"></ul>
+    </div>
+
+    <div class="card">
+      <h3>Discovery order</h3>
+      <div id="orderList"><span class="none">— none yet —</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Pseudocode</h3>
+      <ol class="code" id="codeList">
+        <li>function <b>dfs</b>(start):</li>
+        <li>  mark start <span class="kw">discovered</span>; push start</li>
+        <li>  while stack <span class="kw">not empty</span>:</li>
+        <li>    top = peek(stack)</li>
+        <li>    if top has an unvisited neighbor v:</li>
+        <li>      mark v <span class="kw">discovered</span>; push v</li>
+        <li>    else:</li>
+        <li>      pop top; mark top <span class="kw">finished</span></li>
+        <li>  return discovery order</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h3>Current step</h3>
+      <p id="stepMsg">Ready.</p>
+    </div>
+  </aside>
+</main>
+<script>
+...
+</script>
+</body>
+</html>
+For the pseudocode indentation, using literal spaces in the li text with white-space:pre works.
+
+Now the JS:
+
+js
+
+(() => {
+'use strict';
+
+const NS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('graph');
+const meta = document.getElementById('meta');
+const stepMsg = document.getElementById('stepMsg');
+const stackList = document.getElementById('stackList');
+const orderList = document.getElementById('orderList');
+const codeList = document.getElementById('codeList');
+const playBtn = document.getElementById('playBtn');
+const stepBtn = document.getElementById('stepBtn');
+const resetBtn = document.getElementById('resetBtn');
+const newBtn = document.getElementById('newBtn');
+const speedInput = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+
+let graph, nodeEls = {}, edgeEls = {}, nodePos = {}, startRing = null;
+let gen = null, playing = false, finished = false, timer = null;
+let startId = 'A', visitedCount = 0;
+
+const key = (a, b) => (a < b ? a : b) + '|' + (a < b ? b : a);
+const speedMs = () => 1100 - speedInput.value * 10;
+defaultGraph, randomGraph, loadGraph, buildSvg, drawStartRing, dfsGenerator, reset, step, applyStep, play/stop/schedule, renderers, events, init.
+
+Let me write dfsGenerator carefully:
+
+js
+
+function* dfsGenerator(start) {
+  const color = {}, nextIdx = {}, order = [];
+  const stack = [];
+  for (const n of graph.nodes) { color[n.id] = 0; nextIdx[n.id] = 0; }
+  const snap = (type, extra = {}) => ({
+    type,
+    stack: stack.slice(),
+    color: Object.assign({}, color),
+    order: order.slice(),
+    ...extra
+  });
+  const pushNode = (n, from) => {
+    stack.push(n);
+    color[n] = 1;
+    order.push(n);
+    return snap('push', {
+      node: n,
+      from,
+      line: from ? 5 : 1,
+      edge: from ? [from, n] : null,
+      msg: from
+        ? `${topLabel(from)} has an unvisited neighbor ${n} — go deeper: push ${n} and mark it discovered.`
+        : `Start at ${n}: mark it discovered and push it onto the stack.`
+    });
+  };
+  ...
+}
+topLabel is unnecessary; from is the id. Fix the message: ${from} has an unvisited neighbor ${n} — go deeper: push ${n}, mark it discovered.
+
+Body:
+
+js
+
+  yield pushNode(start, null);
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    const nbs = graph.adj[top];
+    const i = nextIdx[top]++;
+    if (i < nbs.length) {
+      const v = nbs[i];
+      if (color[v] === 0) {
+        yield pushNode(v, top);
+      } else {
+        yield snap('skip', {
+          node: v, from: top, line: 4, edge: [top, v],
+          msg: `Edge ${top}–${v} checked: ${v} is already ${color[v] === 1 ? 'discovered' : 'finished'}, so it is skipped.`
+        });
+      }
+    } else {
+      stack.pop();
+      color[top] = 2;
+      const back = stack[stack.length - 1];
+      yield snap('pop', {
+        node: top, line: 7,
+        msg: back
+          ? `${top} has no unvisited neighbors left — pop it, mark it finished, and backtrack to ${back}.`
+          : `${top} has no unvisited neighbors left — pop it and mark it finished.`
+      });
+    }
+  }
+  const all = graph.nodes.length;
+  yield snap('done', {
+    line: 8,
+    msg: (order.length < all
+      ? `DFS finished, but only ${order.length} of ${all} nodes were reachable from ${start}. `
+      : '') +
+      `Visit order: ${order.join(' → ')}.`
+  });
+Good.
+
+loadGraph:
+
+js
+
+function loadGraph(data) {
+  graph = {
+    nodes: data.nodes.map(([id, x, y]) => ({ id, x, y })),
+    edges: data.edges.map(([a, b]) => [a, b]),
+    adj: {}
+  };
+  for (const n of graph.nodes) graph.adj[n.id] = [];
+  for (const [a, b] of graph.edges) { graph.adj[a].push(b); graph.adj[b].push(a); }
+  for (const id in graph.adj) graph.adj[id].sort();
+  if (!graph.adj[startId]) startId = graph.nodes[0].id;
+  buildSvg();
+  reset();
+}
+buildSvg:
+
+js
+
+function buildSvg() {
+  svg.innerHTML = '';
+  nodeEls = {}; edgeEls = {}; nodePos = {};
+  for (const n of graph.nodes) nodePos[n.id] = n;
+
+  for (const [a, b] of graph.edges) {
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', nodePos[a].x);
+    line.setAttribute('y1', nodePos[a].y);
+    line.setAttribute('x2', nodePos[b].x);
+    line.setAttribute('y2', nodePos[b].y);
+    line.setAttribute('class', 'edge');
+    svg.appendChild(line);
+    edgeEls[key(a, b)] = line;
+  }
+
+  startRing = document.createElementNS(NS, 'circle');
+  startRing.setAttribute('class', 'start-ring');
+  svg.appendChild(startRing);
+  positionStartRing();
+
+  for (const n of graph.nodes) {
+    const g = document.createElementNS(NS, 'g');
+    g.setAttribute('class', 'node');
+    g.setAttribute('transform', `translate(${n.x} ${n.y})`);
+    g.dataset.state = 'unvisited';
+
+    const title = document.createElementNS(NS, 'title');
+    title.textContent = 'Click to make this the start node';
+    const c = document.createElementNS(NS, 'circle');
+    c.setAttribute('r', 22);
+    const t = document.createElementNS(NS, 'text');
+    t.textContent = n.id;
+    g.append(title, c, t);
+    g.addEventListener('click', () => { startId = n.id; reset(); });
+    svg.appendChild(g);
+    nodeEls[n.id] = g;
+  }
+  updateMeta();
+}
+
+function positionStartRing() {
+  const n = nodePos[startId];
+  startRing.setAttribute('cx', n.x);
+  startRing.setAttribute('cy', n.y);
+  startRing.setAttribute('r', 30);
+}
+Wait, order: startRing is added before nodes → it's behind nodes, but added after edges → it's above edges. Visually a ring overlapping edges is fine, or behind? Either way; keep it above edges but under nodes.
+
+updateMeta:
+
+js
+
+function updateMeta() {
+  meta.textContent = `Start: ${startId}  ·  Visited: ${visitedCount} / ${graph.nodes.length}`;
+}
+reset:
+
+js
+
+function reset() {
+  stop();
+  finished = false;
+  visitedCount = 0;
+  gen = dfsGenerator(startId);
+  for (const id in nodeEls) {
+    nodeEls[id].dataset.state = 'unvisited';
+    nodeEls[id].classList.remove('current');
+  }
+  for (const e of Object.values(edgeEls)) e.classList.remove('tree', 'back', 'checking');
+  positionStartRing();
+  renderStack([]);
+  renderOrder([]);
+  highlightLine(null);
+  stepMsg.textContent = `Ready — start node is ${startId}. Press ▶ Play, or advance one move at a time with Step.`;
+  updateMeta();
+}
+step/apply/play/stop/schedule as planned.
+
+renderStack/renderOrder/highlightLine as planned.
+
+Events:
+
+js
+
+playBtn.addEventListener('click', () => (playing ? stop() : play()));
+stepBtn.addEventListener('click', () => { if (playing) stop(); if (finished) reset(); step(); });
+resetBtn.addEventListener('click', reset);
+newBtn.addEventListener('click', () => loadGraph(randomGraph()));
+speedInput.addEventListener('input', () => {
+  speedVal.textContent = speedMs() + ' ms';
+  if (playing) schedule();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.target !== document.body) return;
+  if (e.code === 'Space') { e.preventDefault(); playing ? stop() : play(); }
+  else if (e.key.toLowerCase() === 's') { if (playing) stop(); if (finished) reset(); step(); }
+  else if (e.key.toLowerCase() === 'r') reset();
+  else if (e.key.toLowerCase() === 'n') loadGraph(randomGraph());
+});
+Init:
+
+js
+
+speedVal.textContent = speedMs() + ' ms';
+loadGraph(defaultGraph());
+defaultGraph:
+
+js
+
+function defaultGraph() {
+  return {
+    nodes: [
+      ['A', 100, 140], ['B', 270, 70], ['C', 280, 235], ['D', 460, 110],
+      ['E', 470, 300], ['F', 650, 70], ['G', 660, 240], ['H', 150, 395],
+      ['I', 450, 450], ['J', 670, 420]
+    ],
+    edges: [
+      ['A','B'], ['A','C'], ['A','H'],
+      ['B','D'],
+      ['C','E'], ['C','H'],
+      ['D','E'], ['D','F'],
+      ['E','G'], ['E','I'],
+      ['F','G'],
+      ['G','I'], ['G','J'],
+      ['H','I'], ['I','J']
+    ]
+  };
+}
+randomGraph:
+
+js
+
+function randomGraph() {
+  const labels = 'ABCDEFGHIJ';
+  const n = 7 + Math.floor(Math.random() * 4); // 7..10 nodes
+  const pts = [];
+  let guard = 0;
+  while (pts.length < n && guard++ < 8000) {
+    const x = Math.round(70 + Math.random() * 660);
+    const y = Math.round(70 + Math.random() * 380);
+    if (pts.every(p => (p[1] - x) ** 2 + (p[2] - y) ** 2 >= 118 ** 2)) {
+      pts.push([labels[pts.length], x, y]);
+    }
+  }
+  const edges = [];
+  const has = (a, b) => edges.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
+  for (let i = 1; i < n; i++) {          // random spanning tree → connected
+    edges.push([labels[i], labels[Math.floor(Math.random() * i)]]);
+  }
+  const extra = Math.floor(n / 2);       // a few cross edges to skip
+  let added = 0, tries = 0;
+  while (added < extra && tries++ < 200) {
+    const a = Math.floor(Math.random() * n), b = Math.floor(Math.random() * n);
+    if (a === b || has(labels[a], labels[b])) continue;
+    edges.push([labels[a], labels[b]]);
+    added++;
+  }
+  return { nodes: pts, edges };
+}
+If guard runs out (rare), pts < n; the spanning tree loop uses n → labels beyond pts.length → missing node ids. Guard: set n = pts.length after the loop. Add n = pts.length; after the while. Good.
+
+highlightLine:
+
+js
+
+function highlightLine(n) {
+  for (const li of codeList.children) li.classList.remove('active');
+  if (n !== null && n !== undefined && codeList.children[n]) codeList.children[n].classList.add('active');
+}
+renderOrder:
+
+js
+
+function renderOrder(order) {
+  orderList.innerHTML = '';
+  if (!order.length) {
+    orderList.innerHTML = '<span class="none">— none yet —</span>';
+    return;
+  }
+  order.forEach((id, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'sep';
+      sep.textContent = '→';
+      orderList.appendChild(sep);
+    }
+    const chip = document.createElement('span');
+    chip.className = 'chip' + (i === order.length - 1 ? ' new' : '');
+    chip.textContent = id;
+    orderList.appendChild(chip);
+  });
+}
+applyStep:
+
+js
+
+function applyStep(s) {
+  for (const e of Object.values(edgeEls)) e.classList.remove('checking');
+  for (const n of graph.nodes) {
+    const c = s.color[n.id];
+    nodeEls[n.id].dataset.state = c === 0 ? 'unvisited' : c === 1 ? 'discovered' : 'finished';
+    nodeEls[n.id].classList.remove('current');
+  }
+  const top = s.stack[s.stack.length - 1];
+  if (top) nodeEls[top].classList.add('current');
+  if (s.edge) {
+    const e = edgeEls[key(s.edge[0], s.edge[1])];
+    if (e) {
+      e.classList.add('checking');
+      if (s.type === 'push') e.classList.add('tree');
+      else if (s.type === 'skip' && !e.classList.contains('tree')) e.classList.add('back');
+    }
+  }
+  renderStack(s.stack);
+  renderOrder(s.order);
+  highlightLine(s.line);
+  stepMsg.textContent = s.msg;
+  visitedCount = s.order.length;
+  updateMeta();
+}
+play/stop/schedule/step:
+
+js
+
+function step() {
+  if (finished) return;
+  const r = gen.next();
+  if (r.done) { finished = true; stop(); return; }
+  applyStep(r.value);
+  if (r.value.type === 'done') { finished = true; stop(); }
+}
+function play() {
+  if (finished) reset();
+  playing = true;
+  playBtn.textContent = '⏸ Pause';
+  step();
+  if (playing) schedule();
+}
+function stop() {
+  playing = false;
+  if (timer) { clearTimeout(timer); timer = null; }
+  playBtn.textContent = '▶ Play';
+}
+function schedule() {
+  if (timer) clearTimeout(timer);
+  if (!playing) return;
+  timer = setTimeout(() => { step(); if (playing) schedule(); }, speedMs());
+}
+CSS: .sub { text-transform:none; letter-spacing:0; } or style it inline. h3 sub: small, lowercase. Let me just style it as h3 .sub { color:#5a6580; text-transform:none; font-weight:400; letter-spacing:0; }.
+
+kbd-hint: small muted, hidden on small screens.
+
+I think this is complete. Let me also double-check the code ol list: default ol has list-style; set .code{list-style:none} and use a counter for numbers. Good.
+
+Edge checking glow: filter: drop-shadow(...) on the line — fine.
+
+One concern: CSS transform-box: fill-box on the circle with animation: pulse scaling — the circle is at cx=0, cy=0 inside a translated g; fill-box bounding is the circle's bbox; origin center → scales about its own center.
+
+start-ring spin: a circle at cx,cy in svg coordinates; transform-box fill-box, origin center → rotates around its own center. Dashed ring rotating = subtle motion. Good.
+
+Text dominant-baseline: central works in browsers for SVG text. Also add dy fallback? central is widely supported. Fine.
+
+Also .node text font-size 15.
+
+Media queries:
+
+css
+
+@media (max-width: 960px) {
+  main { grid-template-columns: 1fr; }
+  .kbd-hint { display: none; }
+}
+main:
+
+css
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  gap: 14px;
+  width: min(1180px, 100% - 28px);
+  margin: 0 auto 24px;
+}
+.side { display:flex; flex-direction:column; gap:14px; }
+On mobile, the side becomes a grid of 2 columns? @media (max-width:960px){ .side { display:grid; grid-template-columns:1fr 1fr; } .side .card:first-child {grid-column:1/-1} ... } — could get complex; a single column is simpler and safer. Actually two columns looks nicer on tablets: code card + stack side by side. Let me do this:
+
+css
+
+@media (max-width: 960px) and (min-width: 640px) {
+  .side { display: grid; grid-template-columns: 1fr 1fr; align-items:start; }
+  .card.controls-card { grid-column: 1 / -1; }
+  .code-card { grid-column: 1 / -1; }
+}
+Need to add classes to cards: controls-card, code-card. Fine.
+
+OK, let me assemble the final answer. Concise intro line, code block, short bullets on features/usage. Keep the prose tight.
+
+One more syntax check on tricky lines:
+
+line.setAttribute('transform', translate(
+n
+.
+x
+n.x{n.y})) — g element, fine.
+g.dataset.state = 'unvisited' on SVG g: dataset is supported. CSS selector .node[data-state="discovered"] matches.
+(p[1] - x) ** 2 exponentiation operator — fine in modern JS.
+In the keydown handler, e.target !== document.body — after clicking a button, the button retains focus; then space would trigger the button's click instead of our handler (target = button). That's acceptable (space activates focused button — standard). To be safer, blur the button after click? Add this.blur()? Let me add in the click handlers: e.currentTarget.blur() so space works globally. Let me add a small helper:
+
+js
+
+function onClick(el, fn) {
+  el.addEventListener('click', (e) => { fn(); el.blur(); });
+}
+Use for all buttons. Good.
+
+Range input: keydown on it will change value via arrows — the target check skips it. Good.
+
+Final message text in reset() uses the ▶ character, fine.
+
+Also initial meta text before loadGraph — loadGraph is called immediately, fine.
+
+Let me verify the done message join: order.join(' → ') — arrow character, fine in HTML textContent.
+
+Write web page.
+**IMPORTANT**  Do not recheck and reconfirm . You have all the infor star the implementaiton immediately.
