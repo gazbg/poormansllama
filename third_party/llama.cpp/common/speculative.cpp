@@ -169,6 +169,9 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // (optional) the sequence finished its request
+    virtual void release(llama_seq_id /*seq_id*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1314,6 +1317,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // --spec-mtp-defer: the target gives no hidden states while a prompt is processed.
+    // A seq is armed by begin() and disarmed by release(); the target flag is on while any seq is armed.
+    bool defer  = false;
+    bool tgt_on = false;
+    std::vector<char> armed;   // [n_seq]
+    std::vector<char> h_valid; // [n_seq] pending_h holds the hidden state of the last position of the seq
+
+    void set_tgt_hidden_states() {
+        bool any = false;
+        for (char a : armed) {
+            any = any || a;
+        }
+        if (any != tgt_on) {
+            tgt_on = any;
+            llama_set_embeddings_nextn(params.ctx_tgt, tgt_on, /*masked*/ false);
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1368,11 +1389,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        defer = this->params.mtp_defer;
+        armed.assign(n_seq, 0);
+        h_valid.assign(n_seq, 0);
+
+        if (!defer) {
+            llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            tgt_on = true;
+        }
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        if (defer && (is_mem_shared || chain_heads)) {
+            throw std::runtime_error("--spec-mtp-defer supports only a single MTP head with its own draft cache");
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1420,6 +1452,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
+
+        if (defer) {
+            // the draft cache of the seq starts empty: its first cell comes with the first generated token
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            armed[seq_id]   = 1;
+            h_valid[seq_id] = 0;
+            set_tgt_hidden_states();
+            return;
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
         if (pos_max < N - 1 && !is_mem_shared) {
@@ -1431,6 +1473,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void release(llama_seq_id seq_id) override {
+        if (!defer || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        armed[seq_id]         = 0;
+        h_valid[seq_id]       = 0;
+        verify_h_rows[seq_id] = 0;
+        set_tgt_hidden_states();
+    }
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1438,6 +1491,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        // prompt batches of a deferred seq: the target gave no hidden states
+        if (defer && !tgt_on) {
             return true;
         }
 
@@ -1526,6 +1584,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+
+            if (defer) {
+                // no hidden state of the position before the first row yet: that row was paired with a placeholder, drop its cell
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0 && !h_valid[seq_id]) {
+                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id]];
+                        llama_memory_seq_rm(mem_dft, seq_id, p, p + 1);
+                    }
+                }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1544,6 +1612,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            h_valid[seq_id] = 1;
         }
 
         return true;
@@ -1564,6 +1634,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+
+            // deferred: no hidden state of the last position yet (the first generated token)
+            if (defer && !h_valid[seq_id]) {
                 continue;
             }
 
@@ -2597,6 +2672,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_release(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->release(seq_id);
     }
 }
 

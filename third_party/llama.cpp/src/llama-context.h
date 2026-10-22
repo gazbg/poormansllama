@@ -345,6 +345,7 @@ public:
     bool dense_stream_enable(const llama_dense_stream_params & p, std::string & err);
     void dense_stream_disable();
     bool dense_stream_is_enabled() const { return dstream != nullptr; }
+    bool dense_stream_begin_pass();     // before the graph of a decode step: close the statistics of the last step, re-plan (dynamic); true = rebuild the graph
     void dense_stream_stats(int64_t * v6) const;
     llama_lm_plan lm_make_plan(const llama_batch & b) const;
     void lm_note(const llama_batch & b, const llama_lm_plan & pl) const;   // LLAMA_LM_LOG=1: why a big enough batch was not taken

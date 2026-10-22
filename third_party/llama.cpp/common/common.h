@@ -330,6 +330,8 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    bool mtp_defer = false; // MTP: stay off while the prompt is processed, start drafting after the first generated token (needs -np 1)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -631,12 +633,15 @@ struct common_params {
     bool        lm_prefill         = false;
     std::string lm_decode_stream;             // dense models: decoder layers (a subset of lm_prefill_host_layers) that decode steps compute on the device from a ring of VRAM slots; empty = off
     int32_t     lm_decode_slots    = 2;       // slots in that ring
+    int32_t     lm_evict_layers    = 0;       // with lm_resident_layers: how many of the resident layers are loaded in host memory with a dedicated VRAM slot, released for the layer-major pass; 0 = none
+    int32_t     lm_resident_layers = 0;      // dense models: how many layers stay in VRAM, spread evenly (end-aligned); the others are host layers; 0 = off (--lm-prefill-host-layers decides)
     std::string lm_prefill_host_layers;       // dense models: decoder layers whose weights stay in host memory and stream through the slot window ("N" = the first N layers, or ranges "0-21,30"); empty = placement as given by -ngl / -ot
     int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
     bool        lm_prefill_bf16    = false;   // bf16 activation slab
+    bool        fattn_head_tile = false; // LLAMA_FATTN_HEAD_TILE=1: the CUDA TILE / MMA flash attention converts a quantized K/V cache to f16 one KV head at a time (scratch / n_head_kv)
     bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 K cache, GPU without fast FP16)
     int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)
     bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run

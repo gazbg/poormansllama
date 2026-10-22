@@ -1181,6 +1181,62 @@ extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_input_batch_end(void) {
     g_cuda_input_n_staged = g_cuda_input_n_direct = 0;
 }
 
+// Small host-to-device copies (the activation hops of CPU layers) as a kernel that reads pinned memory: a copy-engine copy waits behind every bulk copy queued before it
+// (a 1 MiB piece of the dense decode ring is 73 us), a kernel does not. Opt-in: LLAMA_CUDA_HOP_KERNEL=1 or ggml_backend_cuda_set_hop_kernel.
+#define GGML_CUDA_HOP_KERNEL_MAX (256*1024)
+static int g_cuda_hop_kernel = -1;
+
+void ggml_backend_cuda_set_hop_kernel(bool on) {
+    g_cuda_hop_kernel = on ? 1 : 0;
+}
+
+static __global__ void k_hop_copy_w(unsigned int * __restrict__ dst, const unsigned int * __restrict__ src, const size_t n) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        dst[i] = __ldcv(src + i);
+    }
+}
+
+static __global__ void k_hop_copy_b(char * __restrict__ dst, const volatile char * __restrict__ src, const size_t n) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+static bool ggml_cuda_hop_kernel_copy(void * dst, const void * data, size_t size) {
+    if (g_cuda_hop_kernel < 0) {
+        const char * e = getenv("LLAMA_CUDA_HOP_KERNEL");
+        g_cuda_hop_kernel = e != nullptr && atoi(e) != 0 ? 1 : 0;
+    }
+    if (g_cuda_hop_kernel == 0 || size == 0 || size > GGML_CUDA_HOP_KERNEL_MAX) {
+        return false;
+    }
+    static thread_local char * h_stage = nullptr;
+    static thread_local char * d_stage = nullptr;
+    static thread_local bool   failed  = false;
+    if (failed) {
+        return false;
+    }
+    if (h_stage == nullptr) {
+        if (cudaHostAlloc((void **) &h_stage, GGML_CUDA_HOP_KERNEL_MAX, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void **) &d_stage, h_stage, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            failed = true;
+            return false;
+        }
+    }
+    memcpy(h_stage, data, size);   // the caller may reuse its memory as soon as this returns; the sync below keeps one staging buffer enough
+    const bool word = ((uintptr_t) dst | size) % 4 == 0;
+    if (word) {
+        const size_t n = size / 4;
+        k_hop_copy_w<<<(unsigned) std::min<size_t>((n + 255) / 256, 64), 256, 0, cudaStreamPerThread>>>((unsigned int *) dst, (const unsigned int *) d_stage, n);
+    } else {
+        k_hop_copy_b<<<(unsigned) std::min<size_t>((size + 255) / 256, 64), 256, 0, cudaStreamPerThread>>>((char *) dst, (const volatile char *) d_stage, size);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -1197,6 +1253,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
         }
         ggml_cuda_input_batch_settle(); // program order: the uploads recorded so far land before this direct one
+    }
+    if (ggml_cuda_hop_kernel_copy((char *) tensor->data + offset, data, size)) {
+        g_cuda_input_n_direct++;
+        return;
     }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));

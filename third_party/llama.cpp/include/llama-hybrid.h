@@ -81,6 +81,15 @@ struct llama_dense_stream_params {
     int32_t         n_layers;
     int32_t         n_slots;    // slots in the VRAM ring (2 or 3)
     int32_t         device;     // CUDA device index (0)
+    // G-DYN: a dynamic plan. Every host layer is a candidate ring layer; the statistics of the previous decode steps (copy time, CPU time between ring layers, GPU time of a ring layer) choose the ring
+    // between steps (include/llama-dense-plan.h); `layers` is then ignored. New members go last: the struct is initialised positionally.
+    const int32_t * host_layers;   // the host layers, ascending (needed when dynamic)
+    int32_t         n_host;
+    int32_t         dynamic;       // 0 = the fixed plan in `layers`
+    int32_t         percentile;    // confidence of the dynamic plan, 50..99 (0 = 95)
+    // G-EVICT: host layers with a VRAM slot of their own (never recycled): computed on the device in decode steps like resident layers, released for the layer-major pass, filled again at the first decode step
+    const int32_t * dedicated;
+    int32_t         n_dedicated;
 };
 LLAMA_API bool llama_dense_stream_enable(struct llama_context * ctx, const struct llama_dense_stream_params * p, char * err, size_t err_len);
 LLAMA_API void llama_dense_stream_disable(struct llama_context * ctx);
@@ -90,6 +99,8 @@ LLAMA_API void llama_dense_stream_stats(const struct llama_context * ctx, int64_
 
 // Stop the helper threads and the callbacks of this API; call before the context is freed.
 LLAMA_API void llama_hybrid_shutdown(void);
+// CUDA flash attention (TILE / MMA kernels) with a quantized K/V cache: convert K and V to f16 one KV head at a time instead of the whole layer (scratch / n_head_kv). Before the first context is created
+LLAMA_API void llama_fattn_head_tile(bool on);
 
 #ifdef __cplusplus
 }

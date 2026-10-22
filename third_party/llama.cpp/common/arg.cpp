@@ -1784,11 +1784,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--lm-decode-stream"}, "SPEC",
         "dense models (Qwen3.5/3.8) with --lm-prefill-host-layers: the decoder layers (a subset of the host layers; a count N = the first N of them is not accepted, give layers or ranges such as 3,7,11 or 0-20) that a decode step computes ON THE DEVICE "
-        "from a ring of VRAM slots, which a copy stream refills while the CPU computes the other host layers. The number of layers must be a multiple of --lm-decode-slots. tools/dense_plan.py proposes a plan for the card and the model",
+        "from a ring of VRAM slots, which a copy stream refills while the CPU computes the other host layers. The number of layers must be a multiple of --lm-decode-slots. tools/dense_plan.py proposes a plan for the card and the model. "
+        "SPEC off or none: no decode ring (--lm-resident-layers otherwise starts the dynamic one). "
+        "SPEC spaced:L or lookahead:L picks the ring layers by formula from --lm-prefill-host-layers: the first --lm-decode-slots host layers fill the ring; counting forward over the host layers (ring layers and layers that are not host layers do not count), "
+        "after L CPU-computed host layers comes the next ring layer (spaced: counted from the previous ring layer, lookahead: from each ring layer that ends), so the copy hides behind L CPU layers. "
+        "SPEC dynamic or dynamic:P lets the statistics of the previous decode steps choose the ring layers (any host layer can be one): the copy time of a layer (percentile P, default 95), the CPU time between two ring layers and the GPU time "
+        "of a ring layer set how many CPU layers the copy of the next ring layer is hidden behind; needs --lm-prefill-host-layers or --lm-resident-layers",
         [](common_params & params, const std::string & value) {
             params.lm_decode_stream = value;
         }
     ).set_env("LLAMA_ARG_LM_DECODE_STREAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-resident-layers"}, "N",
+        "dense models (Qwen3.5/3.8): how many decoder layers stay in VRAM; they are spread evenly over the model (the last layer is always one of them), all the others are host layers, as if --lm-prefill-host-layers listed them "
+        "(an explicit --lm-prefill-host-layers wins). Example: 8 of 64 layers = 7,15,23,...,63. KV cache and recurrent state of every layer stay on the device. Unless --lm-decode-stream is given (off = none), it also starts the dynamic decode ring over the host layers",
+        [](common_params & params, int value) {
+            params.lm_resident_layers = value;
+        }
+    ).set_env("LLAMA_ARG_LM_RESIDENT_LAYERS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-evict-layers"}, "N",
+        "with --lm-resident-layers: N of the resident layers (spread evenly, never the last layer) are loaded in HOST memory and get a VRAM slot of their own for decode steps (computed on the device like resident layers). "
+        "The layer-major pass (--lm-prefill) frees those slots, which gives it the room it needs when the card is full, and streams the layers from host memory like any host layer; the first decode step fills the slots again "
+        "(about 30 ms per layer). Each evicted layer needs its host copy in RAM. Needs the decode ring (the default with --lm-resident-layers)",
+        [](common_params & params, int value) {
+            params.lm_evict_layers = value;
+        }
+    ).set_env("LLAMA_ARG_LM_EVICT_LAYERS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-decode-slots"}, "N",
         "slots in the --lm-decode-stream ring (default: 2; 3 gives the copy stream more slack)",
@@ -1840,6 +1862,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.lm_prefill_attn_int8 = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_ATTN_INT8").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fattn-head-tile"},
+        "CUDA flash attention (TILE / MMA kernels, which read K and V as f16): convert a quantized K/V cache to f16 one KV head at a time instead of the whole layer. The scratch the kernel "
+        "reserves in every context with a flash attention node (4 KiB per context token for the dense Qwen3.8-27B, 1 GiB at 262,144 tokens; the MTP draft context has its own) shrinks by the "
+        "number of KV heads (4x there). Same arithmetic per head, so the result is the one of the untiled kernel up to the summation order of the kernel's own work split; the launches are smaller and more numerous. "
+        "Same as LLAMA_FATTN_HEAD_TILE=1",
+        [](common_params & params) {
+            params.fattn_head_tile = true;
+        }
+    ).set_env("LLAMA_ARG_FATTN_HEAD_TILE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-batch"}, "N",
         "logical batch size (-b) used with --lm-prefill when -b is not given (default: 16384)",
@@ -4308,6 +4340,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-mtp-defer"},
+        "MTP: do not request the target's hidden states while the prompt is processed (prompt batches then output only their last row and --lm-prefill can take them), "
+        "start drafting after the first generated token. The draft cache holds no prompt positions, so drafts may be worse. Needs -np 1",
+        [](common_params & params) {
+            params.speculative.draft.mtp_defer = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MTP_DEFER"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"

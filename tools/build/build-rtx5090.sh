@@ -39,9 +39,33 @@ if command -v nvidia-smi > /dev/null; then
   fi
 fi
 
+# Opt-in AVX-512 VNNI for the x86 CPU kernels that run the host-resident layers (Q8/Q6 dot products, CPU repack).
+# OFF by default, which is what the build has always produced. The MSVC native detection (ggml-cpu/cmake/FindSIMD.cmake)
+# never sets it, so it must be asked for: GGML_AVX512_VNNI=1 tools/build/build-rtx5090.sh. The value is always passed,
+# so switching back to OFF in an existing build directory works too.
+VNNI="${GGML_AVX512_VNNI:-0}"
+case "$VNNI" in
+  0) VNNI=OFF ;;
+  1) VNNI=ON ;;
+  *) echo "build-rtx5090: GGML_AVX512_VNNI must be 0 or 1, got '$VNNI'" >&2; exit 1 ;;
+esac
+
+# Opt-in CUDA flash attention for EVERY K/V cache type pair. OFF by default: then only a K and a V cache of the SAME type
+# (f16, q4_0, q8_0, bf16) have a GPU kernel, and any other pair (for example -ctk q8_0 -ctv q4_0, or -ctvd q4_0 with the
+# default f16 draft K) runs its attention on the CPU: the GPU idles, prompt and decode crawl. ON compiles many more kernel
+# instances (a much longer build, a bigger DLL): GGML_CUDA_FA_ALL_QUANTS=1 BUILD_DIR=build/llama-cuda-faq tools/build/build-rtx5090.sh
+FAQ="${GGML_CUDA_FA_ALL_QUANTS:-0}"
+case "$FAQ" in
+  0) FAQ=OFF ;;
+  1) FAQ=ON ;;
+  *) echo "build-rtx5090: GGML_CUDA_FA_ALL_QUANTS must be 0 or 1, got '$FAQ'" >&2; exit 1 ;;
+esac
+
 cmake -S third_party/llama.cpp -B "$BUILD_DIR" \
   -DGGML_CUDA=ON \
   -DLLAMA_LAYER_STREAMING=ON \
+  -DGGML_AVX512_VNNI="$VNNI" \
+  -DGGML_CUDA_FA_ALL_QUANTS="$FAQ" \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" --config Release --parallel "${NUMBER_OF_PROCESSORS:-8}" --target "${TARGETS[@]}"
