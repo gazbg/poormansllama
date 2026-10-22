@@ -24,6 +24,26 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-10-22 (Linux expert-team default, q4_0 K in the int8 QK flash attention, speculative fit release; llama.cpp vendored tree, PR #5; one machine per measurement, nothing rebuilt in this entry; not the owner's acceptance)
+
+**Asked.** Commit the pending Linux/Pascal changes to `claude/main-branch-integration-c8a6c8`, open a PR against `main`, and record them here with their measured limits.
+
+**Done.** Commit `2c4c6db` (author GAZ, noreply identity), pushed, PR https://github.com/gazbg/poormansllama/pull/5. Three code changes, all opt-in or gated (the speculative release only runs with `--hybrid-moe`):
+
+1. Expert-team size on Linux (`third_party/llama.cpp/src/llama-moe-hybrid.cpp`, `moe_hybrid_default_threads()`): the default team is the number of physical cores this process may use, read from the sysfs sibling lists, at most 8. An unreadable topology and non-Linux builds keep 8. `LLAMA_MOE_HYBRID_THREADS` overrides it.
+2. q4_0 K in the int8 QK flash attention (`ggml/src/ggml-cuda/fattn-tile.cuh`, behind `LLAMA_FATTN_TILE_Q8QK=1`): a q4_0 block is unpacked to int8 `(nibble - 8)` in the shared tile and then takes the q8_0 dp4a path. `test-backend-ops` FLASH_ATTN_EXT now includes q4_0 K and V at the Qwen3.6 causal-window shape.
+3. Speculative fit release (`tools/server/server-context.cpp`): with `--spec-type draft-mtp` (or a draft model) and `--hybrid-moe`, the memory the speculative estimate added to `fit_params_target` is released once the speculative context exists, and the expert cache is sized again. The memory was counted twice before.
+
+**Measured.**
+(1) Thread default, i7-4770K, Qwen3.6-35B-A3B Q4_K_M, MTP, two 192-token chat requests per arm. No variable: 29 threads, 4,988 slow lean requests, 6.0 and 7.8 tok/s. A four-entry `LLAMA_MOE_HYBRID_LEAN_CPUS=2,3,1,0` or `LLAMA_MOE_HYBRID_THREADS=4`: 25 threads, 0 warnings, 30.0 / 33.1 and 30.2 / 33.4 tok/s. Every thread had `Cpus_allowed_list` 0-7 (LINUX-PASCAL.md section 3.2).
+(2) q4_0 K unit test, FLASH_ATTN_EXT, head size 256, causal window: NMSE against the CPU reference 3.8e-8 with the flag, 1.6e-6 without (limit 5e-4). The q8_0 case gives 3.6e-8 and 1.5e-6. The new variant `flash_attn_tile<256,256,32,1,0,0,1>` is the one that runs (LINUX-PASCAL.md section 3.4).
+(3) q4_0 equivalence, Qwen3.8-27B Q6_K_XL, q4_0/q4_0 KV, MTP, `-c 64000`, eight prompts of 1.6k to 4.8k tokens: flag off 8 of 8 bit-identical. Flag on, the first token matched on 8 of 8 (worst |dlogprob| 0.0084) and the continuation was identical on 6 of 8. Of the two divergent prompts, one had a top-2 gap of 0.008 nats at the first difference (near-tie) and the other 0.318 nats, above the 0.25-nat rule. One prompt of eight does not meet the rule.
+(4) MTP decode with the fit release, Qwen3.6-35B-A3B Q4_K_M, `-c 262000`, q4_0 KV, 3 chat prompts x 2 rounds of 192 greedy tokens, order old-fixed-fixed-old: 26.5 to 29.2 tok/s on average (+10.5%), all six cells faster by 4 to 15%, repeat-to-repeat spread 0.1 tok/s (PARAMETERS.md, `--hybrid-moe-slots`). Before the fix the MoE cache held 28 slots per layer instead of 41 on the 8 GiB card (5,813 against 6,759 MiB in use at idle).
+
+**Found on the way.** `LLAMA_MOE_HYBRID_LEAN_CPUS` pinned nothing on Linux: the affinity calls in the hybrid code are Windows `SetThreadAffinityMask`, so only the number of entries counted, as the team size. The "more threads than physical cores" slowdown was spin-workers preempting the decoding and engine threads (stall log 2.4 to 3.7 ms).
+
+**Known gaps.** Team sizes other than 4 were not tested on the i7-4770K. The q4_0 path's speed was not benchmarked (prefill rates logged 0.6 to 3.2% higher, single runs, not an A/B). The q4_0 path fails the 0.25-nat rule on one of eight prompts, so it stays opt-in. The MTP numbers come from one machine with 192-token generations and context up to about 4.9k. Nothing was rebuilt or re-run for this entry; the figures above are the ones recorded in the guide docs when the changes were made. The PR is open for the owner's review and is not accepted.
+
 ## 2026-10-22 (G-TILE: the f16 scratch of a quantized K/V cache in the CUDA flash attention, converted one KV head at a time; dense Qwen3.8-27B-UD-Q6_K_XL on the RTX 5090 Laptop, Windows; GPU lock with -AllowBusy (the busy probe sees only HWiNFO64) and -AllowUnprovenanced, nothing certified; nothing staged, committed or pushed; not the owner's acceptance)
 
 **Asked.** "Implement the tiled conversion": the TILE / MMA flash attention reserves and fills an f16 copy of the whole K and V of a layer when the cache is quantized (4 KiB per context token per context: ~500 MiB at 128k for the target and for the MTP draft each, ~1 GiB at 262k), which keeps an 8 GB card out of reach. Record: [docs/plans/dense-decode-ring-windows.md](plans/dense-decode-ring-windows.md) section G-TILE (contract written before the runs, decision D17).
