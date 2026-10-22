@@ -21,3 +21,7 @@ and use ONE GPU (`CUDA_VISIBLE_DEVICES=0`, `-dev CUDA0 -sm none -mg 0`). One GPU
 
 Tools next to them: `tools/dense_probe.py` (one request), `tools/dense_equiv.py` (collect / compare), `tools/dense_multiturn.py`,
 `tools/dense_plan.py` (the placement planner and its cost model).
+
+## Windows (RTX 5090 Laptop) harness, 2026-10-21
+
+Run under `tools/with-gpu-lock.ps1`. `win-arm.py` (one server arm: 10k-token cold prompt, cached 50-token decodes, VRAM poll, optional `--nsys` capture), `win-batch.py FILE` (arm file: `label | options`, `{plan:HOST,K[,PICK[,SLOTS[,LOOKAHEAD]]]}` expands to the placement flags of `win-plan.py`; PICK spread|att|lookahead|spaced, HOST may be `natt:N` = the non-attention layers of 0..N-1, or `res:N` = every N-th layer resident and all others host layers; `win-arm.py --gpuproc` also samples the server's WDDM dedicated / shared GPU memory), `nsys-ring.py DB.sqlite` (copy engine, kernels, host sync and hop latency of a decode capture), `dram-bw.cu` + `h2d-loop.cu` + `dram-share.sh` (DRAM read bandwidth alone and next to a host-to-device copy loop). Results: `docs/plans/dense-decode-ring-windows.md`.
