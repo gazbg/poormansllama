@@ -638,30 +638,42 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ_q8(
     }
     __syncthreads();
 
+    // Q is loaded once per (column, block, half) and applied to all NK keys of the lane (NK = 1 for 32 keys per tile): the Q reads are a broadcast of 16 bytes to every lane.
+    constexpr int NK = nbatch_fa/warp_size;
 #pragma unroll
-    for (int r = 0; r < nbatch_fa/warp_size; ++r) {
-        const int i_KQ = r*warp_size + threadIdx.x;
+    for (int b = 0; b < QB; ++b) {
+        float dk[NK];
+        int   isum[NK][cpw] = {};
 #pragma unroll
-        for (int b = 0; b < QB; ++b) {
-            const float dk = Kd[i_KQ*Kd_stride + b];
-            int isum[cpw] = {0};
+        for (int r = 0; r < NK; ++r) {
+            dk[r] = Kd[(r*warp_size + threadIdx.x)*Kd_stride + b];
+        }
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const int4 kv = *(const int4 *) (Kq + i_KQ*Kq_stride + b*32 + h*16);
+        for (int h = 0; h < 2; ++h) {
+            int4 kv[NK];
 #pragma unroll
-                for (int jc0 = 0; jc0 < cpw; ++jc0) {
-                    const int jc = jc0 + threadIdx.y*cpw;
-                    const int4 qv = *(const int4 *) (Qq + jc*DKQ + b*32 + h*16);
-                    isum[jc0] = ggml_cuda_dp4a(kv.x, qv.x, isum[jc0]);
-                    isum[jc0] = ggml_cuda_dp4a(kv.y, qv.y, isum[jc0]);
-                    isum[jc0] = ggml_cuda_dp4a(kv.z, qv.z, isum[jc0]);
-                    isum[jc0] = ggml_cuda_dp4a(kv.w, qv.w, isum[jc0]);
-                }
+            for (int r = 0; r < NK; ++r) {
+                kv[r] = *(const int4 *) (Kq + (r*warp_size + threadIdx.x)*Kq_stride + b*32 + h*16);
             }
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
                 const int jc = jc0 + threadIdx.y*cpw;
-                KQ_acc[r*cpw + jc0] += dk*Qd[jc*QB + b]*float(isum[jc0]);
+                const int4 qv = *(const int4 *) (Qq + jc*DKQ + b*32 + h*16);
+#pragma unroll
+                for (int r = 0; r < NK; ++r) {
+                    isum[r][jc0] = ggml_cuda_dp4a(kv[r].x, qv.x, isum[r][jc0]);
+                    isum[r][jc0] = ggml_cuda_dp4a(kv[r].y, qv.y, isum[r][jc0]);
+                    isum[r][jc0] = ggml_cuda_dp4a(kv[r].z, qv.z, isum[r][jc0]);
+                    isum[r][jc0] = ggml_cuda_dp4a(kv[r].w, qv.w, isum[r][jc0]);
+                }
+            }
+        }
+#pragma unroll
+        for (int jc0 = 0; jc0 < cpw; ++jc0) {
+            const int jc = jc0 + threadIdx.y*cpw;
+#pragma unroll
+            for (int r = 0; r < NK; ++r) {
+                KQ_acc[r*cpw + jc0] += dk[r]*Qd[jc*QB + b]*float(isum[r][jc0]);
             }
         }
     }
@@ -678,17 +690,18 @@ template <int warp_size, int nwarps, int ncols, int nbatch_fa, int KQ_cs, int CP
 static __device__ __forceinline__ void flash_attn_tile_pv_i8(
         const float * const __restrict__ KQ, float2 * const VKQ, const char * const __restrict__ V_q8, const int stride_V_bytes,
         char * const __restrict__ KV_raw, int * const __restrict__ Vt, int * const __restrict__ Pq, float * const __restrict__ Sb,
-        const int k_VKQ_0, const int k_VKQ_sup) {
+        const int k_VKQ_0, const int k_VKQ_sup, const int key0) {   // 32 keys per call: the keys key0 .. key0 + 31 of a tile of nbatch_fa keys
     constexpr int DV        = 256;
     constexpr int QB        = DV/32;      // q8_0 blocks per V row
     constexpr int cpw       = ncols/nwarps;
-    constexpr int G         = nbatch_fa/4; // groups of 4 keys
+    constexpr int TK        = warp_size;  // keys per call, one per lane
+    constexpr int G         = TK/4;       // groups of 4 keys
     constexpr int Vq_stride = DV + 16;    // bytes per V row in shared memory
     constexpr int Vd_stride = QB + 1;
     constexpr int nthreads  = nwarps*warp_size;
-    static_assert(nbatch_fa == warp_size, "one key per lane");
+    static_assert(nbatch_fa % TK == 0, "nbatch_fa must be a multiple of 32");
     static_assert(cpw == 4 && ncols % nwarps == 0, "bad cpw");
-    static_assert((nbatch_fa*QB) % nthreads == 0 && QB <= nthreads, "bad V tile size");
+    static_assert((TK*QB) % nthreads == 0 && QB <= nthreads, "bad V tile size");
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -701,7 +714,7 @@ static __device__ __forceinline__ void flash_attn_tile_pv_i8(
         __align__(16) float pv[cpw];
 #pragma unroll
         for (int c0 = 0; c0 < cpw; c0 += KQ_cs) {   // KQ[chunk of KQ_cs columns][key][KQ_cs]
-            ggml_cuda_memcpy_1<KQ_cs*sizeof(float)>(pv + c0, KQ + (c0/KQ_cs + warp*(cpw/KQ_cs))*(nbatch_fa*KQ_cs) + lane*KQ_cs);
+            ggml_cuda_memcpy_1<KQ_cs*sizeof(float)>(pv + c0, KQ + (c0/KQ_cs + warp*(cpw/KQ_cs))*(nbatch_fa*KQ_cs) + (key0 + lane)*KQ_cs);
         }
 #pragma unroll
         for (int c = 0; c < cpw; ++c) {
@@ -712,16 +725,16 @@ static __device__ __forceinline__ void flash_attn_tile_pv_i8(
             // floor(x + u) with u uniform in [0, 1) from a hash of (key, column, head, block): a small weight is kept with probability x
             uint32_t h = (uint32_t) (k_VKQ_0 + lane)*0x9E3779B1u ^ ((uint32_t) (warp*cpw + c) + 1u)*0x85EBCA6Bu ^ ((uint32_t) blockIdx.z + 1u)*0xC2B2AE35u ^ ((uint32_t) blockIdx.x + 1u)*0x27D4EB2Fu;
             h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
-            ((int8_t *) Pq)[(warp*cpw + c)*nbatch_fa + lane] = (int8_t) __float2int_rd(x + float(h >> 8)*(1.0f/16777216.0f));
+            ((int8_t *) Pq)[(warp*cpw + c)*TK + lane] = (int8_t) __float2int_rd(x + float(h >> 8)*(1.0f/16777216.0f));
         }
     }
     __syncwarp();
 
     // V tile as raw q8_0 (int8 + scales), one block per work item as for K.
     int8_t * const Vq = (int8_t *) KV_raw;
-    float  * const Vd = (float *) (KV_raw + nbatch_fa*Vq_stride);
+    float  * const Vd = (float *) (KV_raw + TK*Vq_stride);
 #pragma unroll
-    for (int t0 = 0; t0 < nbatch_fa*QB; t0 += nthreads) {
+    for (int t0 = 0; t0 < TK*QB; t0 += nthreads) {
         const int row = (t0 + tid)/QB;
         const int blk = (t0 + tid)%QB;
         int   w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -747,7 +760,7 @@ static __device__ __forceinline__ void flash_attn_tile_pv_i8(
     if (tid < QB) {
         float m = 0.0f;
 #pragma unroll
-        for (int r = 0; r < nbatch_fa; ++r) {
+        for (int r = 0; r < TK; ++r) {
             m = fmaxf(m, Vd[r*Vd_stride + tid]);
         }
         Sb[tid] = m;
@@ -997,8 +1010,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     if constexpr (K_Q8 && PV8) {
         static_assert(np == 1, "bad np for the int8 PV");
         static_assert(cpw == 4, "bad cpw for the int8 PV");
-        flash_attn_tile_pv_i8<warp_size, nwarps, ncols, nbatch_fa, KQ_cs, (cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size), oob_check>(
-            KQ, (float2 *) VKQ, V_q8, stride_V_bytes, (char *) KV_tmp, Vt, Pq, Sb, k_VKQ_0, k_VKQ_sup);
+#pragma unroll
+        for (int key0 = 0; key0 < nbatch_fa; key0 += warp_size) {
+            if (!oob_check || key0 < k_VKQ_sup) {
+                flash_attn_tile_pv_i8<warp_size, nwarps, ncols, nbatch_fa, KQ_cs, (cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size), oob_check>(
+                    KQ, (float2 *) VKQ, V_q8, stride_V_bytes, (char *) KV_tmp, Vt, Pq, Sb, k_VKQ_0 + key0, k_VKQ_sup - key0, key0);
+            }
+        }
     } else
 #endif // FAST_FP16_AVAILABLE
     {
@@ -1181,8 +1199,8 @@ static __global__ void flash_attn_tile(
     // VKQ == Accumulators in registers for the final VKQ result.
     __shared__ __align__(16) int8_t Qq_s[K_Q8 ? ncols*DKQ : 16];  // K_Q8 only, FP32 kernel only
     __shared__ float                Qd_s[K_Q8 ? ncols*(DKQ/32) : 4];
-    __shared__ __align__(16) int    Vt_s[PV8 ? (nbatch_fa/4)*DV : 4];            // PV8 only: requantized V, words of 4 keys
-    __shared__ int                  Pq_s[PV8 ? nwarps*cpw*(nbatch_fa/4) : 4];    // PV8 only: int8 softmax weights
+    __shared__ __align__(16) int    Vt_s[PV8 ? (32/4)*DV : 4];            // PV8 only: requantized V, words of 4 keys
+    __shared__ int                  Pq_s[PV8 ? nwarps*cpw*(32/4) : 4];    // PV8 only: int8 softmax weights
     __shared__ float                Sb_s[8];
 #ifdef FAST_FP16_AVAILABLE
     if constexpr (K_Q8) {
@@ -1511,14 +1529,21 @@ static void launch_fattn_tile_q8_cfg(ggml_backend_cuda_context & ctx, ggml_tenso
 template <int DKQ, int DV, bool Q4>
 static void launch_fattn_tile_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if constexpr (DKQ == 256 && DV == 256) {
-        static const int cfg = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8CFG"); return e != nullptr ? atoi(e) : 0; }();
+        static const int cfg_env = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8CFG"); return e != nullptr ? atoi(e) : -1; }();
         static const bool pv8 = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8PV"); return e != nullptr && e[0] == '1'; }();
         if constexpr (!Q4) {
-            if (pv8 && cfg == 0 && dst->src[2]->type == GGML_TYPE_Q8_0) {
-                launch_fattn_tile_q8_cfg<0, false, true>(ctx, dst);
+            // The int8 PV defaults to configuration 3 (64 keys per tile, so that each Q read serves two keys of a lane); 0 is the 32-key tile.
+            const int pv8_cfg = cfg_env < 0 ? 3 : cfg_env;
+            if (pv8 && (pv8_cfg == 0 || pv8_cfg == 3) && dst->src[2]->type == GGML_TYPE_Q8_0) {
+                if (pv8_cfg == 0) {
+                    launch_fattn_tile_q8_cfg<0, false, true>(ctx, dst);
+                } else {
+                    launch_fattn_tile_q8_cfg<3, false, true>(ctx, dst);
+                }
                 return;
             }
         }
+        const int cfg = cfg_env < 0 ? 0 : cfg_env;
         switch (cfg) {
             case 1:  launch_fattn_tile_q8_cfg<1, Q4>(ctx, dst); break;
             case 2:  launch_fattn_tile_q8_cfg<2, Q4>(ctx, dst); break;
