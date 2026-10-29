@@ -44,11 +44,17 @@ $vDir = ''
 $vTag = ''
 $vTagSource = ''
 $vStarted = ''
+# The GPU busy probe (Get-GpuComputeApps, Format-GpuBusy) is defined in the helper, so the
+# helper loads whether or not verdicts are written: -NoVerdict must not leave the probe undefined.
+$root = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
+$helper = Join-Path $root 'tools\arm-verdict.ps1'
+if (Test-Path -LiteralPath $helper) {
+    . $helper
+} else {
+    Write-Warning "arm-verdict helper not found at $helper; the GPU busy probe is undefined."
+}
 if (-not $NoVerdict) {
-    $root = Split-Path (Split-Path $PSCommandPath -Parent) -Parent
-    $helper = Join-Path $root 'tools\arm-verdict.ps1'
     if (Test-Path -LiteralPath $helper) {
-        . $helper
         # How the tag came to be is provenance, not trivia: a DERIVED tag is this
         # wrapper guessing from the command string, an EXPLICIT one is the caller
         # naming the artifact to inspect. The verdict records which, so a later
