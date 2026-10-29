@@ -9873,6 +9873,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, 64));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 128, 32, false, false, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, 64));
+    // mmvq with as many rows per block as warps (Pascal, short rows, >= 4096 rows); 4098 rows do not divide and take the old blocks
+    for (ggml_type type_a : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
+        for (int n : { 1, 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4098, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
     // causal window op at the Qwen3.6 shape (head size 256, GQA 8) as used by the layer-major prefill, with an explicit-mask control
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, false, false, 0, 0, GGML_PREC_F32,
@@ -10293,6 +10300,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, 2048,  512)); // down
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 2048, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 2048, 4096, {1, 1}, {1, 1}));
+    // constant useful work per expert (about 64 tokens each), fewer experts and tokens: how much of the expert matmul is the grid of column tiles that no expert fills?
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int n_mats : { 128, 64, 32, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, n_mats, 8, false, 512, n_mats*8, 2048));
+        }
+    }
+    // 32 experts, more and more tokens: about 64, 128, 256, 512 tokens per expert, so the share of the last 64-column tile that is padding falls
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int n : { 512, 1024, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 512, n, 2048));
+        }
+    }
+    // the same expert shapes in other formats, and as one dense matrix: is the expert matmul slow because of the K-quant format or because of the MoE shape?
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false,  512, 2048, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, 2048,  512));
+    }
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, 2048, 2048, {1, 1}, {1, 1})); // gate / up of 8 experts as one matrix
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, 2048, 4096, {1, 1}, {1, 1})); // down, K of 8 experts
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, 2048,  512, {1, 1}, {1, 1})); // down, K of one expert
+    }
+
+    // Qwen3.6-35B-A3B decode (one token, or a 4-row MTP verify): the output head (Q6_K, vocabulary 248320), the dense Q8_0 projections and the routed experts
+    for (int n : { 1, 4 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 2048, {1, 1}, {1, 1}));
+        for (int m : { 8192, 4096, 512 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 2048, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
+    }
 
     // Qwen3.8-27B (dense, UD-IQ3_XXS) layer-major prefill chunk (2048 tokens): the FFN (n_ff 17408, n_embd 5120) and the projections of the layers, as the quantisation of the file has them
     for (ggml_type type : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S }) {

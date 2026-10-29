@@ -395,6 +395,12 @@ struct moe_hybrid_engine {
     double                             serve_max  = 0.0;
     int64_t                            nmiss_hist[GGML_MOE_HYBRID_MAX_USED + 1] = {};
     double                             compute_sum[GGML_MOE_HYBRID_MAX_USED + 1] = {}; // CPU graph time by miss count
+    int64_t                            single_n[GGML_MOE_HYBRID_MAX_USED + 1] = {};    // single-row jobs by miss count (the denominators of compute_sum)
+    // LLAMA_MOE_HYBRID_LEAN_BATCH (default 1, lean leg only): the pending requests of one layer (the rows of a verify step) are served as one job; 0 = one job per request
+    int                                lean_batch = 1;
+    int64_t                            batch_n[GGML_MOE_HYBRID_MAX_WIDTH + 1]  = {};  // lean jobs by token rows
+    double                             batch_us[GGML_MOE_HYBRID_MAX_WIDTH + 1] = {};
+    int64_t                            batch_pairs = 0, batch_uniq = 0;                // (row, expert) pairs and distinct experts of the multi-row jobs
     int64_t                            n_dma_engine   = 0;
     double                             dma_submit_sum = 0.0;
     double                             dma_submit_max = 0.0;
@@ -504,6 +510,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     lean_mode    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN", 0);
     lean_spin_us = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_SPIN_US", 4000);
     lean_prof    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_PROF", 0);
+    lean_batch   = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_BATCH", 1);
     if (const char * lc = getenv("LLAMA_MOE_HYBRID_LEAN_CPUS"); lc != nullptr && *lc != '\0') {
         lean_cpus = lc;
     }
@@ -1254,6 +1261,30 @@ void moe_hybrid_engine::serve() {
                 pf_last[(size_t) il].tok = -1;
             }
         }
+        // the other rows of a verify step post their requests for the same layer with the same launch: serve the ones already posted in the same job
+        int     grp[GGML_MOE_HYBRID_MAX_WIDTH];
+        int32_t grp_seq[GGML_MOE_HYBRID_MAX_WIDTH];
+        int     ng = 0;
+        if (err == 0 && lean_mode == 1 && lean_batch) {
+            for (int k = j + 1; k < GGML_MOE_HYBRID_MAX_WIDTH && ng < moe_lean::MAX_R - 1; ++k) {
+                ggml_moe_hybrid_mailbox * mk = mbs[k];
+                const int32_t sk = mk->req_seq;
+                if (sk == served[k]) {
+                    continue;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const int nk = mk->nmiss;
+                bool      ok = mk->layer == il && nk >= 1 && nk <= n_used;
+                for (int i = 0; ok && i < nk; ++i) {
+                    ok = mk->ids[i] >= 0 && mk->ids[i] < n_expert;
+                }
+                if (ok) {
+                    grp[ng]     = k;
+                    grp_seq[ng] = sk;
+                    ng++;
+                }
+            }
+        }
         bool pf_job = false;
         if (err == 0 && lean_mode == 1) {
             // the lean team reads the request straight from the mailbox and writes the result straight into it
@@ -1264,6 +1295,14 @@ void moe_hybrid_engine::serve() {
             jb.w   = (const float *) m->w;
             jb.x   = (const float *) m->x;
             jb.y   = (float *) m->y;
+            if (ng > 0) {
+                jb.nr      = 1 + ng;
+                jb.rows[0] = { nmiss, jb.ids, jb.w, jb.x, jb.y };
+                for (int g = 0; g < ng; ++g) {
+                    ggml_moe_hybrid_mailbox * mk = mbs[grp[g]];
+                    jb.rows[1 + g] = { mk->nmiss, (const int32_t *) mk->ids, (const float *) mk->w, (const float *) mk->x, (float *) mk->y };
+                }
+            }
             if (lean_pf_k > 0 && il + 1 < n_layer) {
                 jb.pf_lb   = &lean_lb[(size_t) il + 1];
                 jb.pf_rw   = pf_rw[(size_t) il + 1].data();
@@ -1281,8 +1320,20 @@ void moe_hybrid_engine::serve() {
             lean_team->run(jb);
             sv_sub.store(13, std::memory_order_relaxed);
             comp_us = moe_hybrid_us(tc);
-            compute_sum[nmiss] += comp_us;
-            n_lean++;
+            if (ng > 0) {
+                batch_n[1 + ng]++;
+                batch_us[1 + ng] += comp_us;
+                for (int r = 0; r <= ng; ++r) {
+                    batch_pairs += jb.rows[r].m;
+                }
+                batch_uniq += lean_team->last_unique();
+            } else {
+                batch_n[1]++;
+                batch_us[1] += comp_us;
+                compute_sum[nmiss] += comp_us;
+                single_n[nmiss]++;
+            }
+            n_lean += 1 + ng;
         } else if (err == 0) {
             moe_hybrid_host_graph & hg = graphs[(size_t) il*n_used + nmiss - 1];
             memcpy(hg.x->data,   m->x,   (size_t) n_embd*sizeof(float));
@@ -1295,6 +1346,7 @@ void moe_hybrid_engine::serve() {
             sv_sub.store(13, std::memory_order_relaxed);
             comp_us = moe_hybrid_us(tc);
             compute_sum[nmiss] += comp_us;
+            single_n[nmiss]++;
             if (st != GGML_STATUS_SUCCESS) {
                 err = 2;
             } else {
@@ -1346,12 +1398,21 @@ void moe_hybrid_engine::serve() {
         std::atomic_thread_fence(std::memory_order_release);
         m->res_seq = seq;
         served[j] = seq;
+        for (int g = 0; g < ng; ++g) {
+            ggml_moe_hybrid_mailbox * mk = mbs[grp[g]];
+            mk->prof[il][3] = m->prof[il][3];
+            mk->err         = 0;
+            std::atomic_thread_fence(std::memory_order_release);
+            mk->res_seq     = grp_seq[g];
+            served[grp[g]]  = grp_seq[g];
+            nmiss_hist[mk->nmiss]++;
+        }
         sv_phase.store(0, std::memory_order_relaxed);
 
         const double us = moe_hybrid_us(t0);
-        n_requests++;
-        serve_sum += us;
-        serve_max  = std::max(serve_max, us);
+        n_requests += 1 + ng;
+        serve_sum  += us*(1 + ng);
+        serve_max   = std::max(serve_max, us);
         if (us > 5000.0) {
             LLAMA_LOG_WARN("moe_hybrid: slow host request #%lld: layer %d token %d nmiss %d took %.1f ms (copy-in %.1f, graph compute %.1f, rest %.1f), dma_state %d\n",
                            (long long) n_requests, il, j, nmiss, us/1e3, in_us/1e3, comp_us/1e3, (us - in_us - comp_us)/1e3, dma_state.load());
@@ -2081,7 +2142,7 @@ void moe_hybrid_engine::shutdown() {
         off = 0;
         for (int m = 1; m <= n_used && off < (int) sizeof(cmp); ++m) {
             off += snprintf(cmp + off, sizeof(cmp) - off, "%s%.1f", m > 1 ? "," : "",
-                            nmiss_hist[m] ? compute_sum[m]/nmiss_hist[m] : 0.0);
+                            single_n[m] ? compute_sum[m]/single_n[m] : 0.0);
         }
         const double np = n_prof ? (double) n_prof : 1.0;
         LLAMA_LOG_INFO("moe_hybrid: timeline per token over %lld tokens (us): span %.1f = attn %.1f + ovl %.1f + stall %.1f, "
@@ -2091,6 +2152,15 @@ void moe_hybrid_engine::shutdown() {
         if (lean_mode > 0) {
             LLAMA_LOG_INFO("moe_hybrid: lean host leg mode %d: %lld requests through the lean team%s", lean_mode, (long long) n_lean,
                            lean_mode == 2 ? "" : "\n");
+            if (lean_mode == 1) {
+                char bj[256];
+                int  bo = 0;
+                for (int r = 1; r <= GGML_MOE_HYBRID_MAX_WIDTH && bo < (int) sizeof(bj); ++r) {
+                    bo += snprintf(bj + bo, sizeof(bj) - bo, "%s%d rows: %lld jobs, %.1f us", r > 1 ? "; " : "", r, (long long) batch_n[r], batch_n[r] ? batch_us[r]/batch_n[r] : 0.0);
+                }
+                LLAMA_LOG_INFO("moe_hybrid: lean jobs (batching %s): %s | multi-row jobs read %lld distinct experts for %lld (row, expert) pairs\n",
+                               lean_batch ? "on" : "off", bj, (long long) batch_uniq, (long long) batch_pairs);
+            }
             if (lean_mode == 2) {
                 LLAMA_LOG_INFO(", each compared bit for bit with the graph: %lld DIFFER\n", (long long) n_lean_bad);
             }

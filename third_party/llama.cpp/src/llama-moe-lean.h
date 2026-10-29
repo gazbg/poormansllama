@@ -16,6 +16,10 @@
 // first K experts of the predicted top ranks that are not resident and PREFETCH their own row slices of those experts (the same slices B and D read) into their caches, so that the
 // request of layer l reads the experts that were predicted right from the cache instead of from DRAM. A prefetch only touches memory: it cannot change a result.
 //
+// Several token rows (an MTP verify step posts one request per row for the same layer) can be served as ONE job: each expert that any row missed is read once, and each of its
+// weight rows is used for every token row that selected it while it is still in L1. Each row keeps its own expert order for the sum, so its result is the one a job of that row
+// alone gives, bit for bit.
+//
 // Header only; depends on ggml.h / ggml-cpu.h. `team` owns the worker threads (the caller of run() is thread 0).
 
 #include "ggml.h"
@@ -64,6 +68,8 @@ inline uint64_t tsc_now(unsigned * cpu) {
 
 constexpr int MAX_M  = 8; // experts per request (n_expert_used)
 constexpr int MAX_PF = 4; // experts prefetched per request
+constexpr int MAX_R  = 4; // token rows per job
+constexpr int MAX_U  = MAX_R*MAX_M;
 
 // one routed-expert bank of a layer: ne = [k, rows, n_expert], plain contiguous host memory
 struct bank {
@@ -89,6 +95,14 @@ struct layer_banks {
     bank up, gate, down;
 };
 
+struct row {
+    int             m   = 0;
+    const int32_t * ids = nullptr; // [m]
+    const float *   w   = nullptr; // [m]
+    const float *   x   = nullptr; // [n_embd]
+    float *         y   = nullptr; // [n_embd]
+};
+
 struct job {
     const layer_banks * lb  = nullptr;
     int                 m   = 0;
@@ -96,6 +110,16 @@ struct job {
     const float *       w   = nullptr; // [m]
     const float *       x   = nullptr; // [n_embd]
     float *             y   = nullptr; // [n_embd]
+
+    // nr > 0: serve rows[0 .. nr) together (m .. y above are then not used)
+    int nr = 0;
+    row rows[MAX_R];
+
+    // set by run(): the distinct experts of the job; u_pair holds r*MAX_M + e for each row r that has expert u_id at its position e
+    int     n_u = 0;
+    int32_t u_id[MAX_U]          = {};
+    uint8_t u_n[MAX_U]           = {};
+    uint8_t u_pair[MAX_U][MAX_R] = {};
 
     // G15 (optional): after the reply, predict the NEXT layer's misses from this row and prefetch them. pf_lb == nullptr or pf_k == 0 = no such stage.
     const layer_banks * pf_lb    = nullptr; // banks of the next layer
@@ -195,16 +219,16 @@ public:
     team(int n_threads, int64_t n_embd, int64_t n_ff, int64_t n_expert = 0, std::function<void(int)> on_worker_start = nullptr, int spin_us = 4000, bool profile = false) :
         nth_(std::max(1, n_threads)), spin_us_(spin_us), profile_(profile), n_embd_(n_embd), n_expert_(n_expert), on_start_(std::move(on_worker_start)) {
         bar_.n = nth_;
-        xq_.alloc((size_t) 4*n_embd + 64);               // up to 4 bytes per element (f32 activations)
+        xq_.alloc((size_t) MAX_R*(4*n_embd + 64));       // up to 4 bytes per element (f32 activations)
         xf_.assign((size_t) n_embd, 0.0f);
-        up_.assign((size_t) MAX_M*n_ff, 0.0f);
-        gate_.assign((size_t) MAX_M*n_ff, 0.0f);
+        up_.assign((size_t) MAX_U*n_ff, 0.0f);
+        gate_.assign((size_t) MAX_U*n_ff, 0.0f);
         logit_.assign((size_t) std::max<int64_t>(n_expert, 1), 0.0f);
         tc_.resize((size_t) nth_);
         for (auto & t : tc_) {
-            t.act.assign((size_t) MAX_M*n_ff, 0.0f);
-            t.actq.alloc((size_t) MAX_M*(4*n_ff + 64));
-            t.ex.assign((size_t) MAX_M*(n_embd/nth_ + 2), 0.0f);
+            t.act.assign((size_t) MAX_U*n_ff, 0.0f);
+            t.actq.alloc((size_t) MAX_U*(4*n_ff + 64));
+            t.ex.assign((size_t) MAX_U*(n_embd/nth_ + 2), 0.0f);
             if (n_expert > 0 && n_embd % 32 == 0) {
                 t.xq8.alloc(ggml_row_size(GGML_TYPE_Q8_0, n_embd) + 64);
             }
@@ -257,6 +281,27 @@ public:
         }
         const bool want_post = j.pf_lb != nullptr && j.pf_k > 0 && (j.pf_force != nullptr || (j.pf_rw != nullptr && j.pf_map != nullptr && n_expert_ > 0 && !tc_[0].xq8.v.empty()));
         cur_ = j;
+        if (cur_.nr <= 0) {
+            cur_.nr      = 1;
+            cur_.rows[0] = { j.m, j.ids, j.w, j.x, j.y };
+        }
+        cur_.nr  = std::min(cur_.nr, MAX_R);
+        cur_.n_u = 0;
+        for (int r = 0; r < cur_.nr; ++r) {
+            for (int e = 0; e < cur_.rows[r].m; ++e) {
+                const int32_t id = cur_.rows[r].ids[e];
+                int u = 0;
+                while (u < cur_.n_u && !(cur_.u_id[u] == id && cur_.u_n[u] < MAX_R)) {
+                    ++u;
+                }
+                if (u == cur_.n_u) {
+                    cur_.u_id[u] = id;
+                    cur_.u_n[u]  = 0;
+                    cur_.n_u++;
+                }
+                cur_.u_pair[u][cur_.u_n[u]++] = (uint8_t) (r*MAX_M + e);
+            }
+        }
         if (!want_post) {
             cur_.pf_lb = nullptr;       // the workers copy this job: they must not wait for a post stage that is not coming
             cur_.pf_k  = 0;
@@ -300,6 +345,7 @@ public:
     }
 
     const pf_choice & last_choice() const { return choice_; }
+    int last_unique() const { return cur_.n_u; } // distinct experts of the last job
     const stage_stats & stats() const { return stats_; }
 
 private:
@@ -502,7 +548,6 @@ private:
 
     void execute(int ith, const job & j, tctx & tc) {
         const layer_banks & lb = *j.lb;
-        const int           m  = j.m;
 
         const ggml_type_traits_cpu * tu = ggml_get_type_traits_cpu(lb.up.type);
         const ggml_type_traits_cpu * tg = ggml_get_type_traits_cpu(lb.gate.type);
@@ -520,7 +565,10 @@ private:
         auto       t0   = prof ? clk::now() : clk::time_point();
         double     ta = 0.0, tb = 0.0, tcc = 0.0;
 
-        // A. quantize the input row; the block ranges are the ones mul_mat_id hands its threads. (With the post stage on, also keep a private f32 copy of the row: the mailbox
+        // a (row, expert) pair p = r*MAX_M + e has its up / gate / activation / down results at index p
+        const size_t xq_stride = (ggml_row_size(vdt, k) + 63) & ~(size_t) 63;
+
+        // A. quantize the input rows; the block ranges are the ones mul_mat_id hands its threads. (With the post stage on, also keep a private f32 copy of row 0: the mailbox
         // belongs to the GPU again as soon as the reply is out.)
         {
             const int64_t bs = ggml_blck_size(vdt);
@@ -528,9 +576,11 @@ private:
             const int64_t b0 = (ith*nb)/nth_;
             const int64_t b1 = ((ith + 1)*nb)/nth_;
             if (b1 > b0) {
-                q_x(j.x + b0*bs, xq_.p + (size_t) b0*ggml_type_size(vdt), (b1 - b0)*bs);
+                for (int r = 0; r < j.nr; ++r) {
+                    q_x(j.rows[r].x + b0*bs, xq_.p + (size_t) r*xq_stride + (size_t) b0*ggml_type_size(vdt), (b1 - b0)*bs);
+                }
                 if (j.pf_lb != nullptr && j.pf_k > 0 && (int64_t) xf_.size() == k) {
-                    memcpy(xf_.data() + b0*bs, j.x + b0*bs, (size_t) ((b1 - b0)*bs)*sizeof(float));
+                    memcpy(xf_.data() + b0*bs, j.rows[0].x + b0*bs, (size_t) ((b1 - b0)*bs)*sizeof(float));
                 }
             }
         }
@@ -538,18 +588,21 @@ private:
         bar_.wait(tc.ls);
         if (prof) { ta = since_us(t0); }
 
-        // B. up and gate rows of this thread, expert by expert (two weight streams per thread)
+        // B. up and gate rows of this thread, expert by expert (two weight streams per thread); a weight row serves every token row that selected the expert
         {
             const int64_t r0 = (ith*n_ff)/nth_;
             const int64_t r1 = ((ith + 1)*n_ff)/nth_;
-            for (int e = 0; e < m; ++e) {
-                const char * pu = lb.up.data   + (size_t) j.ids[e]*lb.up.expert_bytes;
-                const char * pg = lb.gate.data + (size_t) j.ids[e]*lb.gate.expert_bytes;
-                float *      ou = up_.data()   + (size_t) e*n_ff;
-                float *      og = gate_.data() + (size_t) e*n_ff;
+            for (int u = 0; u < j.n_u; ++u) {
+                const char * pu = lb.up.data   + (size_t) j.u_id[u]*lb.up.expert_bytes;
+                const char * pg = lb.gate.data + (size_t) j.u_id[u]*lb.gate.expert_bytes;
+                const int    nu = j.u_n[u];
                 for (int64_t r = r0; r < r1; ++r) {
-                    tu->vec_dot((int) k, ou + r, 0, pu + (size_t) r*lb.up.row_bytes,   0, xq_.p, 0, 1);
-                    tg->vec_dot((int) k, og + r, 0, pg + (size_t) r*lb.gate.row_bytes, 0, xq_.p, 0, 1);
+                    for (int q = 0; q < nu; ++q) {
+                        const int    p  = j.u_pair[u][q];
+                        const char * xq = xq_.p + (size_t) (p/MAX_M)*xq_stride;
+                        tu->vec_dot((int) k, up_.data()   + (size_t) p*n_ff + r, 0, pu + (size_t) r*lb.up.row_bytes,   0, xq, 0, 1);
+                        tg->vec_dot((int) k, gate_.data() + (size_t) p*n_ff + r, 0, pg + (size_t) r*lb.gate.row_bytes, 0, xq, 0, 1);
+                    }
                 }
             }
         }
@@ -557,41 +610,50 @@ private:
         bar_.wait(tc.ls);
         if (prof) { tb = since_us(t0); }
 
-        // C. activation and its quantization for every expert, by every thread
+        // C. activation and its quantization for every pair, by every thread
         const size_t arow = ggml_row_size(vdt_d, n_ff);
-        for (int e = 0; e < m; ++e) {
-            ggml_cpu_swiglu_f32((int) n_ff, tc.act.data() + (size_t) e*n_ff, gate_.data() + (size_t) e*n_ff, up_.data() + (size_t) e*n_ff);
-            q_a(tc.act.data() + (size_t) e*n_ff, tc.actq.p + (size_t) e*arow, n_ff);
+        for (int r = 0; r < j.nr; ++r) {
+            for (int e = 0; e < j.rows[r].m; ++e) {
+                const size_t p = (size_t) (r*MAX_M + e);
+                ggml_cpu_swiglu_f32((int) n_ff, tc.act.data() + p*n_ff, gate_.data() + p*n_ff, up_.data() + p*n_ff);
+                q_a(tc.act.data() + p*n_ff, tc.actq.p + p*arow, n_ff);
+            }
         }
         if (prof) { tcc = since_us(t0); }
 
-        // D. down rows of this thread, the router weights, the sum over the experts in order
+        // D. down rows of this thread, the router weights, the sum over each row's experts in its order
         {
             const int64_t d0 = (ith*n_out)/nth_;
             const int64_t d1 = ((ith + 1)*n_out)/nth_;
             const int64_t nd = d1 - d0;
-            for (int e = 0; e < m; ++e) {
-                const char * pd = lb.down.data + (size_t) j.ids[e]*lb.down.expert_bytes;
-                float *      ex = tc.ex.data() + (size_t) e*nd;
-                const char * aq = tc.actq.p + (size_t) e*arow;
+            for (int u = 0; u < j.n_u; ++u) {
+                const char * pd = lb.down.data + (size_t) j.u_id[u]*lb.down.expert_bytes;
+                const int    nu = j.u_n[u];
                 for (int64_t r = d0; r < d1; ++r) {
-                    td->vec_dot((int) n_ff, ex + (r - d0), 0, pd + (size_t) r*lb.down.row_bytes, 0, aq, 0, 1);
+                    for (int q = 0; q < nu; ++q) {
+                        const size_t p = j.u_pair[u][q];
+                        td->vec_dot((int) n_ff, tc.ex.data() + p*nd + (r - d0), 0, pd + (size_t) r*lb.down.row_bytes, 0, tc.actq.p + p*arow, 0, 1);
+                    }
                 }
             }
             // the products first (their own loop), then the sums in expert order: the graph's ggml_mul and ggml_add are separate rounded operations
-            for (int e = 0; e < m; ++e) {
-                float *      ex = tc.ex.data() + (size_t) e*nd;
-                const float  we = j.w[e];
+            for (int rr = 0; rr < j.nr; ++rr) {
+                const row & R  = j.rows[rr];
+                float *     ex = tc.ex.data() + (size_t) rr*MAX_M*nd;
+                for (int e = 0; e < R.m; ++e) {
+                    float *     exe = ex + (size_t) e*nd;
+                    const float we  = R.w[e];
+                    for (int64_t r = 0; r < nd; ++r) {
+                        exe[r] = exe[r]*we;
+                    }
+                }
                 for (int64_t r = 0; r < nd; ++r) {
-                    ex[r] = ex[r]*we;
+                    float acc = ex[(size_t) r];
+                    for (int e = 1; e < R.m; ++e) {
+                        acc = acc + ex[(size_t) e*nd + (size_t) r];
+                    }
+                    R.y[d0 + r] = acc;
                 }
-            }
-            for (int64_t r = 0; r < nd; ++r) {
-                float acc = tc.ex[(size_t) r];
-                for (int e = 1; e < m; ++e) {
-                    acc = acc + tc.ex[(size_t) e*nd + (size_t) r];
-                }
-                j.y[d0 + r] = acc;
             }
         }
         arr_[(size_t) ith].t[2] = tsc_now(&arr_[(size_t) ith].cpu[2]);

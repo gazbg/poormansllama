@@ -493,6 +493,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 2:
             case 3:
             case 4:
+                return small_k ? nwarps : 2;
             case 5:
             case 6:
             case 7:
@@ -918,6 +919,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
+        // Pascal: a block that is done with its row in two K iterations costs more to schedule than to run (e.g. a 2048-wide output head with 248k rows)
+        if (is_nvidia_pascal_older && nrows_x >= 4096 && nrows_x % nwarps == 0) {
+            use = use || (nwarps > 1 && blocks_per_row_x <= 2 * nwarps * blocks_per_iter_1warp);
+        }
+
         if (is_nvidia_turing_plus) {
             if (ncols_dst == 1 &&
                     std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
@@ -952,6 +958,37 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int idle = iters_wide * 2 - iters;
 
         return idle * 8 <= iters_wide * 2;
+    };
+
+    // Pascal, 2-4 columns: as many rows per block as warps when a block would be done with its rows in two K iterations (the block scheduling dominates otherwise)
+    const auto pascal_rows_per_warp = [&](int c_ncols_dst) {
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_VOLTA || nrows_x < 4096) {
+            return false;
+        }
+        switch (type) {
+            case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+                break;
+            default:
+                return false; // Q6_K measured 7% slower with 4 rows per block at 4 columns
+        }
+        const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+        return nwarps > 1 && nrows_x % nwarps == 0 && blocks_per_row_x <= 2 * nwarps * blocks_per_iter_1warp;
+    };
+    const auto launch_cols_2_4 = [&](auto ncols_tag) {
+        constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+        const auto run = [&](auto small_k_tag) {
+            constexpr bool c_small_k = decltype(small_k_tag)::value;
+            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, c_small_k);
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 dims.first, dims.second, 0, ids_stride, stream);
+        };
+        if (pascal_rows_per_warp(c_ncols_dst)) {
+            run(std::true_type{});
+        } else {
+            run(std::false_type{});
+        }
     };
 
     if (has_ids && ncols_dst > 1) {
@@ -996,30 +1033,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 launch(std::false_type{}, std::false_type{});
             }
         } break;
-        case 2: {
-            constexpr int c_ncols_dst = 2;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 3: {
-            constexpr int c_ncols_dst = 3;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
-        case 4: {
-            constexpr int c_ncols_dst = 4;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, stream);
-        } break;
+        case 2:
+            launch_cols_2_4(std::integral_constant<int, 2>{});
+            break;
+        case 3:
+            launch_cols_2_4(std::integral_constant<int, 3>{});
+            break;
+        case 4:
+            launch_cols_2_4(std::integral_constant<int, 4>{});
+            break;
         case 5: {
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
