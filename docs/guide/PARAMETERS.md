@@ -128,7 +128,16 @@ overrides it. A team larger than the physical cores made decode 4 to 5 times slo
 i7-4770K (LINUX-PASCAL.md section 3.2). `LLAMA_MOE_HYBRID_LEAN_BATCH` (default 1) serves the
 requests that the rows of an MTP verify step post for one layer as one job of the team, so each
 missed expert is read once; the results are bit-identical, `0` serves every request on its own
-(LINUX-PASCAL.md section 3.7).
+(LINUX-PASCAL.md section 3.7). `GGML_CUDA_MMQ_REMAINDER` computes the leftover
+columns of each expert in a narrower matmul tile (1; 2 or 3: other width sets; `0` off). It is on by
+default for NVIDIA GPUs older than Volta and off elsewhere; bit-identical, prefill +3.6 to +4.3% on the GTX 1070 (section 3.7).
+`LLAMA_MOE_HYBRID_RESIZE_KEEP` (default 1) keeps the surviving expert-cache slots on the device when the cache is
+shrunk for a layer-major pass and regrown after it (device-to-device copies; only the slots that must leave the card are
+uploaded again), `0` re-uploads the whole cache as before; the contents are identical, prefill +3.9 to +6.8% at 16k / 4k
+tokens (section 3.10). `LLAMA_MOE_HYBRID_RESIZE_VERIFY=1` reads every slot back after a resize and compares it with the
+host bank (a test; it adds about 1.2 s per resize). `GGML_CUDA_MMVQ_MOE_ROWS` (1, 2 or 4; default 2) is the rows per block of the
+cached-expert matvec (a test knob: 4 is 0.7% faster on the 4-row verify and not worth a default). `GGML_CUDA_GDN_QUAD`
+(default off) selects the gated-delta-net prefill kernel with 4 lanes per state column (section 3.10).
 
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
 tests fail without it, and the CMake cache keeps the value from configure time.

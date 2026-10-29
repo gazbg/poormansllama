@@ -271,6 +271,130 @@ from 6.26 to 8.79. A model of the tile counts gives 32% padded columns for unifo
 the decode routing trace (a prompt's popularity was not measured); a last tile sized to the leftover columns would leave 5%.
 That is also what `--lm-prefill-ubatch 4096` buys (more tokens per expert), at the price of a larger compute buffer.
 
+Remainder tiles (`GGML_CUDA_MMQ_REMAINDER`, on by default for GPUs older than Volta since 2026-10-29; `=0` turns them off). The last tile of an expert, the columns left after its full
+64-column tiles, is computed in a tile as wide as the leftover needs. Mode 1 uses widths 16 / 32 / 48 / 64 (an expert takes
+exactly one remainder tile, so it reads its weights as often as before), mode 2 uses 32 / 64, mode 3 uses 24 / 40 / 64. It
+applies to MoE matmuls whose rows are a multiple of 128, more than 64 tokens and tiles without stream-k (Pascal); anything else
+runs as before. The flag is read at every launch.
+
+- Matmul (`test-backend-ops perf`, 2048 tokens, 256 experts): Q4_K gate / up 7.25 ms -> 6.54 (mode 1), 6.88 (mode 2), 6.72
+  (mode 3); Q5_K down 9.46 ms -> 8.99, 9.05, 9.11.
+- Prefill, the owner's command, A-B-B-A, mode 1 against off: 4,096 tokens 470.8 -> 488.8 tok/s (+3.8%), 16,384 tokens 573.5 ->
+  594.4 (+3.6%). Decode +0.2 / +0.2 / +1.1%, the same text in all four arms, peak VRAM unchanged (6,795 MiB).
+- Exactness: `tools/pascal/check_mmq_remainder.cpp` runs the same `MUL_MAT_ID` with the mode off and on: 30 comparisons (Q4_K, Q5_K,
+  Q6_K, Q8_0, Q4_0, IQ4_XS; uniform and skewed routing; every leftover class populated) are bit-identical. `test-backend-ops`
+  `MUL_MAT_ID` 887 of 887 and `MUL_MAT` 1,218 of 1,218 pass in every mode (new eval cases have rows that are a multiple of 128).
+  Registers and stack of the J = 64 kernels are unchanged (113 / 119 / 115 registers, no stack).
+
+Why this is +4% and not the +30% that the column count suggests: a tile has a fixed cost (loading and unpacking its weights,
+writing its result back) that does not shrink with its columns, so a 16-column tile costs far more than a quarter of a 64-column
+one. One fixed cost per tile reproduces the three modes within 1% (1.6 times the column work of a full tile for Q4_K gate / up,
+3.7 times for the Q5_K down matmul, whose K of 512 gives a tile only two K steps). With that cost even a leftover tile for every
+multiple of 8 columns would give 10%, and mode 1 gets 9.9%. So the expert matmul is limited by the NUMBER of tiles, not by the
+columns they hold; the next step is cheaper fixed work per tile (the unpack of the weight tile), not less padding.
+
+### 3.8 Decode tuning with MTP: draft confidence, expert team, fit margin (2026-10-29)
+
+Three settings, no code change, take the owner's command from 32.6 / 31.4 / 35.3 tok/s to 39.6 / 37.6 / 39.3 on three chats and from 24.9 to 31.7 tok/s after a 16k-token prompt:
+
+- `--spec-draft-p-min 0.7` (the command has 0.1). The draft chain stops when the head's best token has a probability below p-min, so a doubtful draft is not verified.
+- `LLAMA_MOE_HYBRID_THREADS=6` (the default is the 4 physical cores).
+- `-fitt 512` (the default margin is 1,024 MiB; 256 gives a little more and leaves 540 MiB free).
+
+Measured A-B-B-A, the owner's command against the command with these three settings (the two A arms and the two B arms do not overlap in any cell):
+
+| | before | after | change | ms per round | draft acceptance |
+|---|---|---|---|---|---|
+| Decode, chat 1 (tok/s) | 32.55 | 39.59 | +21.6% | 92.5 -> 67.4 | 0.687 -> 0.941 |
+| Decode, chat 2 | 31.38 | 37.59 | +19.8% | 87.7 -> 64.3 | 0.604 -> 0.829 |
+| Decode, chat 3 | 35.27 | 39.30 | +11.4% | 94.3 -> 74.9 | 0.806 -> 0.914 |
+| Decode after a 16k-token prompt | 24.90 | 31.70 | +27.3% | 102.8 -> 58.5 | 0.538 -> 0.837 |
+| Prefill, 4,096 / 16,384 tokens | 466.3 / 566.9 | 455.5 / 560.0 | -2.3% / -1.2% | | |
+| Peak VRAM / expert cache | 6,795 MiB / 45 slots | 7,305 MiB / 52 slots | +510 MiB | | |
+
+The costs: 510 MiB of the card's headroom and 1 to 2% of the prefill rate (a bigger cache is shrunk and re-uploaded around every large prompt). Safety: a 32k-token and a 60k-token prompt and a decode at 32k depth all completed with `-fitt 512` and with `-fitt 256` (no error, no memory-guard decline); the peak was 7,321 and 7,569 MiB of the 8,107 MiB.
+
+Why `--spec-draft-p-min` matters so much here: a draft token and its verify row cost about 20 ms per round on this machine (the draft layer's experts and the 398 MiB output head run on the CPU / are read again for every draft, and the verify row adds expert misses for the CPU leg) and yield about 0.4 tokens at the default threshold. n-max 2 or 1 gave the same direction (n-max 2: +6 to +13%, n-max 1: +37% at 16k depth); a confidence threshold keeps depth where the text is predictable and drops it where it is not. Screening of the threshold (n-max 3, tok/s change on the three chats and at 16k depth): 0.3 -0.5 / +0.2 / +2.2% / +10.3%; 0.5 +7.9 / +5.1 / +5.5% / +20.5%; 0.6 +11.8 / +7.2 / +6.7% / +29.5%; **0.7 +10.7 / +7.9 / +8.0% / +30.6%**; 0.8 +7.2 / +7.0 / +1.0% / +31.5%; 0.9 +6.4 / +5.4 / +3.9% / +30.6%.
+
+An optional fourth setting, `-ot "blk\.40\.ffn_(up|gate|down)_exps\.weight=CUDA0"` (the MTP layer's experts in VRAM, 430 MiB): on top of the three settings, eight chats
+and the 16k decode, A-B-B-A, tok/s +3.7 / +4.8 / +8.1 / +0.9 / +4.9 / +5.7 / +13.1 / +3.5% (mean +5.6%) and +4.6% after the 16k prompt, ms per round -3.2% on average
+(7 of 9 cells without overlap), prefill +2.0% at 4k, peak VRAM unchanged. The cache ends at 45 slots instead of 52 (hit rate 0.617 against 0.649) and the text differs from
+the control in every cell, because a different set of experts is resident. The 32k and 60k prompts of the safety gate were not rerun with it.
+
+The team size result is reproducible and the cause is not known: with the default of 4 threads the engine has no gain from 3, 5 or 6 in theory, but the measurement says 3 gives +4.6%, 5 gives +3.9%, 6 gives +6.1 and +7.1% (two runs), 7 and an explicit 4 give 0 (screening; the texts are identical to the control). The scheduler's placement of the spinning threads on the 8 logical CPUs (4 cores) is the likely reason.
+
+Tried and left out (screening, texts identical or compared by ms per round; the control repeats to within 0.6%):
+
+| Setting | Result |
+|---|---|
+| `LLAMA_MOE_HYBRID_LEAN_PF` 0 / 3 / 4 (prefetch of predicted experts) | within +-0.6% of the default 2 |
+| `LLAMA_MOE_HYBRID_B` 8 / 32, `LLAMA_MOE_HYBRID_LAMBDA` 0.95 / 0.98 | hit rate falls (0.594 / 0.630 / 0.614 / 0.620 against 0.630); rounds 1 to 5% slower |
+| `LLAMA_MOE_HYBRID_RECENCY=1` | hit rate 0.610, rounds 0 to 6% slower |
+| `LLAMA_CUDA_TOPK_MOE_SMALL=1` | -0.8% per round on average (below the 2% bar) |
+| `LLAMA_FATTN_GQA8=1`, `LLAMA_CUDA_INPUT_BATCH=1`, `LLAMA_CUDA_HOP_KERNEL=1`, `LLAMA_MOE_HYBRID_SCAN=1` | within +-0.7% |
+| `LLAMA_MTP_DRAFT_VOCAB_N=32768` (the draft head reads the first 32,768 token ids only) | mean +2.9% alone; on the stack it loses 6.9% on the code chat (acceptance 0.953 -> 0.839) and gains 3 to 6% elsewhere |
+| `--spec-draft-n-max 4` | not built: the engine handles at most 4 token rows, and the arithmetic above says it would lose |
+
+### 3.9 Time to first token for 700 to 4,000-token prompts (2026-10-29)
+
+On the owner's command a cold prompt of 1,500 tokens takes 9.1 s, longer than one of 2,500 tokens (7.4 s). The layer-major pass takes only batches of `--lm-prefill-min` (1,024) tokens or more, and the server first cuts the last 516 tokens off every prompt for a context checkpoint, so a prompt under about 1,540 tokens runs as ordinary 512-token batches, and each of them copies every expert over PCIe (about 2.3 s). Two flags fix the range:
+
+- `--lm-prefill-ckpt-chunk 4`: the checkpoint chunk is 4 tokens (it runs on the CPU, no bank copy) instead of 512, so the checkpoint sits 8 tokens before the end of the prompt.
+- `--lm-prefill-min 512`: a batch of 512 tokens or more takes the pass.
+
+And one variable for short prompts: `GGML_OP_OFFLOAD_MIN_BATCH=112` (default 32). A batch under that size is computed by the CPU instead of copying the used experts to the GPU; the break-even on this machine is about 110 tokens (at 124 tokens the CPU path is already 5% slower).
+
+Measured A-B-B-A, the owner's command against the command with the two flags and the variable (prompt rate, higher is better; all A / B pairs separate):
+
+| Prompt tokens | 48 | 96 | 384 | 700 | 1,000 | 2,500 | 4,000 |
+|---|---|---|---|---|---|---|---|
+| default (tok/s) | 33.0 | 51.9 | 134.7 | 130.0 | 162.8 | 336.0 | 458.5 |
+| with the settings (tok/s) | 45.9 | 53.8 | 128.4 | 161.9 | 229.1 | 534.9 | 635.8 |
+| change | +38.9% | +3.7% | -4.7% | +24.5% | +40.7% | +59.2% | +38.7% |
+
+A growing conversation (each request extends the previous prompt with the prompt cache on), wall time in seconds, default -> with the settings: cold 1,500 tokens 9.69 -> 5.01 (-48%); +300 tokens 3.21 -> 3.29; +500 tokens 3.73 -> 3.84; +1,200 tokens 9.02 -> 4.76 (-47%); +100 tokens 2.40 -> 2.28; +1,200 tokens 8.86 -> 4.79 (-46%). The prompt cache is used exactly as before (`cache_n` is identical in every request; 4 extra tokens are re-processed, as with the default). The cost is on turns of 300 to 600 tokens (+3%, about 0.1 s): the 4-token checkpoint is one more batch. A chunk of 8 or 16 costs 0.15 to 0.4 s there for no extra gain; 24 costs 0.4 to 0.5 s. The prefill window (`--hybrid-moe-prefill-ubatch` with `--hybrid-moe-prefill-min 513`) does nothing for this range: the checkpoint cut still leaves a 516-token batch, and with a 4- or 24-token chunk it only adds the cost of opening and closing the window (5.55 s at 700 tokens).
+
+One effect to know: the checkpoint 8 tokens before the end changes which tokens a rollback must re-process when a new prompt diverges inside the last tokens of the old one, and the layer-major pass was validated on the RTX 5090 against a checkpoint 516 tokens before the end (G32); hit-versus-fresh equality with the shallower checkpoint was not re-measured here.
+
+### 3.10 Prefill: cache resize, tile default, gated delta net kernel (2026-10-29)
+
+Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), against the previous build.
+
+- **Cache resize that keeps the slots (on by default).** Around every large prompt the server shrinks the expert cache, because the
+  layer-major pass needs the VRAM, and regrows it afterwards. Each of the two used to upload the whole cache over PCIe. Now the slots
+  that stay are copied inside the card and only the slots that must leave it are uploaded again. 4,096 tokens 477.8 -> 510.4 tok/s
+  (+6.8%), 16,384 tokens 587.9 -> 610.7 (+3.9%). The resizes of a 4k prompt took 1.13 s and now take 0.85 s, those of a 16k prompt 1.19 s
+  and 0.62 s; what remains is the upload of the slots that leave the card (1,128 slots, 2,096 MiB, in 438 ms = 5.0 GB/s of the 6.4 GB/s
+  the link measures). The contents are identical: `LLAMA_MOE_HYBRID_RESIZE_VERIFY=1` reads every slot back after a resize and compares it with
+  the host bank, "0 banks differ" in all 10 resizes of a 4k + 16k run (it adds 1.2 s per resize, a test only). Cost: the final cache has
+  one slot fewer (51 instead of 52, 74 MiB; peak VRAM 7,299 against 7,303 MiB) and decode shows no loss (tok/s +0.4 / +2.5 / +2.7% on
+  two chats and after a 16k prompt). `LLAMA_MOE_HYBRID_RESIZE_KEEP=0` goes back to the full upload.
+- **Remainder tiles are now on by default for GPUs older than Volta** (section 3.7): bit-identical, prefill +3.8% / +3.6% at 4k / 16k in an
+  A-B-B-A, +4.3 / +3.7 / +3.6% at 4k / 16k / 32k in single arms. `GGML_CUDA_MMQ_REMAINDER=0` turns them off.
+- **Gated delta net kernel with 4 lanes per state column (opt-in `GGML_CUDA_GDN_QUAD=1`).** The generic kernel gives a warp to a state
+  column and reduces over 32 lanes twice per token. The new one gives 4 lanes to a column (32 rows each in registers, 2 shuffles per
+  reduction) and stages k and q of 8 tokens in shared memory; it is used for 16 tokens or more with a scalar gate and no snapshots.
+  The op is 2.14 times faster (2,048 tokens, 16 heads: 10,149 -> 4,744 us; 2 or 8 lanes per column: 7.1-7.7 and 6.4-6.7 ms), and the prefill
+  is +4.9% at 4k and +6.3 / +6.4% after a 16k / 12k prompt, with +64 MiB peak VRAM at 12k. It sums in a different order, so it is not bit-identical:
+  against the generic kernel `llama-perplexity --kl-divergence` (4 chunks of 2,048 tokens) gives a mean KL divergence of 0.0115, the same top
+  token in 94.0% and PPL 18.72 against 18.78 (-0.3% +- 0.3%). That is the size of any change of the order of the sums in every delta net
+  layer here: the 2-lane and 8-lane variants differ from the 4-lane one by 0.0114 and 0.0116, so the new kernel is as far from the generic one
+  as the variants are from each other. A change that keeps the order (16 tokens per stage) gives 0.0000 with 99.98% of the top tokens equal,
+  and a smaller micro-batch (`-ub 256`) is bit-identical. The generated text changes (every chat and the deep prompt differed), the decode ms per round averages
+  +0.4% over six samples (no systematic effect; the kernel does not run in decode). Use it where a different but equally good text is
+  acceptable.
+- **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
+  `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
+  in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
+
+Where the prefill time goes now (nsys, 16,384-token prompt, the stack; share of kernel time): flash attention 21.5%, `mmq` Q4_K 17.4%, Q8_0 17.1%,
+Q5_K 14.0%, gated delta net 10.4%; every other category is under 5%. The pass is compute bound: kernel time is 26.9 s of the 27.3 s request, and the
+bank copies (91 GiB at 6.45 GB/s) overlap with the kernels. What is left in these five categories is a new kernel, not tuning: attention is
+shared-memory-load bound in QK and FP32 in PV (section 3.4), the expert matmuls pay a fixed cost per tile for unpacking the weights (section
+3.7), and the dense Q8_0 matmuls reach 39% of the `dp4a` peak. In decode (3 chats) the GPU spends 34% of its kernel time spinning for the
+host's experts (`moe_hybrid_wait_add`), 8.9% in the Q6_K output head (417 MB in 1.75 ms = 238 GB/s of the card's 256) and 10.5% in the
+cached-expert matvecs; the host reads an expert in 88 us (22 GB/s) with four threads.
+
 ## 4. Tried and dropped (measured)
 
 | Idea | Result |
@@ -286,7 +410,12 @@ That is also what `--lm-prefill-ubatch 4096` buys (more tokens per expert), at t
 | CUDA graphs on Pascal (the `cc < 7.0` check removed, 2026-10-24) | Decode 0.991 to 0.998 of without; the GPU waits on the CPU leg anyway |
 | Skipping the all-zero miss slot in the cached-expert matvec | No measurable change (within 0.3% per round): those reads hit the L2 |
 | Pinning the lean team on Linux, one thread per core (`1,2,3,0` or `0,1,2,3`) | 1.0 to 2.5% slower per round than the scheduler's own placement |
-| MTP layer's experts in VRAM (`-ot blk\.40\.ffn_(up\|gate\|down)_exps\.weight=CUDA0`) | 7 cache slots fewer (45 -> 38), round cost -1.8 to +6.8%: mixed |
+| MTP layer's experts in VRAM (`-ot blk\.40\.ffn_(up\|gate\|down)_exps\.weight=CUDA0`) | On the owner's command (2026-10-24): 7 cache slots fewer (45 -> 38), round cost -1.8 to +6.8%: mixed. On the tuned stack of section 3.8 (2026-10-29, eight chats): tok/s +5.6% on average (+0.9 to +13.1%, every chat and the 16k decode up), ms per round -3.2%, prefill +2.0% at 4k, cache 45 against 52 slots, the text differs. Worth adding as an optional fourth setting; the 32k / 60k prompts were not rerun with it |
+| Gated delta net with 8 or 16 warps per block (2026-10-29) | No gain at the op level; reverted. A 4-lanes-per-column kernel is faster (section 3.10) |
+| `--lm-prefill-ubatch 4096` on top of the remainder tiles and the keep-slots resize | +1.2% at 4k, +0.4% at 16k (A-B-B-A), under the 2% bar |
+| `GGML_CUDA_MMVQ_MOE_ROWS=4` (cached-expert matvec, 4 rows per block) | Faster on the 4-row verify (Q5_K 138.8 -> 127.9 us) and slower on one row; 0.4 ms of a 65 ms round |
+| `LLAMA_MOE_HYBRID_COPY_MODE` 0 / 1; `-td` 1 / 2 / 3; `-t` 3 / 5 on the stack | +1.4% at best, inside the 2% drift of the control arm |
+| 2 MiB pages for the host expert banks (CPU-leg microbenchmark) | 0 to -1.4% per request; the real banks are file-backed |
 | `LLAMA_MOE_HYBRID_LEAN_SPIN_US=1500`; `-td 2` | 0.3 to 1.4% slower; within noise |
 | MMQ column tile J 96 / 128 for Q4_K and Q5_K | Expert matmuls 5 to 6% slower |
 

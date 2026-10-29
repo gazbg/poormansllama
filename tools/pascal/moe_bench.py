@@ -20,6 +20,11 @@ CHATS = [
     "Write a Python function that parses an ISO 8601 duration string such as P3DT4H5M6S into a number of seconds, with tests.",
     "Explain how a CPU cache hierarchy works, and why a matrix multiplication is usually tiled for it.",
     "A train leaves at 09:40 and travels 312 km at an average of 78 km/h, then waits 25 minutes and covers 96 km at 64 km/h. When does it arrive? Show the steps.",
+    "Translate the following sentence into French and explain two grammar choices you made: 'The committee postponed the vote because several members had not received the final draft of the report.'",
+    "Write a SQL query that returns, for each customer, the total amount of their three most recent orders, given tables customers(id, name) and orders(id, customer_id, amount, created_at). Explain the query.",
+    "List ten practical tips for keeping a long-running Linux server secure, with one sentence of explanation for each.",
+    "Write a JSON object describing a book (title, author, year, tags), then a short paragraph summarising the plot of an invented novel about a lighthouse keeper.",
+    "Explain the difference between a mutex and a semaphore, then give a short C++ example that uses std::mutex to protect a counter incremented by four threads.",
 ]
 DEEP_Q = "\n\nQuestion: summarise the text above in five bullet points."
 
@@ -42,7 +47,14 @@ ap.add_argument("--hlog", action="store_true", help="LLAMA_MOE_HYBRID_LOG per-to
 ap.add_argument("--allow-busy", action="store_true")
 ap.add_argument("--wrap", default="", help="a command prefix for the server, e.g. an nsys profile line")
 ap.add_argument("--chats", type=int, default=len(CHATS), help="how many of the short chats to run")
+ap.add_argument("--quick", action="store_true", help="development preset: no deep prompt, 3 chats of at most 128 tokens, a short warm-up, and no prefill list unless --pp is given (about 45 s per arm)")
+ap.add_argument("--follow", default="", help="N1,N2,...: after the prefill sizes, a growing conversation: each request extends the previous prompt to N tokens with the prompt cache on (cache_prompt)")
 a = ap.parse_args()
+if a.quick:
+    a.deep = 0
+    a.tg = min(a.tg, 128)
+    if "--pp" not in sys.argv:
+        a.pp = ""
 
 out = os.path.join(a.out, a.label)
 os.makedirs(out, exist_ok=True)
@@ -137,14 +149,31 @@ try:
     text = open(a.text, encoding="utf-8").read()
     toks = post("/tokenize", {"content": text})["tokens"]
     # warm-up (kernel loading, first pass), not recorded
-    post("/completion", {"prompt": toks[-3000:], "n_predict": 1, "temperature": 0, "cache_prompt": False})
+    if a.quick and not a.pp:
+        post("/completion", {"prompt": toks[-48:], "n_predict": 24, "temperature": 0, "cache_prompt": False})
+    else:
+        post("/completion", {"prompt": toks[-3000:], "n_predict": 1, "temperature": 0, "cache_prompt": False})
 
     for n in [int(x) for x in a.pp.split(",") if x]:
         if n > len(toks):
             continue
+        t_req = time.time()
         r = post("/completion", {"prompt": toks[:n], "n_predict": 1, "temperature": 0, "cache_prompt": False})
+        wall = time.time() - t_req
         t = r["timings"]
-        emit({"what": "pp", "n": t["prompt_n"], "s": round(t["prompt_ms"] / 1000, 2), "tok_s": round(t["prompt_per_second"], 1)})
+        emit({"what": "pp", "n": t["prompt_n"], "s": round(t["prompt_ms"] / 1000, 2), "tok_s": round(t["prompt_per_second"], 1), "wall_s": round(wall, 2)})
+
+    if a.follow:
+        prev = 0
+        for n in [int(x) for x in a.follow.split(",") if x]:
+            if n > len(toks):
+                continue
+            t_req = time.time()
+            r = post("/completion", {"prompt": toks[:n], "n_predict": 8, "temperature": 0, "cache_prompt": True})
+            wall = time.time() - t_req
+            t = r["timings"]
+            emit({"what": "follow", "n": n, "new_tokens": n - prev, "prompt_n": t["prompt_n"], "cache_n": t.get("cache_n"), "s": round(t["prompt_ms"] / 1000, 2), "wall_s": round(wall, 2)})
+            prev = n
 
     for rep in range(a.reps):
         for i, c in enumerate(CHATS[:a.chats]):
@@ -172,7 +201,7 @@ finally:
     for _ in range(60):
         if gpu0_used() < 300:
             break
-        time.sleep(1)
+        time.sleep(0.5)
     emit({"what": "end", "peak_vram_mib": peak[0], "rc": srv.returncode, "gpu_after": gpu_apps()})
     with open(os.path.join(out, "results.jsonl"), "w") as f:
         for r in results:
