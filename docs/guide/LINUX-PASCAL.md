@@ -31,7 +31,7 @@ still has Win32 code and was not built.
 ## 2. Run on one GPU
 
 ```bash
-LLAMA_FATTN_TILE_Q8QK=1 LLAMA_MOE_HYBRID_LEAN_CPUS=2,3,1,0 CUDA_VISIBLE_DEVICES=0 \
+LLAMA_FATTN_TILE_Q8QK=1 CUDA_VISIBLE_DEVICES=0 \
 $REPO/build/llama-cuda/bin/llama-server \
   -m $MODELS/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
   --host 127.0.0.1 --port 8034 \
@@ -45,8 +45,10 @@ $REPO/build/llama-cuda/bin/llama-server \
 
 - `-fitt` is left out on purpose. The default 1,024 MiB margin suits an 8 GiB card;
   the 16,000 MiB in the main recipe is for a 24 GiB card.
-- `LLAMA_MOE_HYBRID_LEAN_CPUS` pins the expert threads, one per physical core
-  (section 3.2). Choose the list for your CPU.
+- The expert team defaults to the number of physical cores the process may use, at most 8 (Linux, since
+  2026-10-22; section 3.2), so `LLAMA_MOE_HYBRID_LEAN_CPUS` is no longer needed. It never pinned threads on
+  Linux (the pinning code is Windows-only); only its number of entries counted, as the team size.
+  `LLAMA_MOE_HYBRID_THREADS=n` sets the size explicitly.
 - `LLAMA_FATTN_TILE_Q8QK=1` is the int8 attention path (section 3.4).
 - `--lm-prefill-canonical` is left out (section 3.6). Add it back for a cache hit
   that matches a fresh run.
@@ -78,14 +80,29 @@ It costs about 5% in the FP32 kernel on a full prompt (100k tokens: 471 s before
 497 s after). Any earlier `--lm-prefill` number taken on a GPU that uses the tile
 kernel used the wrong attention.
 
-### 3.2 Decode: pin the expert threads
+### 3.2 Decode: size the expert team to the physical cores
 
-The default thread layout assumes the two hardware threads of a core are
-neighbouring CPUs (stride 2). On this CPU they are `i` and `i+4`, so spinning team
-threads share cores. `LLAMA_MOE_HYBRID_LEAN_CPUS=2,3,1,0` (one thread per physical
-core, the last entry for the engine thread) took decode from 5 to 8 tok/s to 30
-to 35 tok/s. The generated text was identical. A profile showed the team threads
-spending about 99.7% of their time in barrier spin loops, not in expert math.
+The expert team defaults to 8 threads (`LLAMA_MOE_HYBRID_THREADS`), which are busy-spin
+workers. On a CPU with 4 cores and 8 hardware threads, with the decoding thread, the
+engine thread and the GPU driver threads also needing CPU, they preempt each other for a
+full scheduler timeslice (the stall log shows 2.4 to 3.7 ms). `LLAMA_MOE_HYBRID_LEAN_CPUS=2,3,1,0`
+(four entries) took decode from 5 to 8 tok/s to 30 to 35 tok/s. The generated text was
+identical. A profile showed the team threads spending about 99.7% of their time in
+barrier spin loops, not in expert math.
+
+What actually does it, checked 2026-10-22 (Qwen3.6-35B-A3B Q4_K_M, MTP, two 192-token chat
+requests per arm, i7-4770K): with no variable the process has 29 threads, the stall log
+reported 4,988 slow lean requests and decode was 6.0 and 7.8 tok/s. With the 4-entry list, or
+with `LLAMA_MOE_HYBRID_THREADS=4` and no list, the process has 25 threads, there were 0
+warnings and decode was 30.0 / 33.1 and 30.2 / 33.4 tok/s. In all three cases every thread of the
+process had `Cpus_allowed_list` 0-7: nothing is pinned on Linux (every affinity call in the hybrid
+code is `SetThreadAffinityMask`), so the CPU numbers in the list are ignored and only the team
+size matters. Team sizes other than 4 were not tested.
+
+Since 2026-10-22 the default on Linux is the number of physical cores the process may use (read from
+the sibling lists in sysfs, capped at 8; a failure to read them keeps 8). The same command with no
+variable then logged `the expert team defaults to 4 threads`, ran 25 threads with 0 stall warnings and
+decoded 30.2 / 33.4 tok/s; an explicit `LLAMA_MOE_HYBRID_THREADS=8` still gives the old 29-thread process.
 
 ### 3.3 Prefill limits on GP104 (measured)
 
@@ -103,8 +120,8 @@ spending about 99.7% of their time in barrier spin loops, not in expert math.
 
 ### 3.4 Int8 QK attention (opt-in)
 
-With `LLAMA_FATTN_TILE_Q8QK=1`, head size 256, a q8_0 K cache and the FP32 tile
-kernel, QK^T runs on `dp4a` against the raw q8_0 K blocks, with the query columns
+With `LLAMA_FATTN_TILE_Q8QK=1`, head size 256, a q8_0 or q4_0 K cache and the FP32 tile
+kernel, QK^T runs on `dp4a` against the raw K blocks, with the query columns
 quantized to int8 per 32 values. That is the arithmetic the decode kernel already
 uses for q8_0 K. V and PV stay FP32.
 
@@ -116,6 +133,28 @@ uses for q8_0 K. V and PV stay FP32.
   identical. This is not a perplexity-grade evaluation.
 - `LLAMA_FATTN_TILE_Q8CFG=n` selects one of seven block configurations. 0 is the
   fastest of those tried.
+
+A q4_0 K cache (`-ctk q4_0`) takes the same path (added 2026-10-22). A q4_0 block is
+unpacked when the K tile is loaded to int8 `(nibble - 8)` with its own scale, which is
+exactly the value it stands for, so the shared layout, the scales and the `dp4a` core
+are those of q8_0 and the query is quantized the same way. It needs no extra VRAM, and
+it works together with `--fattn-head-tile`. Only the layer-major pass reaches it (no
+mask tensor, so no query-head grouping).
+
+- Unit test (`FLASH_ATTN_EXT`, head size 256, causal window, q4_0 K and V): NMSE
+  against the CPU reference 3.8e-8 with the flag, 1.6e-6 without (limit 5e-4). The q8_0
+  case gives 3.6e-8 and 1.5e-6. The kernel trace shows the new variant
+  (`flash_attn_tile<256,256,32,1,0,0,1>`) is what runs.
+- Qwen3.8-27B Q6_K_XL, q4_0/q4_0 KV, MTP, `-c 64000`, eight fixed prompts of 1.6k to
+  4.8k tokens against the exact kernel: flag off, 8 of 8 bit-identical (the default path
+  is untouched). Flag on, the first token is the same on 8 of 8 (worst |dlogprob|
+  0.0084) and the continuation is identical on 6 of 8. The other two diverge in free text
+  after the answer; without MTP, where every token carries logprobs, the exact kernel's
+  top-2 gap at the first difference was 0.008 nats (a near-tie) and **0.318 nats, above
+  the 0.25-nat rule**. So one prompt of eight does not meet the rule.
+- Speed was not benchmarked for q4_0. The equivalence run logged prefill rates 0.6 to
+  3.2% higher with the flag at these lengths (single runs, not a controlled A/B);
+  attention is about 5% of the kernel time at 4k tokens, so the gain is small there.
 
 ### 3.5 Q8_0 matmul tile
 
