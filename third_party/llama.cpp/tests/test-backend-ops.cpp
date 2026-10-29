@@ -10308,6 +10308,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.6-35B-A3B layer-major prefill chunk (2048 tokens): routed experts (256 experts, 8 used, expert size 512) and dense Q8_0 projections
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, 2048, 2048)); // gate / up
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, 2048,  512)); // down
+    // the expert-weight multiply and the sum over the 8 experts of the MoE output of a 2048-token chunk (Qwen3.6: 2048 values, 8 experts used)
+    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {1, 8, 2048, 1}, {2048, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2048, 2048, 1, 1}, {1, 1, 1, 1}, 8));
     // the same expert matmuls for the smaller ordinary-path batches (a 512-token ubatch, short prompts): 16 down to 2 tokens per expert
     for (int n : { 64, 128, 256, 512, 1024 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, n, 2048)); // gate / up
