@@ -393,6 +393,17 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   down -26 / -26 / -15 / -8%), which matters for the 512-token ubatches of the ordinary path. The inner loop was measured on its own (`tools/pascal/mmq_q4k_inner_bench.cu`, shared memory only): 9.6 TOPS, of which the min
   term costs 12%, the nibble unpack 12% and the whole scale epilogue 34%; unpacking by hand outside the column loop changes nothing because
   the compiler already does it, and 4-row tiles with 128 or 256 threads are slower (167 / 151 registers).
+- **Int8 PV in the attention kernel (opt-in `LLAMA_FATTN_TILE_Q8PV=1`, together with `--lm-prefill-attn-int8`; q8_0 K and V, head size 256).** Removing only the
+  PV multiply-adds cuts the int8-QK kernel by 37%, so PV is where the time is. The softmax weights P of a 32-key tile are quantized to int8 per column, the V rows
+  of the tile are requantized to one scale per block of 32 head-dim values (the q8_0 scale varies per key, which cannot be taken out of an integer sum over
+  keys), transposed to words of 4 keys, and the products are `dp4a`. V is read raw from the cache, so the f16 V conversion and its scratch go away. Attention
+  74.2 -> 59.8 ms at 10,240 keys (-19%), 262.5 -> 215.5 ms at 34,816 (-18%). Prefill, A-B-B-A, one binary with the variable off against on: 4k +0.6%, 16k +3.3%
+  (621.8 -> 642.5 tok/s), 32k +6.4% (536.0 -> 570.2), peak VRAM 44 MiB lower; a 55k-token prompt took 114.3 s against 125.2 s (-8.7%).
+  The rounding of P matters. Round-to-nearest drops every weight below 0.4% of the tile maximum, a bias: first-token KL against exact FP32 attention was 0.0010
+  at 4k / 12k but 0.147 on one of two 32k prompts (top-1 logprob off by 0.244 nats). A second byte for P repairs that and is not faster than FP32 PV. The kept
+  variant rounds with a deterministic hash-driven dither (unbiased): mean first-token KL 0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k (2), 0.0040 at 55k (1),
+  against 0.0034 / 0.0026 / 0.0191 for int8 QK alone, the same top token on all 7, repeats bit-identical. It is not exact (text changes) and the evidence is seven
+  first-token points, no perplexity. `tools/pascal/ftk_arm.py` and `fa_pv8_check.cpp` are the harnesses.
 - **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
@@ -405,9 +416,8 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
 Where the prefill time goes now (nsys, 16,384-token prompt, the stack, before the expert-tile change above; share of kernel time): flash attention 21.5%, `mmq` Q4_K 17.4%, Q8_0 17.1%,
 Q5_K 14.0%, gated delta net 10.4%; every other category is under 5%. The pass is compute bound: kernel time is 26.9 s of the 27.3 s request, and the
 bank copies (91 GiB at 6.45 GB/s) overlap with the kernels. The dense Q8_0 matmuls reach 39% of the `dp4a` peak and the inner-loop model above says
-the adopted tile is within 20% of what that loop can do. Attention is shared-memory-load bound in QK and FP32 in PV (section 3.4); the V cache
-is q8_0 with a scale per key and 32 head-dim values, which cannot be folded out of an integer dot over keys, so an int8 PV needs a new kernel
-and a quality evaluation. That is the open research item. In decode (3 chats) the GPU spends 34% of its kernel time spinning for the
+the adopted tile is within 20% of what that loop can do. Attention was the one place with a large untried lever (PV in FP32); the opt-in int8 PV above takes it,
+and what is left there is the QK phase, which is shared-memory-load bound (section 3.4). In decode (3 chats) the GPU spends 34% of its kernel time spinning for the
 host's experts (`moe_hybrid_wait_add`), 8.9% in the Q6_K output head (417 MB in 1.75 ms = 238 GB/s of the card's 256) and 10.5% in the
 cached-expert matvecs; the host reads an expert in 88 us (22 GB/s) with four threads.
 
@@ -427,6 +437,8 @@ cached-expert matvecs; the host reads an expert in 88 us (22 GB/s) with four thr
 | Skipping the all-zero miss slot in the cached-expert matvec | No measurable change (within 0.3% per round): those reads hit the L2 |
 | Pinning the lean team on Linux, one thread per core (`1,2,3,0` or `0,1,2,3`) | 1.0 to 2.5% slower per round than the scheduler's own placement |
 | MTP layer's experts in VRAM (`-ot blk\.40\.ffn_(up\|gate\|down)_exps\.weight=CUDA0`) | On the owner's command (2026-10-24): 7 cache slots fewer (45 -> 38), round cost -1.8 to +6.8%: mixed. On the tuned stack of section 3.8 (2026-10-29, eight chats): tok/s +5.6% on average (+0.9 to +13.1%, every chat and the 16k decode up), ms per round -3.2%, prefill +2.0% at 4k, cache 45 against 52 slots, the text differs. Worth adding as an optional fourth setting; the 32k / 60k prompts were not rerun with it |
+| Int8 PV with round-to-nearest P (2026-10-29) | 20% faster attention, but biased: first-token KL 0.147 on one of two 32k prompts (0.004 for int8 QK alone). Replaced by dithered rounding |
+| Int8 PV with a two-byte P (hi + lo) | Quality repaired (KL 0.0035) but 75.8 against 74.2 ms for FP32 PV: the kernel spills 184 B at 128 registers |
 | Int8 QK attention with 64 query columns per block instead of 32 (2026-10-29, built and timed) | 74.4 -> 121.9 ms (256 threads, occupancy 2) and 159.3 ms (occupancy 1) at 10,240 keys, 259 -> 461 / 585 ms at 34,816; 16 warps need 54.5 KB of shared memory (limit 48 KB). Reverted |
 | Gated delta net with 8 or 16 warps per block (2026-10-29) | No gain at the op level; reverted. A 4-lanes-per-column kernel is faster (section 3.10) |
 | `--lm-prefill-ubatch 4096` on top of the remainder tiles and the keep-slots resize | +1.2% at 4k, +0.4% at 16k (A-B-B-A), under the 2% bar |
