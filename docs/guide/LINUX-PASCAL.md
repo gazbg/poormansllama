@@ -396,15 +396,20 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
 - **Int8 PV in the attention kernel (opt-in `LLAMA_FATTN_TILE_Q8PV=1`, together with `--lm-prefill-attn-int8`; q8_0 K and V, head size 256).** Removing only the
   PV multiply-adds cuts the int8-QK kernel by 37%, so PV is where the time is. The softmax weights P of a 32-key tile are quantized to int8 per column, the V rows
   of the tile are requantized to one scale per block of 32 head-dim values (the q8_0 scale varies per key, which cannot be taken out of an integer sum over
-  keys), transposed to words of 4 keys, and the products are `dp4a`. V is read raw from the cache, so the f16 V conversion and its scratch go away. Attention
-  74.2 -> 59.8 ms at 10,240 keys (-19%), 262.5 -> 215.5 ms at 34,816 (-18%). Prefill, A-B-B-A, one binary with the variable off against on, two sessions: 4k +0.6%,
-  16k +3.3% and +2.9% (621.8 -> 642.5, 621.0 -> 639.0 tok/s), 32k +6.4% and +5.4% (536.0 -> 570.2, 534.1 -> 562.8), 49k +8.2% (452.5 -> 489.6), no A/B overlap at any length; peak
-  VRAM unchanged within the poller noise (-44 MiB in one session, +18 / +80 in the other); a 55k-token prompt took 114.3 s against 125.2 s (-8.7%, single runs).
-  The rounding of P matters. Round-to-nearest drops every weight below 0.4% of the tile maximum, a bias: first-token KL against exact FP32 attention was 0.0010
-  at 4k / 12k but 0.147 on one of two 32k prompts (top-1 logprob off by 0.244 nats). A second byte for P repairs that and is not faster than FP32 PV. The kept
-  variant rounds with a deterministic hash-driven dither (unbiased): mean first-token KL 0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k (2), 0.0040 at 55k (1),
-  against 0.0034 / 0.0026 / 0.0191 for int8 QK alone, the same top token on all 7, repeats bit-identical. It is not exact (text changes) and the evidence is seven
-  first-token points, no perplexity. `tools/pascal/ftk_arm.py` and `fa_pv8_check.cpp` are the harnesses.
+  keys), transposed to words of 4 keys, and the products are `dp4a`. V is read raw from the cache, so the f16 V conversion goes away. The rounding of P matters:
+  round-to-nearest drops every weight below 0.4% of the tile maximum, a bias (first-token KL against exact FP32 attention 0.147 on one of two 32k prompts, top-1
+  logprob off by 0.244 nats); a second byte for P repairs that and is not faster than FP32 PV; the kept variant rounds with a deterministic hash-driven dither
+  (unbiased). With the int8 PV the QK phase is 28% of the kernel (ablation: 16.9 of 60.8 ms at 10,240 keys), 17.6% for the shared-memory reads of Q (a 16-byte
+  broadcast per column, block and half, for every key) and 9.3% for those of K; the `dp4a` arithmetic costs nothing. So the int8 PV runs a 64-key tile (configuration 3):
+  each lane holds two keys and every Q read serves both (a second key per Q read cost +6.3 ms in a proxy that doubled the K reads and `dp4a` of the existing kernel,
+  against 16.9 ms for the first), and the PV is done in two 32-key halves. Configuration 3 had spilled 488 B of registers and been 3.5 times slower; loading Q
+  once per (column, block, half) for all of a lane's keys removed the spill (24 B) and left the 32-key kernels bit-identical. Attention, 2,048 queries, q8_0 KV: FP32 PV
+  74.2 -> 59.8 ms (32-key tile) -> 55.3 ms (64-key tile) at 10,240 keys (-25.5%), 262.5 -> 215.5 -> 193.5 ms at 34,816 (-26.3%). Prefill, A-B-B-A, one binary with the
+  variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), no A/B overlap, peak VRAM unchanged
+  (the 32-key tile gave +2.9 / +5.4 / +8.2% in the session before). Quality, first-token KL (top 20) against exact attention with the 64-key tile: 6 prompts of 8k /
+  24k tokens 0.0200 (int8 QK alone 0.0186), 2 prompts of 32k 0.0079 (0.0026), one top-1 flip on a prompt where int8 QK alone also flips; with the 32-key tile
+  0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k, 0.0040 at 55k. It is not exact (text changes) and the evidence is 14 first-token points and no perplexity.
+  `tools/pascal/ftk_arm.py` and `fa_pv8_check.cpp` are the harnesses.
 - **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
@@ -414,8 +419,8 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   arithmetic removed), the real loop reaches 13.5-14.9, 8 x 4 and 8 x 8 tiles run out of registers (151 / 183) and are slower, and the exact
   magic-number int-to-float replacement is 5-7% slower than the hardware conversion.
 
-Where the prefill time goes now (nsys, 16,384-token prompt, the stack, final build; share of kernel time; 26.4 s of kernels, 25.6 s with the int8 PV): flash attention 22.2% (19.6% with
-the int8 PV, 5,881 -> 4,997 ms), `mmq` Q8_0 17.8%, Q4_K 15.5% (4,664 -> 4,087 ms since the expert-tile change), Q5_K 13.6% (3,759 -> 3,598 ms), gated delta net 10.7%; every other
+Where the prefill time goes now (nsys, 16,384-token prompt, the stack, final build; share of kernel time; 26.4 s of kernels, 25.2 s with the int8 PV): flash attention 22.2% (18.9% with
+the int8 PV on the 64-key tile, 5,881 -> 4,748 ms; 19.6% on the 32-key tile), `mmq` Q8_0 17.8%, Q4_K 15.5% (4,664 -> 4,087 ms since the expert-tile change), Q5_K 13.6% (3,759 -> 3,598 ms), gated delta net 10.7%; every other
 category is under 5%. Decode is unchanged (host wait 34%, Q6_K head 9%, cached-expert matvecs 11%). The pass is compute bound: kernel time is 26.9 s of the 27.3 s request, and the
 bank copies (91 GiB at 6.45 GB/s) overlap with the kernels. The dense Q8_0 matmuls reach 39% of the `dp4a` peak and the inner-loop model above says
 the adopted tile is within 20% of what that loop can do. Attention was the one place with a large untried lever (PV in FP32); the opt-in int8 PV above takes it,
