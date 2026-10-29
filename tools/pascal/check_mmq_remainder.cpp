@@ -1,5 +1,6 @@
 // Bit-exactness of GGML_CUDA_MMQ_REMAINDER: the same MUL_MAT_ID on the CUDA backend with the mode off and on must give identical bits.
 // The routing is uniform or skewed (expert popularity ~ 1/(e+1)^0.8), so the number of columns an expert gets (and the size of its leftover tile) covers every class.
+// With the default mode, every case also prints one `HASH name fnv` line: compare them between two library builds (LD_LIBRARY_PATH) to check a kernel change for bit-identity.
 //   g++ -O2 -I third_party/llama.cpp/ggml/include tools/pascal/check_mmq_remainder.cpp -L build/llama-cuda/bin -lggml -lggml-base -lggml-cpu -lggml-cuda \
 //       -Wl,-rpath,$PWD/build/llama-cuda/bin -o build/pascal/check_mmq_remainder
 #include "ggml.h"
@@ -89,6 +90,11 @@ int main() {
             int rem_hist[5] = {};   // experts by leftover class: none, <=16, <=32, <=48, <=63
             for (int e = 0; e < p.n_mats; ++e) { const int r = count[(size_t) e] % 64; rem_hist[r == 0 ? 0 : r <= 16 ? 1 : r <= 32 ? 2 : r <= 48 ? 3 : 4]++; }
             const std::vector<float> ref = run(be, p, w, b, ids, nullptr);
+            {   // FNV-1a of the output bits with the default mode: run this binary against two sets of libraries and compare the HASH lines to see whether a kernel change moved any bit
+                unsigned long long h = 1469598103934665603ULL;
+                for (float v : ref) { unsigned u; memcpy(&u, &v, 4); h = (h ^ u) * 1099511628211ULL; }
+                std::printf("HASH %-34s %016llx\n", p.name, h);
+            }
             std::printf("%-34s leftover classes (0/16/32/48/63): %3d %3d %3d %3d %3d |", p.name, rem_hist[0], rem_hist[1], rem_hist[2], rem_hist[3], rem_hist[4]);
             for (const char * mode : { "1", "2", "3" }) {
                 const std::vector<float> got = run(be, p, w, b, ids, mode);

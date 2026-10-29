@@ -383,15 +383,31 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   and a smaller micro-batch (`-ub 256`) is bit-identical. The generated text changes (every chat and the deep prompt differed), the decode ms per round averages
   +0.4% over six samples (no systematic effect; the kernel does not run in decode). Use it where a different but equally good text is
   acceptable.
+- **K-quant expert tiles at 128 threads (default for these GPUs, 2026-10-29).** The thread count of the expert tiles had not been swept. In
+  `mmq-config-pascal.cuh` the Q4_K tiles of 16 to 64 columns and the Q5_K tiles of 16 to 48 columns now run 128 threads at occupancy 3
+  (the Q5_K 64-column tile stays at 256 threads, 128 was 3% worse): a thread covers 16 columns instead of 8, so (the likely reason, not isolated) the weights it unpacks and
+  loads are used twice as often. Op level (2,048 tokens, 256 experts, 8 used): Q4_K gate / up 6.57 -> 5.92 ms (-10%), Q5_K down 9.1 -> 8.58 ms
+  (-4 to -7%); occupancy 4 gives the same, 64 threads is 2x slower. Prefill, A-B-B-A against the previous build, 4k 512.4 -> 523.5 tok/s
+  (+2.2%) and 16k 613.5 -> 627.9 (+2.3%). Bit-identical: the output bits of the checker's 10 cases are equal between the old and the new
+  libraries. The smaller expert batches gain more (op level, old against new: 128 / 256 / 512 / 1,024 tokens, Q4_K gate / up -19 / -18 / -17 / -14%, Q5_K
+  down -26 / -26 / -15 / -8%), which matters for the 512-token ubatches of the ordinary path. The inner loop was measured on its own (`tools/pascal/mmq_q4k_inner_bench.cu`, shared memory only): 9.6 TOPS, of which the min
+  term costs 12%, the nibble unpack 12% and the whole scale epilogue 34%; unpacking by hand outside the column loop changes nothing because
+  the compiler already does it, and 4-row tiles with 128 or 256 threads are slower (167 / 151 registers).
 - **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
+  The dense Q8_0 tile was also swept: 64 rows or 128 rows with 128 threads are 18-20% slower than the adopted 128 rows with 256 threads (3.6-3.7
+  against 3.03-3.13 ms for 4096 x 2048 x 2048), and a standalone model of its inner loop (`tools/pascal/mmq_q8_inner_bench.cu`) shows why: the 4 x 8
+  register tile is shared-memory-load bound at 63% of the 26.9 TOPS that register-only `dp4a` reaches on this card (17.1 TOPS with all scale
+  arithmetic removed), the real loop reaches 13.5-14.9, 8 x 4 and 8 x 8 tiles run out of registers (151 / 183) and are slower, and the exact
+  magic-number int-to-float replacement is 5-7% slower than the hardware conversion.
 
-Where the prefill time goes now (nsys, 16,384-token prompt, the stack; share of kernel time): flash attention 21.5%, `mmq` Q4_K 17.4%, Q8_0 17.1%,
+Where the prefill time goes now (nsys, 16,384-token prompt, the stack, before the expert-tile change above; share of kernel time): flash attention 21.5%, `mmq` Q4_K 17.4%, Q8_0 17.1%,
 Q5_K 14.0%, gated delta net 10.4%; every other category is under 5%. The pass is compute bound: kernel time is 26.9 s of the 27.3 s request, and the
-bank copies (91 GiB at 6.45 GB/s) overlap with the kernels. What is left in these five categories is a new kernel, not tuning: attention is
-shared-memory-load bound in QK and FP32 in PV (section 3.4), the expert matmuls pay a fixed cost per tile for unpacking the weights (section
-3.7), and the dense Q8_0 matmuls reach 39% of the `dp4a` peak. In decode (3 chats) the GPU spends 34% of its kernel time spinning for the
+bank copies (91 GiB at 6.45 GB/s) overlap with the kernels. The dense Q8_0 matmuls reach 39% of the `dp4a` peak and the inner-loop model above says
+the adopted tile is within 20% of what that loop can do. Attention is shared-memory-load bound in QK and FP32 in PV (section 3.4); the V cache
+is q8_0 with a scale per key and 32 head-dim values, which cannot be folded out of an integer dot over keys, so an int8 PV needs a new kernel
+and a quality evaluation. That is the open research item. In decode (3 chats) the GPU spends 34% of its kernel time spinning for the
 host's experts (`moe_hybrid_wait_add`), 8.9% in the Q6_K output head (417 MB in 1.75 ms = 238 GB/s of the card's 256) and 10.5% in the
 cached-expert matvecs; the host reads an expert in 88 us (22 GB/s) with four threads.
 
