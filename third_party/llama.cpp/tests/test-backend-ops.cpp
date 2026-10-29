@@ -10308,6 +10308,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.6-35B-A3B layer-major prefill chunk (2048 tokens): routed experts (256 experts, 8 used, expert size 512) and dense Q8_0 projections
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, 2048, 2048)); // gate / up
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, 2048,  512)); // down
+    // the same expert matmuls for the smaller ordinary-path batches (a 512-token ubatch, short prompts): 16 down to 2 tokens per expert
+    for (int n : { 64, 128, 256, 512, 1024 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false,  512, n, 2048)); // gate / up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 2048, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 2048, 4096, {1, 1}, {1, 1}));
     // constant useful work per expert (about 64 tokens each), fewer experts and tokens: how much of the expert matmul is the grid of column tiles that no expert fills?
