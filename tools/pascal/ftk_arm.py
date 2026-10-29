@@ -70,14 +70,14 @@ def compare(labels):
         row = []
         for l in labels[1:]:
             a, b = ref[k], arms[l][k]
-            pa = softmax_top([(t, v) for t, v in a["top"]]); pb = softmax_top([(t, v) for t, v in b["top"]])
+            pa = softmax_top([(t[0], t[1]) for t in a["top"][:20]]); pb = softmax_top([(t[0], t[1]) for t in b["top"][:20]])
             toks = set(pa) | set(pb)
             eps = 1e-9
             # KL(ref || arm) over the union of the top tokens, each side renormalised over the union
             sa = sum(pa.get(t, eps) for t in toks); sb = sum(pb.get(t, eps) for t in toks)
             kl = sum((pa.get(t, eps) / sa) * math.log((pa.get(t, eps) / sa) / (pb.get(t, eps) / sb)) for t in toks)
             top1 = a["top"][0][0] == b["top"][0][0]
-            d1 = abs(a["top"][0][1] - dict(b["top"]).get(a["top"][0][0], -99))
+            d1 = abs(a["top"][0][1] - dict((t[0], t[1]) for t in b["top"]).get(a["top"][0][0], -99))
             tot[l].append(kl)
             row.append(f"KL {kl:.5f} d1 {d1:.3f} {'same' if top1 else 'DIFF'}")
         print(f"{k:>14} " + " ".join(f"{r:>22}" for r in row))
@@ -95,6 +95,8 @@ def main():
     ap.add_argument("--offsets", default="0,150000", help="character offsets into the text, one set of prompts per offset")
     ap.add_argument("--port", type=int, default=8193)
     ap.add_argument("--ctx", type=int, default=20480)
+    ap.add_argument("--text", default=None, help="text file to cut the prompts from (default: the harness text)")
+    ap.add_argument("--piece", type=int, default=200000, help="characters tokenized per offset")
     ap.add_argument("--ppl", default="", help="paired next-token log-likelihood: LENxCOUNT[,LENxCOUNT...] windows of the text; the target is the token after each window")
     ap.add_argument("--ppl-step", type=int, default=1200, help="start offset step, in tokens, between windows of one length")
     a = ap.parse_args()
@@ -129,7 +131,7 @@ def main():
             except Exception:
                 pass
             time.sleep(1)
-        text = open(TEXT, "r", encoding="utf-8", errors="replace").read()
+        text = open(a.text or TEXT, "r", encoding="utf-8", errors="replace").read()
         if a.ppl:
             toks = api(a.port, "/tokenize", {"content": text})["tokens"]
             for spec in a.ppl.split(","):
@@ -148,7 +150,7 @@ def main():
                     if w % 8 == 0:
                         print(f"{a.label} len {ln} window {w}/{cnt}: {time.time() - t0:.1f} s", flush=True)
         for off in [int(x) for x in ([] if a.ppl else a.offsets.split(","))]:
-            piece = text[off:off + 200000]
+            piece = text[off:off + a.piece]
             toks = api(a.port, "/tokenize", {"content": piece})["tokens"]
             for n in [int(x) for x in a.prompts.split(",")]:
                 t0 = time.time()

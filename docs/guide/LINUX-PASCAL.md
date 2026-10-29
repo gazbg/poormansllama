@@ -405,12 +405,12 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   against 16.9 ms for the first), and the PV is done in two 32-key halves. Configuration 3 had spilled 488 B of registers and been 3.5 times slower; loading Q
   once per (column, block, half) for all of a lane's keys removed the spill (24 B) and left the 32-key kernels bit-identical. Attention, 2,048 queries, q8_0 KV: FP32 PV
   74.2 -> 59.8 ms (32-key tile) -> 55.3 ms (64-key tile) at 10,240 keys (-25.5%), 262.5 -> 215.5 -> 193.5 ms at 34,816 (-26.3%). Prefill, A-B-B-A, one binary with the
-  variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), no A/B overlap, peak VRAM unchanged
+  variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), 98k +19.8% (307.3 -> 368.0), 131k +22.2% (254.1 -> 310.6), no A/B overlap, peak VRAM unchanged; the 16k / 32k / 49k session was repeated on the final build (+4.2 / +8.8 / +12.8%, 617.3 -> 643.3, 526.3 -> 572.6, 447.3 -> 504.6 tok/s), the 98k / 131k one (one 4-arm session, 5 and 8.5 minutes per arm) was not
   (the 32-key tile gave +2.9 / +5.4 / +8.2% in the session before). Quality, first-token KL (top 20) against exact attention with the 64-key tile: 6 prompts of 8k /
   24k tokens 0.0200 (int8 QK alone 0.0186), 2 prompts of 32k 0.0079 (0.0026), one top-1 flip on a prompt where int8 QK alone also flips; with the 32-key tile
   0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k, 0.0040 at 55k. A paired next-token log-likelihood (54 positions, the true next token as the target) shows no
   loss either: 44 windows of 4,096 tokens, exact attention NLL 1.4008, int8 QK -0.021 +- 0.021, int8 QK + PV -0.022 +- 0.021; 10 windows of 16,384 tokens, 1.2440,
-  -0.043 +- 0.036 and -0.109 +- 0.068 (negative is noise; the resolution is about 0.02 and 0.07 nats). It is not exact (text changes).
+  -0.043 +- 0.036 and -0.109 +- 0.068 (negative is noise; the resolution is about 0.02 and 0.07 nats). At 98,304 tokens of context (one window) the first-token KL against exact attention is 0.00007 for int8 QK and 0.00024 with the PV, the same top token, and the plain-decode prefill takes 449 s, 314 s and 262 s. It is not exact (text changes).
   `tools/pascal/ftk_arm.py` (`--ppl` for the log-likelihood) and `fa_pv8_check.cpp` are the harnesses. With a q4_0 K and V cache the int8 PV also works (the V rows are
   mapped to +-127 of the tile's largest scale; with the q8_0 scale their 4-bit values were squeezed to a few levels, NMSE 1.2e-3): attention 73.3 -> 59.3 ms at 10,240 keys
   (-19%), 255 -> 216 ms at 34,816 (-15%), NMSE 5e-5 against the FP32 PV; there the 32-key tile is faster than the 64-key one (61.8 against 69.8 ms) and is the default.
