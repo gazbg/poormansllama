@@ -9873,6 +9873,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, 64));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 128, 32, false, false, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, 64));
+    // expert matmul with rows a multiple of 128 and more than 64 tokens: the shapes GGML_CUDA_MMQ_REMAINDER=1|2|3 splits (leftover columns of an expert in a narrower tile)
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS }) {
+        for (int n : { 70, 333, 1000 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 256, n, 512));
+        }
+    }
     // mmvq with as many rows per block as warps (Pascal, short rows, >= 4096 rows); 4098 rows do not divide and take the old blocks
     for (ggml_type type_a : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1 }) {
         for (int n : { 1, 2, 3, 4 }) {
@@ -9991,6 +9997,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    // head size 128 with several tokens and a value-head repeat, as the Qwen3.5 / 3.6 layers use it (GGML_CUDA_GDN_WARPS = 8 | 16 take a different block shape)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 5, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 70, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 33, 2, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
@@ -10323,6 +10333,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, 2048,  512, {1, 1}, {1, 1})); // down, K of one expert
     }
 
+    // Qwen3.6-35B-A3B prefill chunk: gated delta net (16 query / key heads, 32 value heads, head size 128) over 2048 tokens
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Qwen3.6-35B-A3B decode (one token, or a 4-row MTP verify): the output head (Q6_K, vocabulary 248320), the dense Q8_0 projections and the routed experts
     for (int n : { 1, 4 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 2048, {1, 1}, {1, 1}));

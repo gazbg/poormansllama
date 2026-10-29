@@ -952,7 +952,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int tile_mode, const int rem_lo, const int col_main) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -989,13 +989,14 @@ static __global__ void mul_mat_q(
         const int zt = tmp2.y;
         const int jt = blockIdx.y;
         const int it = blockIdx.x;
+        int col0 = jt*J; // first column of the tile within the expert's columns
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
         int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + col0*stride_col_dst;
         int offset_y_scale;
         if constexpr (type == GGML_TYPE_NVFP4) {
             offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1014,8 +1015,15 @@ static __global__ void mul_mat_q(
                 offset_y_scale = 0;
             }
 
-            if (jt*J >= col_diff) {
-                return;
+            if (tile_mode == 2) {
+                // a launch of its own for the columns after the last full col_main tile of the expert, taken when their count is in (rem_lo, J]
+                const int rem = col_diff % col_main;
+                if (rem <= rem_lo || rem > J) {
+                    return;
+                }
+                col0 = col_diff - rem;
+            } else if (col0 >= col_diff || (tile_mode == 1 && col0 + J > col_diff && col_diff - col0 <= rem_lo)) {
+                return; // tile_mode 1: the full tiles, and the partial one unless a remainder launch takes it
             }
 
             // __syncthreads(); // There is no previous tile that could cause a race condition.
@@ -1027,21 +1035,21 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                ids_dst_shared[j] = ids_dst[col_low + col0 + j];
             }
             __syncthreads();
         }
 
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_y   += (col_low + col0)*(sizeof(block_q8_1_mmq)/sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt*J;
+            offset_y_scale += col_low + col0;
             y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
         }
 
         const int tile_x_max_i = nrows_x  - it*I - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
+        const int tile_y_max_j = col_diff - col0 - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
@@ -1385,7 +1393,8 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 }
 
 template <ggml_type type, int J, bool fallback>
-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+        const int tile_mode = 0, const int rem_lo = 0, const int col_main = 0, const bool single_tile = false) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1402,7 +1411,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
-    const int ntx  = (args.ncols_max + config.J - 1) / config.J;
+    const int ntx  = single_tile ? 1 : (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
@@ -1424,7 +1433,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, tile_mode, rem_lo, col_main);
         return;
     }
 
@@ -1453,7 +1462,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, 0, 0, 0);
 
     if (!fixup_needed) {
         return;
@@ -1464,6 +1473,63 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
+}
+
+// GGML_CUDA_MMQ_REMAINDER (MoE, tiles without stream-k, 64-column tiles): a 64-column tile that holds only the few leftover columns of an expert (about a third of all the columns
+// a prefill chunk computes) is replaced by a tile as wide as the leftover needs. 1: widths 16, 32, 48 and 64; 2: 32 and 64; 3: 24, 40 and 64; 0: off. Every expert still reads its weights once per row tile.
+// The result is bit-identical. Default: mode 1 on NVIDIA GPUs older than Volta (validated on a GTX 1070: +3.6 to +4.3% prefill), off elsewhere. Read at each launch, so a test can switch it.
+static int mmq_remainder_mode(const int cc) {
+    const char * e = getenv("GGML_CUDA_MMQ_REMAINDER");
+    if (e != nullptr) {
+        return atoi(e);
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA ? 1 : 0;
+}
+
+template <ggml_type type, int J, bool fallback>
+static bool mmq_remainder_ok(const int cc, const size_t smpbo) {
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+    return config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc);
+}
+
+template <ggml_type type, bool fallback>
+static bool launch_mul_mat_q_split(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int    mode  = mmq_remainder_mode(cc);
+    if (mode < 1 || mode > 3) {
+        return false;
+    }
+
+    const bool ok64 = mmq_remainder_ok<type, 64, fallback>(cc, smpbo);
+    const bool ok16 = mmq_remainder_ok<type, 16, fallback>(cc, smpbo);
+    const bool ok24 = mmq_remainder_ok<type, 24, fallback>(cc, smpbo);
+    const bool ok32 = mmq_remainder_ok<type, 32, fallback>(cc, smpbo);
+    const bool ok40 = mmq_remainder_ok<type, 40, fallback>(cc, smpbo);
+    const bool ok48 = mmq_remainder_ok<type, 48, fallback>(cc, smpbo);
+    if (!ok64 || (mode == 1 && !(ok16 && ok32 && ok48)) || (mode == 2 && !ok32) || (mode == 3 && !(ok24 && ok40))) {
+        return false;
+    }
+
+    // remainder launches first, one tile per expert; the widths are the upper bounds of the leftover-column classes (rem_lo is the bound below)
+    int lo = 0;
+    if (mode == 1) {
+        launch_mul_mat_q<type, 16, fallback>(ctx, args, stream, 2,  0, 64, true);
+        launch_mul_mat_q<type, 32, fallback>(ctx, args, stream, 2, 16, 64, true);
+        launch_mul_mat_q<type, 48, fallback>(ctx, args, stream, 2, 32, 64, true);
+        lo = 48;
+    } else if (mode == 2) {
+        launch_mul_mat_q<type, 32, fallback>(ctx, args, stream, 2,  0, 64, true);
+        lo = 32;
+    } else {
+        launch_mul_mat_q<type, 24, fallback>(ctx, args, stream, 2,  0, 64, true);
+        launch_mul_mat_q<type, 40, fallback>(ctx, args, stream, 2, 24, 64, true);
+        lo = 40;
+    }
+    // the main launch: the full tiles, and the partial tile when the leftover is wider than the last class
+    launch_mul_mat_q<type, 64, fallback>(ctx, args, stream, 1, lo, 64, false);
+    return true;
 }
 
 template <ggml_type type, bool fallback>
@@ -1491,6 +1557,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             J_best = J;
             ntiles_J_best = ntiles_x;
         }
+    }
+
+    if (J_best == 64 && !fallback && args.expert_bounds != nullptr && args.ncols_max > 64 && launch_mul_mat_q_split<type, fallback>(ctx, args, stream)) {
+        return;
     }
 
     switch (J_best) {

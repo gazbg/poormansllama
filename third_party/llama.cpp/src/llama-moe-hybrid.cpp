@@ -235,8 +235,19 @@ struct moe_hybrid_engine {
     std::vector<uint8_t>          last_sel;     // [n_layer*n_expert], the experts routed in the latest ingested step (recency only)
 
     // VRAM cache per layer [ne0, ne1, slots_l[layer] + 1]; the last slot of a layer stays zero and absorbs the misses
-    ggml_context *             cache_ctx = nullptr;
-    ggml_backend_buffer_t      cache_buf = nullptr;
+    // one buffer per layer, so that resize() can move the slots a layer keeps into a smaller or larger buffer on the device and free the old one at once: the peak during a resize is the old cache plus ONE layer
+    std::vector<ggml_context *>        cache_ctxs;
+    std::vector<ggml_backend_buffer_t> cache_bufs;
+    ggml_context *             state_ctx = nullptr;
+    ggml_backend_buffer_t      state_buf = nullptr;
+    int64_t cache_total_bytes() const {
+        int64_t n = state_buf ? (int64_t) ggml_backend_buffer_get_size(state_buf) : 0;
+        for (ggml_backend_buffer_t b : cache_bufs) {
+            n += b ? (int64_t) ggml_backend_buffer_get_size(b) : 0;
+        }
+        return n;
+    }
+    bool cache_ready() const { return !cache_bufs.empty() && cache_bufs[0] != nullptr; }
     std::vector<ggml_tensor *> c_up, c_gate, c_down;
     ggml_tensor *              state = nullptr; // I32[16]: [0] = publish sequence
 
@@ -418,6 +429,30 @@ struct moe_hybrid_engine {
             wake_gen.fetch_add(1, std::memory_order_release);
         }
         cv.notify_one();
+    }
+
+    // the three cache tensors of layer il (slots_l[il] experts and the zero slot) in a buffer of their own, zeroed; false when the allocation failed
+    bool alloc_cache_layer(int il, ggml_context *& ctx, ggml_backend_buffer_t & buf, ggml_tensor * (&t)[3]) {
+        ggml_init_params ip = { ggml_tensor_overhead()*3, nullptr, true };
+        ctx = ggml_init(ip);
+        if (ctx == nullptr) {
+            GGML_ABORT("moe_hybrid: cache context allocation failed");
+        }
+        const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
+        for (int k = 0; k < 3; ++k) {
+            t[k] = ggml_new_tensor_3d(ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], slots_l[(size_t) il] + 1);
+            GGML_ASSERT(t[k]->nb[1] == src[k]->nb[1] && t[k]->nb[2] == src[k]->nb[2]);
+            ggml_format_name(t[k], "moe_hybrid.%d.%d", il, k);
+        }
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cuda));
+        if (buf == nullptr) {
+            ggml_free(ctx);
+            ctx = nullptr;
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(buf, 0);
+        return true;
     }
 
     void queue_expert(int l, int e, int s) {
@@ -747,33 +782,34 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     // VRAM cache
     compute_split();
     {
-        ggml_init_params ip = { ggml_tensor_overhead()*(3*(size_t) n_layer + 1), nullptr, true };
-        cache_ctx = ggml_init(ip);
-        if (cache_ctx == nullptr) {
-            GGML_ABORT("moe_hybrid: cache context allocation failed");
-        }
         c_up.resize(n_layer);
         c_gate.resize(n_layer);
         c_down.resize(n_layer);
+        cache_ctxs.assign(n_layer, nullptr);
+        cache_bufs.assign(n_layer, nullptr);
         for (int il = 0; il < n_layer; ++il) {
-            ggml_tensor ** dst[3] = { &c_up[il], &c_gate[il], &c_down[il] };
-            const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
-            for (int k = 0; k < 3; ++k) {
-                ggml_tensor * t = ggml_new_tensor_3d(cache_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], slots_l[(size_t) il] + 1);
-                GGML_ASSERT(t->nb[1] == src[k]->nb[1] && t->nb[2] == src[k]->nb[2]);
-                ggml_format_name(t, "moe_hybrid.%d.%d", il, k);
-                *dst[k] = t;
+            ggml_tensor * t[3];
+            if (!alloc_cache_layer(il, cache_ctxs[(size_t) il], cache_bufs[(size_t) il], t)) {
+                GGML_ABORT("moe_hybrid: VRAM cache allocation failed (%d slots per layer)", n_slot);
             }
+            c_up[il] = t[0];
+            c_gate[il] = t[1];
+            c_down[il] = t[2];
         }
-        state = ggml_new_tensor_1d(cache_ctx, GGML_TYPE_I32, 16);
+        ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+        state_ctx = ggml_init(ip);
+        if (state_ctx == nullptr) {
+            GGML_ABORT("moe_hybrid: cache context allocation failed");
+        }
+        state = ggml_new_tensor_1d(state_ctx, GGML_TYPE_I32, 16);
         ggml_set_name(state, "moe_hybrid.state");
-        cache_buf = ggml_backend_alloc_ctx_tensors_from_buft(cache_ctx, ggml_backend_get_default_buffer_type(cuda));
-        if (cache_buf == nullptr) {
+        state_buf = ggml_backend_alloc_ctx_tensors_from_buft(state_ctx, ggml_backend_get_default_buffer_type(cuda));
+        if (state_buf == nullptr) {
             GGML_ABORT("moe_hybrid: VRAM cache allocation failed (%d slots per layer)", n_slot);
         }
-        ggml_backend_buffer_set_usage(cache_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        ggml_backend_buffer_clear(cache_buf, 0);
-        info_cache_bytes.store((int64_t) ggml_backend_buffer_get_size(cache_buf));
+        ggml_backend_buffer_set_usage(state_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(state_buf, 0);
+        info_cache_bytes.store(cache_total_bytes());
         info_n_slot.store(n_slot);
     }
 
@@ -862,7 +898,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
         fprintf(log, "{\"event\":\"config\",\"slots\":%d,\"B\":%d,\"lambda\":%.17g,\"threads\":%d,\"first\":%d,\"stride\":%d,\"poll\":%d,"
                      "\"n_layer\":%d,\"n_expert\":%d,\"n_used\":%d,\"cache_bytes\":%zu,\"reg_bytes\":%zu,\"reg_ms\":%.1f,\"fill_ms\":%.1f}\n",
                 n_slot, budget, lambda, n_threads, cpu_first, cpu_stride, poll, n_layer, n_expert, n_used,
-                ggml_backend_buffer_get_size(cache_buf), reg_bytes, reg_ms, fill_ms);
+                (size_t) cache_total_bytes(), reg_bytes, reg_ms, fill_ms);
         fflush(log);
     }
 
@@ -891,7 +927,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
 
     LLAMA_LOG_INFO("%s: moe_hybrid: %d slots x %d layers (%.1f MiB VRAM), B=%d lambda=%g, engine %d threads from CPU %d stride %d poll %d pf %d, "
                    "registered %.1f MiB in %.1f ms, fill %.1f ms, init %.1f ms\n", __func__,
-                   n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll, pf_bytes,
+                   n_slot, n_layer, cache_total_bytes()/1048576.0, budget, lambda, n_threads, cpu_first, cpu_stride, poll, pf_bytes,
                    reg_bytes/1048576.0, reg_ms, fill_ms, moe_hybrid_us(t_init)/1e3);
 }
 
@@ -904,7 +940,7 @@ bool moe_hybrid_engine::resize(int new_slots) {
     if (new_slots == n_slot) {
         return true;
     }
-    if (new_slots < 1 || new_slots > n_expert || freq_.empty() || cache_buf == nullptr) {
+    if (new_slots < 1 || new_slots > n_expert || freq_.empty() || !cache_ready()) {
         return false;
     }
     // G31n: promotion copies of the last decoded token may still be queued (state 1): they target the cache that is about to be freed, drop them; wait (<= 100 ms) for a submission in progress (2, 3)
@@ -932,40 +968,18 @@ bool moe_hybrid_engine::resize(int new_slots) {
     scan_have = false;
     scan_out.clear();
 
-    int32_t st[16] = {};
-    ggml_backend_tensor_get(state, st, 0, sizeof(st));
-
-    ggml_backend_buffer_free(cache_buf);
-    cache_buf = nullptr;
-    ggml_free(cache_ctx);
-    cache_ctx = nullptr;
+    // The old cache stays on the device until its content has moved: a slot that the new policy keeps and that was published (its upload had finished) is copied device to device, the others
+    // are uploaded from the host. Layer by layer, so the peak VRAM is the old cache plus one layer; LLAMA_MOE_HYBRID_RESIZE_KEEP=0 re-uploads everything, as before G43.
+    static const bool keep_on_device = moe_hybrid_env_int("LLAMA_MOE_HYBRID_RESIZE_KEEP", 1) != 0;
+    const std::vector<int32_t>          old_map   = map;
+    const std::vector<int>              old_slots = slots_l;
+    const std::vector<ggml_tensor *>    old_up = c_up, old_gate = c_gate, old_down = c_down;
+    std::vector<ggml_context *>         old_ctxs = std::move(cache_ctxs);
+    std::vector<ggml_backend_buffer_t>  old_bufs = std::move(cache_bufs);
+    cache_ctxs.assign(n_layer, nullptr);
+    cache_bufs.assign(n_layer, nullptr);
     n_slot = new_slots;
     compute_split();
-
-    ggml_init_params ip = { ggml_tensor_overhead()*(3*(size_t) n_layer + 1), nullptr, true };
-    cache_ctx = ggml_init(ip);
-    if (cache_ctx == nullptr) {
-        GGML_ABORT("moe_hybrid: cache context allocation failed");
-    }
-    for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor ** dst[3] = { &c_up[il], &c_gate[il], &c_down[il] };
-        const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
-        for (int k = 0; k < 3; ++k) {
-            ggml_tensor * t = ggml_new_tensor_3d(cache_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], slots_l[(size_t) il] + 1);
-            GGML_ASSERT(t->nb[1] == src[k]->nb[1] && t->nb[2] == src[k]->nb[2]);
-            ggml_format_name(t, "moe_hybrid.%d.%d", il, k);
-            *dst[k] = t;
-        }
-    }
-    state = ggml_new_tensor_1d(cache_ctx, GGML_TYPE_I32, 16);
-    ggml_set_name(state, "moe_hybrid.state");
-    cache_buf = ggml_backend_alloc_ctx_tensors_from_buft(cache_ctx, ggml_backend_get_default_buffer_type(cuda));
-    if (cache_buf == nullptr) {
-        GGML_ABORT("moe_hybrid: VRAM cache allocation failed (%d slots per layer)", n_slot);
-    }
-    ggml_backend_buffer_set_usage(cache_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_buffer_clear(cache_buf, 0);
-    ggml_backend_tensor_set(state, st, 0, sizeof(st));
 
     // policy state and initial fill, exactly as init() does for the new slot count. With keep_stats (the server, G31j/G31q) the popularity statistics (ema, last_sel) are KEPT and the refill takes the experts with the
     // highest policy score, so a shrink keeps the experts the engine found hot; without it (the runner) the statistics are reset and the order is the frequency table's, as recorded
@@ -983,7 +997,12 @@ bool moe_hybrid_engine::resize(int new_slots) {
     dma_dst.clear();
     dma_src.clear();
     dma_size.clear();
+    int64_t n_d2d = 0, n_h2d = 0;
     std::vector<int> order(n_expert);
+    std::vector<void *>       cp_dst;
+    std::vector<const void *> cp_src;
+    std::vector<size_t>       cp_size;
+    std::vector<std::pair<int, int>> cp_es;   // (expert, new slot) of the device copies, to upload them instead when the copies cannot be queued
     for (int il = 0; il < n_layer; ++il) {
         std::iota(order.begin(), order.end(), 0);
         if (keep_stats) {
@@ -994,20 +1013,93 @@ bool moe_hybrid_engine::resize(int new_slots) {
             const int64_t * fl = freq_.data() + (size_t) il*n_expert;
             std::stable_sort(order.begin(), order.end(), [fl](int a, int b) { return fl[a] > fl[b]; });
         }
+        bool have_old = keep_on_device && old_bufs[(size_t) il] != nullptr;
+        ggml_tensor * t[3];
+        if (!alloc_cache_layer(il, cache_ctxs[(size_t) il], cache_bufs[(size_t) il], t)) {
+            // no room for one more layer next to the old cache: give the old layer up (its slots are uploaded from the host)
+            if (old_bufs[(size_t) il] != nullptr) {
+                ggml_backend_cuda_aux_synchronize(cuda);
+                ggml_backend_buffer_free(old_bufs[(size_t) il]);
+                ggml_free(old_ctxs[(size_t) il]);
+                old_bufs[(size_t) il] = nullptr;
+                old_ctxs[(size_t) il] = nullptr;
+                have_old = false;
+            }
+            if (!alloc_cache_layer(il, cache_ctxs[(size_t) il], cache_bufs[(size_t) il], t)) {
+                GGML_ABORT("moe_hybrid: VRAM cache allocation failed (%d slots per layer)", n_slot);
+            }
+        }
+        c_up[il]   = t[0];
+        c_gate[il] = t[1];
+        c_down[il] = t[2];
+        const ggml_tensor * o[3] = { old_up[(size_t) il], old_gate[(size_t) il], old_down[(size_t) il] };
+        cp_dst.clear();
+        cp_src.clear();
+        cp_size.clear();
+        cp_es.clear();
         for (int s = 0; s < slots_l[(size_t) il]; ++s) {
             const int e = order[s];
             map[(size_t) il*n_expert + e]     = s;
             slot_of[(size_t) il*n_expert + e] = s;
             slot_expert[slot_off[(size_t) il] + s] = e;
-            queue_expert(il, e, s);
+            const int os = have_old ? old_map[(size_t) il*n_expert + e] : -1;
+            if (os >= 0 && os < old_slots[(size_t) il]) {
+                for (int k = 0; k < 3; ++k) {
+                    cp_dst.push_back((char *) t[k]->data + (size_t) s*t[k]->nb[2]);
+                    cp_src.push_back((const char *) o[k]->data + (size_t) os*o[k]->nb[2]);
+                    cp_size.push_back(t[k]->nb[2]);
+                }
+                cp_es.emplace_back(e, s);
+                n_d2d++;
+            } else {
+                queue_expert(il, e, s);
+                n_h2d++;
+            }
+        }
+        if (!cp_dst.empty() && !ggml_backend_cuda_copy_d2d_aux(cuda, cp_dst.data(), cp_src.data(), cp_size.data(), cp_dst.size())) {
+            for (const auto & es : cp_es) {
+                queue_expert(il, es.first, es.second);
+                n_h2d++;
+                n_d2d--;
+            }
         }
         submit_dma();
+        if (old_bufs[(size_t) il] != nullptr) {
+            ggml_backend_cuda_aux_synchronize(cuda);   // the copies out of the old layer have finished
+            ggml_backend_buffer_free(old_bufs[(size_t) il]);
+            ggml_free(old_ctxs[(size_t) il]);
+            old_bufs[(size_t) il] = nullptr;
+            old_ctxs[(size_t) il] = nullptr;
+        }
     }
     ggml_backend_cuda_aux_synchronize(cuda);
-    info_cache_bytes.store((int64_t) ggml_backend_buffer_get_size(cache_buf));
+    info_cache_bytes.store(cache_total_bytes());
     info_n_slot.store(n_slot);
-    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms\n", __func__,
-                   n_slot, n_layer, ggml_backend_buffer_get_size(cache_buf)/1048576.0, moe_hybrid_us(t0)/1e3);
+    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host)\n", __func__,
+                   n_slot, n_layer, cache_total_bytes()/1048576.0, moe_hybrid_us(t0)/1e3, (long long) n_d2d, (long long) n_h2d);
+
+    // LLAMA_MOE_HYBRID_RESIZE_VERIFY=1 (test): read every slot back and compare it with the host bank it stands for
+    if (moe_hybrid_env_int("LLAMA_MOE_HYBRID_RESIZE_VERIFY", 0) != 0) {
+        int64_t checked = 0, bad = 0;
+        std::vector<char> buf;
+        for (int il = 0; il < n_layer; ++il) {
+            const ggml_tensor * dst[3] = { c_up[il], c_gate[il], c_down[il] };
+            const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
+            for (int s = 0; s < slots_l[(size_t) il]; ++s) {
+                const int e = slot_expert[slot_off[(size_t) il] + s];
+                if (e < 0) {
+                    continue;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    buf.resize(src[k]->nb[2]);
+                    ggml_backend_tensor_get(dst[k], buf.data(), (size_t) s*dst[k]->nb[2], src[k]->nb[2]);
+                    bad += memcmp(buf.data(), (const char *) src[k]->data + (size_t) e*src[k]->nb[2], src[k]->nb[2]) != 0;
+                }
+                checked++;
+            }
+        }
+        LLAMA_LOG_WARN("%s: moe_hybrid: resize verify: %lld slots read back, %lld banks differ from the host\n", __func__, (long long) checked, (long long) bad);
+    }
     return true;
 }
 
@@ -2212,13 +2304,23 @@ void moe_hybrid_engine::shutdown() {
         ggml_backend_buffer_free(xd_buf);
         xd_buf = nullptr;
     }
-    if (cache_buf) {
-        ggml_backend_buffer_free(cache_buf);
-        cache_buf = nullptr;
+    for (size_t il = 0; il < cache_bufs.size(); ++il) {
+        if (cache_bufs[il]) {
+            ggml_backend_buffer_free(cache_bufs[il]);
+        }
+        if (cache_ctxs[il]) {
+            ggml_free(cache_ctxs[il]);
+        }
     }
-    if (cache_ctx) {
-        ggml_free(cache_ctx);
-        cache_ctx = nullptr;
+    cache_bufs.clear();
+    cache_ctxs.clear();
+    if (state_buf) {
+        ggml_backend_buffer_free(state_buf);
+        state_buf = nullptr;
+    }
+    if (state_ctx) {
+        ggml_free(state_ctx);
+        state_ctx = nullptr;
     }
     if (host_buf) {
         ggml_backend_buffer_free(host_buf);
@@ -2340,7 +2442,7 @@ bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_byte
         }
         eng = g_moe_hybrid_engines.begin()->second.get();
     }
-    if (eng->cache_buf == nullptr || eng->cuda == nullptr) {
+    if (!eng->cache_ready() || eng->cuda == nullptr) {
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(eng->cuda);
@@ -2349,7 +2451,7 @@ bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_byte
     if ((int64_t) free_b >= need_free_bytes) {
         return true;
     }
-    const int64_t cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
+    const int64_t cache_bytes = eng->cache_total_bytes();
     const int64_t row_bytes   = cache_bytes / (eng->n_slot + 1);
     if (row_bytes <= 0) {
         return false;
@@ -2382,13 +2484,13 @@ bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_b
         }
         eng = g_moe_hybrid_engines.begin()->second.get();
     }
-    if (eng->cache_buf == nullptr || eng->cuda == nullptr) {
+    if (!eng->cache_ready() || eng->cuda == nullptr) {
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(eng->cuda);
     size_t free_b = 0, total_b = 0;
     ggml_backend_dev_memory(dev, &free_b, &total_b);
-    const int64_t cache_bytes = (int64_t) ggml_backend_buffer_get_size(eng->cache_buf);
+    const int64_t cache_bytes = eng->cache_total_bytes();
     const int64_t row_bytes   = cache_bytes / (eng->n_slot + 1);
     if (row_bytes <= 0) {
         return false;

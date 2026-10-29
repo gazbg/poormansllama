@@ -5423,6 +5423,25 @@ bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
 #endif
 }
 
+bool ggml_backend_cuda_copy_d2d_aux(ggml_backend_t backend,
+                                    void * const * dsts, const void * const * srcs,
+                                    const size_t * sizes, size_t count) {
+    if (!ggml_backend_is_cuda(backend) || dsts == nullptr || srcs == nullptr || sizes == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, 1);
+    for (size_t i = 0; i < count; ++i) {
+        const cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_backend_cuda_event_ready(ggml_backend_event_t event) {
     const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
     if (err == cudaErrorNotReady) {
