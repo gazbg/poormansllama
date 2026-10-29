@@ -686,7 +686,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ_q8(
 // a two-byte P fixed that but was not faster than FP32 PV (spills). V stays q8_0, whose scale
 // varies per key and per block of 32 head-dim values and so cannot be taken out of an integer sum over keys: the V rows of the tile are requantized
 // to one scale per block (the largest of the tile), transposed to words of 4 keys, and the products are dp4a. The tile's sums are scaled back in FP32.
-template <int warp_size, int nwarps, int ncols, int nbatch_fa, int KQ_cs, int CPYD, bool oob_check>
+template <int warp_size, int nwarps, int ncols, int nbatch_fa, int KQ_cs, int CPYD, bool Q4, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_pv_i8(
         const float * const __restrict__ KQ, float2 * const VKQ, const char * const __restrict__ V_q8, const int stride_V_bytes,
         char * const __restrict__ KV_raw, int * const __restrict__ Vt, int * const __restrict__ Pq, float * const __restrict__ Sb,
@@ -740,13 +740,26 @@ static __device__ __forceinline__ void flash_attn_tile_pv_i8(
         int   w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         float d    = 0.0f;
         if (!oob_check || row < k_VKQ_sup) {
-            const block_q8_0 * b = (const block_q8_0 *) (V_q8 + int64_t(k_VKQ_0 + row)*stride_V_bytes) + blk;
-            d = __half2float(b->d);
+            if constexpr (Q4) {
+                // q4_0 block (as for K): (nibble - 8) is the int8 value of the q8_0 layout, elements 0..15 in w[0..3] and 16..31 in w[4..7]
+                const block_q4_0 * b = (const block_q4_0 *) (V_q8 + int64_t(k_VKQ_0 + row)*stride_V_bytes) + blk;
+                d = __half2float(b->d);
 #pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                int v;
-                ggml_cuda_memcpy_1<sizeof(int), 2>(&v, b->qs + 4*l);
-                w[l] = v;
+                for (int l = 0; l < 4; ++l) {
+                    int v;
+                    ggml_cuda_memcpy_1<sizeof(int), 2>(&v, b->qs + 4*l);
+                    w[l]     = __vsubss4( v       & 0x0F0F0F0F, 0x08080808);
+                    w[4 + l] = __vsubss4((v >> 4) & 0x0F0F0F0F, 0x08080808);
+                }
+            } else {
+                const block_q8_0 * b = (const block_q8_0 *) (V_q8 + int64_t(k_VKQ_0 + row)*stride_V_bytes) + blk;
+                d = __half2float(b->d);
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    int v;
+                    ggml_cuda_memcpy_1<sizeof(int), 2>(&v, b->qs + 4*l);
+                    w[l] = v;
+                }
             }
         }
         int4 * dst = (int4 *) (Vq + row*Vq_stride + blk*32);
@@ -763,7 +776,7 @@ static __device__ __forceinline__ void flash_attn_tile_pv_i8(
         for (int r = 0; r < TK; ++r) {
             m = fmaxf(m, Vd[r*Vd_stride + tid]);
         }
-        Sb[tid] = m;
+        Sb[tid] = Q4 ? m*(8.0f/127.0f) : m;   // q4_0: |q| <= 8, so the largest row of the tile is mapped to +-127 (the q8_0 rows already are)
     }
     __syncthreads();
 
@@ -1013,7 +1026,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
         for (int key0 = 0; key0 < nbatch_fa; key0 += warp_size) {
             if (!oob_check || key0 < k_VKQ_sup) {
-                flash_attn_tile_pv_i8<warp_size, nwarps, ncols, nbatch_fa, KQ_cs, (cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size), oob_check>(
+                flash_attn_tile_pv_i8<warp_size, nwarps, ncols, nbatch_fa, KQ_cs, (cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size), K_Q4, oob_check>(
                     KQ, (float2 *) VKQ, V_q8, stride_V_bytes, (char *) KV_tmp, Vt, Pq, Sb, k_VKQ_0 + key0, k_VKQ_sup - key0, key0);
             }
         }
@@ -1531,14 +1544,14 @@ static void launch_fattn_tile_q8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if constexpr (DKQ == 256 && DV == 256) {
         static const int cfg_env = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8CFG"); return e != nullptr ? atoi(e) : -1; }();
         static const bool pv8 = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8PV"); return e != nullptr && e[0] == '1'; }();
-        if constexpr (!Q4) {
-            // The int8 PV defaults to configuration 3 (64 keys per tile, so that each Q read serves two keys of a lane); 0 is the 32-key tile.
-            const int pv8_cfg = cfg_env < 0 ? 3 : cfg_env;
-            if (pv8 && (pv8_cfg == 0 || pv8_cfg == 3) && dst->src[2]->type == GGML_TYPE_Q8_0) {
+        {
+            // The int8 PV defaults to configuration 3 (64 keys per tile, so that each Q read serves two keys of a lane) for q8_0 and 0 (32 keys) for q4_0; V must have the type of K.
+            const int pv8_cfg = cfg_env < 0 ? (Q4 ? 0 : 3) : cfg_env;   // measured: the 64-key tile is slower than the 32-key one with a q4_0 cache (69.8 against 61.8 ms at 10,240 keys)
+            if (pv8 && (pv8_cfg == 0 || pv8_cfg == 3) && dst->src[2]->type == (Q4 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0)) {
                 if (pv8_cfg == 0) {
-                    launch_fattn_tile_q8_cfg<0, false, true>(ctx, dst);
+                    launch_fattn_tile_q8_cfg<0, Q4, true>(ctx, dst);
                 } else {
-                    launch_fattn_tile_q8_cfg<3, false, true>(ctx, dst);
+                    launch_fattn_tile_q8_cfg<3, Q4, true>(ctx, dst);
                 }
                 return;
             }

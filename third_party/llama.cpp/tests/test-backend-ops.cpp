@@ -10299,7 +10299,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3.6-35B-A3B layer-major prefill chunk: 2048 queries at depth kv - 2048, GQA 8, head size 256, causal window op
     for (int kv : { 2048, 10240, 34816, 67584 }) {
-        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 2048, false, false, 0, 0, GGML_PREC_F32,
                 type_KV, type_KV, {0, 1, 2, 3}, true, kv - 2048));
         }
