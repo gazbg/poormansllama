@@ -67,7 +67,7 @@ Acts on prompt batches of at least `--lm-prefill-min` tokens. Works with and wit
 | `--lm-prefill-bf16` | off | Activations in bf16, half the slab. Not validated against f32 for the MoE model; for the dense Qwen3.8 see the KL study in `docs/plans/dense-qwen38-iq3-residency.md`. Do not use for claims elsewhere |
 | `--lm-prefill-attn-int8` | off | The pass's flash attention computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal). About 1.7x faster attention, 22% of an 18k-token pass of the dense Qwen3.8-27B. An APPROXIMATION (Q quantised to int8 per 32 values, as the decode kernel does). Use with the f32 slab (without `--lm-prefill-bf16`): the pair failed the continuation rule on 1 of 8 prompts. Same as `LLAMA_FATTN_TILE_Q8QK=1` |
 | `--fattn-head-tile` | off | With a QUANTIZED K/V cache the CUDA TILE / MMA flash attention (every prefill batch, the pass included) reads K and V as f16, so every context with a flash-attention node reserves and fills an f16 copy of the layer's whole K and V: 4 KiB per context token for the dense Qwen3.8-27B (~1 GiB at 262,144 tokens; the MTP draft context has its own). This flag converts ONE KV head at a time (runs the kernel once per KV head on strided views), so the scratch is 1/n_head_kv of that (4x smaller dense, 2x the MoE). Same arithmetic per head; not applied with ALiBi, sinks, an f16/f16 cache, or the VEC decode kernel (which reads the quantized cache directly and never had the scratch). Measured at `-c 128000`, q4_0/q4_0 target and draft cache: compute buffers 768.77 -> 396.77 MiB (target) and 705.28 -> 333.28 MiB (each draft context), idle VRAM 7,480 -> 6,736 MiB; `test-backend-ops -o FLASH_ATTN_EXT` 711/711 with and without it; KL against the f16 cache inside the noise of the untiled kernel (below). Not tested: the TILE kernel (Pascal), several sequences per batch, speed. Same as `LLAMA_FATTN_HEAD_TILE=1`. See `docs/plans/dense-decode-ring-windows.md` G-TILE |
-| `--lm-prefill-ckpt-chunk N` | `0` | The last `N + 4` tokens go in a separate chunk, so a checkpoint exists `N + 4` tokens before the end. `0` uses the stock rule (`4 + ubatch`). A chunk of 24 runs on the CPU in about 0.3 s. A chunk of 512 copies every bank, about 1.3 s. The cost is a shallower rollback |
+| `--lm-prefill-ckpt-chunk N` | `0` | The last `N + 4` tokens go in a separate chunk, so a checkpoint exists `N + 4` tokens before the end. `0` uses the stock rule (`4 + ubatch`). A chunk of 24 runs on the CPU in about 0.3 s. A chunk of 512 copies every bank, about 1.3 s (about 2.3 s on a GTX 1070 at PCIe Gen3 x8: 24 gave +29% / +7.8% / +3% prefill at 4k / 16k / 32k tokens, LINUX-PASCAL.md section 3.7). The cost is a shallower rollback |
 | `--lm-prefill-canonical` | off | A cache hit equals a fresh run bit for bit. Checkpoints only at multiples of `--lm-prefill-ubatch`. A continuation resumes from the newest checkpoint before the common prefix. Costs up to one chunk more prefill per follow-up. Needs `-b` to be a multiple of the chunk size and context checkpoints enabled |
 | `--lm-prefill-fuse` | off | With `-np 1`: the rest of a prompt goes in one batch instead of being cut at checkpoints. Checkpoints are still stored. Saves the second and third bank streams, about 1.3 s each |
 | `--lm-prefill-fuse-min N` | `700` | Fewest prompt tokens left after a cache hit that `--lm-prefill-fuse` sends whole |
@@ -125,7 +125,10 @@ the expert team, the last one for the engine thread. The CPUs are pinned on Wind
 Linux only the number of entries counts, as the team size. The team defaults to the physical
 cores the process may use, at most 8, on Linux (a flat 8 elsewhere); `LLAMA_MOE_HYBRID_THREADS`
 overrides it. A team larger than the physical cores made decode 4 to 5 times slower on an
-i7-4770K (LINUX-PASCAL.md section 3.2).
+i7-4770K (LINUX-PASCAL.md section 3.2). `LLAMA_MOE_HYBRID_LEAN_BATCH` (default 1) serves the
+requests that the rows of an MTP verify step post for one layer as one job of the team, so each
+missed expert is read once; the results are bit-identical, `0` serves every request on its own
+(LINUX-PASCAL.md section 3.7).
 
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
 tests fail without it, and the CMake cache keeps the value from configure time.
@@ -155,7 +158,7 @@ so with plain `draft-mtp` the prompt takes the ordinary path (`--lm-prefill-fuse
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--spec-mtp-defer` | off | MTP: no hidden states while the prompt is processed, so the prompt batches output only their last row and `--lm-prefill` takes them. Drafting starts at the second generated token (the first one has no hidden state of the position before it). The draft cache holds no prompt positions, so drafts are worse. Needs `-np 1` and `--spec-type draft-mtp`; one MTP head with its own cache only |
+| `--spec-mtp-defer` | off | MTP: no hidden states while the prompt is processed, so the prompt batches output only their last row and `--lm-prefill` takes them. Drafting starts at the second generated token (the first one has no hidden state of the position before it). The draft cache holds no prompt positions, so drafts are worse. Needs `-np 1` and `--spec-type draft-mtp`; one MTP head with its own cache only. The draft context then gets a ubatch of `max(16, n-max + 1)`: it never decodes more rows, and its compute buffer shrinks (564 -> 266 MiB for Qwen3.6-35B-A3B), which `--hybrid-moe` gives to the expert cache |
 
 Inside the pass a context with snapshots runs as if `n_rs_seq` were 0 (plain delta-net graph,
 plane 0 of the state, no keep-tail split) and is restored afterwards; the pass declines when a

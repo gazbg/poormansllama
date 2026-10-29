@@ -268,6 +268,77 @@ static void check_pair(ggml_backend_t cpu, const type_pair & tp, int n_embd, int
     std::printf("%-22s %4d requests x (thread counts 1,2,3,5,8) %s\n", tp.name, total, bad == 0 ? "bit-identical" : "DIFFER");
 }
 
+// several token rows in one job (the rows of an MTP verify step): every row must get exactly the bits a job of that row alone gives, with experts shared between rows or not
+static void check_multi_row(ggml_backend_t cpu) {
+    const int n_embd = 2048, n_ff = 512, n_expert = 12;
+    const type_pair pairs[] = {
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, "q4_K/q5_K" },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, "q4_K/q6_K" },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "q8_0/q8_0" },
+    };
+    for (const type_pair & tp : pairs) {
+        layer_weights lw;
+        if (!make_layer(lw, cpu, tp.ud, tp.down, n_embd, n_ff, n_expert, false, 4242u)) {
+            CHECK(false, "%s: weight allocation failed", tp.name);
+            continue;
+        }
+        const moe_lean::layer_banks lb = banks_of(lw);
+        std::mt19937                          rng(99u);
+        std::normal_distribution<float>       nd(0.0f, 1.0f);
+        std::uniform_real_distribution<float> ud(0.02f, 0.6f);
+        int bad = 0, total = 0, shared = 0;
+        for (int nth : { 1, 3, 4, 8 }) {
+            moe_lean::team team(nth, n_embd, n_ff, 0, nullptr, 2000);
+            for (int rep = 0; rep < 24; ++rep) {
+                const int nr = 2 + rep % 3;
+                std::vector<std::vector<float>> x((size_t) nr), y1((size_t) nr), yb((size_t) nr);
+                int32_t ids[moe_lean::MAX_R][8];
+                float   w[moe_lean::MAX_R][8];
+                int     m[moe_lean::MAX_R];
+                int     pairs_n = 0;
+                for (int r = 0; r < nr; ++r) {
+                    x[(size_t) r].resize((size_t) n_embd);
+                    for (auto & v : x[(size_t) r]) { v = nd(rng); }
+                    y1[(size_t) r].assign((size_t) n_embd, -1.0f);
+                    yb[(size_t) r].assign((size_t) n_embd, -2.0f);
+                    std::vector<int32_t> pool((size_t) n_expert);
+                    for (int i = 0; i < n_expert; ++i) { pool[(size_t) i] = i; }
+                    std::shuffle(pool.begin(), pool.end(), rng);
+                    m[r] = 1 + (int) (rng() % 8);
+                    for (int i = 0; i < m[r]; ++i) {
+                        ids[r][i] = pool[(size_t) i];
+                        w[r][i]   = ud(rng);
+                    }
+                    pairs_n += m[r];
+                }
+                for (int r = 0; r < nr; ++r) {
+                    moe_lean::job j;
+                    j.lb = &lb; j.m = m[r]; j.ids = ids[r]; j.w = w[r]; j.x = x[(size_t) r].data(); j.y = y1[(size_t) r].data();
+                    team.run(j);
+                }
+                moe_lean::job jb;
+                jb.lb = &lb;
+                jb.nr = nr;
+                for (int r = 0; r < nr; ++r) {
+                    jb.rows[r] = { m[r], ids[r], w[r], x[(size_t) r].data(), yb[(size_t) r].data() };
+                }
+                team.run(jb);
+                CHECK(team.last_unique() <= pairs_n, "%s: %d distinct experts for %d pairs", tp.name, team.last_unique(), pairs_n);
+                shared += pairs_n - team.last_unique();
+                for (int r = 0; r < nr; ++r) {
+                    ++total;
+                    if (memcmp(y1[(size_t) r].data(), yb[(size_t) r].data(), (size_t) n_embd*sizeof(float)) != 0) {
+                        ++bad;
+                    }
+                }
+            }
+        }
+        CHECK(bad == 0, "%s: %d of %d rows of multi-row jobs differ from single-row jobs", tp.name, bad, total);
+        CHECK(shared > 0, "%s: the random rows never shared an expert (the test covers nothing)", tp.name);
+        std::printf("%-22s %4d rows in multi-row jobs (%d shared pairs) %s\n", tp.name, total, shared, bad == 0 ? "bit-identical to single-row jobs" : "DIFFER");
+    }
+}
+
 // G15: the post stage after the reply (router logits of the next layer on the request row, one barrier, the first K non-resident experts of the top ranks, prefetch of the
 // workers' slices). It must change no result bit, must choose exactly the experts a single-threaded reference chooses, and must not leave a worker waiting when the leader skips it
 // or forgets it.
@@ -642,6 +713,7 @@ int main(int argc, char ** argv) {
     for (const type_pair & tp : pairs) {
         check_pair(cpu, tp, n_embd, n_ff, n_expert);
     }
+    check_multi_row(cpu);
 
     // an idle team parks: after the last request the workers spin for the idle window (4 ms here) and then sleep, so a generation that has ended does not leave 8 cores spinning;
     // the first request after a park wakes them and still gives the same bits

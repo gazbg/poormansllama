@@ -2465,6 +2465,12 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // a deferred MTP head never sees a prompt batch: it decodes the sampled token and the accepted drafts only.
+    // A ubatch under the offload threshold (32) keeps the reserve from holding a VRAM copy of host expert weights.
+    if (spec_mtp && !has_draft && params.speculative.draft.mtp_defer) {
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, (uint32_t) std::max(16, params.speculative.draft.n_max + 1));
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

@@ -181,6 +181,96 @@ first-token logprobs and greedy text are bit-identical to the old tile.
 - `--lm-prefill-prearm auto`: turns 3 to 7 of a growing conversation averaged
   6.26 s against 6.68 s with it off (6%).
 
+### 3.7 Decode and prefill with MTP, 2026-10-24 (measured)
+
+Command: the owner's MoE command (`-c 262000 -ctk q8_0 -ctv q8_0 --hybrid-moe --lm-prefill --lm-prefill-ubatch 2048
+--lm-prefill-segment 4096 -b 4096 --hybrid-moe-prefill-ubatch 0 --ctx-checkpoints 32 --fattn-head-tile --lm-prefill-attn-int8
+--spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 -ctkd q8_0 -ctvd q8_0 --spec-mtp-defer`),
+greedy decode of 256 tokens on three chats and after a 16k-token prompt, A-B-B-A arms (`tools/pascal/`).
+
+Where a decode round went before the changes (nsys, one round = one MTP verify step of up to 4 token rows plus up to 3 drafts,
+about 105 ms): the GPU waited for the CPU expert leg about 47 ms; the matrix-vector kernels took about 22 ms, 12 ms of it the
+output head (Q6_K, 248,320 rows, 398 MiB, read once per verify and once per draft); the cached experts about 10 ms; the GPU
+was idle about 11 ms between two verify steps (draft MoE on the CPU, sampling). The CPU leg is near its hardware: one expert
+costs 172 us of dot products on one thread (Q4_K row of 2048: 89 ns; Q5_K row of 512: 39 ns, `tools/pascal/bench_vecdot.cpp`),
+43 us on four threads, against about 90 us of DRAM reads (1.81 MiB at 21 GB/s); the team measures about 112 us per expert.
+
+Three changes are kept (all on by default):
+
+- **One host job per verify step.** The rows of a verify step post one request each for the same layer; the engine now serves
+  the requests already posted as one job of the lean team (`llama-moe-lean.h`), which reads each missed expert once and uses each
+  weight row for every row that selected the expert. Each row's sum keeps its own expert order: the result is bit-identical to
+  one job per row (`test-moe-lean-expert`, 864 rows with shared experts). Multi-row jobs read 19% fewer experts than their (row,
+  expert) pairs; a 4-row job costs 1,384 us against 4 x 394 us. Decode +1.9 / +1.9 / +2.2% on the chats, +1.6% at 16k, the same
+  text in all four arms. `LLAMA_MOE_HYBRID_LEAN_BATCH=0` restores one job per request.
+- **A small ubatch for a deferred MTP head.** With `--spec-mtp-defer` the draft context only decodes the sampled token and the
+  accepted drafts (at most n-max + 1 rows), but it was reserved for the target's 512-token ubatch, which made the scheduler keep a
+  VRAM copy of the MTP layer's expert bank for offload: compute buffer 564 MiB. It now takes `max(16, n-max + 1)` (below the
+  offload threshold of 32): 266 MiB, and the expert cache grows from 41 to 45 slots per layer (hit rate 59.0% -> 63.0%). A round
+  costs 3.2 / 5.4 / 3.2 / 6.0% less. The text changes (a different set of resident experts changes the numerics), so decode in
+  tok/s moved -4.7 / +2.3 / +0.6 / +7.3%: one chat drew a text the head predicts worse (acceptance 77% -> 68%).
+- **More rows per block in the Pascal matrix-vector kernel.** On Pascal a block of `mul_mat_vec_q` that finishes its row in two
+  K iterations costs more to schedule than to run: the output head launched 248,320 blocks and moved 139 GB/s. Rows of at most two
+  K iterations now take one row per warp (one column; also 2 to 4 columns for Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0), when the matrix
+  has at least 4,096 rows that divide evenly. Output head 3.13 -> 2.32 ms (178 GB/s); Q8_0 8192 x 2048: 111 -> 87 us (one
+  column), 106 -> 96 us (four columns). Q6_K at four columns was 7% slower with it and keeps the old blocks. Decode +3.2 / +2.5 /
+  +2.1 / +1.7%, the same text in all four arms. `test-backend-ops` has eval cases for the new path and its 4,098-row fallback.
+
+All three together, the owner's command, the build before the changes (A) against the build after (B), A-B-B-A:
+
+| Measurement | A (tok/s) | B (tok/s) | B / A | ms per round A -> B | draft acceptance A -> B |
+|---|---|---|---|---|---|
+| Decode, chat 1 | 30.80 | 32.55 | 1.057 | 97.8 -> 92.5 | 0.695 -> 0.687 |
+| Decode, chat 2 | 29.48 | 31.30 | 1.062 | 94.4 -> 88.0 | 0.614 -> 0.604 |
+| Decode, chat 3 | 32.38 | 35.28 | 1.090 | 102.7 -> 94.2 | 0.799 -> 0.806 |
+| Decode after a 16k-token prompt | 21.95 | 24.84 | 1.131 | 107.0 -> 103.1 | 0.467 -> 0.538 |
+| Prefill, 4,096 tokens | 476.7 | 468.2 | 0.982 | | |
+| Prefill, 16,384 tokens | 574.6 | 568.4 | 0.989 | | |
+
+Two of the four texts are the same in all arms, two differ (the cache size changes which experts are resident). Prefill is 1
+to 2% slower; the likely cause is the cache regrow that the prompt's last 4-token chunk triggers inside the prompt time, which
+now uploads 45 slots instead of 41. Hit rate 59.1% -> 60.6% on this mix, peak VRAM 6,803 -> 6,795 MiB.
+
+Prefill, measured with flags only:
+
+| Prompt | baseline | `--lm-prefill-ckpt-chunk 24` | `-b 16384` |
+|---|---|---|---|
+| 4,096 tokens | 466 tok/s | 601 tok/s (+29%) | 465 |
+| 16,384 tokens | 565 | 609 (+7.8%) | 576 (+2%) |
+| 32,768 tokens | 492 | 507 (+3%) | 494 |
+
+Without it, the server cuts the last 516 tokens of every prompt into batches of their own for the context checkpoints; the
+512-token one takes the ordinary path, which copies all 40 expert banks over PCIe (17 GB at 6.4 GB/s, about 2.3 s per prompt in
+the profile). `--lm-prefill-ckpt-chunk 24` makes that chunk 24 tokens, which run on the CPU. The cost: the checkpoint sits 28
+tokens before the end of a prompt instead of 516, and a cache hit then differs from a fresh run by a little more (2 of 3 frozen
+pairs at 0.261 / 0.281 nats against the 0.25 rule, measured on the RTX 5090 in G32, `AGENTS.md`). Recommended for speed; leave
+it out when a cache hit must match a fresh run closely.
+
+The pass itself is compute-bound (16k-token profile): flash attention 20.5% of kernel time, routed-expert matmuls 34.7% (Q4_K
+gate / up at 4.4 TFLOPS, Q5_K down at 3.1), dense Q8_0 projections 16.4% (11.4 TFLOPS), gated delta net 9.8%. The expert
+matmuls are the lever left (a third of the efficiency of the dense ones); a wider column tile (J 96 / 128) made them 5 to 6%
+slower. Attention grows with depth: a 4,096-token pass took 5.4 s at depth 0 and 9.4 s at 24k.
+
+Why the expert matmuls run at half the dense speed (`test-backend-ops perf`, 2048 tokens, 256 experts, 8 used; the same 34.4
+GFLOP as one dense matrix):
+
+| Format | dense TFLOPS | expert shape TFLOPS | penalty |
+|---|---|---|---|
+| Q8_0 | 11.3 | 6.1 (gate / up), 5.4 (down) | 1.8x, 2.1x |
+| Q4_0 | 9.7 | 5.1, 4.0 | 1.9x, 2.4x |
+| Q4_K | 8.7 | 4.7 (gate / up) | 1.85x |
+| Q5_K | 8.0 | 3.55 (down) | 2.25x |
+
+The MoE shape costs about twice on every format; the K-quant format itself only 1.3 to 1.4x. Two suspects were tested. (1)
+Empty blocks: the grid is sized from the token count (`ncols_max` = 2048, 32 column tiles of 64 per expert) although an expert
+gets about 64 tokens, so about 95% of the blocks exit at once. Cutting them 16x with the work per expert fixed (16 experts and
+128 tokens instead of 256 and 2048) moved Q4_K from 4.69 to 4.87 to 5.04 TFLOPS: at most 5%. (2) Tile padding: with about 64
+tokens per expert, half of the experts spill a few columns into a second 64-column tile. Raising the tokens per expert (32
+experts, 256 to 2048 tokens) raised Q4_K from 4.90 to 5.80, 6.42 and 6.71 TFLOPS (about 64, 128, 256 and 512 tokens each) and Q8_0
+from 6.26 to 8.79. A model of the tile counts gives 32% padded columns for uniform routing and 34% with the expert popularity of
+the decode routing trace (a prompt's popularity was not measured); a last tile sized to the leftover columns would leave 5%.
+That is also what `--lm-prefill-ubatch 4096` buys (more tokens per expert), at the price of a larger compute buffer.
+
 ## 4. Tried and dropped (measured)
 
 | Idea | Result |
@@ -193,6 +283,12 @@ first-token logprobs and greedy text are bit-identical to the old tile.
 | Whole 32-row V tile (fewer barriers) | No change |
 | `--load-mode none` | No faster; 60 s to load against 4 s |
 | Forcing the pass for all sizes | Section 3.6 |
+| CUDA graphs on Pascal (the `cc < 7.0` check removed, 2026-10-24) | Decode 0.991 to 0.998 of without; the GPU waits on the CPU leg anyway |
+| Skipping the all-zero miss slot in the cached-expert matvec | No measurable change (within 0.3% per round): those reads hit the L2 |
+| Pinning the lean team on Linux, one thread per core (`1,2,3,0` or `0,1,2,3`) | 1.0 to 2.5% slower per round than the scheduler's own placement |
+| MTP layer's experts in VRAM (`-ot blk\.40\.ffn_(up\|gate\|down)_exps\.weight=CUDA0`) | 7 cache slots fewer (45 -> 38), round cost -1.8 to +6.8%: mixed |
+| `LLAMA_MOE_HYBRID_LEAN_SPIN_US=1500`; `-td 2` | 0.3 to 1.4% slower; within noise |
+| MMQ column tile J 96 / 128 for Q4_K and Q5_K | Expert matmuls 5 to 6% slower |
 
 ## 5. Limits of this evidence
 
