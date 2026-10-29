@@ -139,7 +139,7 @@ host bank (a test; it adds about 1.2 s per resize). `GGML_CUDA_MMVQ_MOE_ROWS` (1
 cached-expert matvec (a test knob: 4 is 0.7% faster on the 4-row verify and not worth a default). `GGML_CUDA_GDN_QUAD`
 (default off) selects the gated-delta-net prefill kernel with 4 lanes per state column (section 3.10).
 `LLAMA_FATTN_TILE_Q8PV=1` (default off; needs `--lm-prefill-attn-int8`, a q8_0 K and V cache and head size 256) runs the softmax-weights-times-V product of the layer-major
-attention with `dp4a` on int8 operands (dithered rounding of the weights): attention -18 to -20%, prefill +3.3% at 16k and +6.4% at 32k, not exact (section 3.10).
+attention with `dp4a` on int8 operands (dithered rounding of the weights): attention -18 to -20%, prefill +3% at 16k, +5 to +6% at 32k and +8% at 49k, not exact (section 3.10).
 
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
 tests fail without it, and the CMake cache keeps the value from configure time.
