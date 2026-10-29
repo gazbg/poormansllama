@@ -1,6 +1,6 @@
 # GTX 1070 + i7-4770K: Qwen3.6-35B-A3B MoE + MTP decode and prefill optimization
 
-Status: in-progress. Opened 2026-10-29. Commit: (local commits only, see the ledger).
+Status: accepted on 2026-10-29 by the agent's own autonomous acceptance under the owner's grant (NOT owner approval; scope below). Commits (local, not pushed): `a18ddca` engine changes, `ce12a91` docs and tools, and the commit that adds this status line.
 
 ## Autonomous mode
 
@@ -109,3 +109,20 @@ Expected gain is a guess from the profile before the run, kept so that the guess
 - D7 (2026-10-29) The ms-per-round rule of K1 is kept as written for H21; it is rerun with eight chats instead of being loosened.
 - D8 (2026-10-29) Defaults changed in code, each meeting the default rule (exact, K1 at two lengths or two sessions, gated or harmless elsewhere): remainder tiles on for NVIDIA GPUs older than Volta (H12; `GGML_CUDA_MMQ_REMAINDER=0` turns them off), and the device-to-device cache resize (H10; `LLAMA_MOE_HYBRID_RESIZE_KEEP=0` turns it off). Reversible by the two variables. Opt-in only (not exact, so not defaults): `GGML_CUDA_GDN_QUAD=1` (H27), the MTP-experts-on-GPU flag (H21).
 - D9 (2026-10-29) Stop decision. The closing profiles (prefill 16k, decode 3 chats) leave five prefill categories at 5% or more: flash attention 21.5%, `mmq` Q4_K 17.4%, Q8_0 17.1%, Q5_K 14.0%, gated delta net 10.4%. Each has a resolved hypothesis (H28, H30, H29, H30, H24/H27). H28-H30 are resolved as REJECTED by bound, not by experiment: what is left in them is a new kernel (int8 P in attention, a cheaper per-tile unpack for the expert matmul, a larger register tile for Q8_0), not tuning, and each is bounded below the 2% bar for any change this goal could validate, or needs a quality evaluation that does not exist here. That is a judgement about cost and risk, and the owner may reopen it; it is not a proof that no gain is possible. The goal is accepted under the contract on that basis.
+
+## Acceptance record (the agent's own, autonomous; not owner approval)
+
+Scope: what the contract defines and nothing more. The claims are speed ratios on this machine, this model and the harness prompts, measured A-B-B-A (or
+single arms where the ledger says so); no quality claim beyond bit-identity, the recorded text comparison and one KL / perplexity check of the opt-in delta net kernel;
+no claim for other hardware, models or Windows; no claim of fitness for production.
+
+| Criterion | Evidence |
+|---|---|
+| K1 speed | KEPT items: the flag stack (H1-H3, F1), the resize (H10, `H10`: +6.8% / +3.9%), the remainder tiles (H12, `rem1`), the TTFT recipe (H9, H22, F3), the MTP-experts flag (H21, F4, judged on ms per round), the delta net kernel (H27, `H27` / `H27b`, prefill metric). Each has the session table named in its ledger row. Rejected items did not reach 2% or overlapped their control |
+| K2 collateral | H10: decode tok/s +0.4 / +2.5 / +2.7% (`H10b`), peak VRAM unchanged, one cache slot fewer recorded. Stack: 510 MiB and 1 to 2% prefill recorded as D6. TTFT recipe: +3% on 300 to 500-token turns recorded. H27: peak VRAM +64 MiB at 12k recorded, decode no systematic effect |
+| K3 exactness | Remainder tiles: 30 comparisons 0 differ. Resize: 0 banks differ in 10 verified resizes. Text-changing, labelled: stack settings that move the cache, H21, H27 (KLD 0.0115 = the size of any reorder of the sums; PPL 18.72 against 18.78) |
+| K4 gates | G1 MUL_MAT_ID 887/887 (also matvec rows 1 and 4), MUL_MAT 1,218/1,218, GATED_DELTA_NET 39/39; G2 3,295 checks 0 failures; G3 30 comparisons 0 differ; G5 GPU free before every arm. No error, abort or memory-guard decline in the arms |
+| K5 documented | LINUX-PASCAL.md 3.8-3.10 and 4, PARAMETERS.md, currentstate.md 2026-10-29, this ledger |
+| Stop condition | Every ledger row is KEPT, REJECTED or BLOCKED (H15, the CPU governor, never autonomous: `schedutil` is set, the owner can test `cpupower frequency-set -g performance`). Closing profiles taken (`build/pascal/close-pp`, `close-tg`, git-ignored): five prefill categories at 5% or more, each with a resolved hypothesis (D9); H28-H30 are resolved by bound, not by experiment |
+
+Not certified: the MTP-experts flag and the delta net kernel at 32k / 60k prompts; hit-versus-fresh equality with the 4-token checkpoint chunk; any other machine.
