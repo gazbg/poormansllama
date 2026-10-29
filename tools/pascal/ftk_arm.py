@@ -35,6 +35,32 @@ def softmax_top(lp):
     return {t: math.exp(v - m) / z for t, v in lp}
 
 
+def ppl_compare(labels):
+    arms = {l: json.load(open(os.path.join(OUT, l + ".json"))) for l in labels}
+    ref = arms[labels[0]]
+    def lp(entry):
+        for t in entry["top"]:
+            if (t[2] is not None and t[2] == entry["target"]) or t[0] == entry["piece"]:
+                return t[1]
+        return None
+    keys = [k for k in ref if all(k in arms[l] for l in labels) and all(lp(arms[l][k]) is not None for l in labels)]
+    print(f"{len(keys)} of {len(ref)} windows have the target token in the top 200 of every arm")
+    for grp in sorted({k.split("-")[0] for k in keys}):
+        ks = [k for k in keys if k.startswith(grp + "-")]
+        print(f"-- windows of {grp[1:]} tokens: {len(ks)}")
+        base = [-lp(ref[k]) for k in ks]
+        print(f"   {labels[0]:>8}: mean NLL {sum(base)/len(ks):.4f} (perplexity of these positions {math.exp(sum(base)/len(ks)):.3f})")
+        for l in labels[1:]:
+            d = [(-lp(arms[l][k])) - (-lp(ref[k])) for k in ks]
+            m = sum(d)/len(d)
+            sd = (sum((x - m)**2 for x in d)/max(1, len(d) - 1))**0.5
+            print(f"   {l:>8}: mean NLL {sum(-lp(arms[l][k]) for k in ks)/len(ks):.4f}  dNLL vs {labels[0]} {m:+.4f} +- {sd/len(d)**0.5:.4f} (sd {sd:.3f}, max |d| {max(abs(x) for x in d):.3f})")
+    # KL over the shared top tokens is reported by the first-token comparison; here also the top-1 agreement
+    for l in labels[1:]:
+        same = sum(1 for k in keys if arms[l][k]["top"][0][0] == ref[k]["top"][0][0])
+        print(f"   top-1 token equal to {labels[0]}: {l} {same}/{len(keys)}")
+
+
 def compare(labels):
     arms = {l: json.load(open(os.path.join(OUT, l + ".json"))) for l in labels}
     ref = arms[labels[0]]
@@ -69,10 +95,15 @@ def main():
     ap.add_argument("--offsets", default="0,150000", help="character offsets into the text, one set of prompts per offset")
     ap.add_argument("--port", type=int, default=8193)
     ap.add_argument("--ctx", type=int, default=20480)
+    ap.add_argument("--ppl", default="", help="paired next-token log-likelihood: LENxCOUNT[,LENxCOUNT...] windows of the text; the target is the token after each window")
+    ap.add_argument("--ppl-step", type=int, default=1200, help="start offset step, in tokens, between windows of one length")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     if a.compare:
-        compare(a.compare)
+        if a.compare[0] == "ppl":
+            ppl_compare(a.compare[1:])
+        else:
+            compare(a.compare)
         return
     if gpu_busy():
         sys.exit("GPU busy: " + gpu_busy())
@@ -99,7 +130,24 @@ def main():
                 pass
             time.sleep(1)
         text = open(TEXT, "r", encoding="utf-8", errors="replace").read()
-        for off in [int(x) for x in a.offsets.split(",")]:
+        if a.ppl:
+            toks = api(a.port, "/tokenize", {"content": text})["tokens"]
+            for spec in a.ppl.split(","):
+                ln, cnt = [int(x) for x in spec.split("x")]
+                for w in range(cnt):
+                    st = w*a.ppl_step
+                    if st + ln + 1 > len(toks):
+                        break
+                    t0 = time.time()
+                    js = api(a.port, "/completion", {"prompt": toks[st:st + ln], "n_predict": 1, "temperature": 0, "cache_prompt": False, "n_probs": 200, "seed": 1})
+                    cp = js["completion_probabilities"][0]
+                    tops = cp.get("top_logprobs") or cp.get("top_probs") or []
+                    tgt = toks[st + ln]
+                    piece = api(a.port, "/detokenize", {"tokens": [tgt]}).get("content")
+                    res[f"w{ln}-{st}"] = {"target": tgt, "piece": piece, "top": [(t["token"], t["logprob"] if "logprob" in t else math.log(max(t["prob"], 1e-30)), t.get("id")) for t in tops], "s": round(time.time() - t0, 2)}
+                    if w % 8 == 0:
+                        print(f"{a.label} len {ln} window {w}/{cnt}: {time.time() - t0:.1f} s", flush=True)
+        for off in [int(x) for x in ([] if a.ppl else a.offsets.split(","))]:
             piece = text[off:off + 200000]
             toks = api(a.port, "/tokenize", {"content": piece})["tokens"]
             for n in [int(x) for x in a.prompts.split(",")]:

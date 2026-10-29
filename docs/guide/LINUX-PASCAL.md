@@ -408,8 +408,12 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), no A/B overlap, peak VRAM unchanged
   (the 32-key tile gave +2.9 / +5.4 / +8.2% in the session before). Quality, first-token KL (top 20) against exact attention with the 64-key tile: 6 prompts of 8k /
   24k tokens 0.0200 (int8 QK alone 0.0186), 2 prompts of 32k 0.0079 (0.0026), one top-1 flip on a prompt where int8 QK alone also flips; with the 32-key tile
-  0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k, 0.0040 at 55k. It is not exact (text changes) and the evidence is 14 first-token points and no perplexity.
-  `tools/pascal/ftk_arm.py` and `fa_pv8_check.cpp` are the harnesses.
+  0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k, 0.0040 at 55k. A paired next-token log-likelihood (54 positions, the true next token as the target) shows no
+  loss either: 44 windows of 4,096 tokens, exact attention NLL 1.4008, int8 QK -0.021 +- 0.021, int8 QK + PV -0.022 +- 0.021; 10 windows of 16,384 tokens, 1.2440,
+  -0.043 +- 0.036 and -0.109 +- 0.068 (negative is noise; the resolution is about 0.02 and 0.07 nats). It is not exact (text changes).
+  `tools/pascal/ftk_arm.py` (`--ppl` for the log-likelihood) and `fa_pv8_check.cpp` are the harnesses. With a q4_0 K and V cache the int8 PV also works (the V rows are
+  mapped to +-127 of the tile's largest scale; with the q8_0 scale their 4-bit values were squeezed to a few levels, NMSE 1.2e-3): attention 73.3 -> 59.3 ms at 10,240 keys
+  (-19%), 255 -> 216 ms at 34,816 (-15%), NMSE 5e-5 against the FP32 PV; there the 32-key tile is faster than the 64-key one (61.8 against 69.8 ms) and is the default.
 - **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).

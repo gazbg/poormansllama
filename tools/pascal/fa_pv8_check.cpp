@@ -25,6 +25,7 @@ int main(int argc, char ** argv) {
     const int  ia  = cmp ? 4 : 3;
     const int  kv  = argc > ia     ? atoi(argv[ia])     : 512;
     const int  nq  = argc > ia + 1 ? atoi(argv[ia + 1]) : 128;
+    const ggml_type kvt = getenv("FA_CACHE_TYPE") && std::string(getenv("FA_CACHE_TYPE")) == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;   // FA_CACHE_TYPE=q4_0 for a q4_0 K and V cache
     const int  hs = 256, nkv = 2, nh = 16;
     const size_t n_out = (size_t) hs*nh*nq;
     if (cmp) {
@@ -64,8 +65,8 @@ int main(int argc, char ** argv) {
     ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nq, nh, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, hs, kv, nkv, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, hs, kv, nkv, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, kvt, hs, kv, nkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, kvt, hs, kv, nkv, 1);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_causal(out, kv - nq, kv);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
@@ -79,8 +80,8 @@ int main(int argc, char ** argv) {
     for (auto & x : kf) { x = ud(rng); }
     for (auto & x : vf) { x = ud(rng); }
     std::vector<char> kq(ggml_nbytes(k)), vq(ggml_nbytes(v));
-    ggml_quantize_chunk(GGML_TYPE_Q8_0, kf.data(), kq.data(), 0, (int64_t) kv*nkv, hs, nullptr);
-    ggml_quantize_chunk(GGML_TYPE_Q8_0, vf.data(), vq.data(), 0, (int64_t) kv*nkv, hs, nullptr);
+    ggml_quantize_chunk(kvt, kf.data(), kq.data(), 0, (int64_t) kv*nkv, hs, nullptr);
+    ggml_quantize_chunk(kvt, vf.data(), vq.data(), 0, (int64_t) kv*nkv, hs, nullptr);
     ggml_backend_tensor_set(q, qf.data(), 0, qf.size()*4);
     ggml_backend_tensor_set(k, kq.data(), 0, kq.size());
     ggml_backend_tensor_set(v, vq.data(), 0, vq.size());
