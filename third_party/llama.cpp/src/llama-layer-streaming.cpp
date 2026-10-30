@@ -3643,7 +3643,7 @@ bool llama_layer_streaming::init(const llama_model & model, int n_slots_, int de
         // this costs no VRAM. Sized for the full trunk because every layer gets
         // a companion graph.
         const size_t rowset_input_bytes = row_set_requested
-            ? (size_t) 2u * (size_t) n_layer * (size_t) model_ref->hparams.n_expert_used
+            ? (size_t) 2u * (size_t) n_layer * (size_t) model_ref->hparams.n_expert_used()
               * (size_t) max_ubatch * sizeof(int32_t)
             : 0;
         const size_t input_bytes = pw_probe
@@ -8220,7 +8220,7 @@ void llama_layer_streaming::tel_route(int il, int64_t chunk, ggml_cgraph * g) {
     }
     const int64_t n_expert = probs->ne[0];
     const int64_t n_tok    = probs->ne[1];
-    const int64_t n_used   = (model_ref != nullptr) ? (int64_t) model_ref->hparams.n_expert_used : 0;
+    const int64_t n_used   = (model_ref != nullptr) ? (int64_t) model_ref->hparams.n_expert_used() : 0;
     if (n_expert <= 0 || n_tok <= 0 || n_used <= 0 || n_used > n_expert) {
         tel_write(tel_out,
             "{\"event\":\"route\",\"run_id\":%llu,\"layer\":%d,\"chunk\":%lld,\"error\":\"bad route shape\"}",
@@ -9158,7 +9158,7 @@ size_t llama_layer_streaming::row_cache_bytes_for(int k) const {
     // Same capacity rule the allocation uses: cap = min(n_expert, K*W*top_k)
     // with W == 1 (the telemetry validator rejects window_tokens != 1).
     const int n_exp = (int) model_ref->hparams.n_expert;
-    const int top_k = (int) model_ref->hparams.n_expert_used;
+    const int top_k = (int) model_ref->hparams.n_expert_used();
     const int cap   = std::min(n_exp, (k < 1 ? 1 : k) * top_k);
 
     // one throwaway metadata context: the tensors never receive a buffer, so
@@ -9655,7 +9655,7 @@ bool llama_layer_streaming::set_row_set_spec(int mode, int budget, const std::st
         return false;
     }
     const int n_exp = (int) model_ref->hparams.n_expert;
-    const int top_k = (int) model_ref->hparams.n_expert_used;
+    const int top_k = (int) model_ref->hparams.n_expert_used();
     const int K     = row_set_retain_k < 1 ? 1 : row_set_retain_k;
     const int cap   = std::min(n_exp, K * top_k);
     const int b     = budget > 0 ? budget : top_k;
@@ -9799,7 +9799,7 @@ bool llama_layer_streaming::set_row_set_spec_arm(int arm, bool null_source) {
             return false;
         }
         const int n_exp = (int) model_ref->hparams.n_expert;
-        const int top_k = (int) model_ref->hparams.n_expert_used;
+        const int top_k = (int) model_ref->hparams.n_expert_used();
         const int k = row_set_retain_k < 1 ? 1 : row_set_retain_k;
         const int cap = std::min(n_exp, k * top_k);
         if (row_set_spec_reserve >= cap) {
@@ -9954,7 +9954,7 @@ bool llama_layer_streaming::d1_observe_round(const std::vector<int32_t> & draft_
         error_msg = "d1_observe_round: candidate capture width does not match drafts";
         return false;
     }
-    const int top_k = (int) model_ref->hparams.n_expert_used;
+    const int top_k = (int) model_ref->hparams.n_expert_used();
     for (size_t j = 0; j < draft_tokens.size(); ++j) {
         if (accepted[j] > 1) {
             error_msg = "d1_observe_round: accepted flag is not boolean";
@@ -10532,7 +10532,7 @@ void llama_layer_streaming::tel_d1_shape() {
         "{\"event\":\"d1_shape\",\"run_id\":%llu,\"source\":\"d1\",\"n_expert\":%d,\"top_k\":%d,"
         "\"n_layer\":%d,\"window_tokens\":%d,\"draft_depth\":%d,\"budget\":%d,\"null\":%s,\"predicted_ids\":true,\"t_us\":%lld}",
         (unsigned long long) run_id, d1_state->n_expert, (int) model_ref->hparams.n_layer(),
-        (int) model_ref->hparams.n_expert_used, row_set_window_tokens,
+        (int) model_ref->hparams.n_expert_used(), row_set_window_tokens,
         row_set_window_tokens > 0 ? row_set_window_tokens - 1 : 0,
         row_set_spec_budget, row_set_spec_null ? "true" : "false",
         (long long) ggml_time_us());
@@ -10587,7 +10587,7 @@ bool llama_layer_streaming::begin_row_cache() {
     const ggml_backend_buffer_type_t buft_cuda = ggml_backend_cuda_buffer_type(device);
 
     const int n_exp = (int) model_ref->hparams.n_expert;
-    const int top_k = (int) model_ref->hparams.n_expert_used;
+    const int top_k = (int) model_ref->hparams.n_expert_used();
     const int K     = row_set_retain_k < 1 ? 1 : row_set_retain_k;
     // capacity = min(n_expert, K*W*top_k) rows per layer; W == 1 is enforced by
     // the telemetry validator (rowset_init window_tokens != 1 is an error), so
@@ -10864,7 +10864,7 @@ bool llama_layer_streaming::begin_row_set() {
     // 0 is the reactive slot-keyed policy (unchanged), >0 switches them to the
     // per-layer conservation rule (residency is the layer's private cache).
     tel_rowset_init((int) slots.size(), slot_bytes, row_set_window_tokens, n_exp,
-                    (int) model_ref->hparams.n_expert_used,
+                    (int) model_ref->hparams.n_expert_used(),
                     row_set_retain ? row_set_retain_k : 0);
 
     // T-GPLR-62 S2: with a compact window the slot is no longer bank-shaped, so
@@ -11988,7 +11988,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
         row_set_ids[il] = uniq;
 
         tel_rowset_fetch(il, slot_idx, slot.generation, (int64_t) (n_ubatches - 1),
-                         (int) model_ref->hparams.n_expert_used, uniq, fetch.size(),
+                         (int) model_ref->hparams.n_expert_used(), uniq, fetch.size(),
                          bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
                          retained, retained, retired, row_set_spec_pool > 0 ? &pool_hit_ids_last : nullptr);
         return true;
@@ -12206,7 +12206,7 @@ bool llama_layer_streaming::load_row_set(int il, const std::vector<int32_t> & id
     row_set_ids[il] = uniq;
 
     tel_rowset_fetch(il, slot_idx, slot.generation, (int64_t) (n_ubatches - 1),
-                     (int) model_ref->hparams.n_expert_used, uniq, fetch.size(),
+                     (int) model_ref->hparams.n_expert_used(), uniq, fetch.size(),
                      bytes_staged, bytes_full_bank, host_submit_us, transfer_us, ready_latency_us,
                      uniq.size() - fetch.size(), /*n_rows_retained=*/0, /*n_rows_retired=*/0);
     return true;
@@ -12247,7 +12247,7 @@ bool llama_layer_streaming::read_router_ids(int il, ggml_cgraph * g,
     }
     const int64_t n_expert = probs->ne[0];
     const int64_t n_tok    = probs->ne[1];
-    const int64_t n_used   = (model_ref != nullptr) ? (int64_t) model_ref->hparams.n_expert_used : 0;
+    const int64_t n_used   = (model_ref != nullptr) ? (int64_t) model_ref->hparams.n_expert_used() : 0;
     if (n_expert <= 0 || n_tok <= 0 || n_used <= 0 || n_used > n_expert) {
         error_msg = "read_router_ids: bad route shape";
         return false;
@@ -12864,12 +12864,12 @@ llama_ls_inventory llama_ls_model_inventory(
     std::string j;
     auto add = [&](const std::string & s) { j += s; };
     auto addf = [&](const char * fmt, ...) {
-        char small[512];
+        char sbuf[512];   // not `small`: windows.h (rpcndr.h) defines that as `char`
         va_list args; va_start(args, fmt);
-        const int n = vsnprintf(small, sizeof(small), fmt, args);
+        const int n = vsnprintf(sbuf, sizeof(sbuf), fmt, args);
         va_end(args);
-        if (n >= 0 && (size_t) n < sizeof(small)) {
-            j += small;
+        if (n >= 0 && (size_t) n < sizeof(sbuf)) {
+            j += sbuf;
             return;
         }
         // grow rather than truncate: truncated output would emit invalid JSON
