@@ -5,6 +5,7 @@
 		ListChecks,
 		Loader2,
 		MoreHorizontal,
+		PanelTopOpen,
 		Pencil,
 		Pin,
 		PinOff,
@@ -15,9 +16,16 @@
 	import { TruncatedText } from '$lib/components/app';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { FORK_TREE_DEPTH_PADDING, ICON_CLASS_DEFAULT, UI_DATA_ATTRS } from '$lib/constants';
+	import {
+		FORK_TREE_DEPTH_PADDING,
+		ICON_CLASS_DEFAULT,
+		SHORTCUT_DELETE_CONVERSATION,
+		SHORTCUT_EDIT_CONVERSATION,
+		SHORTCUT_EXPORT_CONVERSATION,
+		UI_DATA_ATTRS
+	} from '$lib/constants';
 	import { RouterService } from '$lib/services/router.service';
-	import { chatStore, conversationsStore } from '$lib/stores';
+	import { chatStore, conversationsStore, settingsStore, tabsStore } from '$lib/stores';
 	import { onMount } from 'svelte';
 
 	interface Props {
@@ -72,6 +80,20 @@
 		onStop?.(conversation.id);
 	}
 
+	let canOpenInNewTab = $derived(Boolean(settingsStore.config.conversationTabs));
+
+	function openInNewTab() {
+		void tabsStore.openInNewTab(conversation.id);
+	}
+
+	// middle-click opens a background tab, like a link in a browser
+	function handleAuxClick(event: MouseEvent) {
+		if (event.button !== 1 || isSelectionMode || !canOpenInNewTab) return;
+
+		event.preventDefault();
+		openInNewTab();
+	}
+
 	function handleTogglePin() {
 		conversationsStore.toggleConversationPin(conversation.id);
 	}
@@ -104,6 +126,8 @@
 	function handleSelect(event: MouseEvent) {
 		if (isSelectionMode) {
 			onSelectionClick?.(conversation.id, { shiftKey: event.shiftKey });
+		} else if ((event.metaKey || event.ctrlKey) && canOpenInNewTab) {
+			openInNewTab();
 		} else {
 			onSelect?.(conversation.id);
 		}
@@ -161,34 +185,35 @@
 		? 'is-selection-mode'
 		: ''} px-2"
 	{...{ [UI_DATA_ATTRS.CONVERSATION_ROW]: conversation.id }}
+	onauxclick={handleAuxClick}
 	onclick={(e) => handleSelect(e)}
-	onmouseover={handleMouseOver}
-	onmouseleave={handleMouseLeave}
-	onmousedown={(e) => handleRowMouseDown(e)}
 	onfocusin={handleMouseOver}
 	onfocusout={(e) => {
 		if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
 			handleMouseLeave();
 		}
 	}}
+	onmousedown={(e) => handleRowMouseDown(e)}
+	onmouseleave={handleMouseLeave}
+	onmouseover={handleMouseOver}
 >
 	<div
-		class="flex min-w-0 flex-1 items-center gap-2"
 		style:padding-left="{depth * FORK_TREE_DEPTH_PADDING}px"
+		class="flex min-w-0 flex-1 items-center gap-2"
 	>
 		{#if isSelectionMode}
 			<div
+				aria-checked={isSelected}
+				aria-label={isSelected ? `Deselect ${conversation.name}` : `Select ${conversation.name}`}
 				class="shrink-0"
 				onclick={(e) => handleCheckboxClick(e)}
 				onkeydown={handleCheckboxKeydown}
 				role="checkbox"
-				aria-checked={isSelected}
-				aria-label={isSelected ? `Deselect ${conversation.name}` : `Select ${conversation.name}`}
 				tabindex="-1"
 			>
 				<Checkbox
-					checked={isSelected}
 					aria-label={isSelected ? `Deselect ${conversation.name}` : `Select ${conversation.name}`}
+					checked={isSelected}
 				/>
 			</div>
 		{/if}
@@ -200,8 +225,8 @@
 					{#snippet child({ props })}
 						<a
 							{...props}
-							href={RouterService.chat(conversation.forkedFromConversationId)}
 							class="flex shrink-0 items-center text-muted-foreground transition-colors hover:text-foreground"
+							href={RouterService.chat(conversation.forkedFromConversationId)}
 						>
 							<GitBranch class="h-3.5 w-3.5" />
 						</a>
@@ -218,12 +243,12 @@
 			<Tooltip.Root>
 				<Tooltip.Trigger>
 					<div
+						aria-label="Stop generation"
 						class="stop-button flex {ICON_CLASS_DEFAULT} shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
 						onclick={handleStop}
 						onkeydown={(e) => e.key === 'Enter' && handleStop(e)}
 						role="button"
 						tabindex="0"
-						aria-label="Stop generation"
 					>
 						<Loader2 class="loading-icon h-3.5 w-3.5 animate-spin" />
 
@@ -237,29 +262,40 @@
 			</Tooltip.Root>
 		{/if}
 
-		<TruncatedText text={conversation.name} class="text-sm font-medium" showTooltip={false} />
+		<TruncatedText class="text-sm font-medium" showTooltip={false} text={conversation.name} />
 	</div>
 
 	{#if !isSelectionMode && renderActionsDropdown}
 		<div class="actions flex items-center">
 			<DropdownMenuActions
-				triggerIcon={MoreHorizontal}
-				triggerTooltip="More actions"
 				bind:open={dropdownOpen}
 				actions={[
+					...(canOpenInNewTab
+						? [
+								{
+									icon: PanelTopOpen,
+									label: 'Open in new tab',
+									onclick: (e: Event) => {
+										e.stopPropagation();
+										openInNewTab();
+									}
+								}
+							]
+						: []),
 					{
 						icon: conversation.pinned ? PinOff : Pin,
 						label: conversation.pinned ? 'Unpin' : 'Pin',
 						onclick: (e: Event) => {
 							e.stopPropagation();
 							handleTogglePin();
-						}
+						},
+						separator: canOpenInNewTab
 					},
 					{
 						icon: Pencil,
 						label: 'Edit',
 						onclick: handleEdit,
-						shortcut: ['shift', 'cmd', 'e']
+						shortcut: SHORTCUT_EDIT_CONVERSATION
 					},
 					{
 						icon: Download,
@@ -268,7 +304,7 @@
 							e.stopPropagation();
 							conversationsStore.downloadConversation(conversation.id);
 						},
-						shortcut: ['shift', 'cmd', 's']
+						shortcut: SHORTCUT_EXPORT_CONVERSATION
 					},
 					{
 						icon: ListChecks,
@@ -280,10 +316,12 @@
 						label: 'Delete',
 						onclick: handleDelete,
 						separator: true,
-						shortcut: ['shift', 'cmd', 'd'],
+						shortcut: SHORTCUT_DELETE_CONVERSATION,
 						variant: 'destructive'
 					}
 				]}
+				triggerIcon={MoreHorizontal}
+				triggerTooltip="More actions"
 			/>
 		</div>
 	{/if}

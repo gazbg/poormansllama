@@ -20,12 +20,12 @@ class llama_memory_hybrid : public llama_memory_i {
 public:
     llama_memory_hybrid(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -63,6 +63,7 @@ public:
     // is nothing to narrow there, and forwarding keeps a hybrid model's
     // attention view and its graph sets consistent with each other.
     bool set_view_pad(uint32_t pad) override;
+    void set_attn_n_pad(uint32_t pad) override;
 
     void clear(bool data) override;
 

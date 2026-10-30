@@ -907,7 +907,7 @@ bool llama_context::dense_stream_enable(const llama_dense_stream_params & p, std
     LLAMA_LOG_INFO("%s: dense-stream: %d %s layers through %d slots, %d dedicated layers\n", __func__, S->n_streamed(), S->is_dynamic() ? "dynamic ring" : "streamed", S->n_slots(), S->n_dedicated());
     synchronize();
     dstream = std::move(S);
-    gf_res_prev->reset();      // a decode graph built before the markers existed must not be reused
+    reset_graph_reuse();      // a decode graph built before the markers existed must not be reused
     return true;
 }
 
@@ -917,7 +917,7 @@ void llama_context::dense_stream_disable() {
     }
     synchronize();
     dstream.reset();
-    gf_res_prev->reset();
+    reset_graph_reuse();
 }
 
 bool llama_context::dense_stream_begin_pass() {

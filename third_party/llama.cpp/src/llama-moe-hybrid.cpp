@@ -483,7 +483,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     cuda     = be;
     n_layer  = (int) g.n_layer;
     n_expert = (int) g.n_expert;
-    n_used   = (int) g.hparams.n_expert_used;
+    n_used   = (int) g.hparams.n_expert_used();
     n_slot   = slots;
     n_embd   = (int) g.n_embd;
 
@@ -540,7 +540,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
         if (trace_fp == nullptr) {
             GGML_ABORT("moe_hybrid: cannot open routing trace %s", tp_path);
         }
-        const int32_t hdr[4] = { (int32_t) g.n_layer, (int32_t) g.hparams.n_expert_used, (int32_t) g.n_expert, GGML_MOE_HYBRID_MAX_USED };
+        const int32_t hdr[4] = { (int32_t) g.n_layer, (int32_t) g.hparams.n_expert_used(), (int32_t) g.n_expert, GGML_MOE_HYBRID_MAX_USED };
         fwrite("MOETRC01", 1, 8, trace_fp);
         fwrite(hdr, sizeof(int32_t), 4, trace_fp);
     }
@@ -2441,7 +2441,7 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     const int     n_slot = moe_hybrid_env_int("LLAMA_MOE_HYBRID", 0);
     const int64_t n_tok  = g.n_tokens;   // 1 for a decode step; 1 + drafts for an MTP verify step
     if (n_slot <= 0 || n_tok < 1 || n_tok > GGML_MOE_HYBRID_MAX_WIDTH || cur->ne[1] != n_tok || g.layer_streaming != nullptr || il < 0 || il >= g.n_layer ||
-        g.n_expert_used != (int64_t) g.hparams.n_expert_used || model.hparams.no_alloc) {
+        g.n_expert_used != (int64_t) g.hparams.n_expert_used() || model.no_alloc()) {
         return nullptr;
     }
 
@@ -2527,16 +2527,16 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     ggml_build_forward_expand(g.gf, experts);
 
     ggml_tensor * views[GGML_MOE_HYBRID_MAX_USED];
-    for (uint32_t i = 0; i < g.hparams.n_expert_used; ++i) {
+    for (uint32_t i = 0; i < g.hparams.n_expert_used(); ++i) {
         views[i] = ggml_view_2d(ctx0, experts, n_embd, n_tok, experts->nb[2], i*experts->nb[1]);
         ggml_build_forward_expand(g.gf, views[i]);
     }
     ggml_tensor * moe_out = views[0];
-    for (uint32_t i = 1; i < g.hparams.n_expert_used; ++i) {
+    for (uint32_t i = 1; i < g.hparams.n_expert_used(); ++i) {
         moe_out = ggml_add(ctx0, moe_out, views[i]);
         ggml_build_forward_expand(g.gf, moe_out);
     }
-    if (g.hparams.n_expert_used == 1) {
+    if (g.hparams.n_expert_used() == 1) {
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
