@@ -321,6 +321,8 @@ and the 16k decode, A-B-B-A, tok/s +3.7 / +4.8 / +8.1 / +0.9 / +4.9 / +5.7 / +13
 (7 of 9 cells without overlap), prefill +2.0% at 4k, peak VRAM unchanged. The cache ends at 45 slots instead of 52 (hit rate 0.617 against 0.649) and the text differs from
 the control in every cell, because a different set of experts is resident. The 32k and 60k prompts of the safety gate were not rerun with it.
 
+Decode at depth (2026-10-30). The three settings above were tuned at 0 to 16k tokens of context. At 32k the better draft threshold is higher: `--spec-draft-p-min 0.9` against 0.7, A-B-B-A on a 32,791-token prompt, 27.84 -> 28.73 tok/s (+3.2%), ms per round 66.2 -> 56.8, acceptance 0.80 -> 0.92 (the text differs). At shallow depth 0.7 is better (section above), so use 0.7 for chats and short contexts and 0.9 for sessions of 32k tokens and more; 0.5 is -9% at 32k. `LLAMA_FATTN_GQA8=1` (packed decode attention) does nothing at 49k (26.17 -> 26.05 tok/s, same text): the host leg, not the attention, bounds the decode here. One deep prompt and 256 tokens per arm; 64k and more was not measured.
+
 The team size result is reproducible and the cause is not known: with the default of 4 threads the engine has no gain from 3, 5 or 6 in theory, but the measurement says 3 gives +4.6%, 5 gives +3.9%, 6 gives +6.1 and +7.1% (two runs), 7 and an explicit 4 give 0 (screening; the texts are identical to the control). The scheduler's placement of the spinning threads on the 8 logical CPUs (4 cores) is the likely reason.
 
 Tried and left out (screening, texts identical or compared by ms per round; the control repeats to within 0.6%):
