@@ -131,6 +131,8 @@ missed expert is read once; the results are bit-identical, `0` serves every requ
 (LINUX-PASCAL.md section 3.7). `GGML_CUDA_MMQ_REMAINDER` computes the leftover
 columns of each expert in a narrower matmul tile (1; 2 or 3: other width sets; `0` off). It is on by
 default for NVIDIA GPUs older than Volta and off elsewhere; bit-identical, prefill +3.6 to +4.3% on the GTX 1070 (section 3.7).
+`LLAMA_FATTN_GQA8_MAXROWS` (default 2; opt-in 4; needs `LLAMA_FATTN_GQA8=1`, which `--hybrid-moe` sets by default) sends the 3-4 row verify batches of the MTP draft to the packed GQA attention kernel instead
+of the tile kernel with its f16 conversion of K and V: decode +6 to +11% at 8k to 64k tokens of context on the GTX 1070, not exact (KL divergence 0.007, same top token 95%, perplexity unchanged), q8_0 K and V only (section 3.8).
 `GGML_CUDA_MMQ_ID_FLAT` (default 1 for NVIDIA GPUs older than Volta, 0 elsewhere; `0` off) lists only the matmul tiles that hold columns in the grid of the MoE expert matmuls
 (instead of a slot for every token tile of every expert): bit-identical, Q5_K down matmul -30% and Q4_K gate / up -4.6% at 2,048 tokens, prefill +3.6% (4k) and +4.1% (16k) on the GTX 1070 (section 3.7).
 `LLAMA_MOE_HYBRID_RESIZE_KEEP` (default 1) keeps the surviving expert-cache slots on the device when the cache is
