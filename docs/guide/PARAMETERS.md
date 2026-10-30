@@ -62,7 +62,7 @@ Acts on prompt batches of at least `--lm-prefill-min` tokens. Works with and wit
 | `--lm-prefill-min N` | `1024` | Smallest prompt batch that takes the pass |
 | `--lm-prefill-ubatch N` | `2048` | Tokens per chunk of the pass |
 | `--lm-prefill-segment N` | `16384` | Tokens per activation-slab segment. Must be a multiple of the chunk. A longer batch repeats the layer sweep per segment. G42 uses `32768` |
-| `--lm-prefill-slots N` | `2` | Layer slots in the VRAM window. Two lets the next bank copy while the current layer computes |
+| `--lm-prefill-slots N` | `2` | Layer slots in the VRAM window. Two lets the next bank copy while the current layer computes; beyond about 200k tokens of prompt use `1` (H61: the pass asks for 432 MiB less, so the memory guard declines 4 batches instead of 14 at 250k tokens, 158.7 against 127.9 tok/s, one unpaired arm) |
 | `--lm-prefill-batch N` | `16384` | Logical batch when `-b` is not given |
 | `--lm-prefill-bf16` | off | Activations in bf16, half the slab. Not validated against f32 for the MoE model; for the dense Qwen3.8 see the KL study in `docs/plans/dense-qwen38-iq3-residency.md`. Do not use for claims elsewhere |
 | `--lm-prefill-attn-int8` | off | The pass's flash attention computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal). About 1.7x faster attention, 22% of an 18k-token pass of the dense Qwen3.8-27B. An APPROXIMATION (Q quantised to int8 per 32 values, as the decode kernel does). Use with the f32 slab (without `--lm-prefill-bf16`): the pair failed the continuation rule on 1 of 8 prompts. Same as `LLAMA_FATTN_TILE_Q8QK=1` |
