@@ -197,6 +197,24 @@ Review of M2 (diff of the fork delta before and after the re-base, 262 differing
 Review of M3 (74 lines of fork code differ from before, 8 files): every line is a port listed above; nothing else in fork code changed.
 
 
+### M4 / W4 (b11675, 1,182 commits from the fork point)
+
+9 files, 19 hunks (the fixed-base dry run said 3 new files); one further compile error and one repaired string.
+
+- **F10 `build_moe_ffn` parameter order.** Upstream appended `post_exp_norm, post_exp_norm_eps` after `selected_experts_in`; the fork appended `selected_experts_weight, moe_weights_in, experts_out` there too. The merged order is upstream's first, then the fork's, which keeps every upstream caller (muse-spark passes `nullptr, post_exp_norm, eps`) unchanged. The three fork callers in `qwen35moe.cpp` (row-set device leg, tail leg, host leg) insert `nullptr, 1e-5f`. A caller passing only one or two of the fork's trailing tensors would have bound them silently to `post_exp_norm`; the audit found three callers, all with three or more trailing arguments, which fail to compile (a tensor pointer is not a float) until fixed. Lesson: the audit script must strip comments before counting arguments (the first run mis-counted a call whose argument list contains a comment with commas).
+- **Upstream MoE expert cache** (`build_moe_cache_slots`, `slots` argument of `build_lora_mm_id`): the fork's four `build_lora_mm_id(..., wsel, ...)` calls take upstream's `slots` argument; `slots` is null unless the cache is switched on, which nothing in the fork does.
+- **G31l is superseded.** The fork's fix for the out-of-bounds read in the MMQ ids branch (slack sized from `ne12`) is replaced by upstream's `src1_q8_1_padding` (a tile of width J reads at most J - 1 extra columns, padded from the widest configured tile). Both address the same bug; whether upstream's is sufficient at `-ub 2048` must be shown with `compute-sanitizer --tool memcheck` (G5, pending).
+- **The T-GPLR-16 sched probe is dropped.** Upstream refactored the input copy loop of `ggml_backend_sched` into `ggml_backend_sched_copy_input`; the fork's only change there was the debugging switch `GGML_SCHED_NO_EXPERT_ROWCOPY_PROBE` (default off, only named in historical state documents).
+- `arg.cpp` / `common.h`: `--spec-mtp-defer` (fork) next to `--spec-draft-sampling` (upstream); `speculative.mtp_defer` next to `probabilistic`. `ggml-cuda.cu`: the dense-decode stream-mark hook next to upstream's graph debug flag. `llama-context.cpp`: the positional initialiser gets upstream's `hdmd` after the fork's `layer_streaming`. `server-context.cpp`: upstream's checked checkpoint restore (a failed load falls back to a full re-process) with the fork's restore timing log around it, the mixed-batch mtmd block next to the fork's `ckpt_ok`, `SERVER_TASK_TYPE_DECISION` next to the G42 fuse block.
+- **Trap T3: backslashes in Python run from the Bash tool.** A `
+` written in a heredoc reached Python as `
+` (a real newline) and broke a string literal in `server-context.cpp` (found by the compiler, repaired). Scripts that must contain a backslash are written with the file tool or build it from `chr(92)`.
+- **Trap T4: the GPU-lock wrapper runs its command through `cmd.exe`.** `$env:X='1'; ...` inside `-Command` does nothing; export the variable in the launching shell instead (`SYNC_SKIP_TBO=1 pwsh ...`).
+
+**M4 gates (W4 tree = vendored tree):** G1 build clean; G2 host suite 78/78; G3 perplexity **synced 10.8174**, control 10.8056, pure upstream 10.8482 (each +/- 0.64); `test-moe-hybrid-dup-ids` 80 checks 0 failures; head-256 q8_0 GQA8 cases OK; the full `test-backend-ops` run is skipped at intermediate waypoints (`SYNC_SKIP_TBO`) and done at W6. Server smoke (hybrid decode + `--lm-prefill`, two prompts of 1,600 and 3,000 tokens, control vs synced): the layer-major pass ran (1,084 tokens in 1.73 s, 627 t/s, the control's 1.77 s), top-1 identical in all 4 pairs, first-token logprob difference max 0.062 and 0.018, KL max 0.0012 / 0.0015 (noise floors in AGENTS). The 3.16 s first pass seen at W3 was cold-start noise: this run's first pass matches the control.
+
+Review of M4 (55 lines of fork code differ from before, 7 files): every line is a resolution listed above.
+
 ## 8. Escalation
 
 If a waypoint cannot be built after the Implementer Workflow's classify-and-repair loop and one documented online pass (upstream issues and PRs for the touched files), stop that waypoint, record the root cause and the blocking files, and return to the owner with options B/C/D from section 3. In autonomous mode this becomes a recorded decision resolved by measurement or a probe, never by guessing.
