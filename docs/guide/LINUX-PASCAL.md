@@ -336,7 +336,7 @@ per such round at 8k tokens, 27.4 ms at 49k. `LLAMA_FATTN_GQA8_MAXROWS=4` (needs
 decode A-B-B-A +6.1% / +7.9% / +11.0% / +10.6% at 8k / 32k (guide text) / 49k / 64k tokens, ms per round -5.7% to -11.6%, no overlap in any cell. It is opt-in because it is not exact: the packed kernel quantizes Q to
 8 bits like the vector path (the tile kernel keeps f32), a KL divergence of 0.0070 against the tile routing on 4,096 tokens decoded 4 rows at a time, same top token 95.2%, perplexity unchanged (ratio 0.9988 +- 0.0034);
 the text changes at near ties and the draft acceptance moved by -0.06 to +0.03 (mean -0.02) over the four cells. A q4_0 K and V cache cannot use it (the packed kernel is q8_0 only), which is why that cache is
-28.9% slower in the deep decode (H43).
+28.9% slower in the deep decode (H43). It stacks with the MTP experts flag and p-min 0.7 (H45, A-B-B-A, old routing against 4 rows, both with the flag): 25.34 -> 28.97 tok/s (+14.3%, ms per round -4.5%, the text accepts more drafts) at 64k and 32.16 -> 34.27 (+6.6%, ms per round -7.0%) at 32k on the code text, no overlap in either cell.
 
 The team size result is reproducible and the cause is not known: with the default of 4 threads the engine has no gain from 3, 5 or 6 in theory, but the measurement says 3 gives +4.6%, 5 gives +3.9%, 6 gives +6.1 and +7.1% (two runs), 7 and an explicit 4 give 0 (screening; the texts are identical to the control). The scheduler's placement of the spinning threads on the 8 logical CPUs (4 cores) is the likely reason.
 
