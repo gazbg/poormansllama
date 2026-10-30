@@ -215,6 +215,19 @@ Review of M3 (74 lines of fork code differ from before, 8 files): every line is 
 
 Review of M4 (55 lines of fork code differ from before, 7 files): every line is a resolution listed above.
 
+### M5 / W5 (b11850, 1,357 commits from the fork point)
+
+8 files, 14 hunks; every one an adjacency conflict except the router nesting. The tree builds after a clean rebuild of `ggml-cuda`.
+
+- **New ops next to the fork's.** Upstream's `GGML_OP_TOP_K_MASK` sits in the same places as the fork's `GGML_OP_MOE_HYBRID_PUBLISH` / `GGML_OP_MOE_HYBRID_WAIT_ADD` (enum, name and symbol tables, `ggml_top_k_mask` next to the two `ggml_moe_hybrid_*` constructors, the CPU dispatch, the tensor-parallel split rule `handle_generic`). Order everywhere: the fork's two, then upstream's one; `GGML_OP_COUNT` is 104. `ggml-cpu/vec.cpp`: the fork's `ggml_cpu_swiglu_f32` next to upstream's new quick-GELU functions.
+- `llama-graph.cpp`: the guard of the implicit-causal phase-0 graph (`self_kq_mask` may be absent) now also checks upstream's `->buffer` (a mask can be unallocated when every attention layer has its own); the down projection takes upstream's amax rescaling block with the fork's `wsel` ids.
+- `server-context.cpp`: the fork's G42 idle-preparation / fuse helpers next to upstream's `slot_audio_step`. `common.h`: the fork's parameter block next to upstream's llama-connect parameters.
+- **Trap T5: incremental CUDA builds go stale.** The first W5 build linked with `unresolved external symbol ggml_backend_cuda_context::new_pool_for_device(int,int)`: upstream had changed the signature in `common.cuh`, and MSBuild did not rebuild `ssm-scan.cu`, which includes it. After a header change in `ggml-cuda` build with `--target ggml-cuda --clean-first`; the W6 build is a full clean one, and so is the final validation build.
+
+**M5 gates (W5 tree = vendored tree):** G1 build clean; G2 host suite 78/78; G3 perplexity **synced 10.8120**, control 10.8056, pure upstream 10.8482; `test-moe-hybrid-dup-ids` 80 checks 0 failures; GQA8 cases OK. Server smoke (hybrid decode + `--lm-prefill`, 1,600 and 3,000 tokens, control vs synced): the layer-major pass ran (1,084 tokens in 1.71 s, 633 t/s), top-1 identical in all 4 pairs, first-token logprob difference max 0.049 and 0.018, KL max 0.0013 / 0.0015.
+
+Review of M5 (30 lines of fork code differ from before, 3 files): every line is a resolution listed above.
+
 ## 8. Escalation
 
 If a waypoint cannot be built after the Implementer Workflow's classify-and-repair loop and one documented online pass (upstream issues and PRs for the touched files), stop that waypoint, record the root cause and the blocking files, and return to the owner with options B/C/D from section 3. In autonomous mode this becomes a recorded decision resolved by measurement or a probe, never by guessing.
