@@ -143,7 +143,7 @@ tokens (section 3.10). `LLAMA_MOE_HYBRID_RESIZE_VERIFY=1` reads every slot back 
 host bank (a test; it adds about 1.2 s per resize). `GGML_CUDA_MMVQ_MOE_ROWS` (1, 2 or 4; default 2) is the rows per block of the
 cached-expert matvec (a test knob: 4 is 0.7% faster on the 4-row verify and not worth a default). `GGML_CUDA_GDN_QUAD`
 (default 1 under `--hybrid-moe` since H51, 0 elsewhere; `=0` turns it off) selects the gated-delta-net prefill kernel with 4 lanes per state column for batches of 16 tokens or more (section 3.10). `GGML_CUDA_GDN_EPS=e` (measurement only, default 0) scales the output of every gated delta net layer by 1+e; it exists to measure the noise floor of the first-token KL.
-`LLAMA_FATTN_TILE_Q8PV` (default 1 inside the tile kernel since H52, for every model that reaches it; `=0` turns it off; it acts only with `--lm-prefill-attn-int8`, a q8_0 K and V cache and head size 256) runs the softmax-weights-times-V product of the layer-major
+`LLAMA_FATTN_TILE_Q8PV` (default 1 inside the tile kernel since H52, for every model that reaches it; on the dense Qwen3.8-27B the continuation rule holds on 8 of 8 prompts with it, H57; `=0` turns it off; it acts only with `--lm-prefill-attn-int8`, a q8_0 K and V cache and head size 256) runs the softmax-weights-times-V product of the layer-major
 attention with `dp4a` on int8 operands (dithered rounding of the weights): attention -25%, prefill +4% at 16k, +9% at 32k, +13% at 49k, +20% at 98k, +22% at 131k and +23% at 150k (q8_0 cache; with a q4_0 cache +3% at 16k, +8% at 49k, +12% at 131k; it uses a 64-key tile for q8_0; `LLAMA_FATTN_TILE_Q8CFG=0` selects the 32-key tile), not exact (section 3.10).
 
 Build and tests: `Q38LS_MODEL_PATH` is read by the CTest entries. The model-backed
