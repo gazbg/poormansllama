@@ -391,7 +391,7 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   two chats and after a 16k prompt). `LLAMA_MOE_HYBRID_RESIZE_KEEP=0` goes back to the full upload.
 - **Remainder tiles are now on by default for GPUs older than Volta** (section 3.7): bit-identical, prefill +3.8% / +3.6% at 4k / 16k in an
   A-B-B-A, +4.3 / +3.7 / +3.6% at 4k / 16k / 32k in single arms. `GGML_CUDA_MMQ_REMAINDER=0` turns them off.
-- **Gated delta net kernel with 4 lanes per state column (opt-in `GGML_CUDA_GDN_QUAD=1`).** The generic kernel gives a warp to a state
+- **Gated delta net kernel with 4 lanes per state column (`GGML_CUDA_GDN_QUAD=1`; the default under `--hybrid-moe` since H51, off elsewhere).** The generic kernel gives a warp to a state
   column and reduces over 32 lanes twice per token. The new one gives 4 lanes to a column (32 rows each in registers, 2 shuffles per
   reduction) and stages k and q of 8 tokens in shared memory; it is used for 16 tokens or more with a scalar gate and no snapshots.
   The op is 2.14 times faster (2,048 tokens, 16 heads: 10,149 -> 4,744 us; 2 or 8 lanes per column: 7.1-7.7 and 6.4-6.7 ms), and the prefill
@@ -505,8 +505,7 @@ not tried; the sizes are expectations, not measurements.
 - (Tried since this list was written: a draft threshold that follows the context depth was built as an env rule and rejected, because the gain of p-min 0.9 is not a function of depth, H33; the MTP layer's experts in VRAM at depth were confirmed at 32k and 64k and the memory gate with the flag passed at 61k, H34.)
 - (Tried since: a q4_0 K and V cache for deep decode, H43: -28.9% tok/s at 64k (25.44 -> 18.09, ms per round 76 -> 110), one cache slot more instead of 7 to 13; rejected.)
 - Stream-k scheduling for the K-quant expert tiles (off in the Pascal configuration): the premise (grid tail effects) is bounded below 1% (5,000 or more active tiles per call over 30-45 resident blocks); the real inefficiency of that grid was its empty blocks, removed by the flat tile list (H37, +3.6% / +4.1% prefill); stream-k itself is not pursued: a profile of a 4,096-token prefill (H50) puts the wave-tail loss of the K-quant expert launches at 1.11% of their time, 0.28% of the kernel time.
-- A bit-identical gated delta net prefill kernel, so that the 4-lane version could be the default: expected +3 to 5% of prefill, but the generic kernel's summation tree needs 32 partial sums per
-  column, which costs the shuffles that the new kernel saves.
+- (Closed since: the 4-lane gated delta net kernel did not need to be bit-identical to be the default under `--hybrid-moe`. H51 judged it against the noise floor of the first-token KL (a one-millionth change of the layer output, `GGML_CUDA_GDN_EPS=1e-6`): on nine prompts its mean KL is 0.158 against the bar 0.226 (floor 0.082 +- 0.072), the same top token on 9 of 9, medians 0.0036 against 0.0034, and without the one knife-edge prompt 0.0103 against 0.0106; prefill +4.8% at 4k and +6.5% at 16k (A-B-B-A, no overlap). `GGML_CUDA_GDN_QUAD=0` turns it off.)
 - The int8 PV beyond 131k tokens, with a q4_0 cache at 131k (a session was planned by the second instance of the work), and on the draft head's attention: not measured.
 
 ## 6. Reproduce

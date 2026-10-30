@@ -410,7 +410,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int64_t sb2 = nbb2 / sizeof(float);
     const int64_t sb3 = nbb3 / sizeof(float);
 
-    const float scale = 1.0f / sqrtf((float) S_v);
+    // H51: GGML_CUDA_GDN_EPS=e scales the output of every gated delta net layer by 1+e (a measurement knob for the noise floor of the first-token KL; default 0)
+    static const float gdn_eps = [] { const char * e = getenv("GGML_CUDA_GDN_EPS"); return e != nullptr ? (float) atof(e) : 0.0f; }();
+    const float scale = (1.0f / sqrtf((float) S_v)) * (1.0f + gdn_eps);
 
     cudaStream_t stream = ctx.stream();
 
