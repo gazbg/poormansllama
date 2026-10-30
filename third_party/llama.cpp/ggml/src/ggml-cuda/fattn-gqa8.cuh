@@ -32,6 +32,8 @@ static __device__ __forceinline__ int sx8(uint32_t x, int i) {   // signed byte 
 #endif
 }
 
+// exact (H46): the dot product of Q and K in f32 on the dequantized K (Q is not quantized to q8_1): slower per key than dp4a, but without the approximation
+template <bool exact>
 __launch_bounds__(128, 2)
 static __global__ void kernel(
         const char * GGML_CUDA_RESTRICT Qp, const char * GGML_CUDA_RESTRICT Kp, const char * GGML_CUDA_RESTRICT Vp, const half * GGML_CUDA_RESTRICT mask,
@@ -48,19 +50,31 @@ static __global__ void kernel(
     Kp += (size_t) kvh * nb12;
     Vp += (size_t) kvh * nb22;
 
-    __shared__ __align__(16) int    Qq[NH * 64];
-    __shared__ __align__(16) float2 Qds[NH * 8];
+    __shared__ __align__(16) int    Qq[exact ? 4 : NH * 64];
+    __shared__ __align__(16) float2 Qds[exact ? 1 : NH * 8];
+    __shared__ __align__(16) float  Qf[exact ? NH * D : 4];
     __shared__ __align__(16) float Pw[NW][32 * NH];
     __shared__ __align__(16) float red[NW][NH * D];
     __shared__ float mw[NW][NH];
     __shared__ float lw[NW][NH];
 
-    // Q to q8_1, pre-scaled, the same quantization as the vector kernel
-    for (int j = warp; j < NH; j += NW) {
-        const float * Q_f = (const float *) (Qp + (size_t) row * nb01 + (size_t) (head0 + j) * nb02);
+    if constexpr (exact) {
+        // Q in f32, pre-scaled
+        for (int j = warp; j < NH; j += NW) {
+            const float * Q_f = (const float *) (Qp + (size_t) row * nb01 + (size_t) (head0 + j) * nb02);
 #pragma unroll
-        for (int i0 = 0; i0 < D / (int) sizeof(int); i0 += 32) {
-            quantize_q8_1_to_shared<float2, 32>(Q_f + i0 * sizeof(int), scale, Qq + j * 64 + i0, Qds + j * 8 + i0 / QI8_1);
+            for (int i = lane; i < D; i += 32) {
+                Qf[j * D + i] = Q_f[i] * scale;
+            }
+        }
+    } else {
+        // Q to q8_1, pre-scaled, the same quantization as the vector kernel
+        for (int j = warp; j < NH; j += NW) {
+            const float * Q_f = (const float *) (Qp + (size_t) row * nb01 + (size_t) (head0 + j) * nb02);
+#pragma unroll
+            for (int i0 = 0; i0 < D / (int) sizeof(int); i0 += 32) {
+                quantize_q8_1_to_shared<float2, 32>(Q_f + i0 * sizeof(int), scale, Qq + j * 64 + i0, Qds + j * 8 + i0 / QI8_1);
+            }
         }
     }
     __syncthreads();
@@ -109,20 +123,43 @@ static __global__ void kernel(
 #pragma unroll
                 for (int j = 0; j < 8; ++j) kq[j] = (int) w[17 * mm + 9 + j];
             }
+            if constexpr (exact) {
+                float sb[NH];
 #pragma unroll
-            for (int h = 0; h < NH; ++h) {
-                const int4 q0 = *(const int4 *) &Qq[h * 64 + b * 8];
-                const int4 q1 = *(const int4 *) &Qq[h * 64 + b * 8 + 4];
-                int s = 0;
-                s = ggml_cuda_dp4a(kq[0], q0.x, s);
-                s = ggml_cuda_dp4a(kq[1], q0.y, s);
-                s = ggml_cuda_dp4a(kq[2], q0.z, s);
-                s = ggml_cuda_dp4a(kq[3], q0.w, s);
-                s = ggml_cuda_dp4a(kq[4], q1.x, s);
-                s = ggml_cuda_dp4a(kq[5], q1.y, s);
-                s = ggml_cuda_dp4a(kq[6], q1.z, s);
-                s = ggml_cuda_dp4a(kq[7], q1.w, s);
-                S[h] += (float) s * (dK * Qds[h * 8 + b].x);
+                for (int h = 0; h < NH; ++h) sb[h] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float k0 = (float) sx8((uint32_t) kq[j], 0);
+                    const float k1 = (float) sx8((uint32_t) kq[j], 1);
+                    const float k2 = (float) sx8((uint32_t) kq[j], 2);
+                    const float k3 = (float) sx8((uint32_t) kq[j], 3);
+#pragma unroll
+                    for (int h = 0; h < NH; ++h) {
+                        const float4 q = *(const float4 *) &Qf[h * D + b * 32 + 4 * j];
+                        sb[h] = fmaf(q.x, k0, sb[h]);
+                        sb[h] = fmaf(q.y, k1, sb[h]);
+                        sb[h] = fmaf(q.z, k2, sb[h]);
+                        sb[h] = fmaf(q.w, k3, sb[h]);
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < NH; ++h) S[h] = fmaf(sb[h], dK, S[h]);
+            } else {
+#pragma unroll
+                for (int h = 0; h < NH; ++h) {
+                    const int4 q0 = *(const int4 *) &Qq[h * 64 + b * 8];
+                    const int4 q1 = *(const int4 *) &Qq[h * 64 + b * 8 + 4];
+                    int s = 0;
+                    s = ggml_cuda_dp4a(kq[0], q0.x, s);
+                    s = ggml_cuda_dp4a(kq[1], q0.y, s);
+                    s = ggml_cuda_dp4a(kq[2], q0.z, s);
+                    s = ggml_cuda_dp4a(kq[3], q0.w, s);
+                    s = ggml_cuda_dp4a(kq[4], q1.x, s);
+                    s = ggml_cuda_dp4a(kq[5], q1.y, s);
+                    s = ggml_cuda_dp4a(kq[6], q1.z, s);
+                    s = ggml_cuda_dp4a(kq[7], q1.w, s);
+                    S[h] += (float) s * (dK * Qds[h * 8 + b].x);
+                }
             }
         }
         const float mk = __half2float(mask[key]);
@@ -230,15 +267,21 @@ static int ggml_cuda_fattn_gqa8_min_kv() {
 
 // Blocks per SM for the kernel, queried once per device. The first query loads the kernel module, so applies() makes it on the first flash-attention op of any
 // size and not in the middle of a decode (a driver call on the launching thread while the hybrid engine's GPU kernels spin is the deadlock of G5).
-static int ggml_cuda_fattn_gqa8_occupancy(const int device) {
-    static std::atomic<int> occ[GGML_CUDA_MAX_DEVICES];
-    int o = occ[device].load(std::memory_order_relaxed);
+static int ggml_cuda_fattn_gqa8_occupancy(const int device, const bool exact = false) {
+    static std::atomic<int> occ[2][GGML_CUDA_MAX_DEVICES];
+    int o = occ[exact][device].load(std::memory_order_relaxed);
     if (o == 0) {
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, fattn_gqa8::kernel, 128, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, exact ? (const void *) fattn_gqa8::kernel<true> : (const void *) fattn_gqa8::kernel<false>, 128, 0));
         o = std::max(o, 1);
-        occ[device].store(o, std::memory_order_relaxed);
+        occ[exact][device].store(o, std::memory_order_relaxed);
     }
     return o;
+}
+
+// H46 (opt-in): LLAMA_FATTN_GQA8_EXACT_ROWS=N runs the batches of N or more rows with the f32 Q.K kernel (no q8_1 quantization of Q); default 99 = never.
+static int ggml_cuda_fattn_gqa8_exact_rows() {
+    static const int v = []() { const char * e = getenv("LLAMA_FATTN_GQA8_EXACT_ROWS"); return e != nullptr ? atoi(e) : 99; }();
+    return v;
 }
 
 // Shapes this kernel serves: one to four tokens (G30), one sequence, head_dim 256, q8_0 K and V, 8 query heads per KV head, an f16 mask, no sinks, no alibi, no softcap.
@@ -247,6 +290,7 @@ static bool ggml_cuda_fattn_gqa8_applies(const ggml_tensor * dst) {
         return false;
     }
     (void) ggml_cuda_fattn_gqa8_occupancy(ggml_cuda_get_device());
+    (void) ggml_cuda_fattn_gqa8_occupancy(ggml_cuda_get_device(), true);
     if (dst->src[1]->ne[1] < ggml_cuda_fattn_gqa8_min_kv()) {
         return false;
     }
@@ -295,9 +339,14 @@ static int ggml_cuda_fattn_gqa8_parallel_blocks(const int N, const int nkv, cons
 
 // scale is the op's own softmax scale (op_params[0]), applied to Q before it is quantized, like launch_fattn() does
 static void ggml_cuda_fattn_gqa8_launch(const char * Q, const int nb01, const int nb02, const char * K, const int nb11, const int nb12, const char * V, const int nb21, const int nb22,
-        const half * mask, const int mask_stride, float * dst, float * dst_tmp, float2 * dst_meta, const int N, const int nkv, const int nrows, const int pb, const float scale, cudaStream_t stream) {
-    fattn_gqa8::kernel<<<dim3(nrows, pb, nkv), dim3(32, fattn_gqa8::NW, 1), 0, stream>>>(
-        Q, K, V, mask, pb > 1 ? dst_tmp : dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, nkv * fattn_gqa8::NH);
+        const half * mask, const int mask_stride, float * dst, float * dst_tmp, float2 * dst_meta, const int N, const int nkv, const int nrows, const int pb, const float scale, const bool exact, cudaStream_t stream) {
+    if (exact) {
+        fattn_gqa8::kernel<true><<<dim3(nrows, pb, nkv), dim3(32, fattn_gqa8::NW, 1), 0, stream>>>(
+            Q, K, V, mask, pb > 1 ? dst_tmp : dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, nkv * fattn_gqa8::NH);
+    } else {
+        fattn_gqa8::kernel<false><<<dim3(nrows, pb, nkv), dim3(32, fattn_gqa8::NW, 1), 0, stream>>>(
+            Q, K, V, mask, pb > 1 ? dst_tmp : dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, nkv * fattn_gqa8::NH);
+    }
     CUDA_CHECK(cudaGetLastError());
     if (pb > 1) {
         flash_attn_combine_results<fattn_gqa8::D><<<dim3(nrows, nkv * fattn_gqa8::NH, 1), dim3(fattn_gqa8::D, 1, 1), pb * sizeof(float2), stream>>>(dst_tmp, dst_meta, dst, pb);
@@ -313,11 +362,16 @@ static void ggml_cuda_flash_attn_ext_gqa8(ggml_backend_cuda_context & ctx, ggml_
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    {   // H47, measurement only: LLAMA_FATTN_GQA8_EPS=e scales the softmax scale by 1+e, a relative perturbation of every attention score, to measure the noise floor of a KL test
+        static const float eps = []() { const char * e = getenv("LLAMA_FATTN_GQA8_EPS"); return e != nullptr ? (float) atof(e) : 0.0f; }();
+        scale *= 1.0f + eps;
+    }
 
     const int N     = (int) K->ne[1];
     const int nkv   = (int) K->ne[2];
     const int nrows = (int) Q->ne[1];
-    const int pb    = ggml_cuda_fattn_gqa8_parallel_blocks(N, nkv, nrows, ggml_cuda_info().devices[ctx.device].nsm, ggml_cuda_fattn_gqa8_occupancy(ctx.device));
+    const bool exact = nrows >= ggml_cuda_fattn_gqa8_exact_rows();
+    const int pb    = ggml_cuda_fattn_gqa8_parallel_blocks(N, nkv, nrows, ggml_cuda_info().devices[ctx.device].nsm, ggml_cuda_fattn_gqa8_occupancy(ctx.device, exact));
 
     // the pool is a stack: allocate in declaration order so that the destructors free in reverse
     ggml_cuda_pool_alloc<float>  dst_tmp(ctx.pool());
@@ -328,5 +382,5 @@ static void ggml_cuda_flash_attn_ext_gqa8(ggml_backend_cuda_context & ctx, ggml_
     dst_meta.alloc((size_t) pb * ggml_nrows(dst));
     ggml_cuda_fattn_gqa8_launch((const char *) Q->data, (int) Q->nb[1], (int) Q->nb[2], (const char *) K->data, (int) K->nb[1], (int) K->nb[2],
         (const char *) V->data, (int) V->nb[1], (int) V->nb[2], (const half *) mask->data, (int) (mask->nb[1] / sizeof(ggml_fp16_t)), (float *) dst->data, dst_tmp.ptr, dst_meta.ptr,
-        N, nkv, nrows, pb, scale, ctx.stream());
+        N, nkv, nrows, pb, scale, exact, ctx.stream());
 }
