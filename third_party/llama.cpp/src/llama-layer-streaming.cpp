@@ -4768,10 +4768,7 @@ int64_t llama_layer_streaming_reserve_ubatch(llama_context * ctx, uint32_t n_uba
 // device/host result tensor directly. This is the quantity a normal-path
 // greedy sampler generates first: P(.|prompt) at the last prompt position.
 int64_t llama_context::layer_major_pp_first_token() {
-    if (gf_res_prev == nullptr) {
-        return -1;
-    }
-    ggml_tensor * t = gf_res_prev->get_logits();
+    ggml_tensor * t = get_gf_res_prev()->get_logits();
     if (t == nullptr || t->data == nullptr || t->ne[0] <= 0 || t->ne[1] <= 0) {
         return -1;
     }
@@ -4796,10 +4793,10 @@ int64_t llama_context::layer_major_pp_first_token() {
 // returning the top-k (id, logit) pairs so two engines can be compared at the
 // logit level instead of by first-token identity. Read-only.
 int llama_context::layer_major_pp_topk(int k, int64_t * ids, float * vals) {
-    if (gf_res_prev == nullptr || k <= 0 || ids == nullptr || vals == nullptr) {
+    if (k <= 0 || ids == nullptr || vals == nullptr) {
         return -1;
     }
-    ggml_tensor * t = gf_res_prev->get_logits();
+    ggml_tensor * t = get_gf_res_prev()->get_logits();
     if (t == nullptr || t->data == nullptr || t->ne[0] <= 0 || t->ne[1] <= 0) {
         return -1;
     }
@@ -4861,9 +4858,7 @@ void llama_context::set_eval_cb(ggml_backend_sched_eval_callback cb, void * user
 
 void llama_context::drop_graph_reuse() {
     synchronize();
-    if (gf_res_prev) {
-        gf_res_prev->reset();
-    }
+    reset_graph_reuse();
 }
 
 // G30: reserve_for_decode with an explicit ubatch, for the MTP draft context: its prompt catch-up decodes up to 512 rows (a 296 MiB compute buffer), its rounds at most 2 + draft rows.
@@ -6551,7 +6546,8 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
         batch.n_tokens = n_c;
 
         llama_batch_allocr vballoc(hparams.n_pos_per_embd());
-        if (!vballoc.init(batch, model.vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+        llama_batch_compat vcompat(this, batch);   // llama_batch_ext since upstream #24669
+        if (!vballoc.init(*vcompat.batch_ext, model.vocab, output_all)) {
             llama_batch_free(batch);
             ret = GGML_STATUS_FAILED;
             return -2;
@@ -7244,10 +7240,12 @@ int llama_context::layer_major_pp(const llama_batch & batch_inp, ggml_status & r
     // subsequent TG step (T-Q38LM-04) reads consistent tensors
     {
         auto * last = sets[n_chunks - 1];
-        gf_res_prev->t_logits      = last->res->t_logits;
-        gf_res_prev->t_embd        = last->res->t_embd;
-        gf_res_prev->t_embd_pooled = last->res->t_embd_pooled;    gf_res_prev->t_h_nextn     = last->res->t_h_nextn;
-    gf_res_prev->t_inp_tokens  = last->res->t_inp_tokens;
+        auto * gres = get_gf_res_prev();   // the buffer a following decode of the same output width picks
+        gres->t_logits      = last->res->t_logits;
+        gres->t_embd        = last->res->t_embd;
+        gres->t_embd_pooled = last->res->t_embd_pooled;
+        gres->t_h_nextn     = last->res->t_h_nextn;
+        gres->t_inp_tokens  = last->res->t_inp_tokens;
     }
 
     // T-GPLR-36: emit the host ledger once per pass (recon only). `other_us` is
