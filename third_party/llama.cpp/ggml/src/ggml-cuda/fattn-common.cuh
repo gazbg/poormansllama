@@ -1191,6 +1191,10 @@ void launch_fattn(
     memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    {   // H49, measurement only: LLAMA_FATTN_EPS=e scales the softmax scale by 1+e (a relative change of every score) to measure the noise floor of a KL comparison
+        static const float eps = []() { const char * e = getenv("LLAMA_FATTN_EPS"); return e != nullptr ? (float) atof(e) : 0.0f; }();
+        scale *= 1.0f + eps;
+    }
 
     const bool    causal     = ggml_get_op_params_i32(KQV, 4) != 0;
     const int32_t q_pos_base = ggml_get_op_params_i32(KQV, 5);
