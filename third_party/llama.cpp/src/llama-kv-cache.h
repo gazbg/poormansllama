@@ -98,6 +98,7 @@ public:
     //       likely through `struct llama_memory_params`
     llama_kv_cache(
             const llama_model & model,
+                         bool   no_alloc,
           const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
@@ -106,7 +107,6 @@ public:
                          bool   unified,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
-                     uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
                llama_memory_t   mem_other,
@@ -134,6 +134,7 @@ public:
     bool get_can_shift() const override;
 
     bool set_view_pad(uint32_t pad) override;
+    void set_attn_n_pad(uint32_t pad) override { n_pad = pad ? pad : 1; }
 
     void clear(bool data) override;
 
@@ -320,7 +321,8 @@ private:
     const uint32_t n_stream  = 1;
 
     // required padding
-    const uint32_t n_pad = 1;
+    // required padding (the fork's pin of the view width, set from cparams.n_pad through set_attn_n_pad(); upstream fixes it at 256)
+    uint32_t n_pad = 1;
 
     // T-GPLR-71: phase-scoped override of n_pad inside get_n_kv(); 0 = off
     uint32_t n_pad_view = 0;
@@ -353,7 +355,7 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    llama_memory_bufs ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

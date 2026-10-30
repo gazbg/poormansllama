@@ -7,8 +7,6 @@ base_date=2026-08-18
 base_subject=common: share thread pools when `n_threads` differ (#27138)
 base_found_by=tools/find-upstream-base.py on commit 6dae153 (3403 of 3488 files byte-identical), 2026-10-30
 # State of the sync (docs/plans/upstream-sync-plan.md): the vendored tree is upstream synced_tag plus the fork delta.
-synced_tag=b11850
-synced_sha=9ae73e68f5a78933c0d988bbd17bf4647ad6a0b2
-# Pinned target of the sync in progress (decision D1, 2026-10-30). Not merged yet; base_* above still describes the tree.
-sync_target_tag=b12004
-sync_target_sha=3c809f44383bcebc318b8cddd8c6d11aaa861e9b
+synced_tag=b12004
+synced_sha=3c809f44383bcebc318b8cddd8c6d11aaa861e9b
+# The sync of 2026-10-30 (decision D1: target b12004) is complete; base_* is the OLD fork point, kept for the record.

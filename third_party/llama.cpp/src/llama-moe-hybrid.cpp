@@ -2441,7 +2441,7 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     const int     n_slot = moe_hybrid_env_int("LLAMA_MOE_HYBRID", 0);
     const int64_t n_tok  = g.n_tokens;   // 1 for a decode step; 1 + drafts for an MTP verify step
     if (n_slot <= 0 || n_tok < 1 || n_tok > GGML_MOE_HYBRID_MAX_WIDTH || cur->ne[1] != n_tok || g.layer_streaming != nullptr || il < 0 || il >= g.n_layer ||
-        g.n_expert_used != (int64_t) g.hparams.n_expert_used() || model.hparams.no_alloc) {
+        g.n_expert_used != (int64_t) g.hparams.n_expert_used() || model.no_alloc()) {
         return nullptr;
     }
 

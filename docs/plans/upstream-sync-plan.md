@@ -1,8 +1,8 @@
 # Plan: sync the vendored llama.cpp with upstream ggml-org/llama.cpp
 
-Status: draft (planning only, nothing merged, nothing built; owner decisions D1-D4 below are open)
+Status: done for the contract of section 9 (2026-10-30; the agent's own acceptance under the owner's goal). Owner decisions D1-D4 approved 2026-10-30
 Dependencies: none (does not touch the active GPLR plan; it changes the engine every GPLR result was measured on)
-Commit: unfilled (plan written 2026-10-30; no vendored-tree change yet)
+Commit: M0 `eba0e9e`; M1-M2 `f245299` + `bca3421`; M3 `bd5944b`; M4 `1c8ad220`; M5 `b3a2f887`; M6 the commit "third_party: sync llama.cpp to b12004"
 Authority: owner request 2026-10-30, "pull the latest, see how (plan) to update the current repo with the latest ggml-org/llama.cpp it is based on".
 
 ## 1. Where things stand (measured 2026-10-30)
@@ -228,6 +228,64 @@ Review of M4 (55 lines of fork code differ from before, 7 files): every line is 
 
 Review of M5 (30 lines of fork code differ from before, 3 files): every line is a resolution listed above.
 
+### M6 / W6 (b12004 = the pinned target, 1,516 commits from the fork point)
+
+5 files, 7 hunks, plus three compile errors. The tree was built from a clean state (`--clean-first`, all targets).
+
+- **F11 the KV padding pin.** Upstream removed `cparams.n_pad` and the `n_pad` constructor argument of the memory types; `get_n_kv()` now pads to a fixed 256. The layer-streaming runner pins the width of the attention views to the whole context (`cparams.n_pad = n_ctx`, AGENTS: "the single switch" for how much of the cache decode attention scans) so that its persistent graph sets never depend on the live position; losing the pin would have made those sets silently under-read the cache. The pin is back through a new virtual `llama_memory_i::set_attn_n_pad()` (appended after `set_view_pad`, overridden by `llama_kv_cache` and forwarded by `llama_memory_hybrid`), which `llama_context` calls right after it creates the memory; `llama_kv_cache::get_n_kv()` keeps the fork's phase override (`n_pad_view`) and the pin (member `n_pad`, default 1), and without either it equals upstream's fixed 256. The 512-token QA rung of the runner passes on the synced tree (below).
+- `kv-cache.cpp` allocation: upstream's `ctxs_bufs.emplace(...)` replaces the in-place buffer allocation; the fork's lazy KV commit (`LLAMA_KV_LAZY`, G31) wraps it (the allocator call the flag is consumed by is the one inside `emplace`); `hparams.no_alloc` became `llama_model::no_alloc()` / the constructor's `no_alloc` argument (two fork uses fixed).
+- `llama-graph.cpp`: the router derivation stays nested in the fork's else-branch (T-GPLR-82 S2); the one new upstream line in it (DeepSeek 4.1's `weights_sum + 1e-20` instead of the F16 clamp) is ported by hand; a check that every line upstream added to `llama-graph.cpp` between b11850 and b12004 is present in the merged file found nothing else missing.
+- `fattn.cu`: the fork's FAFIX gate next to upstream's `#if !defined(GGML_USE_MUSA)` (sparse flash attention now also on HIP CDNA).
+
+**M6 gates (W6 tree = vendored tree = the target):**
+- G1 build: clean build of all targets, MSVC 19.5 / CUDA 13.2 / sm_120.
+- G2 host suite 78/78.
+- **G3 default-off identity: perplexity of the same text is 10.8482 +/- 0.64602 on the synced build and on pure upstream b12004 (identical to all digits printed); the previous fork gave 10.8056.** With every fork flag off the synced engine computes exactly what pure upstream computes on this text.
+- `test-moe-hybrid-dup-ids` 80 checks 0 failures; head-256 q8_0 GQA8 cases OK; `test-backend-ops`: failures only in the IQ-quantisation family (finding F10), none outside it (`tools/sync-tbo-compare.py` exit 0; 2 of the synced failures pass on pure upstream, which the erratic family explains).
+- G4 server equivalence (hybrid decode + `--lm-prefill`, 1,600 and 3,000 token prompts, control vs synced): top-1 identical in 4 of 4 pairs, first-token logprob difference max 0.015, KL max 0.0010; the layer-major pass ran (1,084 tokens in 1.72 s, 630 t/s).
+- G6 runner QA smoke (`tools/run-tests.ps1 -Suite qa-smoke -BuildDir <scratch build>`, 512-token rung, the layer-streaming runner with its persistent graphs and the n_pad pin): check-telemetry OK, all five needle items PASS, the negative control FAILs as designed.
+- G7 speed, A B B A in one mutex hold, mains power, same server flags (hybrid decode + `--lm-prefill`, 1,600-token prompt, 128 greedy tokens, 3 reps, medians): **prompt 614.8 / 615.3 t/s (control) against 635.6 / 636.4 (synced), +3.4%; decode 84.52 / 85.00 t/s against 83.20 / 83.27, -1.8%** (inside the 3% bar of T-SYNC-04, smaller than the rep-to-rep spread of 3-4%). One prompt length, one model, one machine: it supports "no regression of the kind a merge accident causes", nothing more.
+- G4b the real `--hybrid-moe -fitt 16000 --lm-prefill` server (lazy KV commit, expert cache sized to the margin, prefill window; `-c 32768`), control vs synced, same two prompts: the cache starts at 62 slots per layer in both and shrinks at the KV commits identically (62 -> 38, 61 -> 42 in the control; 62 -> 38, 60 -> 40 in the synced build), top-1 identical in 4 of 4 pairs, first-token logprob difference max 0.030, KL max 0.0016; speed from sequential runs (not A B B A): prompt 484.8 (control) against 501.2 t/s (synced), decode 124.27 against 125.25 t/s. This exercises the one hunk the W1 resolution changed in `server-context.cpp` only without a draft model; MTP with this mode was not run.
+- G5 memory: `compute-sanitizer --tool memcheck` on `test-backend-ops MUL_MAT_ID` q4_K, 256 experts, 2,048 tokens: 0 errors on the synced build and on pure upstream. The server itself, `-ub 2048` with `--lm-prefill` and the hybrid decode, under `compute-sanitizer --tool memcheck`: one 1,600-token prompt, served through one layer-major pass of 1,596 tokens (one 2,048-token chunk), status 200, **ERROR SUMMARY: 0 errors** (the sanitizer's "target application returned an error" is the server being stopped). One prompt shape only; the original G31l fault depended on the prompt.
+
 ## 8. Escalation
 
 If a waypoint cannot be built after the Implementer Workflow's classify-and-repair loop and one documented online pass (upstream issues and PRs for the touched files), stop that waypoint, record the root cause and the blocking files, and return to the owner with options B/C/D from section 3. In autonomous mode this becomes a recorded decision resolved by measurement or a probe, never by guessing.
+
+## 9. Result and owner summary (2026-10-30; the agent's own acceptance under the owner's goal, not owner approval)
+
+Status: **done for the contract below** (W1-W6 merged, `third_party/llama.cpp` = upstream b12004 + the fork delta). Commit field: M0 `eba0e9e`, M1/M2 `f245299`, `bca3421`, M3 `bd5944b`, M4 `1c8ad220`, M5 `b3a2f887`, M6 see `git log` (the commit "third_party: sync llama.cpp to b12004").
+
+**1. What was asked and why it mattered.** The owner asked to pull the repository and plan, then (by `/goal`) implement, an update of the vendored llama.cpp to the latest ggml-org/llama.cpp, with a review and a local commit at each milestone. The tree was 1,516 upstream commits behind (10 weeks); upstream had meanwhile built a MoE expert cache, native MTP, new CUDA fusions, a KV-cache rework and a new batch API, all of which touch the code the fork's work lives in.
+
+**2. How it works, in simple terms.** The fork is a few hundred files added to, and a few hundred lines changed in, upstream's code. The tree's true upstream starting point was found by comparing file hashes (the recorded one was wrong). Upstream was then merged into it with git, in six steps of increasing size, in a scratch clone; at each step the conflicts were resolved by hand, the result built, and a fixed set of checks run; the resulting tree was copied into this repository byte for byte (its git tree id is compared) and committed. Where upstream had changed an interface under fork code, the fork code was ported to it; where upstream had done the same job as a fork patch, the fork patch was dropped.
+
+**3. Glossary.** *Waypoint (W1-W6)*: an upstream release tag merged in one step (b10729, b10991, b11311, b11675, b11850, b12004). *Fork delta*: the fork's changes against upstream. *Hybrid decode*: the fork's MoE decode with the expert weights in host memory and a VRAM expert cache. *Layer-major prefill / `--lm-prefill`*: the fork's prompt processing that copies each layer's expert bank to the GPU once and runs all prompt chunks through it. *PP / TG*: prompt processing / token generation speed. *PPL*: perplexity, the model's average surprise at a text (lower is better; equal numbers mean equal arithmetic). *`test-backend-ops`*: upstream's check of each GPU operation against the CPU. *IQ family*: the IQ1_S / IQ2_S / IQ3_S (and a few related) weight formats. *KL / logprob difference*: how far two runs' next-token probabilities are apart. *memcheck*: NVIDIA's memory-error checker for GPU code. *Control*: the fork before the sync (side-copied binaries). *`n_pad` pin*: the fork's way of making attention read the whole KV cache width so its prebuilt graphs never go stale.
+
+**4. Pros and cons.**
+- Pro (measured): the default path now computes exactly what pure upstream b12004 computes (perplexity 10.8482 on both, to every digit printed; the previous fork gave 10.8056). Source: M6 gates, `build/llama-cuda/sync-gates/w6/`.
+- Pro (measured): 78/78 host tests, `test-moe-hybrid-dup-ids` 80/80, hybrid server with the layer-major pass matches the control (top-1 4/4, first-token logprob difference <= 0.015, KL <= 0.001), the runner's 512-token needle rung passes with its negative control, prompt +3.4% and decode -1.8% against the control in one A B B A cell, memcheck 0 errors on the large-batch expert matmul and on a 1,596-token pass at `-ub 2048`.
+- Pro (measured): the fork needs fewer patches: the top-k router barrier (G30) and the MMQ slack fix (G31l) are upstream's now; four fork-only files (`topk-moe.*`, one probe) are gone. Fork delta against b12004: 143 files, +58,408 / -310.
+- Pro (measured): two silent hazards found and removed that no compiler would have reported: the flash-attention `op_params` slot collision and four mis-bound positional test arguments; plus a pre-existing Windows build break (`mmvq.cu`, since 2026-10-29).
+- Con (measured): the full sync was verified on ONE model (Qwen3.6-35B-A3B Q4_K_S), ONE machine (RTX 5090 Laptop, Windows, MSVC, CUDA 13.2) and mostly short prompts (<= 3,000 tokens). Not run: the Linux GCC / CUDA 12.8 build, the GTX 1070 and the dense Qwen3.8 cells, MTP with the hybrid server (`--spec-type mtp`, the 16,000 MiB margin of the changed reservation code), `-np 2`, the canonical / fuse / prearm modes, the 4k-200k QA ladder, long-context decode (where the KV pin matters most), `server_hitfresh.py` replicated pairs, the dense ring. Status: unproven.
+- Con (measured): `test-backend-ops` fails IQ1/2/3_S and related matmul cases on this machine on every build, upstream included, erratically (three runs of one binary: 28/26/26 cases). The synced build adds nothing outside that family, but the family itself is a fault of unknown cause that would matter for the dense Qwen3.8 UD-IQ3 model on a Blackwell card (owner information).
+- Con (expected): the fork now has to carry ports of several upstream interfaces (batch API, double-buffered graph result, KV pin, `build_moe_ffn` parameter order); each next sync will touch them again. Upstream's own MoE cache and MTP are compiled in but off; whether they beat the fork's engines is a separate measurement (decision D3).
+- Con (measured, small): decode -1.8% in the A B B A cell, inside the 3% bar and inside the 3-4% rep-to-rep spread; unexplained.
+
+**5. Recommendation.** Keep the sync (adopt `third_party/llama.cpp` at b12004). Before relying on it for the numbers in AGENTS.md: (a) run the Linux GCC / CUDA 12.8 build and the GTX 1070 / dense Qwen3.8 cells on the Pascal machine; (b) rerun the long-context decode cells (50k-200k) and the 4k QA rung, because the KV `n_pad` pin was re-applied by a new hook and only the 512-token rung covers it; (c) run the hybrid server with MTP and `--fit-target 16000` once to confirm the memory margin of the changed reservation; (d) decide D3 (upstream MoE cache against the fork's) as its own measured task. Numbers recorded before 2026-10-30 were measured on the b10488-based engine and stay valid for that engine only.
+
+**Acceptance contract (written into this plan on 2026-10-30, before the first waypoint was built) and its evidence.**
+
+| Criterion | Evidence |
+|---|---|
+| All six waypoints merged, every conflict recorded | section 7 (M2-M6), 25 conflicting files, 70 hunks at the fixed base, all resolved |
+| G1 build of every target on Windows MSVC + CUDA 13.2 | M6 clean build, exit 0 |
+| G2 host suite equal to the control (78/78) | 78/78 at W2-W6 |
+| G3 default-off identity with pure upstream | PPL equal to every digit at W6; tbo no failure outside the erratic IQ family |
+| G4 server equivalence at an equal chunk shape | smoke at W3-W6, top-1 identical, KL <= 0.0015 (the replicated-pair harness was not run) |
+| G5 memory | memcheck 0 errors (MUL_MAT_ID 2,048 tokens; server pass at `-ub 2048`) |
+| G6 QA smoke | runner 512-token rung PASS with negative control |
+| G7 no cell > 3% below the control | prompt +3.4%, decode -1.8% (one cell) |
+| Claims limited to what was run | this section |
+
+Decisions taken during the work (all reversible; section 7 has the reasons): pin b12004 (D1), six waypoints (D2), keep the fork MoE / MTP engines and leave upstream's off (D3), sync on need (D4); drop the fork's G30 and G31l and the T-GPLR-16 sched probe in favour of upstream's; move the fork's causal `op_params` to slots 12-14; upstream's parameters before the fork's in `build_moe_ffn`; fork hooks in `decode()` run on the sanitised batch; re-apply the KV pin through `set_attn_n_pad`; perplexity instead of greedy text as the cross-build numerical gate; IQ-family-level instead of case-level backend-op gate; the performance cells of the control were not recorded in advance (G7 is a same-session A/B); intermediate waypoints skip the full `test-backend-ops` run.
