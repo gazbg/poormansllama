@@ -61,7 +61,6 @@ void llama_hybrid_prepare_env(int32_t initial_slots, const char * freq_path) {
     hybrid_setenv_default("LLAMA_MOE_HYBRID_LEAN_PF", "2");     // lean prefetch K = 2
     hybrid_setenv_default("LLAMA_CUDA_INPUT_BATCH", "1");       // batched small input uploads
     hybrid_setenv_default("LLAMA_FATTN_GQA8", "1");             // packed GQA decode attention (1-4 rows)
-    hybrid_setenv_default("LLAMA_FATTN_TILE_Q8PV", "1");        // int8 PV of the int8-attention prefill (acts only with --lm-prefill-attn-int8 and a q8_0 KV cache; H49)
     hybrid_setenv_default("GGML_CUDA_GDN_QUAD", "1");           // 4-lane gated delta net prefill kernel (batches of 16 tokens or more; within the first-token KL floor, +5..6% prefill; H51)
     hybrid_setenv_default("LLAMA_KV_LAZY", "1");                // the KV cache commits its rows on demand (the expert cache gets the rest)
     hybrid_setenv_default("LLAMA_KV_LAZY_ONDEMAND", "1");       // ... and the cache itself does the committing (G31r; the runner commits its rows up front)

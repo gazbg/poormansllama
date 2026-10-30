@@ -1543,7 +1543,8 @@ template <int DKQ, int DV, bool Q4>
 static void launch_fattn_tile_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if constexpr (DKQ == 256 && DV == 256) {
         static const int cfg_env = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8CFG"); return e != nullptr ? atoi(e) : -1; }();
-        static const bool pv8 = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8PV"); return e != nullptr && e[0] == '1'; }();
+        // on by default whenever the int8 QK path is on (H49, H52: within the first-token KL floor on the MoE and the dense model); LLAMA_FATTN_TILE_Q8PV=0 turns it off
+        static const bool pv8 = [] { const char * e = getenv("LLAMA_FATTN_TILE_Q8PV"); return e == nullptr || e[0] != '0'; }();
         {
             // The int8 PV defaults to configuration 3 (64 keys per tile, so that each Q read serves two keys of a lane) for q8_0 and 0 (32 keys) for q4_0; V must have the type of K.
             const int pv8_cfg = cfg_env < 0 ? (Q4 ? 0 : 3) : cfg_env;   // measured: the 64-key tile is slower than the 32-key one with a q4_0 cache (69.8 against 61.8 ms at 10,240 keys)
