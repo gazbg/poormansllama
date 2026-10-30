@@ -415,10 +415,14 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   -0.043 +- 0.036 and -0.109 +- 0.068 (negative is noise; the resolution is about 0.02 and 0.07 nats). At 98,304 tokens of context (one window) the first-token KL against exact attention is 0.00007 for int8 QK and 0.00024 with the PV, the same top token, and the plain-decode prefill takes 449 s, 314 s and 262 s. It is not exact (text changes).
   At 131,072 tokens (one window) the first-token KL is 0.0194 (int8 QK) and 0.0191 (with the PV), the true-token NLL -0.025 and -0.014 against exact attention; a wider paired
   log-likelihood over 144 windows of 4,096 tokens gives int8 QK +0.0053 +- 0.0086 and int8 QK + PV +0.0037 +- 0.0079 (about +0.4% perplexity at a resolution of +-0.8%).
+  A second set of 146 windows from another stretch of the text is noisier (digits inside number tables have an exact NLL of 5 to 9, and three of them move by 5.6-8.0 nats, all
+  towards a better NLL): int8 QK -0.0246 +- 0.0447, int8 QK + PV -0.1266 +- 0.0764, medians 0.0006 / -0.0001. Pooled over the two sets (290 positions): exact NLL 1.6670, int8 QK
+  -0.0098 +- 0.0229, int8 QK + PV -0.0619 +- 0.0388, top token equal to exact attention at 270/290 and 274/290 positions. So no loss is detectable at a resolution of about
+  +-0.05 / +-0.08 nats (a loss of 1% perplexity or less cannot be excluded); 5.5-6.9% of positions change the top token.
   `tools/pascal/ftk_arm.py` (`--ppl` for the log-likelihood) and `fa_pv8_check.cpp` are the harnesses. With a q4_0 K and V cache the int8 PV also works (the V rows are
   mapped to +-127 of the tile's largest scale; with the q8_0 scale their 4-bit values were squeezed to a few levels, NMSE 1.2e-3): attention 73.3 -> 59.3 ms at 10,240 keys
   (-19%), 255 -> 216 ms at 34,816 (-15%), NMSE 5e-5 against the FP32 PV; there the 32-key tile is faster than the 64-key one (61.8 against 69.8 ms) and is the default. On the hybrid server with a q4_0 cache the
-  prefill gains +2.8% at 16k and +7.8% at 49k (A-B-B-A).
+  prefill gains +2.8% at 16k, +7.8% at 49k and +11.7% at 131k (264.3 -> 295.2 tok/s, A-B-B-A, no overlap).
 - **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
