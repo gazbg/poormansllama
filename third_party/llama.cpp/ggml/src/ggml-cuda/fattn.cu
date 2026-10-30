@@ -538,10 +538,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
-            // H44 (opt-in): LLAMA_FATTN_GQA8_MAXROWS=4 sends three or four rows (a verify batch of the MTP draft) to the packed GQA kernel when it applies;
-            // the tile kernel would first convert the whole K and V cache to f16 (decode +6..11% at 8k..64k tokens of depth). It quantizes Q like the vector
-            // path does, so the output differs from the tile kernel's (KL divergence 0.007, same top token 95%): the default 2 keeps the tile kernel for 3-4 rows.
-            static const int gqa8_max_rows = []() { const char * e = getenv("LLAMA_FATTN_GQA8_MAXROWS"); return e != nullptr ? atoi(e) : 2; }();
+            // H44/H48: three or four rows (a verify batch of the MTP draft) go to the packed GQA kernel when it applies (LLAMA_FATTN_GQA8=1, which --hybrid-moe sets);
+            // the tile kernel would first convert the whole K and V cache to f16 (decode +6..11% at 8k..64k tokens of depth). The packed kernel quantizes Q like the
+            // vector path does for 1-2 rows, so its output differs from the tile kernel's by no more than a 1e-6 change of every score does (H47, H48: KL within 1.5x of that
+            // floor on two texts, perplexity unchanged). LLAMA_FATTN_GQA8_MAXROWS=2 restores the tile kernel for 3-4 rows.
+            static const int gqa8_max_rows = []() { const char * e = getenv("LLAMA_FATTN_GQA8_MAXROWS"); return e != nullptr ? atoi(e) : 4; }();
             if (Q->ne[1] <= gqa8_max_rows && ggml_cuda_fattn_gqa8_applies(dst)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
