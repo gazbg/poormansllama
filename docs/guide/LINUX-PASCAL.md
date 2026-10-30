@@ -477,6 +477,17 @@ cached-expert matvecs; the host reads an expert in 88 us (22 GB/s) with four thr
 - `ncu` needs root for hardware counters here; kernel behaviour was read from the
   machine code and `nsys`. Profiling used `kernel.perf_event_paranoid=1`.
 
+Ideas not pursued (2026-10-30). The ledger of `docs/plans/gtx1070-moe-mtp-optimization.md` has no open row, which only records that every listed idea was closed. These ones exist and were
+not tried; the sizes are expectations, not measurements.
+
+- A draft threshold that follows the context depth (0.7 up to about 16k tokens, 0.9 from 32k, section 3.8): about the +3% of the deep case without the manual switch; a change in `common/speculative.cpp`.
+- The MTP layer's experts in VRAM at depth: a single arm at 32k gave +4.9%; it needs an A-B-B-A and the 32k / 60k memory gate.
+- A q4_0 K and V cache for contexts of 100k and more: it frees about 0.5 to 1 GB for the expert cache (7 to 13 slots), expected +1 to 2% decode, at the cost of the cache quality.
+- Stream-k scheduling for the K-quant expert tiles (off in the Pascal configuration): expected up to 2 to 3% of prefill, a large change in `mmq.cuh`.
+- A bit-identical gated delta net prefill kernel, so that the 4-lane version could be the default: expected +3 to 5% of prefill, but the generic kernel's summation tree needs 32 partial sums per
+  column, which costs the shuffles that the new kernel saves.
+- The int8 PV beyond 131k tokens, with a q4_0 cache at 131k (a session was planned by the second instance of the work), and on the draft head's attention: not measured.
+
 ## 6. Reproduce
 
 ```bash
