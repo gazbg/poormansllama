@@ -277,6 +277,12 @@ exactly one remainder tile, so it reads its weights as often as before), mode 2 
 applies to MoE matmuls whose rows are a multiple of 128, more than 64 tokens and tiles without stream-k (Pascal); anything else
 runs as before. The flag is read at every launch.
 
+Flat tile list (`GGML_CUDA_MMQ_ID_FLAT`, on by default for GPUs older than Volta since 2026-10-30; `=0` turns it off; H37). The main launch of an expert matmul had a grid of
+(row tiles, ntx = tokens / 64, all experts), 65,536 blocks for the Q4_K gate / up matrices and 262,144 for the Q5_K down matrix at a 2,048-token chunk, while an expert gets about 64 tokens,
+so 96% of the blocks found nothing to do and exited, after holding an SM slot for the read of the expert bounds. The grid now lists only the tiles that hold columns (a one-block
+prefix sum over the experts' tile counts, a binary search per block, at most tokens x experts used / 64 + experts tiles): the op is 4.6% (Q4_K) and 30% (Q5_K down) faster at
+2,048 tokens, prefill +3.6% at 4k and +4.1% at 16k (A-B-B-A, no overlap), bit-identical (first-token log-probabilities equal, `check_mmq_remainder` hashes equal, MUL_MAT_ID 887/887, MUL_MAT 1,218/1,218).
+
 - Matmul (`test-backend-ops perf`, 2048 tokens, 256 experts): Q4_K gate / up 7.25 ms -> 6.54 (mode 1), 6.88 (mode 2), 6.72
   (mode 3); Q5_K down 9.46 ms -> 8.99, 9.05, 9.11.
 - Prefill, the owner's command, A-B-B-A, mode 1 against off: 4,096 tokens 470.8 -> 488.8 tok/s (+3.8%), 16,384 tokens 573.5 ->
@@ -486,7 +492,7 @@ not tried; the sizes are expectations, not measurements.
 
 - (Tried since this list was written: a draft threshold that follows the context depth was built as an env rule and rejected, because the gain of p-min 0.9 is not a function of depth, H33; the MTP layer's experts in VRAM at depth were confirmed at 32k and 64k and the memory gate with the flag passed at 61k, H34.)
 - A q4_0 K and V cache for contexts of 100k and more: it frees about 0.5 to 1 GB for the expert cache (7 to 13 slots), expected +1 to 2% decode, at the cost of the cache quality.
-- Stream-k scheduling for the K-quant expert tiles (off in the Pascal configuration): expected up to 2 to 3% of prefill, a large change in `mmq.cuh`.
+- Stream-k scheduling for the K-quant expert tiles (off in the Pascal configuration): the premise (grid tail effects) is bounded below 1% (5,000 or more active tiles per call over 30-45 resident blocks); the real inefficiency of that grid was its empty blocks, removed by the flat tile list (H37, +3.6% / +4.1% prefill); stream-k itself is not pursued.
 - A bit-identical gated delta net prefill kernel, so that the 4-lane version could be the default: expected +3 to 5% of prefill, but the generic kernel's summation tree needs 32 partial sums per
   column, which costs the shuffles that the new kernel saves.
 - The int8 PV beyond 131k tokens, with a q4_0 cache at 131k (a session was planned by the second instance of the work), and on the draft head's attention: not measured.
