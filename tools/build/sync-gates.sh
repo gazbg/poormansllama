@@ -27,6 +27,8 @@ echo "== test-moe-hybrid-dup-ids (synced)"
 echo "== FLASH_ATTN_EXT q8_0 head 256 GQA8 (synced)"
 "$S/test-backend-ops.exe" test -b CUDA0 -o FLASH_ATTN_EXT -p 'hsk=256,hsv=256,nh=2,nr23=\[8,1\].*type_K=q8_0' > "$OUT/fa-gqa8.log" 2>&1; echo "exit=$?" >> "$OUT/fa-gqa8.log"; tail -2 "$OUT/fa-gqa8.log"
 
-echo "== test-backend-ops full (synced)  $(date +%T)"
-"$S/test-backend-ops.exe" test -b CUDA0 > "$OUT/tbo.log" 2>&1; echo "exit=$?" >> "$OUT/tbo.log"; tail -3 "$OUT/tbo.log"
+if [ -z "${SYNC_SKIP_TBO:-}" ]; then   # SYNC_SKIP_TBO=1: intermediate waypoints skip the 5-10 minute full run
+  echo "== test-backend-ops full (synced)  $(date +%T)"
+  "$S/test-backend-ops.exe" test -b CUDA0 > "$OUT/tbo.log" 2>&1; echo "exit=$?" >> "$OUT/tbo.log"; tail -3 "$OUT/tbo.log"
+fi
 echo "== done $(date +%T)"
