@@ -952,7 +952,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const int tile_mode, const int rem_lo, const int col_main) {
+        const uint3 ntx, const int tile_mode, const int rem_lo, const int col_main, const int32_t * __restrict__ tile_offsets) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -966,6 +966,31 @@ static __global__ void mul_mat_q(
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
 
     const uint32_t nty = (nrows_x + I - 1) / I; // Number of tiles y
+
+    // flat tile list (GGML_CUDA_MMQ_ID_FLAT): blockIdx.y counts the tiles that hold columns, expert after expert
+    int flat_e  = -1;
+    int flat_jt = 0;
+    if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
+        if (tile_offsets != nullptr) {
+            const int n_experts = nchannels_y.z;
+            const int flat      = blockIdx.y;
+            if (flat >= tile_offsets[n_experts]) {
+                return;
+            }
+            int lo = 0;
+            int hi = n_experts - 1; // the last expert with tile_offsets[e] <= flat: it holds the tile
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) >> 1;
+                if (tile_offsets[mid] <= flat) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            flat_e  = lo;
+            flat_jt = flat - tile_offsets[lo];
+        }
+    }
 
     // Initialize the ids for writing back data with just the index.
     // For regular matrix multiplications this is never changed.
@@ -985,9 +1010,9 @@ static __global__ void mul_mat_q(
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        const int wt = flat_e >= 0 ? 0       : tmp2.x;
+        const int zt = flat_e >= 0 ? flat_e  : tmp2.y;
+        const int jt = flat_e >= 0 ? flat_jt : blockIdx.y;
         const int it = blockIdx.x;
         int col0 = jt*J; // first column of the tile within the expert's columns
 
@@ -1392,6 +1417,48 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// tile_mode 1 of the expert launch: the number of tiles an expert has is its full J-column tiles plus the partial one unless a remainder launch takes it.
+// One block: every thread sums a run of experts, a scan over the runs gives each expert's first tile.
+static __global__ void mmq_tile_offsets(const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ offsets, const int n_experts, const int J, const int rem_lo) {
+    __shared__ int runs[256];
+    const int per = (n_experts + blockDim.x - 1) / blockDim.x;
+    const int e0  = min((int) threadIdx.x*per, n_experts);
+    const int e1  = min(e0 + per, n_experts);
+
+    int sum = 0;
+    for (int e = e0; e < e1; ++e) {
+        const int col_diff = expert_bounds[e + 1] - expert_bounds[e];
+        sum += col_diff / J + (col_diff % J > rem_lo ? 1 : 0);
+    }
+    runs[threadIdx.x] = sum;
+    __syncthreads();
+    for (int d = 1; d < (int) blockDim.x; d <<= 1) {
+        const int v = threadIdx.x >= d ? runs[threadIdx.x - d] : 0;
+        __syncthreads();
+        runs[threadIdx.x] += v;
+        __syncthreads();
+    }
+
+    int run = runs[threadIdx.x] - sum;
+    for (int e = e0; e < e1; ++e) {
+        offsets[e] = run;
+        const int col_diff = expert_bounds[e + 1] - expert_bounds[e];
+        run += col_diff / J + (col_diff % J > rem_lo ? 1 : 0);
+    }
+    if (threadIdx.x == blockDim.x - 1) {
+        offsets[n_experts] = runs[threadIdx.x];
+    }
+}
+
+// GGML_CUDA_MMQ_ID_FLAT: 1 on, 0 off. Default: on for NVIDIA GPUs older than Volta (the tile configurations without stream-k). Read at each launch, so a test can switch it.
+static bool mmq_id_flat_enabled(const int cc) {
+    const char * e = getenv("GGML_CUDA_MMQ_ID_FLAT");
+    if (e != nullptr) {
+        return atoi(e) != 0;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
         const int tile_mode = 0, const int rem_lo = 0, const int col_main = 0, const bool single_tile = false) {
@@ -1413,7 +1480,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = single_tile ? 1 : (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
-    const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
+
+    // GGML_CUDA_MMQ_ID_FLAT (MoE, tiles without stream-k, the main launch of the remainder split): instead of ntx tile slots for every expert, of which a prefill chunk
+    // fills about one (an expert gets ncols_dst / n_experts columns), the grid holds a flat list of the tiles that have columns, found by a prefix sum of the experts' tile counts.
+    // The tile arithmetic is untouched (bit-identical), the 96% of the blocks that exited at once are gone.
+    const bool flat_ok = tile_mode == 1 && args.expert_bounds != nullptr && args.nsamples_y == 1 && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_id_flat_enabled(cc);
+    const int  n_flat  = flat_ok ? (int) (args.ncols_dst / config.J) + (int) args.nchannels_y : 0; // upper bound of the tiles that hold columns
+    const bool use_flat = flat_ok && n_flat < ntx*ntzw && n_flat <= 65535;
+    ggml_cuda_pool_alloc<int32_t> tile_offsets(ctx.pool(id));
+    if (use_flat) {
+        tile_offsets.alloc(args.nchannels_y + 1);
+        mmq_tile_offsets<<<1, 256, 0, stream>>>(args.expert_bounds, tile_offsets.ptr, (int) args.nchannels_y, config.J, rem_lo);
+    }
+    const dim3 block_nums_xy_tiling(nty, use_flat ? n_flat : ntx, use_flat ? 1 : ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -1433,7 +1512,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, tile_mode, rem_lo, col_main);
+             ntx_fd, tile_mode, rem_lo, col_main, use_flat ? tile_offsets.ptr : nullptr);
         return;
     }
 
@@ -1462,7 +1541,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, 0, 0, 0);
+         ntx_fd, 0, 0, 0, nullptr);
 
     if (!fixup_needed) {
         return;
