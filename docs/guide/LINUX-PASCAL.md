@@ -413,7 +413,7 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   against 16.9 ms for the first), and the PV is done in two 32-key halves. Configuration 3 had spilled 488 B of registers and been 3.5 times slower; loading Q
   once per (column, block, half) for all of a lane's keys removed the spill (24 B) and left the 32-key kernels bit-identical. Attention, 2,048 queries, q8_0 KV: FP32 PV
   74.2 -> 59.8 ms (32-key tile) -> 55.3 ms (64-key tile) at 10,240 keys (-25.5%), 262.5 -> 215.5 -> 193.5 ms at 34,816 (-26.3%). Prefill, A-B-B-A, one binary with the
-  variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), 98k +19.8% (307.3 -> 368.0), 131k +22.2% (254.1 -> 310.6), no A/B overlap, peak VRAM unchanged; the 16k / 32k / 49k session was repeated on the final build (+4.2 / +8.8 / +12.8%, 617.3 -> 643.3, 526.3 -> 572.6, 447.3 -> 504.6 tok/s), the 98k one was repeated later (H34: 307.1 -> 367.6 tok/s, +19.7%, arms of one kind within 0.07%) and the 131k one (a single 4-arm session) was not
+  variable off against on: 16k +4.2% (618.3 -> 644.3 tok/s), 32k +8.8% (530.6 -> 577.4), 49k +12.7% (451.7 -> 509.0), 98k +19.8% (307.3 -> 368.0), 131k +22.2% (254.1 -> 310.6), no A/B overlap, peak VRAM unchanged; the 16k / 32k / 49k session was repeated on the final build (+4.2 / +8.8 / +12.8%, 617.3 -> 643.3, 526.3 -> 572.6, 447.3 -> 504.6 tok/s), the 98k one was repeated later (H34: 307.1 -> 367.6 tok/s, +19.7%, arms of one kind within 0.07%) and the 131k one was repeated as well (H42: 255.95 -> 311.05 tok/s, +21.5%, no overlap, VRAM +8 MiB)
   (the 32-key tile gave +2.9 / +5.4 / +8.2% in the session before). Quality, first-token KL (top 20) against exact attention with the 64-key tile: 6 prompts of 8k /
   24k tokens 0.0200 (int8 QK alone 0.0186), 2 prompts of 32k 0.0079 (0.0026), one top-1 flip on a prompt where int8 QK alone also flips; with the 32-key tile
   0.0040 at 4k / 12k (4 prompts), 0.0052 at 32k, 0.0040 at 55k. A paired next-token log-likelihood (54 positions, the true next token as the target) shows no
@@ -491,7 +491,7 @@ Ideas not pursued (2026-10-30). The ledger of `docs/plans/gtx1070-moe-mtp-optimi
 not tried; the sizes are expectations, not measurements.
 
 - (Tried since this list was written: a draft threshold that follows the context depth was built as an env rule and rejected, because the gain of p-min 0.9 is not a function of depth, H33; the MTP layer's experts in VRAM at depth were confirmed at 32k and 64k and the memory gate with the flag passed at 61k, H34.)
-- A q4_0 K and V cache for contexts of 100k and more: it frees about 0.5 to 1 GB for the expert cache (7 to 13 slots), expected +1 to 2% decode, at the cost of the cache quality.
+- (Tried since: a q4_0 K and V cache for deep decode, H43: -28.9% tok/s at 64k (25.44 -> 18.09, ms per round 76 -> 110), one cache slot more instead of 7 to 13; rejected.)
 - Stream-k scheduling for the K-quant expert tiles (off in the Pascal configuration): the premise (grid tail effects) is bounded below 1% (5,000 or more active tiles per call over 30-45 resident blocks); the real inefficiency of that grid was its empty blocks, removed by the flat tile list (H37, +3.6% / +4.1% prefill); stream-k itself is not pursued.
 - A bit-identical gated delta net prefill kernel, so that the 4-lane version could be the default: expected +3 to 5% of prefill, but the generic kernel's summation tree needs 32 partial sums per
   column, which costs the shuffles that the new kernel saves.
