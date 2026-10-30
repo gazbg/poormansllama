@@ -33,8 +33,20 @@ WHY THE THRESHOLDS ARE A BAND, NOT A NUMBER
   (see USAGE). If a future measurement narrows the bracket, move the thresholds
   and say so here -- do not treat 512,000 as verified.
 
+WHAT IS CHECKED
+  Every tracked text file EXCEPT the upstream-owned part of the vendored llama.cpp
+  tree (`third_party/llama.cpp/`): upstream's generated tables (`docs/ops/*.csv`),
+  vendored libraries (`miniaudio.h`, `json.hpp`), benchmarks and big sources are
+  not ours to split, and after the 2026-10-30 sync (b10488 -> b12004) they alone
+  put 25 files in the FAIL band, so the guard failed on every host-suite run for
+  reasons no one here can act on. Files the FORK owns inside that tree stay
+  checked (FORK_OWNED below): `src/llama-layer-streaming.cpp` (636 KB) is exactly
+  where an agent searches and `ctx_search` cannot see it. `--include-vendored`
+  checks the whole tree again.
+
 USAGE
-  python tools/check-doc-sizes.py                       # all tracked text files
+  python tools/check-doc-sizes.py                       # all tracked text files, vendored upstream excluded
+  python tools/check-doc-sizes.py --include-vendored    # + the upstream-owned vendored files
   python tools/check-doc-sizes.py --top 10              # + the largest N, with band %
   python tools/check-doc-sizes.py --ext .md             # scope by extension
   python tools/check-doc-sizes.py --selftest            # classification negative controls
@@ -56,6 +68,26 @@ import sys
 WARN_DEFAULT = 250_000
 FAIL_DEFAULT = 480_000
 
+# The vendored upstream tree is not ours to split. The fork's own files inside it
+# (prefixes relative to the repo root) stay in scope. Extend FORK_OWNED when the
+# fork adds a source family there; a file missing from it is skipped silently,
+# so --include-vendored is the check for an omission.
+VENDORED = 'third_party/llama.cpp/'
+FORK_OWNED = tuple(VENDORED + s for s in (
+    'src/llama-layer-streaming',
+    'src/llama-moe-hybrid',
+    'src/llama-moe-lean',
+    'src/llama-lm-prefill',
+    'src/llama-dense-stream',
+    'src/llama-hybrid',
+    'src/llama-expert-split-policy',
+    'src/llama-ls-',
+    'tools/layer-streaming/',
+    'tests/test-layer-streaming',
+    'tests/test-moe-',
+    'ggml/src/ggml-cuda/fattn-gqa8',
+))
+
 # Extensions whose CONTENT search never reads as text (lean-ctx skips binaries).
 # Everything else tracked is checked, because a 500 KB source file is just as
 # invisible to `ctx_search` as a 500 KB document.
@@ -75,6 +107,11 @@ def fmt(n):
     if n >= 1024:
         return '%.1f KiB' % (n / 1024)
     return '%d B' % n
+
+
+def is_upstream_owned(rel):
+    """True for a tracked path inside the vendored llama.cpp tree that the fork does not own."""
+    return rel.startswith(VENDORED) and not rel.startswith(FORK_OWNED)
 
 
 def classify(size, warn, fail):
@@ -117,7 +154,24 @@ def selftest(warn, fail):
                                              got if ok else got + ' != ' + want, why,
                                              'expected ' + want))
     print('selftest: %d/%d classification cases PASS' % (len(cases) - bad, len(cases)))
-    return 0 if bad == 0 else 1
+    own = [
+        ('third_party/llama.cpp/vendor/miniaudio/miniaudio.h', True, 'vendored library'),
+        ('third_party/llama.cpp/docs/ops/CUDA.csv', True, "upstream's generated table"),
+        ('third_party/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu', True, 'upstream source the fork edits'),
+        ('third_party/llama.cpp/src/llama-layer-streaming.cpp', False, 'fork-owned, stays checked'),
+        ('third_party/llama.cpp/tools/layer-streaming/main.cpp', False, 'fork-owned, stays checked'),
+        ('third_party/llama.cpp/ggml/src/ggml-cuda/fattn-gqa8.cuh', False, 'fork-owned, stays checked'),
+        ('third_party/README.md', False, 'outside the vendored tree'),
+        ('docs/plans/generic-prefill-layer-residency-plan.md', False, 'our own document'),
+    ]
+    bad_own = 0
+    for rel, want, why in own:
+        got = is_upstream_owned(rel)
+        ok = got == want
+        bad_own += 0 if ok else 1
+        print('  %-5s %-9s %s  (%s)' % ('ok' if ok else 'FAIL', 'skipped' if got else 'checked', rel, why))
+    print('selftest: %d/%d ownership cases PASS' % (len(own) - bad_own, len(own)))
+    return 0 if bad == 0 and bad_own == 0 else 1
 
 
 def main():
@@ -135,6 +189,8 @@ def main():
                     help='also print the largest N checked files')
     ap.add_argument('--strict', action='store_true',
                     help='treat a WARN as a failure (exit 1)')
+    ap.add_argument('--include-vendored', action='store_true',
+                    help='also check the upstream-owned files of the vendored third_party/llama.cpp tree')
     ap.add_argument('--selftest', action='store_true',
                     help='run the classification negative controls and exit')
     args = ap.parse_args()
@@ -155,7 +211,11 @@ def main():
     files = tracked_files(args.repo)
     checked = []          # (size, relpath)
     skipped_binary = 0
+    skipped_vendored = 0
     for rel in files:
+        if not args.include_vendored and is_upstream_owned(rel):
+            skipped_vendored += 1
+            continue
         ext = os.path.splitext(rel)[1].lower()
         if args.ext and ext not in [e.lower() for e in args.ext]:
             continue
@@ -173,8 +233,8 @@ def main():
     warn_hits = [(s, p) for s, p in checked if s >= args.warn]
     fail_hits = [(s, p) for s, p in checked if s >= args.fail]
 
-    print('doc-size guard: %d tracked files, %d checked as text (%d binary skipped)'
-          % (len(files), len(checked), skipped_binary))
+    print('doc-size guard: %d tracked files, %d checked as text (%d binary skipped, %d upstream-owned vendored skipped)'
+          % (len(files), len(checked), skipped_binary, skipped_vendored))
     print('band: WARN >= %d B (%s), FAIL >= %d B (%s)   [cap not observable; see the docstring]'
           % (args.warn, fmt(args.warn), args.fail, fmt(args.fail)))
     if args.top:
