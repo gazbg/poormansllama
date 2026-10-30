@@ -9922,7 +9922,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // G30: the rows of an MTP verify step (frontier + 1 or 2 drafts): the GQA8 kernel serves up to four tokens
     for (int64_t kv : { 512, 2048, 8192 }) {
-        for (int64_t nb : { 2, 3 }) {
+        for (int64_t nb : { 2, 3, 4 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0,
                                                             GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
