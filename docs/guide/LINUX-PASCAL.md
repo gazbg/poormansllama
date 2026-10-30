@@ -429,7 +429,7 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   mapped to +-127 of the tile's largest scale; with the q8_0 scale their 4-bit values were squeezed to a few levels, NMSE 1.2e-3): attention 73.3 -> 59.3 ms at 10,240 keys
   (-19%), 255 -> 216 ms at 34,816 (-15%), NMSE 5e-5 against the FP32 PV; there the 32-key tile is faster than the 64-key one (61.8 against 69.8 ms) and is the default. On the hybrid server with a q4_0 cache the
   prefill gains +2.8% at 16k, +7.8% at 49k and +11.7% at 131k (264.3 -> 295.2 tok/s, A-B-B-A, no overlap).
-- **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k;
+- **Settings that did not help** (all with `--lm-prefill`): `--lm-prefill-ubatch 4096` on top of the tiles and the resize +1.2% at 4k, +0.4% at 16k (again after the flat tile list: +1.1% / +0.1%, H39);
   `GGML_CUDA_MMVQ_MOE_ROWS=4` (rows per block of the cached-expert matvec) saves 0.4 ms of a 65 ms verify round; 8 or 16 warps per block
   in the generic delta net kernel; 2 MiB pages for the host banks (at most 1.4% in a microbenchmark of the CPU leg, `tools/pascal/bench_stream.cpp`).
   The dense Q8_0 tile was also swept: 64 rows or 128 rows with 128 threads are 18-20% slower than the adopted 128 rows with 256 threads (3.6-3.7
