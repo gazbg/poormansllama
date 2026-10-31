@@ -1539,9 +1539,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion>), nbytes_shared);
+    // Both variants are raised together and only once (a static flag per kernel), with the larger of their two needs: the Pascal tiles of a width differ in thread count between
+    // the fallback and the other variant, which moves the padding of the y tile, so the first launch must not fix the limit of the other variant at its own size.
+    size_t nbytes_limit = nbytes_shared;
+    {
+        const ggml_cuda_mmq_config config_other = ggml_cuda_mmq_get_config(type, J, !fallback, cc, prec_src1);
+        if (config_other.type != GGML_TYPE_COUNT) {
+            nbytes_limit = std::max(nbytes_limit, mmq_get_nbytes_shared(config_other, cc));
+        }
+    }
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion>), nbytes_limit);
     if constexpr (!has_fusion) {
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false>), nbytes_limit);
     }
 
     const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.

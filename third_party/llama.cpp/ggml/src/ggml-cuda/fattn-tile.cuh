@@ -1536,7 +1536,7 @@ static void launch_fattn_tile_q8_cfg(ggml_backend_cuda_context & ctx, ggml_tenso
     constexpr int nbatch_fa = int((cfg >> 14) & 511);
     fattn_kernel_t fattn_kernel = flash_attn_tile<256, 256, 32, 1, false, CFG, Q4, PV8>;
     // K stays q8_0 / q4_0 (not converted to FP16), V is converted as for the other tile kernels unless the int8 PV reads it as q8_0.
-    launch_fattn<256, 32, 1>(ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, !PV8, false, 32);
+    launch_fattn<256, 32, 1>(ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, !PV8, /*stream_k =*/ false, /*use_sparse =*/ false, /*warp_size =*/ 32);
 }
 
 template <int DKQ, int DV, bool Q4>
