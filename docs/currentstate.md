@@ -24,6 +24,12 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-10-31 (GTX 1070, Linux: `origin/main` merged into the Pascal MoE + MTP branch; the agent's own work, not the owner's acceptance)
+
+**Asked.** "Pull the latest code from github and merge it to the current one, then do a test and then a pr." `origin/main` had the `llama.cpp` sync to b12004 and the doc-size guard (16 commits, 2,215 files).
+
+**Done.** Merge commit `af8ddd7` with five hand-resolved conflicts (`mmq.cuh`, `mmvq.cu`, `llama-moe-hybrid.cpp`, `test-backend-ops.cpp`, this file) and two fixes found by the gates (`667eb91`: the shared-memory limit of the two tile variants, and the `use_sparse` argument of the int8 tile launch). Gates on the merged tree: MUL_MAT 2,522/2,522, MUL_MAT_ID 949/949 (flat list and remainder tiles on, off and modes 2 and 3), GATED_DELTA_NET 46/46, FLASH_ATTN_EXT 4,060/4,060 in five modes, `test-moe-lean-expert` 3,295 / 0, `test-moe-hybrid-dup-ids` 80/80 (negative control opt-in), sampling and grammar tests. Real model against the pre-merge build: prefill +0.4% (4k) and +1.7% (16k); **decode -8.5%** on short cold chats (38.6 -> 35.4 tok/s, deterministic, -6.4% for an identical text), cause not found (kernel time equal, the engine waits longer for the host, the cache learns slower in the first decode steps of a request; details in the plan, D49). The PR reports it.
+
 ## 2026-10-30 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, Qwen3.6-35B-A3B Q4_K_S: the vendored llama.cpp updated from upstream b10488 to b12004; the agent's own acceptance, not the owner's)
 
 **Asked.** "Pull the latest update from git for this repo and see how (plan) to update the current repo with the latest ggml-org/llama.cpp that it is based on", then `/goal` "implement it and on each milestone do a review and a commit".
