@@ -1968,6 +1968,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HYBRID_MOE_GPU1").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--mtp-draft-vocab"}, "N",
+        "the MTP draft head reads only the first N rows of the output head (default: 0 = all rows). The draft is verified by the target, so only the speed changes: fewer rows make a draft step cheaper but can lower the acceptance (131072 of 248320 rows kept it at the Qwen3.6-35B-A3B level)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --mtp-draft-vocab");
+            }
+            params.mtp_draft_vocab = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_DRAFT_VOCAB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

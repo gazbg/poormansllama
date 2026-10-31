@@ -1384,6 +1384,17 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        // read once by the model graph: set before anything builds one (the fit step does)
+        if (params.mtp_draft_vocab > 0) {
+            const std::string n = std::to_string(params.mtp_draft_vocab);
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MTP_DRAFT_VOCAB_N", n.c_str());
+#else
+            setenv("LLAMA_MTP_DRAFT_VOCAB_N", n.c_str(), 1);
+#endif
+            SRV_INF("MTP draft head restricted to the first %s output rows\n", n.c_str());
+        }
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");

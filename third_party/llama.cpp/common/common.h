@@ -652,6 +652,7 @@ struct common_params {
     bool        hybrid_moe_frozen = false; // fixed expert cache (--hybrid-moe-slots, default 16) and no promotions: the hybrid decode is deterministic
     std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
     std::string hybrid_moe_gpu1;         // second expert tier in the VRAM of another GPU: slots per layer, or auto (empty: off)
+    int32_t     mtp_draft_vocab  = 0;    // the MTP draft head reads only the first N rows of the output head (0 = all; the target verifies every draft, so only the speed changes)
     int32_t     hybrid_moe_ubatch = 0;    // physical batch size (-ub) used with --hybrid-moe when -ub is not given, for the whole run (0 = keep the stock default; the prefill window below is the better way)
     int32_t     hybrid_moe_prefill_ubatch = 2048; // physical batch size while a big prompt batch is processed (the expert cache gives the room back afterwards); 0 = off
     int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window

@@ -5572,8 +5572,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // GGML_CUDA_GRAPHS_PASCAL=1 (private fork, opt-in): allow CUDA graphs before Volta, where the decode is launch-bound once the second-GPU tier removes the host wait
+    static const bool graphs_pascal = getenv("GGML_CUDA_GRAPHS_PASCAL") != nullptr && atoi(getenv("GGML_CUDA_GRAPHS_PASCAL")) != 0;
     if (graph->instances.empty()) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !graphs_pascal) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
@@ -5602,10 +5604,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    static const bool graph_trace = getenv("LLAMA_CUDA_GRAPH_TRACE") != nullptr;   // diagnostics: why a big decode graph is or is not captured
+    static std::atomic<int> graph_trace_n{0};
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (graph_trace && cgraph->n_nodes >= 800 && !graph_compatible && graph_trace_n.fetch_add(1) % 25 == 0) {
+            fprintf(stderr, "graph-trace: dev %d nodes %d compatible 0\n", cuda_ctx->device, cgraph->n_nodes);
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (graph_trace && cgraph->n_nodes >= 800 && graph_trace_n.fetch_add(1) % 25 == 0) {
+                fprintf(stderr, "graph-trace: dev %d nodes %d compatible 1 properties_changed %d warmup_complete %d instances %zu\n", cuda_ctx->device, cgraph->n_nodes,
+                        (int) properties_changed, (int) graph->warmup_complete, graph->instances.size());
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
