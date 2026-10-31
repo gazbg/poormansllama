@@ -1958,6 +1958,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HYBRID_MOE_FREQ").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--hybrid-moe-gpu1"}, "N|auto",
+        "keep N more experts per layer in the VRAM of a second GPU (device LLAMA_MOE_HYBRID_G1_DEVICE, default 1) and compute them there; auto fills that GPU (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && atoi(value.c_str()) <= 0) {
+                throw std::invalid_argument("invalid value for --hybrid-moe-gpu1 (a slot count or auto)");
+            }
+            params.hybrid_moe_gpu1 = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_GPU1").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

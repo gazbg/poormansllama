@@ -1594,6 +1594,14 @@ private:
 #endif
                 SRV_INF("hybrid-moe: frozen expert cache of %d slots per layer, no promotions (deterministic decode)\n", params_base.hybrid_moe_slots);
             }
+            if (!params_base.hybrid_moe_gpu1.empty()) {
+#if defined(_WIN32)
+                _putenv_s("LLAMA_MOE_HYBRID_G1_SLOTS", params_base.hybrid_moe_gpu1.c_str());
+#else
+                setenv("LLAMA_MOE_HYBRID_G1_SLOTS", params_base.hybrid_moe_gpu1.c_str(), 1);
+#endif
+                SRV_INF("hybrid-moe: second expert tier on another GPU, %s slots per layer\n", params_base.hybrid_moe_gpu1.c_str());
+            }
             llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
             SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
         }
