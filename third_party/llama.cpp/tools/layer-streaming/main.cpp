@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <thread>
 
 #ifdef _WIN32
