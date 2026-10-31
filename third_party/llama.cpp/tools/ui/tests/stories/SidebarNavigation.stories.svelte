@@ -1,6 +1,7 @@
-<script module lang="ts">
+<script lang="ts" module>
 	import { defineMeta } from '@storybook/addon-svelte-csf';
 	import SidebarNavigation from '$lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte';
+	import { expect } from 'storybook/test';
 	import { waitFor } from 'storybook/test';
 	import { screen } from 'storybook/test';
 
@@ -53,7 +54,7 @@
 	asChild
 	name="Default"
 	play={async () => {
-		const { conversationsStore } = await import('$lib/stores/conversations.svelte');
+		const { conversationsStore } = await import('$lib/stores/conversations/index.svelte');
 
 		waitFor(() =>
 			setTimeout(() => {
@@ -71,7 +72,7 @@
 	asChild
 	name="SearchActive"
 	play={async ({ userEvent }) => {
-		const { conversationsStore } = await import('$lib/stores/conversations.svelte');
+		const { conversationsStore } = await import('$lib/stores/conversations/index.svelte');
 
 		waitFor(() =>
 			setTimeout(() => {
@@ -85,7 +86,9 @@
 		await userEvent.click(logoTrigger);
 		const searchTrigger = screen.getByText('Search');
 
-		userEvent.click(searchTrigger);
+		await userEvent.click(searchTrigger);
+
+		await expect(await screen.findByRole('combobox')).toHaveFocus();
 	}}
 >
 	<div class="flex-column h-screen w-72 bg-background">
@@ -98,7 +101,7 @@
 	name="Empty"
 	play={async () => {
 		// Mock empty conversations store
-		const { conversationsStore } = await import('$lib/stores/conversations.svelte');
+		const { conversationsStore } = await import('$lib/stores/conversations/index.svelte');
 
 		conversationsStore.conversations = [];
 	}}

@@ -1,0 +1,309 @@
+# Plan: sync the vendored llama.cpp with upstream ggml-org/llama.cpp
+
+Status: draft (planning only, nothing merged, nothing built; owner decisions D1-D4 below are open)
+Dependencies: none (does not touch the active GPLR plan; it changes the engine every GPLR result was measured on)
+Commit: unfilled (plan written 2026-10-30; no vendored-tree change yet)
+Authority: owner request 2026-10-30, "pull the latest, see how (plan) to update the current repo with the latest ggml-org/llama.cpp it is based on".
+
+## 1. Where things stand (measured 2026-10-30)
+
+**Pull.** `git fetch origin --prune`: local `main` equals `origin/main` (`0a7a0f4`, PR #7), 0 commits behind. Two stale remote branches pruned. Nothing to pull.
+
+**The recorded upstream base is wrong.** `third_party/README.md` and `docs/reference/HISTORY.md` name `36f0ae09` as the "upstream base". That id is not on ggml-org: a fetch by id is refused with `not our ref`, and `docs/plans/generic-prefill-layer-residency-plan.md:52` calls `36f0ae090` a nested fork commit ("whitespace fixup"). The vendored copy is therefore "fork snapshot of 2026-09-23 + 26 commits", not "upstream + 26 commits".
+
+**True fork point, recovered by file hashes** (`tools/find-upstream-base.py`, host-only, 0.7 s): the vendored base commit `6dae153` matches upstream **`04b569142da23d91beca090a99098d592d3f3c80`** = tag **b10488**, "common: share thread pools when `n_threads` differ (#27138)", 2026-08-18. 3,403 of 3,488 vendored files are byte-identical to that commit; the next best position scores 1 file lower. The 85 others are fork-added or fork-modified.
+
+**Upstream now.** `master` = `e216f4ec8753` (2026-10-30, b12004 + 5 commits). 1,516 commits ahead of the fork point (236 / 582 / 698 in Aug / Sep / Oct), 2,201 files, +392,277 / -146,386 lines.
+
+**Fork delta against the true base** (HEAD tree `2404a1e8`): 148 files, +58,337 / -314. 100 files are added (63 under `tools/layer-streaming`, `src/llama-layer-streaming.cpp` 623 KB, `tools/layer-streaming/main.cpp` 464 KB, `src/llama-moe-hybrid.cpp` 120 KB, `src/llama-lm-prefill.cpp`, `src/llama-layer-streaming.h`, the tests); 48 are modified, 45 of those also changed upstream. No fork-added path exists upstream (no add/add collision). The fork is overwhelmingly additive: 314 deleted lines in total.
+
+**Merge dry run** (`git merge-tree --write-tree`, merge base = `04b569142da2`, ours = the vendored tree committed on top of it, theirs = `e216f4ec8753`; read-only, 0.3 s): **25 files conflict, 70 hunks, 1,402 fork-side and 776 upstream-side lines inside the hunks.** Everything else (including 20 of the 45 files both sides touched) merges textually clean.
+
+| File | Hunks | Lines in hunks (fork / upstream) | Fork delta | Upstream delta | First conflicts at |
+|---|---|---|---|---|---|
+| `src/llama-graph.cpp` | 12 | 41 / 171 | +279 -127 | +837 -333 | b10991 |
+| `src/llama-context.cpp` | 6 | 461 / 14 | +561 -6 | +718 -150 | b10991 |
+| `tools/server/server-context.cpp` | 6 | 239 / 81 | +817 -13 | +2353 -549 | b10729 |
+| `ggml/src/ggml.c` | 6 | 80 / 49 | +86 -2 | +280 -42 | b10991 |
+| `tests/test-backend-ops.cpp` | 4 | 86 / 97 | +103 -4 | +3196 -317 | b10729 |
+| `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | 4 | 20 / 16 | +39 -13 | +307 -165 | b10991 |
+| `src/llama-kv-cache.cpp` | 3 | 151 / 6 | +340 -2 | +481 -181 | b11311 |
+| `ggml/include/ggml.h` | 3 | 40 / 25 | +43 -0 | +143 -15 | b10991 |
+| `common/speculative.cpp` | 3 | 30 / 4 | +92 -1 | +666 -299 | b11311 |
+| `src/llama-graph.h` | 2 | 44 / 13 | +85 -2 | +175 -35 | b11311 |
+| `common/common.h` | 2 | 35 / 1 | +36 -0 | +198 -39 | b11311 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 2 | 10 / 7 | +888 -6 | +1130 -215 | b10729 |
+| `src/models/qwen35moe.cpp` | 2 | 7 / 5 | +765 -36 | +27 -34 | b10991 |
+| `src/models/qwen35.cpp` | 2 | 7 / 5 | +313 -22 | +48 -30 | b10991 |
+| `ggml/src/ggml-cuda/topk-moe.cu` | 2 | 2 / 4 | +13 -0 | +91 -13 | b11850 |
+| `src/llama-model.cpp` | 2 | 2 / 0 | +2 -2 | +1197 -215 | b12004 |
+| `ggml/src/ggml-backend.cpp` | 1 | 101 / 10 | +4 -1 | +660 -194 | b11675 |
+| `src/llama-kv-cache.h` | 1 | 12 / 0 | +58 -1 | +53 -17 | b12004 |
+| `src/llama-context.h` | 1 | 8 / 1 | +128 -0 | +55 -2 | b11311 |
+| `common/arg.cpp` | 1 | 7 / 14 | +237 -3 | +316 -105 | b11675 |
+| `ggml/src/ggml-cuda/fattn.cu` | 1 | 5 / 161 | +142 -4 | +316 -105 | b10991 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 1 | 5 / 4 | +36 -2 | +76 -14 | b11850 |
+| `ggml/src/ggml-cpu/vec.cpp` | 1 | 4 / 86 | +4 -0 | +110 -10 | b11850 |
+| `ggml/src/ggml-cuda/mmq.cu` | 1 | 3 / 1 | +2 -1 | +199 -50 | b11675 |
+| `ggml/src/ggml-backend-meta.cpp` | 1 | 2 / 1 | +3 -1 | +344 -67 | b11850 |
+
+"First conflicts at" comes from dry runs of the same fork tree against five upstream waypoints (always the original base as merge base): conflicted files grow 3 (b10729, 236 commits) -> 11 (b10991, 498) -> 16 (b11311, 818) -> 19 (b11675, 1,182) -> 23 (b11850, 1,357) -> 25 (tip, 1,516). A file that conflicts early can stop conflicting later (`server-context.cpp` is clean at b11675), so the column is first sight, not a stable mapping. `ggml-backend.cpp` (101 fork-side lines for a +4 -1 fork change) and `vec.cpp` (86 upstream-side lines for +4) show a one-line fork edit sitting inside code upstream rewrote: read these as small, not as large.
+
+Not read yet: the hunks themselves. The table ranks effort by size; triage is step T-SYNC-02.
+
+## 2. What upstream changed that touches fork code (clean merges can still break)
+
+A textual merge says nothing about meaning. These upstream changes sit under code the fork depends on; each becomes a named re-check in section 5.
+
+1. **KV cache rework.** `cache_v_l` and the `cache_k_l%d`/`cache_v_l%d` tensor naming are gone from `src/llama-kv-cache.cpp`; `n_pad_cur` (the padding rule `get_n_kv()` uses, which the AGENTS gotchas call "the single switch" for decode attention scan length) is gone; graph params now carry `attn_v_trans`. The fork's layer-streaming code names `cache_k_l`/`cache_v_l`, pins `cparams.n_pad`, and patches K/V view extents (T-Q38FA-01). Highest semantic risk.
+2. **MMQ restructure.** `ggml_cuda_mmq_get_J_max` and `args.ncols_max` are gone. The fork's G31l fix (slack of the quantized-activation buffer in `ggml_cuda_mul_mat_q()`'s ids branch, sized from `ne12`) must be re-derived, and the out-of-bounds read it fixed must be re-tested rather than assumed fixed or still present.
+3. **Native MoE expert GPU cache** (`src/llama-moe-cache.{cpp,h}`: #29887 2026-10-07, multi-GPU #30112, SLRU #30637). Overlaps the fork's hybrid MoE decode and its VRAM expert cache (`src/llama-moe-hybrid.cpp`). Both hook `MUL_MAT_ID` and `ggml-backend`; see decision D3.
+4. **Native MTP and speculative work** (#27694, #28549 "CUDA graph for MTP draft", #29761, #30017/#30020 nextn extraction, #30257, #31350 spec checkpoint restore, `--spec-draft-n-ubatch`). Overlaps the fork's MTP draft, mirror and catch-up paths and conflicts in `common/{arg.cpp,common.h,speculative.cpp}` and `server-context.cpp`.
+5. **CUDA changes under fork kernels.** Chunked CUDA graphs (#30804, 2026-10-24) against the fork's GPU spin-wait handshake (`moe_hybrid_wait_add`) and input batching; MoE `MUL_MAT_ID` gate/up/GLU MMQ fusion (#31188, #29948), top-k MoE fusion for 384 experts (#31288) and grouped experts (#29181) against `LLAMA_CUDA_TOPK_MOE_SMALL` and `GGML_MOE_HYBRID_ID_FLAG_DUP`; the `flash_attn_ext_vec` shared-memory fix (#30573) under `fattn-gqa8.cuh`; "always MMVQ for `MUL_MAT_ID` on sm_60" (#27828); faster low-bit MMVQ (#30517).
+6. **Pascal MMQ config split.** Upstream deleted `mmq-config-pascal.cuh` and split it into `mmq-config-pascal-dp4a.cuh` and a new `mmq-config-pascal-older.cuh` (#26264). Git detected the 99% rename and carried the fork's 128-row Q8_0/IQ3/IQ4_XS tile change into `-pascal-dp4a.cuh` cleanly (verified by content); still unverified: which of the two files the GTX 1070 (sm_61) selects, and whether the tile still wins there.
+7. **Tensor parallel (`-sm tensor`, `ggml-backend-meta.cpp`)** and backend-sched changes: the fork is single-GPU; the risk is compile and scheduler behaviour, not features.
+
+A cheap identifier check (fork-added code against identifiers upstream removed, confirmed with `git grep` on both trees) found only the removals in items 1 and 2 plus `attn_n_pad` and `batch_view`. It does not see changed signatures; the real check is a build (T-SYNC-03).
+
+## 3. Strategy
+
+| Option | What | Verdict |
+|---|---|---|
+| **A. Staged three-way merge** (recommended) | Real `git merge` of upstream tags into a scratch clone, six waypoints, one resolution session and one validation each; vendored tree replaced waypoint by waypoint | Conflicts are few (70 hunks) and arrive in groups of 3, 8, 5, 3, 4, 2, so each is resolved with its upstream context in mind; a failure bisects to one waypoint; merge base is exact |
+| B. Replay the fork commits (`git am`) | Re-apply the 26 + 8 fork commits onto new upstream | Rejected. The Aug-Sep fork work exists only as the 6dae153 snapshot (the nested `.git` was removed); replay covers 34 of the commits and conflicts repeatedly on the same hunks |
+| C. Fresh upstream, re-port the fork as one patch | Start from the tag, apply the 148-file delta by hand | Fallback for single files whose merge is unreadable (`llama-graph.cpp` is the candidate); not the default, 100 files are pure additions anyway |
+| D. No sync, cherry-pick fixes | Pull only specific upstream commits | Fallback if A's cost proves too high; each cherry-pick still needs the same re-validation and the gap keeps growing |
+
+Waypoints (tags exist on ggml-org; commits from the fork point): **W1 b10729** (236), **W2 b10991** (498), **W3 b11311** (818), **W4 b11675** (1,182), **W5 b11850** (1,357), **W6 target tag** (1,516 at `e216f4ec8753`; pin a tag, see D1).
+
+## 4. Task contract
+
+### T-SYNC-01 Scratch merge workspace and baselines (no vendored change)
+
+- Goal: a reproducible place to merge, and a frozen control to measure against.
+- Steps:
+  1. Correct `third_party/README.md` and `docs/reference/HISTORY.md`: upstream base is `04b569142da2` (b10488), `36f0ae09` is a fork commit; keep the tree-check row. Add `third_party/UPSTREAM_BASE` with the base tag and sha so the next sync does not need detection.
+  2. Short path (Windows `gc` fails with "Filename too long" in deep scratch paths), for example `C:/Development/AI/llama-sync`: `git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git C:/Development/AI/llama-sync`, then `git fetch <this repo> HEAD:poor-head`, then `OURS=$(git commit-tree poor-head:third_party/llama.cpp -p 04b569142da2 -m "vendored fork tree")`, `git checkout -b sync/w0 $OURS`. Do not push anything from it.
+  3. Build the current tree (docs/AGENT_ENVIRONMENT.md for Windows MSVC + CUDA 13.2; docs/guide/LINUX-PASCAL.md for GCC + CUDA 12.8) and **side-copy the exe and all DLLs before the first merge** (AGENTS: rebuilding destroys the control). Also build a pure-upstream tree at the target tag with all fork flags absent, for the default-off comparison in T-SYNC-04.
+  4. Record baselines with the existing harnesses on the same session, mains power, GPU mutex: hybrid decode and layer-major prefill cells of `docs/plans/llama-server-integration-results.md`, the dense Qwen3.8 GTX 1070 prefill cells of `docs/plans/dense-qwen38-iq3-residency.md`, host suite, `test-backend-ops` subset. The recorded history is a reference only; the side-copied control run in the same session is the comparison.
+- Acceptance: README/HISTORY corrected, control binaries and baseline logs present with command, flags, exit status and telemetry path.
+- Non-goals: any change under `third_party/llama.cpp`.
+
+### T-SYNC-02 Waypoint merges W1 .. W6
+
+- Per waypoint: `git merge --no-ff <tag>` in the scratch clone; triage hunks first (which of the table's entries are one-line edits inside rewritten code, which are real logic); resolve; compile CPU and CUDA; export the tree as one commit in this repo (`third_party: sync llama.cpp to bNNNN`), with the conflict list and every non-trivial resolution decision in the commit body and in this file.
+- Resolution rules, binding: (1) upstream structure wins; re-apply the fork's hook on top of it instead of reverting an upstream refactor to keep a fork line; (2) API drift in fork-added files is fixed in the fork files, never by editing upstream signatures; (3) every fork behaviour stays behind its opt-in gate, the default path equals upstream; (4) no resolution is guessed: a hunk that cannot be understood from both sides goes to option C for that file and is recorded.
+- Expected content per waypoint (from the dry runs, dates are upstream): W1 `ggml-cuda.cu`, `test-backend-ops.cpp`, `server-context.cpp`; W2 + `ggml.h`, `ggml.c`, `fattn.cu`, `fattn-mma-f16.cuh`, `llama-context.cpp`, `llama-graph.cpp`, `qwen35.cpp`, `qwen35moe.cpp`; W3 + `common.h`, `speculative.cpp`, `llama-context.h`, `llama-graph.h`, `llama-kv-cache.cpp`; W4 + `arg.cpp`, `ggml-backend.cpp`, `mmq.cu`; W5 + `ggml-backend-meta.cpp`, `ggml-cpu.c`, `vec.cpp`, `topk-moe.cu`; W6 + `llama-kv-cache.h`, `llama-model.cpp`. Re-run the dry run on the stepwise result before each waypoint; counts will differ because earlier resolutions become the new base.
+- Acceptance per waypoint: both builds succeed; the cheap gates of T-SYNC-04 (G1-G3) pass; the waypoint is recorded with its upstream tag, sha, conflict list and gate output.
+
+### T-SYNC-03 Semantic re-verification of the section 2 items
+
+A named check for each, run after W6 and, for items 1 and 2, also where they first appear (W3 and W4):
+
+1. KV rework: layer-streaming K/V lookup and view patching, `n_pad` pin and graph-set key; run the PP-vs-stock identity arms and the TG decode-scan-length sweep (`build/stock-levers/tg-decode-scan-length.py`: ctx 50,176 / 128,000 / 262,144). Treat the gotchas "never mutate TG KV views" and "graph sets carry no `n_kv`" as binding.
+2. MMQ ids slack: `compute-sanitizer --tool memcheck` on the server at `-ub 2048` with `--lm-prefill` and `--hybrid-moe` (command shape in the G31l/G32q AGENTS entries); `ERROR SUMMARY: 0 errors` required.
+3. `test-moe-hybrid-dup-ids` (GPU, 80/80 expected, was 38 failures when unfixed) and a `--hybrid-moe-slots 16` run on a Q8_K_XL model to force the miss path.
+4. `fattn-gqa8` against the #30573 fix: `test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256,hsv=256,nh=2,nr23=[8,1].*type_K=q8_0"` and the `fa-bench` rate.
+5. Chunked CUDA graphs against the GPU spin-wait handshake and the dedicated copy thread: the 16-of-16 reproducer (`LLAMA_CUDA_GRAPH_RESET_EVERY=4 LLAMA_CUDA_DEBUG_FREE_AT_NODE=110`) plus a 4k hybrid decode soak.
+6. Pascal: which `mmq-config-pascal-*` file sm_61 selects; dense Qwen3.8 prefill cells (3.7k, 16k) against the control.
+7. Upstream MoE cache and MTP: confirm neither is active in a fork run that does not ask for it, and that fork flags and upstream flags do not share a name (`common/arg.cpp`).
+
+### T-SYNC-04 Validation gates
+
+Per the Gate Policy these are soft evidence; each proves only what it names. All GPU runs go through `tools/with-gpu-lock.ps1`, one at a time, with the nvidia-smi probe and the battery check (`tools/run-tg-arms.py` `power_state()`).
+
+| Gate | Run | Expected |
+|---|---|---|
+| G1 build | Windows CUDA 13.2 and Linux GCC/CUDA 12.8, both | link clean, no new warnings in fork files |
+| G2 host | the ctest command printed by `tools/run-tests.ps1 -Suite host` (that script halts at its doc-size guard, run the ctest line directly; Release config) | 78/78 (or the recorded count, stated if it changed) |
+| G3 default-off | fork build with every fork flag off vs the pure-upstream build at the same tag: greedy tokens and first-token logprobs on 2 prompts, `test-backend-ops` failure list | identical tokens; no failure that upstream does not also show |
+| G4 equivalence | the existing server harnesses at an equal chunk shape (`server_firsttok_matrix.py`, `server_hitfresh.py` with a frozen cache), `--lm-prefill-canonical` suites | within the recorded noise floors (AGENTS: first-token 0.0002 nats at chunk 512; hit-vs-fresh rule 0.25 nats) |
+| G5 memory | compute-sanitizer memcheck (T-SYNC-03 item 2) | 0 errors |
+| G6 semantic-QA | smoke tier 512; the 4k rung is owner/agent invoked, one length per mutex hold | aggregate checker PASS, negative control fails as designed |
+| G7 performance | same-session A/B, control vs synced build, on the T-SYNC-01 cells | no cell more than 3% below the control (a different bar is a dated decision made before the run); upstream gains reported separately and not claimed as fork gains |
+
+Claims allowed: exactly the gates' results for this machine, model files and flags. No speedup or quality claim for the sync as such.
+
+### T-SYNC-05 Landing
+
+- Updated `third_party/README.md` (new base tag and sha, fork delta numbers, tree-check row), `third_party/UPSTREAM_BASE`, `docs/currentstate.md` (new engine identity: source digest plus the gates' verdicts, remove superseded claims), `docs/reference/LEDGER.md`, and a line in `docs/reference/HISTORY.md`.
+- Note for readers of older evidence: every number recorded before the sync was measured on the b10488-based engine; the sync does not retroactively change them.
+- No push, no upstream PR (AGENTS: private fork). Commits are local and need the owner's go-ahead unless autonomous mode is on.
+
+## 5. Decisions needed from the owner
+
+- **D1 target.** Pin the tag current when work starts (today b12004, `e216f4ec8753` is 5 commits past it) and ignore later commits until the sync lands. Recommended.
+- **D2 strategy.** Option A, six waypoints. Recommended; the alternative is B-style single jump (one 25-file conflict session, no bisect).
+- **D3 upstream MoE cache and MTP.** Recommended: keep the fork engines as they are, compile the upstream ones in but leave them off, and file a separate comparison task afterwards (upstream's cache may match or beat `llama-moe-hybrid.cpp` on the 16 GB/8 GB cases; that is a measurement, not something to decide inside a merge). The alternative, replacing the fork engine with upstream's, changes the architecture and belongs in an SDD update.
+- **D4 cadence.** Recommended: sync when a specific upstream fix or model is needed, not on a schedule; the `UPSTREAM_BASE` file and `tools/find-upstream-base.py` keep the next sync cheap.
+
+## 6. What this plan does not know
+
+- No merged tree has been compiled or run; the 25 conflicts and the section 2 list come from text, hashes and names only.
+- The 70 hunks were counted, not read; real resolution cost may differ from their size.
+- Section 2 item 5 (chunked CUDA graphs against the spin-wait handshake) is a suspicion from names and dates; no code path was traced.
+- Performance after the sync is unknown in both directions: fork kernels may lose to or merge with upstream's new fusions.
+- The dry runs use a blobless clone and the merge-base `04b569142da2` found by hash matching; a wrong base would show up as an implausibly large conflict set, and 3,403 of 3,488 files matching exactly argues against it.
+
+## 7. Progress log
+
+Owner approved D1-D4 as recommended on 2026-10-30 (pin b12004 `3c809f44383b`, six waypoints, keep the fork MoE/MTP engines, sync on need). Work started the same day, in this worktree (`claude/sync-llama-cpp-upstream-abe892`) and in the scratch repo `C:/Development/AI/llama-sync` (branches `sync/w0` = vendored tree on the true base, `sync/w1` = W1 merge; tag `w1`); the pure-upstream control tree is the worktree `C:/Development/AI/llama-up-b12004` (detached at b12004).
+
+**T-SYNC-01, state: partly done.**
+- Done: `third_party/README.md` and `docs/reference/HISTORY.md` corrected, `third_party/UPSTREAM_BASE` added, scratch repo and upstream control tree created.
+- **Finding F1 (not caused by the sync): the current fork HEAD does not build on Windows MSVC + CUDA 13.2.** `ggml/src/ggml-cuda/mmvq.cu(982)` (`mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k>` inside a nested generic lambda: "expression did not evaluate to a constant", error C2672). Introduced by `5ca1025` (2026-10-29, "Pascal matvec rows per warp"), which was evidently only built with GCC. Repaired in the worktree by naming the value through `decltype(ncols_tag)::value` at that call (no behaviour change; uncommitted). The control binaries are built from HEAD plus that one line.
+- Decision (made 2026-10-30, reversible): the performance cells are NOT recorded now. The comparison in G7 is a same-session A/B with the side-copied control, so a history-style baseline taken today would be spent GPU time that G7 repeats; T-SYNC-01 records the build, the host suite and the failure list of `test-backend-ops` for the control and for pure upstream instead. The dense Qwen3.8 GTX 1070 cells need the Linux/Pascal machine and are listed for the owner to run there; they cannot be produced on this RTX 5090 machine.
+- Open: control build finishing, side-copy to `build/llama-cuda/bin/sync-control/`, pure-upstream build, `test-backend-ops` failure lists, host ctest count.
+
+**T-SYNC-02 W1 (b10729, 236 commits): resolved in the scratch repo, not yet built.** Three conflicts, as the dry run said.
+- `ggml-cuda.cu` (1 hunk): upstream's. **Finding F2:** upstream #27621 (merged before b10729) is the fork's G30 in another form: the fused top-k router now ends every row's reads with `__syncthreads()` and allows the logits to alias the outputs for up to `TOPK_MOE_ROWS_PER_BLOCK` = 8 rows. The fork's `LLAMA_CUDA_TOPK_MOE_SMALL` / `sync_rows` / `ggml_cuda_topk_moe_small_rows()` is removed; `topk-moe.cu` and `topk-moe.cuh` are byte-identical to upstream b10729, which also removes the W5 conflict in that file. The environment variable is now ignored (the "MF" recipe in AGENTS may still set it; harmless).
+- `server-context.cpp` (1 hunk): upstream moved the draft/MTP memory reservation into `common_fit_extra_model`. `--hybrid-moe` turns the fit step off, so the fork's own measurement (and `spec_fit_added`, read later to release the reservation once the context exists) is kept but only runs when `hybrid_moe` is set; otherwise the memory would be counted twice. To verify on the GPU: hybrid server with `--spec-type mtp` keeps the 16,000 MiB margin.
+- `test-backend-ops.cpp` (4 hunks): `test_flash_attn_ext` gets upstream's `kv_view`, `v_is_view_of_k` at constructor positions 13-14 (its new cases pass them positionally) and the fork's `causal`, `q_pos_base` after them. **Four fork call sites outside the conflict hunks passed `causal, q_pos_base` positionally (`..., {0,1,2,3}, true, 64)`, `true, 384`, `true, kv - 2048`); a textual merge accepts them and they would have bound `64`/`384` to `v_is_view_of_k` and `causal` to `kv_view` without any compile error.** All four were moved. This is exactly the class of silent break section 2 warns about; the same check (search fork-added calls to any function whose signature upstream changed) belongs in every waypoint.
+- Stepwise dry run of W2 (b10991) on the resolved W1: 9 conflicted files (`ggml.h`, `ggml.c`, `fattn.cu`, `fattn-mma-f16.cuh`, `llama-context.cpp`, `llama-graph.cpp`, `qwen35.cpp`, `qwen35moe.cpp`, `test-backend-ops.cpp`), against 8 predicted from the fixed-base runs.
+
+## 8. Escalation
+
+If a waypoint cannot be built after the Implementer Workflow's classify-and-repair loop and one documented online pass (upstream issues and PRs for the touched files), stop that waypoint, record the root cause and the blocking files, and return to the owner with options B/C/D from section 3. In autonomous mode this becomes a recorded decision resolved by measurement or a probe, never by guessing.
+# Usage
+
+This guide covers building the server, running it with the best measured
+configuration, sending a first request, measuring, and fixing common problems.
+For the meaning of each flag see [PARAMETERS.md](PARAMETERS.md). For why the
+design is what it is, see [DESIGN.md](DESIGN.md).
+
+## 1. Prerequisites
+
+Tested on Windows 11 with:
+
+- NVIDIA GPU with 24 GiB (RTX 5090 Laptop GPU, 82 SMs, Blackwell `sm_120a`).
+  Any CUDA GPU may build; the numbers in the record come from this card only.
+- CUDA Toolkit 13.2 (`nvcc`).
+- CMake 4.2 or newer.
+- Visual Studio Build Tools 2022 or 18 (MSVC 19.4x or newer).
+- Git for Windows with `core.longpaths` enabled (this repository sets it locally).
+- The model file. It is not in the repository (`*.gguf` is git-ignored). The
+  record uses `Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf` (19.9 GiB, Unsloth quant).
+
+## 2. Get the code
+
+```bash
+git clone <this repository> qwen38GZI
+cd qwen38GZI
+```
+
+`third_party/llama.cpp/` is part of the repository. There is no submodule to
+initialise. See [third_party/README.md](../../third_party/README.md) for where
+the fork's commits came from.
+
+## 3. Build the server
+
+Set the CUDA variables in the same shell that runs CMake. CMake reads them at
+configure time, and a shell without them fails with
+`CUDA Toolkit directory '' does not exist`.
+
+```bash
+export CUDA_PATH="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2"
+export CUDA_PATH_V13_2="$CUDA_PATH"
+
+cmake -S third_party/llama.cpp -B build/llama-cuda -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON
+cmake --build build/llama-cuda --config Release --target llama-server --parallel 16
+```
+
+Two options matter:
+
+- `GGML_CUDA=ON` builds the CUDA backend.
+- `LLAMA_LAYER_STREAMING=ON` builds the experimental path. It is OFF by default,
+  and without it `--hybrid-moe` refuses to load with
+  `--hybrid-moe needs a build with LLAMA_LAYER_STREAMING (CUDA)`.
+
+The server is produced as `build/llama-cuda/bin/Release/llama-server.exe` with a
+companion `llama-server-impl.dll`. Keep both together.
+
+Use forward slashes in `-D` paths on Windows. Backslashes break CMake's escaping.
+
+## 4. Run the best configuration
+
+This is the G42 configuration. It is the one the record measures against.
+
+```bash
+build/llama-cuda/bin/Release/llama-server.exe 
+  -m "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf" 
+  --host 127.0.0.1 --port 8034 
+  -c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 
+  --hybrid-moe 
+  --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto 
+  --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 
+  --hybrid-moe-prefill-ubatch 0 
+  -fitt 16000 --ctx-checkpoints 32
+```
+
+What each group does:
+
+| Group | Flags | Why it is set |
+|---|---|---|
+| Context | `-c 262144 -ctk q8_0 -ctv q8_0 -fa on` | 262k context with q8_0 KV (half the size of f16 KV) and flash attention |
+| Slots | `-np 1` | One slot. The fuse and prearm features need it |
+| Decode | `--hybrid-moe` | Experts on the host, VRAM expert cache, cold experts on the CPU |
+| Prefill | `--lm-prefill --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768` | Layer-major prefill for batches of 1,024 tokens or more |
+| Canonical | `--lm-prefill-canonical` | A cache hit gives the same bits as a fresh run. A follow-up prefills up to one chunk more than its new tokens, about 1 s |
+| Fuse and prearm | `--lm-prefill-fuse --lm-prefill-prearm auto` | Rest of a prompt in one pass; prepare the next pass while idle |
+| Hybrid prefill | `--hybrid-moe-prefill-ubatch 0` | Off, because `--lm-prefill` takes over the big batches |
+| Budget | `-fitt 16000` | Keep 16,000 MiB of the card free |
+| Checkpoints | `--ctx-checkpoints 32` | Up to 32 prefix checkpoints per slot for follow-up turns |
+
+`releases/g42-s53/start-server.cmd` in a local checkout has the same flags for
+the earlier `s53` binary. That folder is git-ignored, so the command above is the
+copy to use.
+
+## 5. Send a first request
+
+Check health, then send one chat request:
+
+```bash
+curl http://127.0.0.1:8034/health
+
+curl http://127.0.0.1:8034/v1/chat/completions 
+  -H "Content-Type: application/json" 
+  -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Reply with exactly one word: pong"}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+`/health` returns `{"status":"ok"}` once the model is loaded. The last smoke run
+reported health after 7 to 8 seconds and answered `pong` with 19 prompt tokens
+and 2 generated tokens.
+
+The server listens on `127.0.0.1` only. Do not bind `0.0.0.0` without a reason.
+The default CORS setting allows all origins, which the server logs as a warning.
+
+## 6. Use it for agents and multi-turn work
+
+- Keep the same slot and prompt prefix between turns. The prefix cache and the
+  checkpoints are what make follow-up turns cheap.
+- `--lm-prefill` only acts on batches of 1,024 tokens or more. Short turns and
+  tool results of a few hundred tokens take the ordinary path. This is expected:
+  the record measures no gain below about 1,000 tokens.
+- Each big pass costs about 0.6 s in expert-cache resize (shrink plus regrow)
+  unless the idle preparation hides it. See [DESIGN](DESIGN.md#6-limits).
+- With `-np 2` the big batches can decline under concurrency. That is recorded
+  behaviour, not a crash.
+
+## 7. Measure
+
+Every claim about speed or quality needs a recorded run. Use this sequence:
+
+1. Pre-register the contract in a plan file under `docs/plans/`. Write the
+   criteria, the expected result and the validation commands before the first run.
+2. Run the arms as paired runs, for example `A B B A`, so drift shows up.
+3. Run GPU work through the lock wrapper. Put the executable path in the command
+   so the verdict can hash the binary:
+
+   ```powershell
+   & toolswith-gpu-lock.ps1 `
+     -Command 'powershell -NoProfile -ExecutionPolicy Bypass -File "<your-script>.ps1" -Exe "buildllama-cudabinReleasellama-server.exe"' `
+     -VerdictTag 'my-run-tag'
+   ```
+
+   The wrapper waits for the mutex, refuses to start while another compute process
+   is visible, and writes `build/llama-cuda/verdicts/<tag>.verdict.json` and a
+   `.done` file. Both are git-ignored.
+4. Check the verdict. A run with provenance reads `PROVENANCE PASS`. A run
+   without it is

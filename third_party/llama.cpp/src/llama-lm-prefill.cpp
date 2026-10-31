@@ -351,7 +351,7 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
     }
     if (dstream && dstream->held_bytes() > 0) {
         dstream->suspend();
-        gf_res_prev->reset();     // a graph built while the ring is away has no markers and must not be reused after it is back
+        reset_graph_reuse();     // a graph built while the ring is away has no markers and must not be reused after it is back
     }
     S.free_pre   = lm_dev_free();
     S.slot_total = slot_total;
@@ -432,7 +432,7 @@ void llama_context::lm_release() {
         if (!dstream->resume()) {
             LLAMA_LOG_ERROR("%s: dense-stream: could not take the ring of slots back from the pass\n", __func__);
         }
-        gf_res_prev->reset();
+        reset_graph_reuse();
     }
     const int64_t t_r1 = ggml_time_us();
     if (S.vram_hooked && llama_lm_vram_hook != nullptr) {
@@ -650,7 +650,8 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                 /*.logits   =*/ nullptr,
             };
             llama_batch_allocr vballoc(hparams.n_pos_per_embd());
-            if (!vballoc.init(cb, model.vocab, memory.get(), n_embd_io, n_seq_max, output_all)) {
+            llama_batch_compat vcompat(this, cb);   // llama_batch_ext since upstream #24669
+            if (!vballoc.init(*vcompat.batch_ext, model.vocab, output_all)) {
                 return fail("could not initialise a chunk batch", 1);
             }
             force_guard.kv->lm_force(pl.c0 + pl.p0 + chunk_t0[c]);

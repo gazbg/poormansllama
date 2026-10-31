@@ -34,6 +34,7 @@ Every row points to a source. The full list of dated entries is generated in
 
 | ID | Date | Tried | Result | Why / what it taught | Source |
 |---|---|---|---|---|---|
+| SYNC-1 | 2026-10-30 | Update the vendored llama.cpp from upstream b10488 to b12004 (six waypoints, 1,516 commits) | ACCEPTED (agent's own contract, plan section 9; not owner approval). Default path equals pure upstream (perplexity identical); host 78/78; server and runner smokes match the control; prompt +3.4%, decode -1.8% in one cell | Upstream had done the fork's G30 and G31l itself, collided with the fork on `FLASH_ATTN_EXT` `op_params[4]`, replaced the batch API and the KV padding the runner pins, and the recorded upstream base was a fork commit. Untested: Linux/Pascal build, MTP + hybrid margin, long-context decode, 4k+ QA ladder | `docs/plans/upstream-sync-plan.md` |
 | PASCAL-1 | 2026-10-19/20 | Linux build on a GTX 1070 (8 GiB, no tensor cores); prefill limits and optimisations; thread pinning for decode | Built, measured, committed locally. Not certified (no provenance gate, no GPU mutex). Causal attention bug fixed | The tile flash-attention kernel ignored the causal window, so `--lm-prefill` computed wrong attention on this GPU (fixed). Int8 QK (opt-in) makes attention 1.67x faster; cold prefill at 100k tokens 471 s to 332 s. Pinning the expert threads took decode from 5-8 to 30-35 tok/s | [guide/LINUX-PASCAL.md](../guide/LINUX-PASCAL.md); `currentstate.md`, 2026-10-19/20 (PASCAL-1) |
 | G42 | 2026-10-18 | Fused prefill (`--lm-prefill-fuse`), idle preparation (`--lm-prefill-prearm auto`), canonical checkpoints, `-np 1` | Implemented, opt-in. One contract item missed (GA-5a, by 0.017 nats on one dynamic-cache check) | Request wall, fixture A: 4.84 s to 3.66 s (0.755x against BASE). Idle preparation 0.714x. Small turn 0.902x. Canonical 0.787x. Stability soaks to 138k context | `currentstate.md`, 2026-10-18 entry |
 | G32 | 2026-10-15/16 | `--lm-prefill`: batches of 1,024 tokens or more run layer by layer in llama-server | ACCEPTED (own contract LM-1..LM-8) | The owner was right that the G31 estimate of about 1.35x was wrong. Batches below about 1,000 tokens are not taken. Attention-bound past about 50k. The default mode fails hit-versus-fresh checks on swapped fixtures; the canonical mode passes | `currentstate.md`, 2026-10-15/16 entry; `docs/plans/llama-server-integration-results.md` |
@@ -206,6 +207,7 @@ The full list with dates is in [../../AGENTS.md](../../AGENTS.md), section
 
 | ID | Status |
 |---|---|
+| Upstream sync follow-ups (2026-10-30) | Open: Linux GCC / CUDA 12.8 build and the GTX 1070 + dense Qwen3.8 cells; long-context decode (50k-200k) and the 4k QA rung on the synced tree (the KV `n_pad` pin was re-applied through `set_attn_n_pad`); hybrid server with MTP at `--fit-target 16000`; upstream's MoE cache against the fork's (decision D3); the cause of the erratic IQ1/2/3_S matmul failures on the RTX 5090 Laptop |
 | T-GPLR-82 | Gate FAILS. Left flagged off by default |
 | T-GPLR-61 | AC2 FAILED. Not enabled |
 | T-Q38HG-05 | Open. Gated on GTX 1080 access |

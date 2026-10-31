@@ -3,13 +3,12 @@
 	import { page } from '$app/state';
 	import { ChatForm } from '$lib/components/app';
 	import { useDraftMessages } from '$lib/hooks/use-draft-messages.svelte';
-	import { isMobile } from '$lib/stores';
+	import { deviceStore } from '$lib/stores';
 	import { onMount } from 'svelte';
 
 	interface Props {
 		class?: string;
 		disabled?: boolean;
-		initialMessage?: string;
 		isLoading?: boolean;
 		onFileRemove?: (fileId: string) => void;
 		onFileUpload?: (files: File[]) => void;
@@ -22,7 +21,6 @@
 	let {
 		class: className,
 		disabled = false,
-		initialMessage = '',
 		isLoading = false,
 		onFileRemove,
 		onFileUpload,
@@ -33,6 +31,7 @@
 	}: Props = $props();
 
 	let chatFormRef: ChatForm | undefined = $state(undefined);
+
 	let formWrapperEl: HTMLDivElement | undefined = $state();
 	let chatId = $derived(page.params.id as string | undefined);
 
@@ -61,14 +60,12 @@
 		};
 	});
 	let hasLoadingAttachments = $derived(uploadedFiles.some((f) => f.isLoading));
-	let message = $derived(initialMessage);
+	let message = $state('');
 	let previousIsLoading = $derived(isLoading);
-	let previousInitialMessage = $derived(initialMessage);
 
 	const { clearDraft } = useDraftMessages({
 		getChatId: () => chatId,
 		getFiles: () => uploadedFiles,
-		getInitialMessage: () => initialMessage,
 		getMessage: () => message,
 		setFiles: (f) => (uploadedFiles = f),
 		setMessage: (m) => (message = m)
@@ -120,21 +117,14 @@
 	}
 
 	onMount(() => {
-		if (!isMobile.current) {
+		if (!deviceStore.isMobile) {
 			setTimeout(focusFormUnlessCaptured, 100);
 		}
 	});
 
 	afterNavigate((navigation) => {
-		if (navigation?.from != null && !isMobile.current) {
+		if (navigation?.from != null && !deviceStore.isMobile) {
 			setTimeout(focusFormUnlessCaptured, 100);
-		}
-	});
-
-	$effect(() => {
-		if (initialMessage !== previousInitialMessage) {
-			message = initialMessage;
-			previousInitialMessage = initialMessage;
 		}
 	});
 
@@ -147,15 +137,14 @@
 	});
 </script>
 
-<div class="chat-screen-form-wrapper" bind:this={formWrapperEl}>
+<div bind:this={formWrapperEl} class="chat-screen-form-wrapper">
 	<ChatForm
-		class="mx-auto max-w-3xl {className}"
 		bind:this={chatFormRef}
-		bind:value={message}
 		bind:uploadedFiles
+		bind:value={message}
+		class="mx-auto max-w-3xl {className}"
 		{disabled}
 		{isLoading}
-		showMcpPromptButton
 		onFilesAdd={handleFilesAdd}
 		{onStop}
 		onSubmit={handleSubmit}
