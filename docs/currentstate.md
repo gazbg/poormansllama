@@ -32,6 +32,8 @@ risk tail.
 
 **Whole local suite (2026-10-31, D53).** All targets build (one missing `<climits>` in the layer-streaming runner fixed). `ctest` over 190 tests: 156 pass, 34 fail, none in this branch's code (2 Python modules missing, 1 download test, 1 vocabulary file not loadable, 30 model-backed tests that need `Q38LS_MODEL_PATH`); with the dense 27B model set, 118 of 119 model-backed tests pass and the last is the 24 GB-card capacity preflight refusing on 8 GB, as designed.
 
+**Second GPU as an extra expert tier (2026-10-31, H74-H77, D54-D57; the owner allowed GPU 1 for this experiment only).** A request to GPU 1 costs 50.6 us + 14.6 us per expert (H74); a decode model with that latency gave +36..41% for 110 slots (H75) and +24..35% with a realistic swap policy (H76). Built into the hybrid engine (`LLAMA_MOE_HYBRID_G1_SLOTS`, opt-in): with copy-engine requests it was 4.7% SLOWER (small copies queued behind the bulk promotion copies), with kernel-read requests it is +14.5% over 8 chats and +11.4% at 32k depth against the same binary (A-B-B-A, H77), prefill unchanged. Known gaps: no deadlock stress run yet, no run beyond 32k tokens, no text-quality gate beyond the per-result check (largest 7.8% against the host), threads of the host team not retuned for the extra thread.
+
 ## 2026-10-30 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, Qwen3.6-35B-A3B Q4_K_S: the vendored llama.cpp updated from upstream b10488 to b12004; the agent's own acceptance, not the owner's)
 
 **Asked.** "Pull the latest update from git for this repo and see how (plan) to update the current repo with the latest ggml-org/llama.cpp that it is based on", then `/goal` "implement it and on each milestone do a review and a commit".

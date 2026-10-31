@@ -6126,21 +6126,25 @@ bool ggml_backend_cuda_aux_stream_ok(ggml_backend_t backend) {
 
 void ggml_backend_cuda_memcpy_1d_aux(ggml_backend_t backend, void * dst, const void * src, size_t nbytes) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);   // a thread may serve two devices (the second expert tier)
     CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
 void ggml_backend_cuda_event_record_aux(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t) event->context, cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
 void ggml_backend_cuda_event_wait_aux(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 1), (cudaEvent_t) event->context, 0));
 }
 
 void ggml_backend_cuda_aux_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
@@ -6348,6 +6352,7 @@ bool ggml_backend_cuda_event_ready(ggml_backend_event_t event) {
 
 void ggml_backend_cuda_aux_flush(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     const cudaError_t err = cudaStreamQuery(cuda_ctx->stream(cuda_ctx->device, 1));
     if (err == cudaErrorNotReady) {
         (void) cudaGetLastError();

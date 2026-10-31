@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "moe-hybrid.cuh"
+#include "ggml-backend-impl.h"
 
 // T-Q36-AER experimental hybrid MoE decode. publish maps the router's selected
 // experts to VRAM cache slots and posts the misses to a host mailbox; wait_add
@@ -236,6 +237,44 @@ static __global__ void moe_hybrid_wait_add_f32(
     if (tid == 0) {
         mb->prof[il][4] = moe_hybrid_globaltimer();
     }
+}
+
+// G1 (the second expert tier, on another GPU): the request is read from pinned host memory, and the reply written back with its completion flag, by kernels. A copy-engine copy would
+// wait behind the bulk promotion copies of that GPU (one copy queue per direction); a kernel does not. The pointers are host pointers of portable pinned memory (UVA).
+static __global__ void moe_hybrid_g1_in_k(const float * x_src, const int32_t * ids_src, const float * w_src, float * x_dst, int32_t * ids_dst, float * w_dst, const int n_embd, const int m) {
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        x_dst[i] = __ldcv(x_src + i);
+    }
+    if (threadIdx.x < m) {
+        ids_dst[threadIdx.x] = __ldcv(ids_src + threadIdx.x);
+        w_dst[threadIdx.x]   = __ldcv(w_src + threadIdx.x);
+    }
+}
+
+static __global__ void moe_hybrid_g1_out_k(const float * y_src, float * y_dst, volatile int32_t * res_seq, const int n_embd, const int32_t seq) {
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        y_dst[i] = y_src[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *res_seq = seq;
+    }
+}
+
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_moe_hybrid_g1_in(ggml_backend_t backend, const float * x_src, const int32_t * ids_src, const float * w_src,
+        float * x_dst, int32_t * ids_dst, float * w_dst, int n_embd, int m) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    moe_hybrid_g1_in_k<<<1, 256, 0, ctx->stream()>>>(x_src, ids_src, w_src, x_dst, ids_dst, w_dst, n_embd, m);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_moe_hybrid_g1_out(ggml_backend_t backend, const float * y_src, float * y_dst, volatile int32_t * res_seq, int n_embd, int32_t seq) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    moe_hybrid_g1_out_k<<<1, 256, 0, ctx->stream()>>>(y_src, y_dst, res_seq, n_embd, seq);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static char * moe_hybrid_mailbox(const ggml_tensor * pub) {

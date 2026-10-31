@@ -43,6 +43,14 @@ void ggml_backend_cuda_moe_hybrid_set_timeout_ms(int ms);
 #ifdef _WIN32
 __declspec(dllimport)
 #endif
+void ggml_backend_cuda_moe_hybrid_g1_in(ggml_backend_t backend, const float * x_src, const int32_t * ids_src, const float * w_src, float * x_dst, int32_t * ids_dst, float * w_dst, int n_embd, int m);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+void ggml_backend_cuda_moe_hybrid_g1_out(ggml_backend_t backend, const float * y_src, float * y_dst, volatile int32_t * res_seq, int n_embd, int32_t seq);
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
 int64_t ggml_backend_cuda_dbg_nodes_launched(void);
 #ifdef _WIN32
 __declspec(dllimport)
@@ -189,6 +197,24 @@ struct moe_hybrid_pair {
     int    l;
     int    cand;
     int    victim;
+};
+
+// G1: one request to the second GPU's expert tier, in pinned memory. The engine thread posts it (x points into the row's mailbox), the G1 thread serves it and writes y.
+struct moe_hybrid_g1_req {
+    volatile int32_t req_seq;
+    int32_t          pad0[15];
+    int32_t          layer;
+    int32_t          m;
+    int32_t          err;
+    int32_t          pad1;
+    int32_t          slots[GGML_MOE_HYBRID_MAX_USED];
+    float            w[GGML_MOE_HYBRID_MAX_USED];
+    const float *    x;
+    int64_t          t_post;      // steady-clock ns when the engine thread posted it (diagnostics)
+    int64_t          pad2[6];
+    volatile int32_t res_seq;
+    int32_t          pad3[15];
+    float            y[GGML_MOE_HYBRID_MAX_EMBD];
 };
 
 std::atomic<bool> g_moe_hybrid_keep_stats{false};   // see llama_moe_hybrid_set_keep_stats()
@@ -416,6 +442,46 @@ struct moe_hybrid_engine {
     double                             dma_submit_sum = 0.0;
     double                             dma_submit_max = 0.0;
 
+    // G1 (env LLAMA_MOE_HYBRID_G1_SLOTS = N | auto, lean host leg only): a second expert tier in the VRAM of another GPU. An expert that misses the main cache but sits in tier 1 is computed there
+    // (the same MUL_MAT_ID kernels as a main-cache hit) instead of by the host. Tier 1 has g1_slots experts per layer and its own copy of the promotion policy (swaps from host memory, at most
+    // g1_budget per decode row); its tiers are disjoint except for the moment a main-cache promotion duplicates an expert, and a duplicate is the first victim. A G1 thread owns device 1 during decode.
+    int                                g1_slots   = 0;         // slots per layer, 0 = tier 1 off
+    int                                g1_device  = 1;
+    int                                g1_budget  = 25;        // LLAMA_MOE_HYBRID_G1_B: swaps per decode row (< 0 = unlimited, 0 = static tier)
+    int                                g1_check   = 0;         // LLAMA_MOE_HYBRID_G1_CHECK=1: every tier-1 result is also computed by the lean team and compared
+    ggml_backend_t                     cuda1      = nullptr;
+    ggml_backend_event_t               ev1        = nullptr;
+    std::vector<ggml_context *>        g1_ctxs;
+    std::vector<ggml_backend_buffer_t> g1_bufs;
+    std::vector<ggml_tensor *>         g1_up, g1_gate, g1_down;
+    std::vector<int32_t>               map1;          // [n_layer*n_expert] published tier-1 slot or -1
+    std::vector<int32_t>               slot1_of;      // [n_layer*n_expert] tier-1 slot incl. pending, -1 if not in tier 1
+    std::vector<int32_t>               slot1_expert;  // [n_layer*g1_slots]
+    std::vector<int32_t>               pfmap;         // [n_layer*n_expert] >= 0 when the expert is resident in either tier (the lean prefetch skips those)
+    std::vector<moe_hybrid_promo>      pending1;
+    std::vector<moe_hybrid_pair>       pairs1, scan_out1;
+    bool                               scan_have1 = false;   // main thread only, like scan_have
+    int64_t                            n_hits_t1 = 0;        // lookups that missed the main cache and hit tier 1
+    std::vector<void *>                dma1_dst;
+    std::vector<const void *>          dma1_src;
+    std::vector<size_t>                dma1_size;
+    bool                               batch1_ok = true;
+    std::vector<moe_hybrid_host_graph> g1_graphs;     // [n_layer*n_used], graph (l, m) serves m tier-1 experts of layer l
+    ggml_backend_buffer_t              g1_rq_buf = nullptr;
+    moe_hybrid_g1_req *                g1_rq[GGML_MOE_HYBRID_MAX_WIDTH] = {};
+    int32_t                            g1_posted[GGML_MOE_HYBRID_MAX_WIDTH] = {};   // engine thread only
+    int32_t                            g1_served[GGML_MOE_HYBRID_MAX_WIDTH] = {};   // G1 thread only
+    std::thread                        g1_th;
+    std::atomic<bool>                  g1_stop{false};
+    std::atomic<int>                   g1_ready{0};   // 1 = graphs built and warm, -1 = failed
+    int64_t                            g1_n_req = 0, g1_n_rows_t1 = 0, g1_n_hits1 = 0, g1_n_chk = 0, g1_n_chk_bad = 0, g1_n_prom = 0, g1_n_skip = 0;
+    double                             g1_serve_sum = 0.0, g1_wait_sum = 0.0, g1_chk_max = 0.0;   // G1 thread service time, engine thread wait after its own host job (us)
+    std::atomic<int64_t>               g1_thr_n{0};
+    std::atomic<int64_t>               g1_thr_us{0};
+    std::atomic<int64_t>               g1_pick_ns{0}, g1_set_ns{0}, g1_launch_ns{0}, g1_sync_ns{0};   // G1 thread: post -> pick-up, input copies, graph launch, wait for the result
+    int64_t                            g1_m_hist[GGML_MOE_HYBRID_MAX_USED + 1] = {};
+    std::vector<float>                 g1_chk_y;
+
     ~moe_hybrid_engine() { shutdown(); }
 
     void init(const llm_graph_context & g, const llama_model & mdl, ggml_backend_t be, int slots);
@@ -465,7 +531,43 @@ struct moe_hybrid_engine {
         }
     }
 
+    void queue_expert1(int l, int e, int s) {
+        const ggml_tensor * src[3] = { h_up[l], h_gate[l], h_down[l] };
+        const ggml_tensor * dst[3] = { g1_up[l], g1_gate[l], g1_down[l] };
+        for (int k = 0; k < 3; ++k) {
+            dma1_dst.push_back((char *) dst[k]->data + (size_t) s*dst[k]->nb[2]);
+            dma1_src.push_back((const char *) src[k]->data + (size_t) e*src[k]->nb[2]);
+            dma1_size.push_back(src[k]->nb[2]);
+        }
+    }
+
+    // the tier-1 copies go on device 1's auxiliary stream; ev1 marks their end
+    void submit_dma1() {
+        if (dma1_dst.empty()) {
+            return;
+        }
+        if (!batch1_ok || !ggml_backend_cuda_copy_batch_aux(cuda1, dma1_dst.data(), dma1_src.data(), dma1_size.data(), dma1_dst.size())) {
+            if (batch1_ok) {
+                LLAMA_LOG_WARN("%s: batched copy to device %d unavailable, using one async copy per region\n", __func__, g1_device);
+                batch1_ok = false;
+            }
+            for (size_t i = 0; i < dma1_dst.size(); ++i) {
+                ggml_backend_cuda_memcpy_1d_aux(cuda1, dma1_dst[i], dma1_src[i], dma1_size[i]);
+            }
+        }
+        ggml_backend_cuda_event_record_aux(cuda1, ev1);
+        ggml_backend_cuda_aux_flush(cuda1);
+        dma1_dst.clear();
+        dma1_src.clear();
+        dma1_size.clear();
+    }
+
     void submit_dma() {
+        submit_dma0();
+        submit_dma1();
+    }
+
+    void submit_dma0() {
         if (dma_dst.empty()) {
             return;
         }
@@ -494,6 +596,15 @@ struct moe_hybrid_engine {
     void        start_scan();
     void        join_scan();
     void        seed(const int32_t * ids, int K);
+
+    // G1
+    void        g1_init(const std::vector<int64_t> & freq);
+    std::string g1_build_graph(moe_hybrid_host_graph & hg, int l, int m);
+    void        g1_loop();
+    void        g1_serve_row(int k);
+    void        g1_shutdown();
+    void        compute_pairs1(std::vector<moe_hybrid_pair> & out) const;
+    void        refresh_pfmap();
 };
 
 // host expert tensors must be plain, contiguous host memory the DMA can read and the CPU can compute on
@@ -873,6 +984,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     if (ev == nullptr) {
         GGML_ABORT("moe_hybrid: event creation failed");
     }
+    g1_init(freq);
 
     if (xd_ntok > 0) {
         const size_t xd_bytes = (size_t) xd_ntok*n_layer*n_embd*sizeof(float);
@@ -952,6 +1064,7 @@ bool moe_hybrid_engine::resize(int new_slots) {
                 dma_dst.clear();
                 dma_src.clear();
                 dma_size.clear();
+                submit_dma1();   // tier 1 does not change with the main cache: its queued copies still go out
                 dma_state.store(0, std::memory_order_release);
                 break;
             }
@@ -967,6 +1080,9 @@ bool moe_hybrid_engine::resize(int new_slots) {
     join_scan();
     scan_have = false;
     scan_out.clear();
+    scan_have1 = false;
+    scan_out1.clear();
+    pairs1.clear();
 
     // The old cache stays on the device until its content has moved: a slot that the new policy keeps and that was published (its upload had finished) is copied device to device, the others
     // are uploaded from the host. Layer by layer, so the peak VRAM is the old cache plus one layer; LLAMA_MOE_HYBRID_RESIZE_KEEP=0 re-uploads everything, as before G43.
@@ -1074,6 +1190,7 @@ bool moe_hybrid_engine::resize(int new_slots) {
     }
     ggml_backend_cuda_aux_synchronize(cuda);
     info_cache_bytes.store(cache_total_bytes());
+    refresh_pfmap();
     info_n_slot.store(n_slot);
     LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host)\n", __func__,
                    n_slot, n_layer, cache_total_bytes()/1048576.0, moe_hybrid_us(t0)/1e3, (long long) n_d2d, (long long) n_h2d);
@@ -1152,6 +1269,336 @@ std::string moe_hybrid_engine::build_host_graph(moe_hybrid_host_graph & hg, int 
         return "graph allocation failed";
     }
     return "";
+}
+
+// G1: the request graph of tier 1, the op sequence of the main cache's hit path on device 1 (ids are tier-1 slots)
+std::string moe_hybrid_engine::g1_build_graph(moe_hybrid_host_graph & hg, int l, int m) {
+    ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(64, false), nullptr, true };
+    hg.ctx = ggml_init(ip);
+    if (hg.ctx == nullptr) {
+        return "graph context allocation failed";
+    }
+    ggml_context * ctx = hg.ctx;
+    hg.x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    hg.ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m, 1);
+    hg.w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, m, 1);
+    ggml_set_input(hg.x);
+    ggml_set_input(hg.ids);
+    ggml_set_input(hg.w);
+
+    ggml_tensor * cur  = ggml_reshape_3d(ctx, hg.x, n_embd, 1, 1);
+    ggml_tensor * up   = ggml_mul_mat_id(ctx, g1_up[l],   cur, hg.ids);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, g1_gate[l], cur, hg.ids);
+    ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * ex   = ggml_mul_mat_id(ctx, g1_down[l], act, hg.ids); // [n_embd, m, 1]
+    ex = ggml_mul(ctx, ex, hg.w);
+    ggml_tensor * p = ggml_cont(ctx, ggml_permute(ctx, ex, 1, 0, 2, 3)); // [m, n_embd, 1]
+    hg.out = ggml_sum_rows(ctx, p);                                       // [1, n_embd, 1]
+    ggml_set_output(hg.out);
+
+    hg.gf = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(hg.gf, hg.out);
+    hg.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cuda1));
+    if (hg.ga == nullptr || !ggml_gallocr_alloc_graph(hg.ga, hg.gf)) {
+        return "graph allocation failed";
+    }
+    return "";
+}
+
+void moe_hybrid_engine::refresh_pfmap() {
+    if (g1_slots <= 0) {
+        return;
+    }
+    const size_t ne = (size_t) n_layer*n_expert;
+    for (size_t i = 0; i < ne; ++i) {
+        pfmap[i] = map[i] >= 0 ? map[i] : (map1[i] >= 0 ? 0 : -1);
+    }
+}
+
+// Called from init() after the main cache is filled. Tier 1 is optional: a setting that cannot work is reported and the engine runs without it.
+void moe_hybrid_engine::g1_init(const std::vector<int64_t> & freq) {
+    const char * gs = getenv("LLAMA_MOE_HYBRID_G1_SLOTS");
+    if (gs == nullptr || *gs == '\0' || strcmp(gs, "0") == 0) {
+        return;
+    }
+    if (lean_mode != 1) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: LLAMA_MOE_HYBRID_G1_SLOTS needs the lean host leg (LLAMA_MOE_HYBRID_LEAN=1); tier 1 is off\n", __func__);
+        return;
+    }
+    g1_device = moe_hybrid_env_int("LLAMA_MOE_HYBRID_G1_DEVICE", 1);
+    g1_budget = moe_hybrid_env_int("LLAMA_MOE_HYBRID_G1_B", 25);
+    g1_check  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_G1_CHECK", 0);
+    if (g1_device < 0 || g1_device >= ggml_backend_cuda_get_device_count()) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: CUDA device %d does not exist (%d devices); tier 1 is off\n", __func__, g1_device, ggml_backend_cuda_get_device_count());
+        return;
+    }
+    char want[32];
+    snprintf(want, sizeof(want), "CUDA%d", g1_device);
+    if (strcmp(ggml_backend_dev_name(ggml_backend_get_device(cuda)), want) == 0) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: tier 1 would sit on the main cache's own device %s; tier 1 is off\n", __func__, want);
+        return;
+    }
+    const auto t_g1 = moe_clock::now();
+    cuda1 = ggml_backend_cuda_init(g1_device);
+    if (cuda1 == nullptr || !ggml_backend_cuda_aux_stream_ok(cuda1)) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: cannot initialise CUDA device %d; tier 1 is off\n", __func__, g1_device);
+        cuda1 = nullptr;
+        return;
+    }
+    size_t per_slot = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        per_slot += h_up[il]->nb[2] + h_gate[il]->nb[2] + h_down[il]->nb[2];
+    }
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_cuda_get_device_memory(g1_device, &free_b, &total_b);
+    int slots = 0;
+    if (strcmp(gs, "auto") == 0) {
+        const size_t reserve = (size_t) moe_hybrid_env_int("LLAMA_MOE_HYBRID_G1_RESERVE_MIB", 700)*1048576;
+        slots = free_b > reserve ? (int) ((free_b - reserve)/per_slot) : 0;
+    } else {
+        slots = atoi(gs);
+    }
+    const int max_main = *std::max_element(slots_l.begin(), slots_l.end());
+    slots = std::min(slots, n_expert - max_main);
+    if (slots < 1 || (size_t) slots*per_slot > free_b) {
+        LLAMA_LOG_WARN("%s: moe_hybrid: tier 1 of %s slots does not fit device %d (%.0f MiB free, %.2f MiB per slot over %d layers); tier 1 is off\n", __func__, gs, g1_device,
+                       free_b/1048576.0, per_slot/1048576.0, n_layer);
+        ggml_backend_free(cuda1);
+        cuda1 = nullptr;
+        return;
+    }
+    ev1 = ggml_backend_event_new(ggml_backend_get_device(cuda1));
+    if (ev1 == nullptr) {
+        GGML_ABORT("moe_hybrid: tier-1 event creation failed");
+    }
+    g1_ctxs.assign(n_layer, nullptr);
+    g1_bufs.assign(n_layer, nullptr);
+    g1_up.resize(n_layer);
+    g1_gate.resize(n_layer);
+    g1_down.resize(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_init_params ip = { ggml_tensor_overhead()*3, nullptr, true };
+        g1_ctxs[(size_t) il] = ggml_init(ip);
+        const ggml_tensor * src[3] = { h_up[il], h_gate[il], h_down[il] };
+        ggml_tensor *       t[3];
+        for (int k = 0; k < 3; ++k) {
+            t[k] = ggml_new_tensor_3d(g1_ctxs[(size_t) il], src[k]->type, src[k]->ne[0], src[k]->ne[1], slots);
+            GGML_ASSERT(t[k]->nb[1] == src[k]->nb[1] && t[k]->nb[2] == src[k]->nb[2]);
+            ggml_format_name(t[k], "moe_hybrid.g1.%d.%d", il, k);
+        }
+        g1_bufs[(size_t) il] = ggml_backend_alloc_ctx_tensors_from_buft(g1_ctxs[(size_t) il], ggml_backend_get_default_buffer_type(cuda1));
+        if (g1_bufs[(size_t) il] == nullptr) {
+            GGML_ABORT("moe_hybrid: tier-1 allocation failed at layer %d (%d slots per layer on device %d)", il, slots, g1_device);
+        }
+        ggml_backend_buffer_set_usage(g1_bufs[(size_t) il], GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        g1_up[(size_t) il] = t[0];
+        g1_gate[(size_t) il] = t[1];
+        g1_down[(size_t) il] = t[2];
+    }
+    g1_slots = slots;
+
+    // initial fill: per layer the experts that follow the main cache's in frequency order
+    const size_t ne = (size_t) n_layer*n_expert;
+    map1.assign(ne, -1);
+    slot1_of.assign(ne, -1);
+    slot1_expert.assign((size_t) n_layer*slots, -1);
+    pfmap.assign(ne, -1);
+    std::vector<int> order(n_expert);
+    for (int il = 0; il < n_layer; ++il) {
+        std::iota(order.begin(), order.end(), 0);
+        const int64_t * fl = freq.data() + (size_t) il*n_expert;
+        std::stable_sort(order.begin(), order.end(), [fl](int a, int b) { return fl[a] > fl[b]; });
+        for (int s = 0; s < slots; ++s) {
+            const int e = order[(size_t) slots_l[(size_t) il] + s];
+            map1[(size_t) il*n_expert + e]     = s;
+            slot1_of[(size_t) il*n_expert + e] = s;
+            slot1_expert[(size_t) il*slots + s] = e;
+            queue_expert1(il, e, s);
+        }
+        submit_dma1();
+    }
+    ggml_backend_cuda_aux_synchronize(cuda1);
+    refresh_pfmap();
+
+    const size_t rq_size = GGML_PAD(sizeof(moe_hybrid_g1_req), 256);
+    g1_rq_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), rq_size*GGML_MOE_HYBRID_MAX_WIDTH);
+    if (g1_rq_buf == nullptr) {
+        GGML_ABORT("moe_hybrid: tier-1 request buffer allocation failed");
+    }
+    char * rb = (char *) ggml_backend_buffer_get_base(g1_rq_buf);
+    memset(rb, 0, rq_size*GGML_MOE_HYBRID_MAX_WIDTH);
+    for (int k = 0; k < GGML_MOE_HYBRID_MAX_WIDTH; ++k) {
+        g1_rq[k] = (moe_hybrid_g1_req *) (rb + (size_t) k*rq_size);
+    }
+    if (g1_check) {
+        g1_chk_y.assign((size_t) n_embd, 0.0f);
+    }
+
+    g1_th = std::thread([this]() { g1_loop(); });
+    while (g1_ready.load(std::memory_order_acquire) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (g1_ready.load() < 0) {
+        g1_th.join();
+        GGML_ABORT("moe_hybrid: tier-1 graph setup failed");
+    }
+    LLAMA_LOG_INFO("%s: moe_hybrid: tier 1 on device %d: %d slots x %d layers (%.1f MiB), swaps per row %d, check %d, ready in %.1f ms\n", __func__, g1_device, slots, n_layer,
+                   (double) slots*per_slot/1048576.0, g1_budget, g1_check, moe_hybrid_us(t_g1)/1e3);
+}
+
+void moe_hybrid_engine::g1_loop() {
+    std::string err;
+    g1_graphs.resize((size_t) n_layer*n_used);
+    for (int l = 0; l < n_layer && err.empty(); ++l) {
+        for (int m = 1; m <= n_used && err.empty(); ++m) {
+            err = g1_build_graph(g1_graphs[(size_t) l*n_used + m - 1], l, m);
+        }
+    }
+    if (err.empty()) {
+        // the first runs load the kernels and capture the CUDA graphs: do it here, not during a decode
+        std::vector<float> xz((size_t) n_embd, 0.0f), sink((size_t) n_embd);
+        const int32_t      idz[GGML_MOE_HYBRID_MAX_USED] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        const float        wz[GGML_MOE_HYBRID_MAX_USED]  = { 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f };
+        for (int rep = 0; rep < 6; ++rep) {
+            for (moe_hybrid_host_graph & hg : g1_graphs) {
+                const int m = (int) hg.ids->ne[0];
+                ggml_backend_tensor_set_async(cuda1, hg.x,   xz.data(), 0, xz.size()*sizeof(float));
+                ggml_backend_tensor_set_async(cuda1, hg.ids, idz,       0, (size_t) m*sizeof(int32_t));
+                ggml_backend_tensor_set_async(cuda1, hg.w,   wz,        0, (size_t) m*sizeof(float));
+                if (ggml_backend_graph_compute_async(cuda1, hg.gf) != GGML_STATUS_SUCCESS) {
+                    err = "warm-up graph compute failed";
+                    break;
+                }
+                ggml_backend_tensor_get_async(cuda1, hg.out, sink.data(), 0, sink.size()*sizeof(float));
+                ggml_backend_synchronize(cuda1);
+            }
+            if (!err.empty()) {
+                break;
+            }
+        }
+    }
+    if (!err.empty()) {
+        LLAMA_LOG_ERROR("%s: moe_hybrid: tier 1: %s\n", __func__, err.c_str());
+        g1_ready.store(-1, std::memory_order_release);
+        return;
+    }
+    g1_ready.store(1, std::memory_order_release);
+
+    uint32_t seen_gen = wake_gen.load(std::memory_order_acquire);
+    uint32_t spins    = 0;
+    auto     active   = moe_clock::now();
+    while (!g1_stop.load(std::memory_order_relaxed)) {
+        bool did = false;
+        for (int k = 0; k < GGML_MOE_HYBRID_MAX_WIDTH; ++k) {
+            if (g1_rq[k]->req_seq != g1_served[k]) {
+                g1_serve_row(k);
+                did = true;
+            }
+        }
+        if (did) {
+            active = moe_clock::now();
+            continue;
+        }
+        MOE_HYBRID_PAUSE();
+        if ((++spins & 4095) == 0) {
+            const uint32_t gen = wake_gen.load(std::memory_order_acquire);
+            if (gen != seen_gen) {
+                seen_gen = gen;
+                active   = moe_clock::now();
+            } else if (moe_clock::now() - active > std::chrono::milliseconds(50)) {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait_for(lk, std::chrono::milliseconds(10), [&] {
+                    return g1_stop.load() || wake_gen.load() != seen_gen;
+                });
+            }
+        }
+    }
+}
+
+void moe_hybrid_engine::g1_serve_row(int k) {
+    moe_hybrid_g1_req * r = g1_rq[k];
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const int32_t seq = r->req_seq;
+    const auto    t0  = moe_clock::now();
+    const int64_t n0  = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t       n1 = n0, n2 = n0, n3 = n0;
+    int32_t       err = 0;
+    bool          replied = false;
+    if (r->layer < 0 || r->layer >= n_layer || r->m < 1 || r->m > n_used) {
+        err = 1;
+    } else {
+        const auto now_ns = [] { return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        moe_hybrid_host_graph & hg = g1_graphs[(size_t) r->layer*n_used + r->m - 1];
+        ggml_backend_cuda_moe_hybrid_g1_in(cuda1, r->x, r->slots, r->w, (float *) hg.x->data, (int32_t *) hg.ids->data, (float *) hg.w->data, n_embd, r->m);
+        n1 = now_ns();
+        if (ggml_backend_graph_compute_async(cuda1, hg.gf) != GGML_STATUS_SUCCESS) {
+            err = 2;
+        } else {
+            n2 = now_ns();
+            // the GPU writes the result and then the reply flag itself: nothing here waits for it
+            ggml_backend_cuda_moe_hybrid_g1_out(cuda1, (const float *) hg.out->data, r->y, &r->res_seq, n_embd, seq);
+            n3 = now_ns();
+            replied = true;
+        }
+    }
+    g1_pick_ns.fetch_add(n0 - r->t_post, std::memory_order_relaxed);
+    g1_set_ns.fetch_add(n1 - n0, std::memory_order_relaxed);
+    g1_launch_ns.fetch_add(n2 - n1, std::memory_order_relaxed);
+    g1_sync_ns.fetch_add(n3 - n2, std::memory_order_relaxed);
+    g1_thr_us.fetch_add((int64_t) moe_hybrid_us(t0), std::memory_order_relaxed);
+    g1_thr_n.fetch_add(1, std::memory_order_relaxed);
+    g1_served[k] = seq;
+    if (!replied) {
+        r->err = err;
+        std::atomic_thread_fence(std::memory_order_release);
+        r->res_seq = seq;
+    }
+}
+
+void moe_hybrid_engine::g1_shutdown() {
+    if (g1_th.joinable()) {
+        g1_stop.store(true);
+        wake();
+        g1_th.join();
+    }
+    dma1_dst.clear();
+    dma1_src.clear();
+    dma1_size.clear();
+    if (cuda1) {
+        ggml_backend_cuda_aux_synchronize(cuda1);
+    }
+    for (auto & hg : g1_graphs) {
+        if (hg.ga) {
+            ggml_gallocr_free(hg.ga);
+        }
+        if (hg.ctx) {
+            ggml_free(hg.ctx);
+        }
+    }
+    g1_graphs.clear();
+    for (size_t il = 0; il < g1_bufs.size(); ++il) {
+        if (g1_bufs[il]) {
+            ggml_backend_buffer_free(g1_bufs[il]);
+        }
+        if (g1_ctxs[il]) {
+            ggml_free(g1_ctxs[il]);
+        }
+    }
+    g1_bufs.clear();
+    g1_ctxs.clear();
+    if (g1_rq_buf) {
+        ggml_backend_buffer_free(g1_rq_buf);
+        g1_rq_buf = nullptr;
+    }
+    if (ev1) {
+        ggml_backend_event_free(ev1);
+        ev1 = nullptr;
+    }
+    if (cuda1) {
+        ggml_backend_free(cuda1);
+        cuda1 = nullptr;
+    }
+    g1_slots = 0;
 }
 
 void moe_hybrid_engine::run(std::promise<std::string> ready) {
@@ -1378,7 +1825,166 @@ void moe_hybrid_engine::serve() {
             }
         }
         bool pf_job = false;
-        if (err == 0 && lean_mode == 1) {
+        if (err == 0 && lean_mode == 1 && g1_slots > 0) {
+            // G1: the experts that sit in tier 1 go to device 1 (one request per row), the lean team computes the rest meanwhile, and the two partial sums are added
+            constexpr int W = GGML_MOE_HYBRID_MAX_WIDTH;
+            int           rows[W];
+            int32_t       rseq[W];
+            int           nr = 0;
+            rows[nr] = j;
+            rseq[nr++] = seq;
+            for (int g = 0; g < ng; ++g) {
+                rows[nr]   = grp[g];
+                rseq[nr++] = grp_seq[g];
+            }
+            int             mh[W] = {}, m1[W] = {};
+            int32_t         ids1[W][GGML_MOE_HYBRID_MAX_USED];
+            const int32_t * pm1 = map1.data() + (size_t) il*n_expert;
+            for (int r = 0; r < nr; ++r) {
+                ggml_moe_hybrid_mailbox * mr = mbs[rows[r]];
+                moe_hybrid_g1_req *       q  = g1_rq[rows[r]];
+                const int                 nm = mr->nmiss;
+                for (int i = 0; i < nm; ++i) {
+                    const int     e  = mr->ids[i];
+                    const float   we = mr->w[i];
+                    const int32_t s1 = pm1[e];
+                    if (s1 >= 0) {
+                        q->slots[m1[r]] = s1;
+                        q->w[m1[r]]     = we;
+                        ids1[r][m1[r]]  = e;
+                        m1[r]++;
+                    } else {
+                        mr->ids[mh[r]] = e;   // the host part moves to the front of the mailbox; only this thread reads it
+                        mr->w[mh[r]]   = we;
+                        mh[r]++;
+                    }
+                }
+                if (m1[r] > 0) {
+                    q->layer = il;
+                    q->m     = m1[r];
+                    q->x     = mr->x;
+                    q->err   = 0;
+                    q->t_post = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    std::atomic_thread_fence(std::memory_order_release);
+                    q->req_seq = ++g1_posted[rows[r]];
+                    g1_n_req++;
+                    g1_n_hits1 += m1[r];
+                    g1_m_hist[m1[r]]++;
+                }
+            }
+            moe_lean::job jb;
+            int           nj = 0, jr[W];
+            for (int r = 0; r < nr; ++r) {
+                if (mh[r] > 0) {
+                    jr[nj++] = r;
+                }
+            }
+            const auto tc = moe_clock::now();
+            in_us = moe_hybrid_us(t0);
+            sv_sub.store(12, std::memory_order_relaxed);
+            if (nj > 0) {
+                ggml_moe_hybrid_mailbox * m0 = mbs[rows[jr[0]]];
+                jb.lb  = &lean_lb[(size_t) il];
+                jb.m   = mh[jr[0]];
+                jb.ids = (const int32_t *) m0->ids;
+                jb.w   = (const float *) m0->w;
+                jb.x   = (const float *) m0->x;
+                jb.y   = (float *) m0->y;
+                if (nj > 1) {
+                    jb.nr = nj;
+                    for (int i = 0; i < nj; ++i) {
+                        ggml_moe_hybrid_mailbox * mk = mbs[rows[jr[i]]];
+                        jb.rows[i] = { mh[jr[i]], (const int32_t *) mk->ids, (const float *) mk->w, (const float *) mk->x, (float *) mk->y };
+                    }
+                }
+                if (lean_pf_k > 0 && il + 1 < n_layer && !g1_check) {
+                    jb.pf_lb   = &lean_lb[(size_t) il + 1];
+                    jb.pf_rw   = pf_rw[(size_t) il + 1].data();
+                    jb.pf_map  = pfmap.data() + (size_t) (il + 1)*n_expert;
+                    jb.pf_k    = lean_pf_k;
+                    jb.pf_pool = lean_pf_pool;
+                    jb.pf_hint = lean_pf_hint;
+                    jb.pf_abort = moe_hybrid_pf_abort;
+                    jb.pf_abort_ctx = &pf_ctx;
+                    pf_job     = true;
+                }
+                lean_team->run(jb);
+            }
+            sv_sub.store(13, std::memory_order_relaxed);
+            comp_us = moe_hybrid_us(tc);
+            if (nj > 1) {
+                batch_n[nj]++;
+                batch_us[nj] += comp_us;
+                for (int i = 0; i < nj; ++i) {
+                    batch_pairs += mh[jr[i]];
+                }
+                batch_uniq += lean_team->last_unique();
+            } else if (nj == 1) {
+                batch_n[1]++;
+                batch_us[1] += comp_us;
+                compute_sum[mh[jr[0]]] += comp_us;
+                single_n[mh[jr[0]]]++;
+            }
+            n_lean += nj;
+            // the replies of device 1
+            const auto tw = moe_clock::now();
+            for (int r = 0; r < nr && err == 0; ++r) {
+                if (m1[r] == 0) {
+                    continue;
+                }
+                moe_hybrid_g1_req * q = g1_rq[rows[r]];
+                uint32_t            spins1 = 0;
+                while (q->res_seq != g1_posted[rows[r]]) {
+                    MOE_HYBRID_PAUSE();
+                    if ((++spins1 & 0xFFFF) == 0 && moe_hybrid_us(tw) > 2.0e6) {
+                        LLAMA_LOG_ERROR("moe_hybrid: tier-1 request of layer %d row %d unanswered for 2 s\n", il, rows[r]);
+                        err = 2;
+                        break;
+                    }
+                }
+                if (err != 0) {
+                    break;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (q->err != 0) {
+                    err = 2;
+                    break;
+                }
+                float * y = mbs[rows[r]]->y;
+                if (mh[r] > 0) {
+                    for (int i = 0; i < n_embd; ++i) {
+                        y[i] += q->y[i];
+                    }
+                } else {
+                    memcpy(y, q->y, (size_t) n_embd*sizeof(float));
+                }
+                if (g1_check) {
+                    moe_lean::job cj;
+                    cj.lb  = &lean_lb[(size_t) il];
+                    cj.m   = m1[r];
+                    cj.ids = ids1[r];
+                    cj.w   = q->w;
+                    cj.x   = mbs[rows[r]]->x;
+                    cj.y   = g1_chk_y.data();
+                    lean_team->run(cj);
+                    double num = 0.0, den = 0.0;
+                    for (int i = 0; i < n_embd; ++i) {
+                        const double d = (double) q->y[i] - (double) g1_chk_y[(size_t) i];
+                        num += d*d;
+                        den += (double) g1_chk_y[(size_t) i]*(double) g1_chk_y[(size_t) i];
+                    }
+                    const double rel = std::sqrt(num/std::max(den, 1e-30));
+                    g1_n_chk++;
+                    g1_chk_max = std::max(g1_chk_max, rel);
+                    if (rel > 0.05) {
+                        if (g1_n_chk_bad++ < 8) {
+                            LLAMA_LOG_ERROR("moe_hybrid: TIER-1 CHECK: layer %d row %d, %d experts, relative error %.4f against the lean host leg\n", il, rows[r], m1[r], rel);
+                        }
+                    }
+                }
+            }
+            g1_wait_sum += moe_hybrid_us(tw);
+        } else if (err == 0 && lean_mode == 1) {
             // the lean team reads the request straight from the mailbox and writes the result straight into it
             moe_lean::job jb;
             jb.lb  = &lean_lb[(size_t) il];
@@ -1816,6 +2422,73 @@ void moe_hybrid_engine::compute_pairs(std::vector<moe_hybrid_pair> & out) const 
     }
 }
 
+// G1: swaps for tier 1. Candidates are the best experts held by neither tier, victims the worst tier-1 experts; an expert that the main cache holds too goes first.
+void moe_hybrid_engine::compute_pairs1(std::vector<moe_hybrid_pair> & out) const {
+    out.clear();
+    for (int l = 0; l < n_layer; ++l) {
+        double cs[MOE_HYBRID_K]; int ce[MOE_HYBRID_K]; int nc = 0;
+        double vs[MOE_HYBRID_K]; int ve[MOE_HYBRID_K]; int nv = 0;
+        const size_t base = (size_t) l*n_expert;
+        for (int e = 0; e < n_expert; ++e) {
+            const size_t i = base + e;
+            double s = ema[i] + tie[i];
+            int    p;
+            if (slot1_of[i] < 0) {
+                if (slot_of[i] >= 0) {
+                    continue;
+                }
+                if (nc < MOE_HYBRID_K) {
+                    p = nc++;
+                } else if (s > cs[MOE_HYBRID_K - 1]) {
+                    p = MOE_HYBRID_K - 1;
+                } else {
+                    continue;
+                }
+                while (p > 0 && cs[p - 1] < s) {
+                    cs[p] = cs[p - 1];
+                    ce[p] = ce[p - 1];
+                    --p;
+                }
+                cs[p] = s;
+                ce[p] = e;
+            } else {
+                if (slot_of[i] >= 0) {
+                    s = -1e30;
+                }
+                if (nv < MOE_HYBRID_K) {
+                    p = nv++;
+                } else if (s < vs[MOE_HYBRID_K - 1]) {
+                    p = MOE_HYBRID_K - 1;
+                } else {
+                    continue;
+                }
+                while (p > 0 && vs[p - 1] > s) {
+                    vs[p] = vs[p - 1];
+                    ve[p] = ve[p - 1];
+                    --p;
+                }
+                vs[p] = s;
+                ve[p] = e;
+            }
+        }
+        const int n = std::min(nc, nv);
+        for (int k = 0; k < n; ++k) {
+            const double gain = cs[k] - vs[k];
+            if (!(gain > 0.0)) {
+                break;
+            }
+            out.push_back({ gain, l, ce[k], ve[k] });
+        }
+    }
+    const int cap = g1_budget > 0 ? g1_budget*std::max(1, scan_mult) : g1_budget;
+    if (cap > 0 && (int) out.size() > cap) {
+        std::stable_sort(out.begin(), out.end(), [](const moe_hybrid_pair & a, const moe_hybrid_pair & b) {
+            return a.gain > b.gain;
+        });
+        out.resize(cap);
+    }
+}
+
 void moe_hybrid_engine::scan_loop() {
 #ifdef _WIN32
     if (scan_cpu >= 0 && scan_cpu < 64) {
@@ -1831,6 +2504,9 @@ void moe_hybrid_engine::scan_loop() {
             scan_req = false;
             lk.unlock();
             compute_pairs(scan_out);
+            if (g1_slots > 0 && g1_budget != 0) {
+                compute_pairs1(scan_out1);
+            }
             scan_busy.store(0, std::memory_order_release);
             lk.lock();
             continue;
@@ -1843,9 +2519,13 @@ void moe_hybrid_engine::scan_loop() {
 
 // asks for a scan against the current state; in mode 1 the same scan runs inline (the reference), in mode 2 on the helper
 void moe_hybrid_engine::start_scan() {
-    scan_have = true;
+    scan_have  = true;
+    scan_have1 = true;
     if (scan_mode == 1 || !scan_th.joinable()) {
         compute_pairs(scan_out);
+        if (g1_slots > 0 && g1_budget != 0) {
+            compute_pairs1(scan_out1);
+        }
         return;
     }
     scan_busy.store(1, std::memory_order_release);
@@ -1990,6 +2670,7 @@ void moe_hybrid_engine::on_token(int n_new) {
     }
     const auto tB = moe_clock::now();
     int  hits    = 0;
+    int  hits1   = 0;
     int  lookups = 0;
     bool have    = false;
     const double decay = 1.0 - lambda;
@@ -2049,6 +2730,7 @@ void moe_hybrid_engine::on_token(int n_new) {
                         const size_t i = (size_t) l*n_expert + e;
                         lookups++;
                         hits += map[i] >= 0;
+                        hits1 += map[i] < 0 && g1_slots > 0 && map1[i] >= 0;
                         ema[i] += wgt;
                         if (recency) {
                             last_sel[i] = 1;
@@ -2073,6 +2755,18 @@ void moe_hybrid_engine::on_token(int n_new) {
                 map[(size_t) p.l*n_expert + p.e] = p.s;
             }
             pending.clear();
+        }
+    }
+
+    bool waited1 = false;
+    if (!pending1.empty()) {
+        if (!ggml_backend_cuda_event_ready(ev1)) {
+            waited1 = true;
+        } else {
+            for (const moe_hybrid_promo & p : pending1) {
+                map1[(size_t) p.l*n_expert + p.e] = p.s;
+            }
+            pending1.clear();
         }
     }
 
@@ -2109,6 +2803,43 @@ void moe_hybrid_engine::on_token(int n_new) {
         }
         n_prom = (int) pairs.size();
         tF = moe_clock::now();
+    }
+    if (g1_slots > 0 && g1_budget != 0 && have && !waited1) {
+        // tier 1: the pairs of the same lag-1 scan; the main cache's apply above may have taken a candidate, which is then skipped
+        if (scan_mode == 0) {
+            compute_pairs1(pairs1);
+        } else {
+            pairs1.clear();
+            if (scan_have1) {
+                pairs1.swap(scan_out1);
+            }
+            scan_have1 = false;
+        }
+        int n1 = 0;
+        for (const moe_hybrid_pair & c : pairs1) {
+            const size_t iv = (size_t) c.l*n_expert + c.victim;
+            const size_t ic = (size_t) c.l*n_expert + c.cand;
+            if (slot_of[ic] >= 0 || slot1_of[ic] >= 0 || slot1_of[iv] < 0) {
+                g1_n_skip++;
+                continue;
+            }
+            const int s = slot1_of[iv];
+            GGML_ASSERT(map1[iv] == s);
+            map1[iv]     = -1;
+            slot1_of[iv] = -1;
+            slot1_of[ic] = s;
+            slot1_expert[(size_t) c.l*g1_slots + s] = c.cand;
+            pending1.push_back({ c.l, c.cand, s });
+            queue_expert1(c.l, c.cand, s);
+            n1++;
+        }
+        if (n1 > 0) {
+            dma_state.store(1, std::memory_order_release);
+            g1_n_prom += n1;
+        }
+    }
+    if (g1_slots > 0 && lean_pf_k > 0) {
+        refresh_pfmap();
     }
     if (scan_mode != 0 && have && budget != 0) {
         start_scan();   // against the state after this apply, for the next token
@@ -2149,6 +2880,7 @@ void moe_hybrid_engine::on_token(int n_new) {
         n_tokens++;
         n_rows       += rows_valid;
         n_hits       += hits;
+        n_hits_t1    += hits1;
         n_lookups    += lookups;
         n_promotions += n_prom;
         n_waits      += waited;
@@ -2202,6 +2934,21 @@ void moe_hybrid_engine::shutdown() {
     dma_state.store(0);
     if (cuda) {
         ggml_backend_cuda_aux_synchronize(cuda);
+    }
+    if (g1_slots > 0) {
+        const int64_t gn = g1_thr_n.load();
+        LLAMA_LOG_INFO("moe_hybrid: tier 1 (device %d, %d slots): %lld lookups hit it (%.4f of all, main cache %.4f), %lld requests (%.2f experts each), G1 thread %.1f us per request, engine waited %.1f us per request after its own host job, "
+                       "%lld swaps queued (%lld skipped)\n", g1_device, g1_slots, (long long) n_hits_t1, n_lookups ? (double) n_hits_t1/n_lookups : 0.0, n_lookups ? (double) n_hits/n_lookups : 0.0,
+                       (long long) g1_n_req, g1_n_req ? (double) g1_n_hits1/g1_n_req : 0.0, gn ? (double) g1_thr_us.load()/gn : 0.0, g1_n_req ? g1_wait_sum/g1_n_req : 0.0,
+                       (long long) g1_n_prom, (long long) g1_n_skip);
+        if (gn > 0) {
+            LLAMA_LOG_INFO("moe_hybrid: tier 1 request anatomy, mean us over %lld requests: post -> pick-up %.1f, input kernel launch %.1f, graph launch %.1f, result kernel launch %.1f\n", (long long) gn,
+                           g1_pick_ns.load()*1e-3/gn, g1_set_ns.load()*1e-3/gn, g1_launch_ns.load()*1e-3/gn, g1_sync_ns.load()*1e-3/gn);
+        }
+        if (g1_check) {
+            LLAMA_LOG_INFO("moe_hybrid: tier-1 check: %lld results compared with the lean host leg, %lld above 5%% relative error, largest %.4f\n", (long long) g1_n_chk, (long long) g1_n_chk_bad, g1_chk_max);
+        }
+        g1_shutdown();
     }
     if (n_tokens > 0 || n_requests > 0) {
         char hist[256];
