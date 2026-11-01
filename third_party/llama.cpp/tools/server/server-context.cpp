@@ -1736,9 +1736,6 @@ private:
                     SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding (except MTP with --spec-mtp-defer)\n");
                     return false;
                 }
-                if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_fuse_max_set) {
-                    params_base.lm_prefill_fuse_max = 6000;   // H106
-                }
                 if (params_base.lm_prefill_fuse_min < 1) {
                     SRV_ERR("%s", "--lm-prefill-fuse-min must be at least 1\n");
                     return false;

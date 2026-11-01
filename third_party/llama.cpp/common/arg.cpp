@@ -1937,8 +1937,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-fuse-max"}, "N",
-        "most prompt tokens left that --lm-prefill-fuse sends whole; a longer rest is cut at the checkpoints as without --lm-prefill-fuse (default: no limit; 6000 with --lm-prefill-peer-gpu, "
-        "because a fused pass runs on one GPU and a split pass over two is faster from ~6000 tokens)",
+        "most prompt tokens left that --lm-prefill-fuse sends whole; a longer rest is cut at the checkpoints as without --lm-prefill-fuse (default: no limit; with --lm-prefill-peer-gpu a fused pass is "
+        "split over the two GPUs, or interleaved below 2816 tokens, and is faster than the cut flow at every size measured up to 16384)",
         [](common_params & params, int value) {
             params.lm_prefill_fuse_max     = value;
             params.lm_prefill_fuse_max_set = true;
