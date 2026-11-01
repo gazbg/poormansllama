@@ -26,6 +26,8 @@ CHATS = [
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--rounds", type=int, default=3)
+ap.add_argument("--peer", action="store_true", help="add the two-GPU prefill (the tier is shrunk to fit) and send long prompts instead of short chats")
+ap.add_argument("--long", type=int, default=12000, help="prompt tokens per request with --peer")
 ap.add_argument("--tokens", type=int, default=192)
 ap.add_argument("--bin", default=os.path.join(REPO, "build/llama-cuda/bin"))
 ap.add_argument("--out", default=os.path.join(REPO, "build/pascal/g1np2"))
@@ -48,6 +50,13 @@ def smi(q):
 if subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], capture_output=True, text=True).stdout.strip():
     sys.exit("GPU busy, refusing")
 env = dict(os.environ, CUDA_VISIBLE_DEVICES="0,1", LD_LIBRARY_PATH=os.path.abspath(a.bin), LLAMA_MOE_HYBRID_THREADS="4", LLAMA_MOE_HYBRID_G1_B="40")
+if a.peer:
+    # the layer-major pass is refused for a context that gives hidden states to an MTP draft (embeddings_nextn), which --spec-mtp-defer limits to -np 1: no draft in this test
+    for frag in ("--spec-type draft-mtp ", "--spec-draft-p-min 0.7 ", "--spec-draft-n-min 0 ", "--spec-draft-n-max 3 ", "-ctkd q8_0 ", "-ctvd q8_0 "):
+        BASE = BASE.replace(frag, "")
+    BASE += " --lm-prefill-peer-gpu 1 --lm-prefill-peer-ctx 33024 -b 16384 --lm-prefill-segment 16384"
+    env["LLAMA_MOE_HYBRID_G1_RESERVE_MIB"] = "4900"
+    env["LLAMA_LM_LOG"] = "1"
 cmd = [os.path.join(a.bin, "llama-server"), "--model", MODEL, "--host", "127.0.0.1", "--port", str(a.port)] + shlex.split(BASE)
 log = open(os.path.join(a.out, "server.log"), "w")
 srv = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -77,15 +86,24 @@ try:
         except Exception:
             pass
         time.sleep(1)
+    toks = None
+    if a.peer:
+        toks = post("/tokenize", {"content": open(os.path.join(REPO, "build/ctx100k/base.txt") if os.path.exists(os.path.join(REPO, "build/ctx100k/base.txt")) else os.path.expanduser("~/Development/poormansllama/build/ctx100k/base.txt"), encoding="utf-8").read()})["tokens"]
     for rnd in range(a.rounds):
         res = [None, None]
 
         def one(k):
             q = CHATS[(2 * rnd + k) % len(CHATS)]
             t0 = time.time()
-            js = post("/v1/chat/completions", {"messages": [{"role": "user", "content": q}], "max_tokens": a.tokens, "temperature": 0, "seed": 1, "id_slot": -1})
-            n = js["usage"]["completion_tokens"]
-            res[k] = (n, n / (time.time() - t0), (js["choices"][0]["message"].get("content") or js["choices"][0]["message"].get("reasoning_content") or "")[:60].replace("\n", " "))
+            if a.peer:
+                off = 2000 + 30000 * k + 1000 * rnd
+                js = post("/completion", {"prompt": toks[off:off + a.long], "n_predict": 32, "temperature": 0, "cache_prompt": False, "seed": 1})
+                n = js["tokens_predicted"]
+                res[k] = (n, n / (time.time() - t0), js["content"][:60].replace("\n", " "))
+            else:
+                js = post("/v1/chat/completions", {"messages": [{"role": "user", "content": q}], "max_tokens": a.tokens, "temperature": 0, "seed": 1, "id_slot": -1})
+                n = js["usage"]["completion_tokens"]
+                res[k] = (n, n / (time.time() - t0), (js["choices"][0]["message"].get("content") or js["choices"][0]["message"].get("reasoning_content") or "")[:60].replace("\n", " "))
 
         th = [threading.Thread(target=one, args=(k,)) for k in range(2)]
         [t.start() for t in th]
@@ -102,7 +120,9 @@ finally:
     except subprocess.TimeoutExpired:
         srv.kill()
 txt = open(os.path.join(a.out, "server.log"), errors="replace").read()
-bad = [l for l in txt.splitlines() if any(w in l.lower() for w in ("cuda error", "timed out", "unanswered", "abort", "segmentation"))]
+bad = [l for l in txt.splitlines() if any(w in l.lower() for w in ("cuda error", "timed out", "unanswered", "abort", "segmentation", "the split pass failed"))]
+n_split = sum("split pass" in l or "lm-prefill: pass" in l for l in txt.splitlines())
+print(f"pass lines (leader + follower): {n_split}; fallbacks to the leader: {sum('the split pass failed' in l for l in txt.splitlines())}")
 print(f"peak memory: GPU 0 {peak[0]} MiB, GPU 1 {peak[1]} MiB; error lines in the server log: {len(bad)}")
 for l in bad[:5]:
     print("   ", l[:200])
