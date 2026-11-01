@@ -379,6 +379,7 @@ public:
     int32_t lm_snap_count() const;
     int32_t lm_snap_cut(int32_t i) const;
     size_t  lm_snap_data(int32_t i, uint8_t * dst, size_t size) const;
+    bool    lm_snap_take(int32_t i, std::vector<uint8_t> & out);
     int64_t lm_n_pass() const;
     bool    lm_is_armed() const;
 #endif

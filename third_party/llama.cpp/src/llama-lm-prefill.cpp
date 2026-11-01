@@ -36,6 +36,11 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -1659,6 +1664,14 @@ int32_t llama_context::lm_snap_cut(int32_t i) const {
     return lm_state != nullptr && i >= 0 && (size_t) i < lm_state->snaps.size() ? lm_state->snaps[(size_t) i].cut : -1;
 }
 
+bool llama_context::lm_snap_take(int32_t i, std::vector<uint8_t> & out) {
+    if (lm_state == nullptr || i < 0 || (size_t) i >= lm_state->snaps.size()) {
+        return false;
+    }
+    out.swap(lm_state->snaps[(size_t) i].blob);
+    return true;
+}
+
 size_t llama_context::lm_snap_data(int32_t i, uint8_t * dst, size_t size) const {
     if (lm_state == nullptr || i < 0 || (size_t) i >= lm_state->snaps.size()) {
         return 0;
@@ -1904,6 +1917,9 @@ int32_t llama_lm_prefill_snap_cut(const struct llama_context * ctx, int32_t i) {
 size_t llama_lm_prefill_snap_data(struct llama_context * ctx, int32_t i, uint8_t * dst, size_t size) {
     return ctx != nullptr ? ctx->lm_snap_data(i, dst, size) : 0;
 }
+bool llama_lm_prefill_snap_take(struct llama_context * ctx, int32_t i, std::vector<uint8_t> & out) {
+    return ctx != nullptr && ctx->lm_snap_take(i, out);
+}
 
 bool llama_lm_prefill_arm(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {
     bool ok = false;
@@ -1954,6 +1970,7 @@ void llama_lm_prefill_snap_request(struct llama_context *, const int32_t *, int3
 int32_t llama_lm_prefill_snap_count(const struct llama_context *) { return 0; }
 int32_t llama_lm_prefill_snap_cut(const struct llama_context *, int32_t) { return -1; }
 size_t llama_lm_prefill_snap_data(struct llama_context *, int32_t, uint8_t *, size_t) { return 0; }
+bool llama_lm_prefill_snap_take(struct llama_context *, int32_t, std::vector<uint8_t> &) { return false; }
 bool llama_lm_prefill_arm(struct llama_context *, llama_seq_id, int32_t) { return false; }
 void llama_lm_prefill_disarm(struct llama_context *) {}
 bool llama_lm_prefill_armed(const struct llama_context *) { return false; }

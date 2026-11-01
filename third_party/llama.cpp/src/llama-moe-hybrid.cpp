@@ -518,7 +518,16 @@ struct moe_hybrid_engine {
             return false;
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        ggml_backend_buffer_clear(buf, 0);
+        // H112: only the zero slot (the last one: a miss points at it) must be zero; every other slot is filled by a device copy or an upload before it is published, so clearing the
+        // whole buffer (a memset of ~2-3.7 GB per resize) is not needed. LLAMA_MOE_HYBRID_CLEAR_ALL=1 restores it.
+        static const bool clear_all = moe_hybrid_env_int("LLAMA_MOE_HYBRID_CLEAR_ALL", 0) != 0;
+        if (clear_all) {
+            ggml_backend_buffer_clear(buf, 0);
+        } else {
+            for (int k = 0; k < 3; ++k) {
+                ggml_backend_tensor_memset(t[k], 0, (size_t) slots_l[(size_t) il]*t[k]->nb[2], t[k]->nb[2]);
+            }
+        }
         return true;
     }
 

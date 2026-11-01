@@ -687,6 +687,7 @@ struct common_params {
     int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole
     int32_t     lm_prefill_fuse_max = 0;      // H106: most tokens left that are sent whole (0 = no limit)
     bool        lm_prefill_fuse_max_set = false;
+    bool        lm_prefill_fuse_one_cut = false;  // H112: a fused prompt keeps only the checkpoint 4 tokens before its end (not the one 4 + ubatch tokens before it)
     int32_t     lm_prefill_prearm  = 0;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle
 
     // llama-connect params

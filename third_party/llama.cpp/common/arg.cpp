@@ -1936,6 +1936,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lm-prefill-fuse-one-cut"},
+        "with --lm-prefill-fuse: do not keep the context checkpoint that the stock rule puts 4 + ubatch tokens before the end of a prompt, only the one 4 tokens before it. One cut fewer inside the pass "
+        "(about 0.1-0.15 s of the time to the first token); the price is the rollback depth: a follow-up that differs from the previous prompt within its last ~516 tokens finds no checkpoint to resume from "
+        "and re-processes from the next older one (default: off)",
+        [](common_params & params) {
+            params.lm_prefill_fuse_one_cut = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_ONE_CUT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lm-prefill-fuse-max"}, "N",
         "most prompt tokens left that --lm-prefill-fuse sends whole; a longer rest is cut at the checkpoints as without --lm-prefill-fuse (default: no limit; with --lm-prefill-peer-gpu a fused pass is "
         "split over the two GPUs, or interleaved below 2816 tokens, and is faster than the cut flow at every size measured up to 16384)",

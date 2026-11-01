@@ -3358,6 +3358,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, std::vector<uint8_t> * blob = nullptr) {
+        const int64_t t_cc0 = ggml_time_us();
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3426,8 +3427,8 @@ private:
                     h *= 1099511628211ULL;
                 }
             }
-            SRV_WRN("lm-fuse: checkpoint n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, %zu bytes, fnv %016llx, taken %s\n", cur.n_tokens, cur.pos_min, cur.pos_max, cur.data_tgt.size(),
-                    (unsigned long long) h, blob != nullptr ? "inside the pass" : "from the live state");
+            SRV_WRN("lm-fuse: checkpoint n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, %zu bytes, fnv %016llx, taken %s (%.1f ms in create_checkpoint)\n", cur.n_tokens, cur.pos_min, cur.pos_max, cur.data_tgt.size(),
+                    (unsigned long long) h, blob != nullptr ? "inside the pass" : "from the live state", (ggml_time_us() - t_cc0)/1000.0);
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4225,8 +4226,15 @@ private:
                 n_lost++;
                 continue;
             }
-            std::vector<uint8_t> blob(llama_lm_prefill_snap_data(ctx_tgt, found, nullptr, 0));
-            if (blob.empty() || llama_lm_prefill_snap_data(ctx_tgt, found, blob.data(), blob.size()) != blob.size()) {
+            std::vector<uint8_t> blob;
+            static const bool snap_copy = getenv("LLAMA_LM_SNAP_COPY") != nullptr;      // the copy of before H111, for a comparison
+            if (snap_copy) {
+                blob.resize(llama_lm_prefill_snap_data(ctx_tgt, found, nullptr, 0));
+                if (blob.empty() || llama_lm_prefill_snap_data(ctx_tgt, found, blob.data(), blob.size()) != blob.size()) {
+                    n_lost++;
+                    continue;
+                }
+            } else if (!llama_lm_prefill_snap_take(ctx_tgt, found, blob) || blob.empty()) {
                 n_lost++;
                 continue;
             }
@@ -5309,6 +5317,9 @@ private:
                             d = false;
                         }
                         d = d && !has_mtmd;
+                        if (params_base.lm_prefill_fuse_one_cut && near_end && e != N) {
+                            d = false;      // H112: only the checkpoint 4 tokens before the end (the virtual batch that ends at N) is kept
+                        }
                         return d && (sim_empty || s == last_user_pos || near_end || s > sim_back + params_base.checkpoint_min_step);
                     };
                     // a cut the legacy code would have made at token index `pos` (= the virtual batch [fuse_vstart, pos) ends here)

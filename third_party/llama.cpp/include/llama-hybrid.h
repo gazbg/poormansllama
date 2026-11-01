@@ -113,4 +113,11 @@ LLAMA_API void llama_fattn_head_tile(bool on);
 }
 #endif
 
+#ifdef __cplusplus
+#include <cstdint>
+#include <vector>
+// H111: move the snapshot's bytes out of the pass instead of copying them (63 MiB each); the pass's own copy is empty afterwards. False: no such snapshot
+LLAMA_API bool llama_lm_prefill_snap_take(struct llama_context * ctx, int32_t i, std::vector<uint8_t> & out);
+#endif
+
 #endif // LLAMA_HYBRID_H
