@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #ifdef LLAMA_LAYER_STREAMING
+extern bool llama_kv_lazy_suppress;   // H94: defined below
 // defined in ggml/src/ggml-cuda/ggml-cuda.cu (opt-in lazily committed KV buffer, env LLAMA_KV_LAZY)
 #include "ggml-cuda.h"
 extern "C" {
@@ -297,7 +298,7 @@ llama_kv_cache::llama_kv_cache(
         // opt-in (runner flag --kv-lazy sets LLAMA_KV_LAZY): reserve the CUDA KV buffer, let the runner commit the rows the run uses
         bool kv_lazy = false;
         // G31: the commit works on whole cell rows of one stream: not with several streams or the transposed V layout
-        if (!no_alloc && getenv("LLAMA_KV_LAZY") != nullptr && n_stream == 1 && !v_trans) {
+        if (!no_alloc && getenv("LLAMA_KV_LAZY") != nullptr && !llama_kv_lazy_suppress && n_stream == 1 && !v_trans) {
             for (int i_dev = 0; i_dev < ggml_backend_cuda_get_device_count(); ++i_dev) {
                 kv_lazy = kv_lazy || buft == ggml_backend_cuda_buffer_type(i_dev);
             }
@@ -1447,6 +1448,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1454,6 +1461,9 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 }
 
 #ifdef LLAMA_LAYER_STREAMING
+// H94: set while the follower context of the two-GPU prefill is created (llama_lm_prefill_follower_scope): the lazy KV commit is one process-global region of the first GPU
+bool llama_kv_lazy_suppress = false;
+
 // G31: called with the bytes a commit is about to map (llama-hybrid-api.cpp registers it: the VRAM expert cache makes room)
 void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes) = nullptr;
 

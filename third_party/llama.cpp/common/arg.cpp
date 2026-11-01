@@ -1842,9 +1842,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_DECODE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-min"}, "N",
-        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024)",
+        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024; 256 with --lm-prefill-peer-gpu)",
         [](common_params & params, int value) {
-            params.lm_prefill_min = value;
+            params.lm_prefill_min     = value;
+            params.lm_prefill_min_set = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -1929,11 +1930,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-fuse-min"}, "N",
-        "fewest prompt tokens left (after the cache hit) that --lm-prefill-fuse sends whole (default: 700)",
+        "fewest prompt tokens left (after the cache hit) that --lm-prefill-fuse sends whole (default: 700; 180 with --lm-prefill-peer-gpu, from where a fused pass interleaved over the two GPUs beats the cut flow by 5% or more)",
         [](common_params & params, int value) {
-            params.lm_prefill_fuse_min = value;
+            params.lm_prefill_fuse_min     = value;
+            params.lm_prefill_fuse_min_set = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-fuse-one-cut"},
+        "with --lm-prefill-fuse: do not keep the context checkpoint that the stock rule puts 4 + ubatch tokens before the end of a prompt, only the one 4 tokens before it. One cut fewer inside the pass "
+        "(about 0.1-0.15 s of the time to the first token); the price is the rollback depth: a follow-up that differs from the previous prompt within its last ~516 tokens finds no checkpoint to resume from "
+        "and re-processes from the next older one (default: off)",
+        [](common_params & params) {
+            params.lm_prefill_fuse_one_cut = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_ONE_CUT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-fuse-max"}, "N",
+        "most prompt tokens left that --lm-prefill-fuse sends whole; a longer rest is cut at the checkpoints as without --lm-prefill-fuse (default: no limit; with --lm-prefill-peer-gpu a fused pass is "
+        "split over the two GPUs, or interleaved below 2816 tokens, and is faster than the cut flow at every size measured up to 16384)",
+        [](common_params & params, int value) {
+            params.lm_prefill_fuse_max     = value;
+            params.lm_prefill_fuse_max_set = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-prearm"}, "MODE",
         "with --lm-prefill and -np 1: when the slots go idle after a request, prepare the layer-major pass of the next one (make room, allocate the slot window and the slab, copy the banks of the first layers). "
@@ -1957,6 +1977,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.hybrid_moe_freq = value;
         }
     ).set_env("LLAMA_ARG_HYBRID_MOE_FREQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-peer-gpu"}, "N",
+        "two-GPU prefill (needs --lm-prefill): load a second copy of the model on CUDA device N and let it compute the second part of every big prompt batch, one layer behind --lm-prefill, "
+        "taking the K/V and recurrent state of each layer from it (default: off)",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_gpu = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_GPU").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-peer-ctx"}, "N",
+        "context size of the second GPU's model: the longest prompt batch it can take (default: 33024)",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-peer-min"}, "N",
+        "smallest prompt batch (tokens) that is split over the two GPUs by token position (default: 3584); smaller batches, from --lm-prefill-min, alternate the layers between the GPUs instead, "
+        "so that each streams half of the expert banks",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_min = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-gpu1"}, "N|auto",
+        "keep N more experts per layer in the VRAM of a second GPU (device LLAMA_MOE_HYBRID_G1_DEVICE, default 1) and compute them there; auto fills that GPU (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && atoi(value.c_str()) <= 0) {
+                throw std::invalid_argument("invalid value for --hybrid-moe-gpu1 (a slot count or auto)");
+            }
+            params.hybrid_moe_gpu1 = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_GPU1").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--mtp-draft-vocab"}, "N",
+        "the MTP draft head reads only the first N rows of the output head (default: 0 = all rows). The draft is verified by the target, so only the speed changes: fewer rows make a draft step cheaper but can lower the acceptance (131072 of 248320 rows kept it at the Qwen3.6-35B-A3B level)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --mtp-draft-vocab");
+            }
+            params.mtp_draft_vocab = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_DRAFT_VOCAB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

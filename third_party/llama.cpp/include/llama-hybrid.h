@@ -71,6 +71,13 @@ LLAMA_API size_t  llama_lm_prefill_snap_data(struct llama_context * ctx, int32_t
 LLAMA_API bool    llama_lm_prefill_arm(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens);
 LLAMA_API void    llama_lm_prefill_disarm(struct llama_context * ctx);
 LLAMA_API bool    llama_lm_prefill_armed(const struct llama_context * ctx);
+
+// H94 (private fork): the sequence split of the layer-major prefill over two GPUs. The follower is a second context of the same model on the other GPU, created by the caller between
+// llama_lm_prefill_follower_scope(true) and (false) (its KV cache then does not use the lazy commit, which is process-global) and enabled with llama_lm_prefill_enable (params.device = its
+// CUDA ordinal, a context of one sequence). A batch of at least min_tokens tokens that the leader's pass takes (fresh sequence, one segment) is split: the leader computes the first part,
+// the follower the rest, one layer behind, and the K/V and recurrent state of each layer move over as the layer completes. Anything else runs as before.
+LLAMA_API void    llama_lm_prefill_follower_scope(bool on);
+LLAMA_API bool    llama_lm_prefill_set_peer(struct llama_context * leader, struct llama_context * follower, int32_t min_tokens);
 LLAMA_API int64_t llama_lm_prefill_n_pass(const struct llama_context * ctx);
 
 // Dense decode streaming (dense Qwen3.5/3.8 only, CUDA): the listed layers (ascending; their weights are in host memory, for example placed with --lm-prefill-host-layers) are computed ON THE DEVICE during decode
@@ -104,6 +111,13 @@ LLAMA_API void llama_fattn_head_tile(bool on);
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+#include <cstdint>
+#include <vector>
+// H111: move the snapshot's bytes out of the pass instead of copying them (63 MiB each); the pass's own copy is empty afterwards. False: no such snapshot
+LLAMA_API bool llama_lm_prefill_snap_take(struct llama_context * ctx, int32_t i, std::vector<uint8_t> & out);
 #endif
 
 #endif // LLAMA_HYBRID_H

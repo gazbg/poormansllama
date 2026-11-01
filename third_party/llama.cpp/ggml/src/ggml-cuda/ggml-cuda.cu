@@ -1002,18 +1002,19 @@ struct ggml_cuda_input_copy {
     const char * src;
     size_t       size;
 };
-static bool         g_cuda_input_batch_open = false;
-static bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
-static bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
-static char *       g_cuda_input_stage      = nullptr;
-static size_t       g_cuda_input_stage_used = 0;
-static bool         g_cuda_input_failed     = false;
-static cudaStream_t g_cuda_input_stream     = nullptr;
-static cudaEvent_t  g_cuda_input_event      = nullptr;
-static ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
-static size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
-static size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
-static size_t       g_cuda_input_n_direct   = 0;
+// thread_local: a batch is opened and closed by the thread that sets the inputs of a graph; two threads on two GPUs (the second-GPU tier, the two-GPU prefill) must not share it
+static thread_local bool         g_cuda_input_batch_open = false;
+static thread_local bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
+static thread_local bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
+static thread_local char *       g_cuda_input_stage      = nullptr;
+static thread_local size_t       g_cuda_input_stage_used = 0;
+static thread_local bool         g_cuda_input_failed     = false;
+static thread_local cudaStream_t g_cuda_input_stream     = nullptr;
+static thread_local cudaEvent_t  g_cuda_input_event      = nullptr;
+static thread_local ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
+static thread_local size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
+static thread_local size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
+static thread_local size_t       g_cuda_input_n_direct   = 0;
 
 // diagnostics for the hybrid engine's watchdog (read through the exported getters below): how far the main thread got launching this graph's nodes,
 // whether it is inside a graph compute, and which promotion copy the engine thread is submitting
@@ -5572,8 +5573,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // GGML_CUDA_GRAPHS_PASCAL=1 (private fork, opt-in): allow CUDA graphs before Volta, where the decode is launch-bound once the second-GPU tier removes the host wait
+    static const bool graphs_pascal = getenv("GGML_CUDA_GRAPHS_PASCAL") != nullptr && atoi(getenv("GGML_CUDA_GRAPHS_PASCAL")) != 0;
     if (graph->instances.empty()) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !graphs_pascal) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
@@ -5602,10 +5605,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    static const bool graph_trace = getenv("LLAMA_CUDA_GRAPH_TRACE") != nullptr;   // diagnostics: why a big decode graph is or is not captured
+    static std::atomic<int> graph_trace_n{0};
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (graph_trace && cgraph->n_nodes >= 800 && !graph_compatible && graph_trace_n.fetch_add(1) % 25 == 0) {
+            fprintf(stderr, "graph-trace: dev %d nodes %d compatible 0\n", cuda_ctx->device, cgraph->n_nodes);
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (graph_trace && cgraph->n_nodes >= 800 && graph_trace_n.fetch_add(1) % 25 == 0) {
+                fprintf(stderr, "graph-trace: dev %d nodes %d compatible 1 properties_changed %d warmup_complete %d instances %zu\n", cuda_ctx->device, cgraph->n_nodes,
+                        (int) properties_changed, (int) graph->warmup_complete, graph->instances.size());
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -6126,21 +6138,25 @@ bool ggml_backend_cuda_aux_stream_ok(ggml_backend_t backend) {
 
 void ggml_backend_cuda_memcpy_1d_aux(ggml_backend_t backend, void * dst, const void * src, size_t nbytes) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);   // a thread may serve two devices (the second expert tier)
     CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
 void ggml_backend_cuda_event_record_aux(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t) event->context, cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
 void ggml_backend_cuda_event_wait_aux(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 1), (cudaEvent_t) event->context, 0));
 }
 
 void ggml_backend_cuda_aux_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream(cuda_ctx->device, 1)));
 }
 
@@ -6317,6 +6333,25 @@ bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
 #endif
 }
 
+bool ggml_backend_cuda_copy_d2d_aux(ggml_backend_t backend,
+                                    void * const * dsts, const void * const * srcs,
+                                    const size_t * sizes, size_t count) {
+    if (!ggml_backend_is_cuda(backend) || dsts == nullptr || srcs == nullptr || sizes == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, 1);
+    for (size_t i = 0; i < count; ++i) {
+        const cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_backend_cuda_event_ready(ggml_backend_event_t event) {
     const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
     if (err == cudaErrorNotReady) {
@@ -6329,6 +6364,7 @@ bool ggml_backend_cuda_event_ready(ggml_backend_event_t event) {
 
 void ggml_backend_cuda_aux_flush(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     const cudaError_t err = cudaStreamQuery(cuda_ctx->stream(cuda_ctx->device, 1));
     if (err == cudaErrorNotReady) {
         (void) cudaGetLastError();
@@ -6343,6 +6379,28 @@ void ggml_backend_cuda_aux_flush(ggml_backend_t backend) {
 // window, DMA then at 14.44 GB/s = the pinned ceiling), which is what lets the
 // staging path skip its CPU memcpy hop. Failures fill `err` from
 // cudaGetErrorString so the caller can refuse loudly instead of degrading.
+// H102: a copy between the memories of two GPUs (direct when peer access is possible, else staged by the driver); synchronous for the host
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_peer_copy(void * dst, int dst_dev, const void * src, int src_dev, size_t nbytes) {
+    // cudaMemcpyPeer is ordered only against the legacy default stream, and the compute streams of ggml do not block on it: copy on a stream of our own and wait for it
+    static thread_local cudaStream_t streams[16] = {};
+    if (dst_dev < 0 || dst_dev >= 16) {
+        return false;
+    }
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    if (cudaSetDevice(dst_dev) != cudaSuccess) {
+        return false;
+    }
+    if (streams[dst_dev] == nullptr && cudaStreamCreateWithFlags(&streams[dst_dev], cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaSetDevice(prev);
+        return false;
+    }
+    bool ok = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, nbytes, streams[dst_dev]) == cudaSuccess;
+    ok = ok && cudaStreamSynchronize(streams[dst_dev]) == cudaSuccess;
+    (void) cudaSetDevice(prev);
+    return ok;
+}
+
 bool ggml_backend_cuda_register_host_range(const void * ptr, size_t nbytes, char * err, size_t err_len) {
     if (err != nullptr && err_len > 0) {
         err[0] = '\0';

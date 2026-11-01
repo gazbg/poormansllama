@@ -121,6 +121,10 @@ GGML_BACKEND_API void * ggml_backend_cuda_host_device_ptr(void * host_ptr);
 GGML_BACKEND_API bool ggml_backend_cuda_copy_batch_aux(ggml_backend_t backend,
                                                        void * const * dsts, const void * const * srcs,
                                                        const size_t * sizes, size_t count);
+// device-to-device copies on the auxiliary stream (No. 1): count regions, each sizes[i] bytes; false if a copy could not be queued
+GGML_BACKEND_API bool ggml_backend_cuda_copy_d2d_aux(ggml_backend_t backend,
+                                                     void * const * dsts, const void * const * srcs,
+                                                     const size_t * sizes, size_t count);
 // non-blocking completion test of a backend event (cudaEventQuery)
 GGML_BACKEND_API bool ggml_backend_cuda_event_ready(ggml_backend_event_t event);
 // hand the auxiliary stream's queued work to the GPU now (cudaStreamQuery): under WDDM the driver

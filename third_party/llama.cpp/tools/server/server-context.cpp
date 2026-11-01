@@ -1213,6 +1213,7 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
+    common_init_result_ptr llama_init_peer;   // H94: the second GPU's model and context of the two-GPU prefill
 
     llama_context * ctx_tgt = nullptr;
 
@@ -1285,6 +1286,7 @@ private:
 
         llama_hybrid_shutdown();
         llama_init.reset();
+        llama_init_peer.reset();
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
@@ -1384,6 +1386,17 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        // read once by the model graph: set before anything builds one (the fit step does)
+        if (params.mtp_draft_vocab > 0) {
+            const std::string n = std::to_string(params.mtp_draft_vocab);
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MTP_DRAFT_VOCAB_N", n.c_str());
+#else
+            setenv("LLAMA_MTP_DRAFT_VOCAB_N", n.c_str(), 1);
+#endif
+            SRV_INF("MTP draft head restricted to the first %s output rows\n", n.c_str());
+        }
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1594,6 +1607,14 @@ private:
 #endif
                 SRV_INF("hybrid-moe: frozen expert cache of %d slots per layer, no promotions (deterministic decode)\n", params_base.hybrid_moe_slots);
             }
+            if (!params_base.hybrid_moe_gpu1.empty()) {
+#if defined(_WIN32)
+                _putenv_s("LLAMA_MOE_HYBRID_G1_SLOTS", params_base.hybrid_moe_gpu1.c_str());
+#else
+                setenv("LLAMA_MOE_HYBRID_G1_SLOTS", params_base.hybrid_moe_gpu1.c_str(), 1);
+#endif
+                SRV_INF("hybrid-moe: second expert tier on another GPU, %s slots per layer\n", params_base.hybrid_moe_gpu1.c_str());
+            }
             llama_hybrid_prepare_env(params_base.hybrid_moe_slots > 0 ? params_base.hybrid_moe_slots : 14, params_base.hybrid_moe_freq.c_str());
             SRV_INF("%s", "hybrid-moe: expert banks on the host, VRAM expert cache, fit step off\n");
         }
@@ -1710,9 +1731,13 @@ private:
                     SRV_ERR("--lm-prefill-fuse / --lm-prefill-prearm need -np 1 (they are for one conversation at a time; got -np %d)\n", params_base.n_parallel);
                     return false;
                 }
-                if (has_spec) {
-                    SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding\n");
+                // H106: MTP with --spec-mtp-defer keeps no prompt positions in the draft cache, so the draft part of a checkpoint is the same inside and after the pass
+                if (has_spec && !(spec_mtp && !has_draft && params_base.speculative.draft.mtp_defer)) {
+                    SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding (except MTP with --spec-mtp-defer)\n");
                     return false;
+                }
+                if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_fuse_min_set) {
+                    params_base.lm_prefill_fuse_min = 180;   // H114: a fused pass is interleaved over the two GPUs from 128 tokens; measured against the cut flow: 160 tokens -3%, 200 -11%, 250 -13%, 300 -10%, 600 -45%
                 }
                 if (params_base.lm_prefill_fuse_min < 1) {
                     SRV_ERR("%s", "--lm-prefill-fuse-min must be at least 1\n");
@@ -1763,6 +1788,9 @@ private:
         }
 
         if (params_base.lm_prefill) {
+            if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_min_set) {
+                params_base.lm_prefill_min = 256;   // the layer interleave makes even the 512-token tail of a prompt cheaper in a pass than on the ordinary path (H102)
+            }
             // before the expert cache is sized: the slot window is allocated once here and freed at once, the cache then takes the rest
             llama_lm_prefill_params lp = llama_lm_prefill_default_params();
             lp.n_slots    = params_base.lm_prefill_slots;
@@ -1777,6 +1805,52 @@ private:
             }
             SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\n",
                     lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+        }
+
+        if (params_base.lm_prefill && params_base.lm_prefill_peer_gpu >= 0) {
+            // H94: the same model once more, on the other GPU: its context takes the second part of a big prompt batch (see llama_lm_prefill_set_peer)
+            char dn[32];
+            snprintf(dn, sizeof(dn), "CUDA%d", params_base.lm_prefill_peer_gpu);
+            ggml_backend_dev_t pdev = ggml_backend_dev_by_name(dn);
+            if (pdev == nullptr) {
+                SRV_ERR("--lm-prefill-peer-gpu: no device %s\n", dn);
+                return false;
+            }
+            common_params pp = params_base;
+            pp.devices.clear();
+            pp.devices.push_back(pdev);
+            pp.devices.push_back(nullptr);
+            pp.main_gpu    = 0;
+            pp.split_mode  = LLAMA_SPLIT_MODE_NONE;
+            pp.n_ctx       = params_base.lm_prefill_peer_ctx;
+            pp.n_parallel  = 1;
+            pp.kv_unified  = false;
+            pp.hybrid_moe  = false;
+            pp.warmup      = false;
+            pp.fit_params  = false;
+            pp.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            llama_lm_prefill_follower_scope(true);
+            llama_init_peer = common_init_from_params(pp);
+            llama_lm_prefill_follower_scope(false);
+            llama_context * ctx_peer = llama_init_peer ? llama_init_peer->context() : nullptr;
+            if (ctx_peer == nullptr) {
+                SRV_ERR("--lm-prefill-peer-gpu: could not create the model on %s\n", dn);
+                return false;
+            }
+            llama_lm_prefill_params lpp = llama_lm_prefill_default_params();
+            lpp.n_slots    = params_base.lm_prefill_slots;
+            lpp.ubatch     = params_base.lm_prefill_ubatch;
+            lpp.segment    = params_base.lm_prefill_segment;
+            lpp.min_tokens = params_base.lm_prefill_min;
+            lpp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lpp.device     = params_base.lm_prefill_peer_gpu;
+            char perr[512] = { 0 };
+            if (!llama_lm_prefill_enable(ctx_peer, &lpp, perr, sizeof(perr)) || !llama_lm_prefill_set_peer(ctx_tgt, ctx_peer, params_base.lm_prefill_peer_min)) {
+                SRV_ERR("--lm-prefill-peer-gpu: %s\n", perr);
+                return false;
+            }
+            SRV_INF("lm-prefill: two-GPU prefill with the model on %s (context of %d tokens): batches of %d .. %d tokens alternate their layers between the GPUs, batches of >= %d are split by token position\n",
+                    dn, params_base.lm_prefill_peer_ctx, params_base.lm_prefill_min, params_base.lm_prefill_peer_min - 1, params_base.lm_prefill_peer_min);
         }
 
         if (!params_base.lm_decode_stream.empty()) {
@@ -3287,6 +3361,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, std::vector<uint8_t> * blob = nullptr) {
+        const int64_t t_cc0 = ggml_time_us();
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3355,8 +3430,8 @@ private:
                     h *= 1099511628211ULL;
                 }
             }
-            SRV_WRN("lm-fuse: checkpoint n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, %zu bytes, fnv %016llx, taken %s\n", cur.n_tokens, cur.pos_min, cur.pos_max, cur.data_tgt.size(),
-                    (unsigned long long) h, blob != nullptr ? "inside the pass" : "from the live state");
+            SRV_WRN("lm-fuse: checkpoint n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, %zu bytes, fnv %016llx, taken %s (%.1f ms in create_checkpoint)\n", cur.n_tokens, cur.pos_min, cur.pos_max, cur.data_tgt.size(),
+                    (unsigned long long) h, blob != nullptr ? "inside the pass" : "from the live state", (ggml_time_us() - t_cc0)/1000.0);
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4154,8 +4229,15 @@ private:
                 n_lost++;
                 continue;
             }
-            std::vector<uint8_t> blob(llama_lm_prefill_snap_data(ctx_tgt, found, nullptr, 0));
-            if (blob.empty() || llama_lm_prefill_snap_data(ctx_tgt, found, blob.data(), blob.size()) != blob.size()) {
+            std::vector<uint8_t> blob;
+            static const bool snap_copy = getenv("LLAMA_LM_SNAP_COPY") != nullptr;      // the copy of before H111, for a comparison
+            if (snap_copy) {
+                blob.resize(llama_lm_prefill_snap_data(ctx_tgt, found, nullptr, 0));
+                if (blob.empty() || llama_lm_prefill_snap_data(ctx_tgt, found, blob.data(), blob.size()) != blob.size()) {
+                    n_lost++;
+                    continue;
+                }
+            } else if (!llama_lm_prefill_snap_take(ctx_tgt, found, blob) || blob.empty()) {
                 n_lost++;
                 continue;
             }
@@ -5208,7 +5290,7 @@ private:
                     if (params_base.lm_prefill_fuse && !has_mtmd && !slot.prompt.tokens.has_mtmd && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         batch.size() == 0) {
                         const int64_t left = (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens();
-                        if (left >= params_base.lm_prefill_fuse_min) {
+                        if (left >= params_base.lm_prefill_fuse_min && (params_base.lm_prefill_fuse_max <= 0 || left < params_base.lm_prefill_fuse_max)) {
                             const int64_t t_arm0 = ggml_time_us();
                             fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
                             if (getenv("LLAMA_LM_LOG") != nullptr) {
@@ -5238,6 +5320,9 @@ private:
                             d = false;
                         }
                         d = d && !has_mtmd;
+                        if (params_base.lm_prefill_fuse_one_cut && near_end && e != N) {
+                            d = false;      // H112: only the checkpoint 4 tokens before the end (the virtual batch that ends at N) is kept
+                        }
                         return d && (sim_empty || s == last_user_pos || near_end || s > sim_back + params_base.checkpoint_min_step);
                     };
                     // a cut the legacy code would have made at token index `pos` (= the virtual batch [fuse_vstart, pos) ends here)

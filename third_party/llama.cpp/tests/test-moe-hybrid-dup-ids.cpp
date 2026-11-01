@@ -166,7 +166,11 @@ int main() {
 
                 const std::vector<float> ref  = run_mul_mat_id(cpu, tc.type, w, x, ids, T, false);
                 const std::vector<float> got  = run_mul_mat_id(gpu, tc.type, w, x, ids, T, true);
-                const std::vector<float> bare = run_mul_mat_id(gpu, tc.type, w, x, ids, T, false);
+                // the unflagged dispatch is the negative control: with repeated ids it used to drop them silently (mmf / mmq keep one entry per (token, expert)); since the
+                // upstream sync the same input reaches the host-sorted fallback of ggml_cuda_mul_mat_id, which asserts that every (token, expert) pair is listed once and aborts.
+                // It therefore only runs on request (MOE_HYBRID_DUP_BARE=1); the flagged dispatch above is the one the hybrid decode uses.
+                static const bool run_bare = std::getenv("MOE_HYBRID_DUP_BARE") != nullptr;
+                const std::vector<float> bare = run_bare ? run_mul_mat_id(gpu, tc.type, w, x, ids, T, false) : ref;
                 const double e_flag = rel_err(got, ref);
                 const double e_bare = rel_err(bare, ref);
                 CHECK(e_flag < tc.tol, "%s T=%d variant=%d: flagged MUL_MAT_ID differs from the CPU reference by %.3g (tolerance %.3g)", ggml_type_name(tc.type), T, variant, e_flag, tc.tol);

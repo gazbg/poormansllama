@@ -911,6 +911,9 @@ struct llama_model {
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 
+    // H94: the second GPU's model of the two-GPU prefill: its graphs never take the hybrid expert path (that engine belongs to the first GPU)
+    bool no_hybrid = false;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model

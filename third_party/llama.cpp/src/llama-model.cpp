@@ -1352,7 +1352,14 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
     }
 }
 
+#ifdef LLAMA_LAYER_STREAMING
+extern bool llama_kv_lazy_suppress;   // llama-kv-cache.cpp: set while the follower of the two-GPU prefill is created
+#endif
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+#ifdef LLAMA_LAYER_STREAMING
+    no_hybrid = llama_kv_lazy_suppress;
+#endif
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.

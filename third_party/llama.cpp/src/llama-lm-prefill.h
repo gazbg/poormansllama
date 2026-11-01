@@ -7,14 +7,84 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #ifdef LLAMA_LAYER_STREAMING
 
 struct llama_layer_streaming;
+struct llama_context;
+class  llama_kv_cache;
+class  llama_memory_recurrent_context;
+
+// H94: what the two contexts of a sequence-split pass share while it runs
+struct llama_lm_link {
+    std::atomic<int>   layers_done{0};          // leader: layers finished for its chunks (the follower may take layer il once this is > il)
+    std::atomic<bool>  abort{false};            // either side: stop waiting
+    std::atomic<int>   fstate{0};               // follower: 0 running, 1 done, -1 failed
+    int                kc          = 0;         // first chunk of the follower
+    int64_t            lead_tokens = 0;         // tokens of the leader's chunks
+    int64_t            p0          = 0;         // position of the batch's first token (the earlier batches' state went over at the start)
+    std::vector<int32_t> widths;                // the leader's chunk widths (the follower's plan must be the same)
+    llama_kv_cache *   lead_kv     = nullptr;
+    int64_t            lead_c0     = 0;         // KV cell of position 0 in the leader
+    const llama_memory_recurrent_context * lead_rc = nullptr;   // the recurrent cell of the leader's last chunk (valid once layers_done > 0)
+    float *            lead_logits   = nullptr;  // the leader's logits row, written by the follower at the end
+    // H102: the layer interleave (small batches): the GPUs alternate pairs of layers, each streams only its own banks, the activations hop between them
+    bool               ilv           = false;
+    std::atomic<int>   ilv_done{0};              // layers 0 .. ilv_done - 1 are complete (on whichever GPU owns them)
+    std::atomic<bool>  joined{false};            // the follower's lm_run has started (a follower that returns without it did not run the pass)
+    char *             slab_base[2]  = { nullptr, nullptr };   // [0] the leader's activation slab, [1] the follower's
+    size_t             slab_half[2]  = { 0, 0 };
+    int                dev[2]        = { 0, 0 };             // CUDA ordinals of the two
+    size_t             lead_logits_n = 0;
+    // H107: a fused pass (snapshot cuts) in the interleave: the rows of the follower's recurrent layers at each cut, [snapshot] -> (layer, 0 = r / 1 = s, bytes); the leader writes the blobs
+    struct snap_row_t {
+        int                  il;
+        int                  kind;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<std::vector<snap_row_t>> fol_snap;
+    std::mutex              m;
+    std::condition_variable cv;
+};
+
+// the follower's persistent thread: it runs llama_decode(follower, batch) when the leader hands it a pass
+struct llama_lm_peer_worker {
+    ~llama_lm_peer_worker();
+    llama_context *         ctx = nullptr;      // the follower
+    std::thread             th;
+    std::mutex              m;
+    std::condition_variable cv;
+    std::condition_variable cv_done;
+    bool                    stop = false;
+    bool                    have = false;
+    std::atomic<int>        result{0};
+    std::atomic<int>        done{1};            // 1 = idle / finished
+    llama_lm_link *         link = nullptr;
+    // the follower's copy of the batch (sequence 0, logits for the last token only)
+    std::vector<llama_token>   tokens;
+    std::vector<llama_pos>     pos;
+    std::vector<int32_t>       n_seq_id;
+    std::vector<llama_seq_id>  seq_ids;
+    std::vector<llama_seq_id*> seq_id_ptr;
+    std::vector<int8_t>        logits_flag;
+    // the leader's sequence state before the batch (p0 > 0), imported by the follower first; the buffer is kept between passes (H121: a fresh zero-filled vector cost 430 ms per GiB)
+    uint8_t *                  prefix_buf = nullptr;
+    size_t                     prefix_cap = 0;
+    size_t                     prefix_n   = 0;
+    void start(llama_context * follower);
+    uint8_t * prefix_reserve(size_t n);         // room for n bytes (not zeroed unless LLAMA_LM_PREFIX_PERSIST=0); null when the allocation fails
+    void kick(llama_lm_link * l, const llama_batch & b, bool want_logits, size_t prefix_bytes);
+    int  wait();                                // blocks until the pass is over; its llama_decode result
+};
 
 struct llama_lm_state {
     ~llama_lm_state();
@@ -63,6 +133,13 @@ struct llama_lm_state {
     int64_t                n_arm_used    = 0;
     int64_t                n_arm_wasted  = 0;
     int64_t                t_arm_us      = 0;       // time the last arm took
+
+    // H94: the follower of a sequence split
+    llama_context *                       peer_ctx = nullptr;
+    int32_t                               peer_min = 0;
+    std::unique_ptr<llama_lm_peer_worker> peer_worker;
+    int64_t                               n_split = 0;      // passes that ran split
+    int64_t                               n_split_fallback = 0;
 
     // statistics
     int64_t n_pass  = 0;

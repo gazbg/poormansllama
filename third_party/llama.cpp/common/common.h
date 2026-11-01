@@ -651,6 +651,8 @@ struct common_params {
     int32_t     hybrid_moe_slots = -1;   // -1: size the cache to the --fit-target margin; N > 0: N slots per layer
     bool        hybrid_moe_frozen = false; // fixed expert cache (--hybrid-moe-slots, default 16) and no promotions: the hybrid decode is deterministic
     std::string hybrid_moe_freq;         // expert frequency table of the model (empty: uniform prior)
+    std::string hybrid_moe_gpu1;         // second expert tier in the VRAM of another GPU: slots per layer, or auto (empty: off)
+    int32_t     mtp_draft_vocab  = 0;    // the MTP draft head reads only the first N rows of the output head (0 = all; the target verifies every draft, so only the speed changes)
     int32_t     hybrid_moe_ubatch = 0;    // physical batch size (-ub) used with --hybrid-moe when -ub is not given, for the whole run (0 = keep the stock default; the prefill window below is the better way)
     int32_t     hybrid_moe_prefill_ubatch = 2048; // physical batch size while a big prompt batch is processed (the expert cache gives the room back afterwards); 0 = off
     int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window
@@ -665,7 +667,13 @@ struct common_params {
     int32_t     lm_evict_layers    = 0;       // with lm_resident_layers: how many of the resident layers are loaded in host memory with a dedicated VRAM slot, released for the layer-major pass; 0 = none
     int32_t     lm_resident_layers = 0;      // dense models: how many layers stay in VRAM, spread evenly (end-aligned); the others are host layers; 0 = off (--lm-prefill-host-layers decides)
     std::string lm_prefill_host_layers;       // dense models: decoder layers whose weights stay in host memory and stream through the slot window ("N" = the first N layers, or ranges "0-21,30"); empty = placement as given by -ngl / -ot
-    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
+    // H94 (private fork): the sequence split of the layer-major prefill over two GPUs (needs --lm-prefill): a second context of the model on this CUDA device, with a context of
+    // lm_prefill_peer_ctx tokens, takes the second part of a prompt batch of at least lm_prefill_peer_min tokens
+    int32_t     lm_prefill_peer_gpu = -1;
+    int32_t     lm_prefill_peer_ctx = 33024;
+    int32_t     lm_prefill_peer_min = 3584;   // batches of 256 .. this - 1 tokens take the layer interleave, larger ones the token split (H102: the crossover is at ~3.5k tokens)
+    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken (256 with the peer GPU, unless given)
+    bool        lm_prefill_min_set = false;   // --lm-prefill-min was given
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
@@ -676,7 +684,11 @@ struct common_params {
     bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
     int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule
     bool        lm_prefill_fuse    = false;   // G42 (-np 1): the rest of a prompt goes in one batch, the context checkpoints inside it are taken by the layer-major pass
-    int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole
+    int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole (180 with the peer GPU, unless given)
+    bool        lm_prefill_fuse_min_set = false;
+    int32_t     lm_prefill_fuse_max = 0;      // H106: most tokens left that are sent whole (0 = no limit)
+    bool        lm_prefill_fuse_max_set = false;
+    bool        lm_prefill_fuse_one_cut = false;  // H112: a fused prompt keeps only the checkpoint 4 tokens before its end (not the one 4 + ubatch tokens before it)
     int32_t     lm_prefill_prearm  = 0;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle
 
     // llama-connect params

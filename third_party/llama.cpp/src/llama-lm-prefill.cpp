@@ -36,7 +36,13 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -108,13 +114,18 @@ static uint64_t lm_fnv64(const uint8_t * p, size_t n) {
 
 llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     llama_lm_plan pl;
+    if (lm_role == 2 && getenv("LLAMA_LM_PEER_DECLINE") != nullptr) {      // test hook: the follower declines its half of a kicked batch (the leader must fail the request, not wait)
+        pl.why = "LLAMA_LM_PEER_DECLINE";
+        return pl;
+    }
 
     if (lm_state == nullptr) {
         return pl;
     }
     const auto & P = lm_state->p;
 
-    if (b.n_tokens < P.min_tokens && !(lm_state->armed_batch && lm_state->armed_n == b.n_tokens)) {
+    // the follower takes whatever batch the leader kicked (the leader decided; a follower that declined would leave the leader waiting for its hops)
+    if (b.n_tokens < P.min_tokens && lm_role != 2 && !(lm_state->armed_batch && lm_state->armed_n == b.n_tokens)) {
         pl.why = "below --lm-prefill-min";
         return pl;
     }
@@ -253,7 +264,12 @@ void llama_context::lm_note(const llama_batch & b, const llama_lm_plan & pl) con
 // resources of one pass
 //
 
-static int64_t lm_dev_free() {
+static int64_t lm_dev_free(int cuda_ordinal = -1) {
+    if (cuda_ordinal >= 0) {
+        size_t f = 0, t = 0;
+        ggml_backend_cuda_get_device_memory(cuda_ordinal, &f, &t);
+        return (int64_t) f;
+    }
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -277,7 +293,7 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
             S.armed        = false;
             S.armed_batch  = false;
             S.cur_w        = wmax;
-            S.free_pre     = lm_dev_free() + S.slot_total + 2*(int64_t) S.slab_half;
+            S.free_pre     = lm_dev_free(lm_follower ? S.p.device : -1) + S.slot_total + 2*(int64_t) S.slab_half;
             S.t_acquire_us = 0;
             S.n_arm_used++;
             return true;
@@ -333,16 +349,17 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
     }
     const int64_t need = slot_total + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
 
-    if (llama_lm_vram_hook != nullptr && !llama_lm_vram_hook(this, need, 1)) {
+    auto * const vram_hook = lm_follower ? nullptr : llama_lm_vram_hook;     // H94: the follower's GPU has no hybrid expert cache
+    if (vram_hook != nullptr && !vram_hook(this, need, 1)) {
         LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\n", __func__, (double) need/1048576.0);
         return false;
     }
-    if (llama_lm_vram_hook == nullptr) {
+    if (vram_hook == nullptr) {
         // no expert cache to shrink (dense models, MoE without the hybrid engine): the room has to exist already. A pass that runs out of device memory half way has changed the cache, and the
         // allocator of ggml does not survive a failed reservation, so the check is made BEFORE anything is touched
         const int64_t margin = (int64_t) 96*1048576;
         const int64_t held   = dstream ? (int64_t) dstream->held_bytes() : 0;     // the decode ring of slots gives its memory back for the pass
-        const int64_t free_b = lm_dev_free() + held;
+        const int64_t free_b = lm_dev_free(lm_follower ? P.device : -1) + held;
         if (free_b < need + margin) {
             LLAMA_LOG_WARN("%s: lm-prefill: %.0f MiB of device memory are free, the pass needs %.0f MiB (slot window %.0f + slab %.0f + compute buffer %.0f + margin %.0f); this batch takes the ordinary path\n",
                            __func__, (double) free_b/1048576.0, (double) (need + margin)/1048576.0, (double) slot_total/1048576.0, 2*(double) half/1048576.0, (double) sched_est/1048576.0, (double) (margin + 64*1048576)/1048576.0);
@@ -353,10 +370,10 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         dstream->suspend();
         reset_graph_reuse();     // a graph built while the ring is away has no markers and must not be reused after it is back
     }
-    S.free_pre   = lm_dev_free();
+    S.free_pre   = lm_dev_free(lm_follower ? P.device : -1);
     S.slot_total = slot_total;
     S.cur_w      = wmax;
-    S.vram_hooked = llama_lm_vram_hook != nullptr;
+    S.vram_hooked = vram_hook != nullptr;
 
     S.slots_live = true;    // also for a window that is only partly allocated: lm_release frees what exists
     if (!S.ls->lm_alloc_slots()) {
@@ -394,7 +411,7 @@ void llama_context::lm_release() {
 
     // G40: what this pass really took on the device besides the slot window and the slab (the next pass asks for it)
     if (S.live && S.free_pre > 0) {
-        const int64_t var = S.free_pre - lm_dev_free() - S.slot_total - 2*(int64_t) S.slab_half;
+        const int64_t var = S.free_pre - lm_dev_free(lm_follower ? S.p.device : -1) - S.slot_total - 2*(int64_t) S.slab_half;
         // a pass of a few tokens (the 4-token tail behind a checkpoint) measures only the fixed cost; scaled by the width ratio it asked for 2 GB and starved the next pass (found 2026-10-20)
         if (var > 0 && S.cur_w >= 256) {
             S.var_meas = var;
@@ -449,6 +466,232 @@ void llama_context::lm_release() {
 //
 
 // returns 0 when the batch is done, 1 when nothing was run (the caller takes the ordinary path), < 0 on a failure after the memory was changed
+//
+// H94: the sequence split over two GPUs (plan H94)
+//
+
+extern "C" {
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+bool ggml_backend_cuda_peer_copy(void * dst, int dst_dev, const void * src, int src_dev, size_t nbytes);
+}
+
+// copy n_rows rows (row = nb[1] bytes, a KV cell or a recurrent cell) of one tensor into another, through host memory
+static void lm_copy_rows(ggml_tensor * src, int64_t src_row, ggml_tensor * dst, int64_t dst_row, int64_t n_rows, std::vector<uint8_t> & stage) {
+    const size_t rb = src->nb[1];
+    GGML_ASSERT(dst->nb[1] == rb);
+    stage.resize((size_t) n_rows*rb);
+    ggml_backend_tensor_get(src, stage.data(), (size_t) src_row*rb, stage.size());
+    ggml_backend_tensor_set(dst, stage.data(), (size_t) dst_row*rb, stage.size());
+}
+
+llama_lm_peer_worker::~llama_lm_peer_worker() {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        stop = true;
+    }
+    cv.notify_all();
+    if (th.joinable()) {
+        th.join();
+    }
+    std::free(prefix_buf);
+}
+
+// H121: with the default the buffer is kept between passes and not zeroed (its pages stay resident); LLAMA_LM_PREFIX_PERSIST=0 allocates a zeroed one per pass, as before
+static bool lm_prefix_persist() {
+    static const bool v = getenv("LLAMA_LM_PREFIX_PERSIST") == nullptr || atoi(getenv("LLAMA_LM_PREFIX_PERSIST")) != 0;
+    return v;
+}
+
+uint8_t * llama_lm_peer_worker::prefix_reserve(size_t n) {
+    if (lm_prefix_persist()) {
+        if (n > prefix_cap) {
+            constexpr size_t step = (size_t) 128 << 20;
+            std::free(prefix_buf);
+            prefix_cap = (n + step - 1) / step * step;
+            prefix_buf = static_cast<uint8_t *>(std::malloc(prefix_cap));
+            if (prefix_buf == nullptr) {
+                prefix_cap = 0;
+            }
+        }
+    } else {
+        std::free(prefix_buf);
+        prefix_buf = static_cast<uint8_t *>(std::malloc(n > 0 ? n : 1));
+        prefix_cap = prefix_buf != nullptr ? n : 0;
+        if (prefix_buf != nullptr) {
+            std::memset(prefix_buf, 0, n);      // what a freshly resized vector does: this is the cost the default avoids
+        }
+    }
+    return prefix_buf;
+}
+
+void llama_lm_peer_worker::start(llama_context * follower) {
+    ctx = follower;
+    th = std::thread([this]() {
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            cv.wait(lk, [&] { return stop || have; });
+            if (stop) {
+                return;
+            }
+            have = false;
+            lk.unlock();
+            int rc = -9;
+            try {
+                llama_batch b = {};
+                b.n_tokens = (int32_t) tokens.size();
+                b.token    = tokens.data();
+                b.pos      = pos.data();
+                b.n_seq_id = n_seq_id.data();
+                b.seq_id   = seq_id_ptr.data();
+                b.logits   = logits_flag.data();
+                llama_memory_clear(llama_get_memory(ctx), true);     // the follower holds nothing between passes
+                bool prefix_ok = true;
+                if (prefix_n > 0) {
+                    // the batch continues a sequence: the K/V cells and the recurrent state of the earlier batches go over in one piece (plan H93: exact)
+                    const size_t n_in = prefix_n;
+                    prefix_n  = 0;
+                    prefix_ok = llama_state_seq_set_data_ext(ctx, prefix_buf, n_in, 0, LLAMA_STATE_SEQ_FLAGS_NONE) == n_in;
+                    if (!lm_prefix_persist()) {
+                        std::free(prefix_buf);
+                        prefix_buf = nullptr;
+                        prefix_cap = 0;
+                    }
+                }
+                if (prefix_ok) {
+                    ctx->lm_role = 2;
+                    ctx->lm_link = link;
+                    link->joined.store(false);
+                    rc = llama_decode(ctx, b);
+                    if (rc == 0 && !link->joined.load()) {
+                        // the follower's decode returned without running the pass (it took the ordinary path): the leader would wait for hops that never come
+                        LLAMA_LOG_ERROR("lm-prefill: the follower did not take the batch into the pass\n");
+                        rc = -9;
+                    }
+                } else {
+                    LLAMA_LOG_ERROR("lm-prefill: the follower could not take the sequence state of the earlier batches\n");
+                }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("lm-prefill: the follower failed: %s\n", e.what());
+            }
+            ctx->lm_role = 0;
+            ctx->lm_link = nullptr;
+            link->fstate.store(rc == 0 && link->fstate.load() != -1 ? 1 : -1);
+            if (rc != 0) {
+                link->abort.store(true);
+                link->cv.notify_all();
+            }
+            lk.lock();
+            result.store(rc);
+            done.store(1);
+            cv_done.notify_all();
+        }
+    });
+}
+
+void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool want_logits, size_t prefix_bytes) {
+    const int32_t n = b.n_tokens;
+    tokens.assign(b.token, b.token + n);
+    pos.assign(b.pos, b.pos + n);
+    n_seq_id.assign((size_t) n, 1);
+    seq_ids.assign((size_t) n, 0);
+    seq_id_ptr.resize((size_t) n);
+    for (int32_t i = 0; i < n; ++i) {
+        seq_id_ptr[(size_t) i] = &seq_ids[(size_t) i];
+    }
+    logits_flag.assign((size_t) n, 0);
+    logits_flag[(size_t) n - 1] = want_logits ? 1 : 0;
+    link     = l;
+    prefix_n = prefix_bytes;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        done.store(0);
+        have = true;
+    }
+    cv.notify_all();
+}
+
+int llama_lm_peer_worker::wait() {
+    std::unique_lock<std::mutex> lk(m);
+    cv_done.wait(lk, [&] { return done.load() == 1; });
+    return result.load();
+}
+
+extern bool llama_kv_lazy_suppress;   // llama-kv-cache.cpp
+
+void llama_lm_prefill_follower_scope(bool on) {
+    llama_kv_lazy_suppress = on;
+}
+
+bool llama_context::lm_set_peer(llama_context * follower, int32_t min_tokens) {
+    if (follower == nullptr || follower == this || lm_state == nullptr || follower->lm_state == nullptr || lm_follower) {
+        return false;
+    }
+    auto & S = *lm_state;
+    follower->lm_follower = true;
+    // H102: the follower's banks are the leader's bytes, already page-locked (portable) by the hybrid engine: read them there instead of page-locking the follower's own mapping bank by bank
+    // (the registration of 432 MiB cost ~80 ms of every bank's stage, 117 ms against 69 ms of the copy itself)
+    if (getenv("LLAMA_LM_PEER_OWN_SRC") == nullptr && follower->lm_state->ls) {
+        int n_re = 0, n_all = 0, n_bad = 0;
+        static const bool verify = getenv("LLAMA_LM_PEER_VERIFY") != nullptr;
+        for (auto & pkg : follower->lm_state->ls->pkg_cache) {
+            for (auto & m : pkg.members) {
+                if (m.src == nullptr || m.src->buffer == nullptr || !ggml_backend_buffer_is_host(m.src->buffer)) {
+                    continue;
+                }
+                n_all++;
+                const ggml_tensor * t = model.get_tensor(ggml_get_name(m.src));
+                if (t != nullptr && t != m.src && t->data != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) &&
+                    t->type == m.src->type && ggml_nbytes(t) == ggml_nbytes(m.src) && ggml_are_same_shape(t, m.src)) {
+                    if (verify && m.src->data != nullptr && std::memcmp(t->data, m.src->data, ggml_nbytes(t)) != 0) {
+                        n_bad++;
+                        LLAMA_LOG_WARN("%s: lm-prefill: %s differs between the leader and the follower mapping\n", __func__, ggml_get_name(t));
+                    }
+                    m.src = t;
+                    n_re++;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: lm-prefill: %d of %d host sources of the follower read the leader's banks\n", __func__, n_re, n_all);
+        if (verify) {
+            LLAMA_LOG_WARN("%s: lm-prefill: %d of %d host sources of the follower read the leader's banks, %d differ in content\n", __func__, n_re, n_all, n_bad);
+        }
+    }
+    S.peer_ctx    = follower;
+    S.peer_min    = min_tokens;
+    S.peer_worker = std::make_unique<llama_lm_peer_worker>();
+    S.peer_worker->start(follower);
+
+    // warm the follower up with one ordinary pass of its own (kernel loading, first allocations): the first split pass would otherwise pay them
+    {
+        const int32_t n_warm = std::min<int32_t>({ 2*follower->lm_state->p.ubatch + 64, (int32_t) follower->get_cparams().n_batch, (int32_t) follower->get_cparams().n_ctx - 64 });
+        if (n_warm >= follower->lm_state->p.min_tokens) {
+            std::vector<llama_token> toks((size_t) n_warm, 1);
+            std::vector<llama_pos>   pos((size_t) n_warm);
+            std::vector<int32_t>     nsid((size_t) n_warm, 1);
+            std::vector<llama_seq_id> sid((size_t) n_warm, 0);
+            std::vector<llama_seq_id *> sidp((size_t) n_warm);
+            std::vector<int8_t>      lg((size_t) n_warm, 0);
+            for (int32_t i = 0; i < n_warm; ++i) {
+                pos[(size_t) i]  = i;
+                sidp[(size_t) i] = &sid[(size_t) i];
+            }
+            llama_batch b = {};
+            b.n_tokens = n_warm; b.token = toks.data(); b.pos = pos.data(); b.n_seq_id = nsid.data(); b.seq_id = sidp.data(); b.logits = lg.data();
+            const int64_t t_w0 = ggml_time_us();
+            const int rc = llama_decode(follower, b);
+            llama_memory_clear(llama_get_memory(follower), true);
+            LLAMA_LOG_INFO("%s: lm-prefill: the follower's warm-up pass of %d tokens: %d, %.0f ms\n", __func__, (int) n_warm, rc, (double) (ggml_time_us() - t_w0)/1e3);
+        }
+    }
+    return true;
+}
+
+bool llama_lm_prefill_set_peer(struct llama_context * leader, struct llama_context * follower, int32_t min_tokens) {
+    return leader != nullptr && leader->lm_set_peer(follower, min_tokens);
+}
+
 int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     auto & S  = *lm_state;
     auto & ls = *S.ls;
@@ -532,10 +775,132 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     }
     const int n_segs = (int) seg_first.size() - 1;
 
+    // H94: the sequence split. role 0: the ordinary pass; 1: the leader of a split pass (it computes the chunks before kc); 2: the follower (the chunks from kc, the head)
+    int            role = lm_role;
+    llama_lm_link  link_own;
+    llama_lm_link * link = lm_link;
+    int            kc   = n_chunks;
+    bool           ilv  = false;      // H102: the layer interleave (a batch too small for the token split: the pass is bound by the bank stream of one link)
+    static const int ilv_min = getenv("LLAMA_LM_ILV_MIN") != nullptr ? atoi(getenv("LLAMA_LM_ILV_MIN")) : 128;     // 0 = off (128 since H114b: a fused pass of 200 tokens is 11% faster interleaved, 140 tokens 2%)
+    const bool peer_base = role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1
+        && (int64_t) pl.p0 + pl.n + 64 <= (int64_t) S.peer_ctx->get_cparams().n_ctx && getenv("LLAMA_LM_PEER_OFF") == nullptr;
+    // H108: the split takes a fused pass as well (each GPU captures the rows of the cuts inside its own chunks, for every layer)
+    static const bool split_snap = getenv("LLAMA_LM_SPLIT_NOSNAP") == nullptr;
+    // H122: a deep fused batch below the split threshold goes to the token split: the attention of a deep batch is a serial chain in the interleave (and in the one-GPU pass), the split halves it
+    // (measured at depth 8k-102k, plan H122: 2,900+ tokens from position 8,000 and 1,490+ tokens from position 90,000 are 7-10% faster than the default; everything else keeps its mode)
+    static const auto env_int = [](const char * key, int def) { const char * v = getenv(key); return v != nullptr ? atoi(v) : def; };
+    static const bool deep_rule = env_int("LLAMA_LM_PEER_DEEP_RULE", 1) != 0;
+    static const int  deep_a_n  = env_int("LLAMA_LM_PEER_DEEP_A_N", 2900);
+    static const int  deep_a_p  = env_int("LLAMA_LM_PEER_DEEP_A_P", 8000);
+    static const int  deep_b_n  = env_int("LLAMA_LM_PEER_DEEP_B_N", 1490);
+    static const int  deep_b_p  = env_int("LLAMA_LM_PEER_DEEP_B_P", 90000);
+    const bool deep_split = deep_rule && peer_base && split_snap && !pl.snap_cuts.empty() && n_chunks >= 2 && pl.n < S.peer_min
+        && ((pl.n >= deep_a_n && pl.p0 >= deep_a_p) || (pl.n >= deep_b_n && pl.p0 >= deep_b_p));
+    if (deep_split && lm_log_on()) {
+        LLAMA_LOG_WARN("lm-prefill: deep rule: %d tokens at position %d go to the token split\n", (int) pl.n, (int) pl.p0);
+    }
+    const bool split_mode = peer_base && (pl.snap_cuts.empty() || split_snap) && n_chunks >= 2 && (pl.n >= S.peer_min || deep_split);
+    // a fused pass (snapshot cuts) is interleaved up to ILV_SNAP_MAX tokens: the interleave halves the bank stream of each GPU but computes every layer once, so it ties with one GPU
+    // where the compute chain reaches the one-GPU stream (measured 2026-11-01: x0.62 at 800 tokens, x0.77 at 2,048, x0.97 at 2,800, x1.02 at 3,000)
+    static const bool ilv_snap     = getenv("LLAMA_LM_ILV_NOSNAP") == nullptr;      // set: the interleave refuses a pass with snapshot cuts, as before H107
+    static const int  ilv_snap_max = getenv("LLAMA_LM_ILV_SNAP_MAX") != nullptr ? atoi(getenv("LLAMA_LM_ILV_SNAP_MAX")) : 2816;
+    const bool ilv_mode   = (pl.snap_cuts.empty() ? peer_base : (peer_base && ilv_snap && pl.n < ilv_snap_max)) && ilv_min > 0 && pl.n >= ilv_min && pl.n < S.peer_min && !deep_split;
+    if (split_mode || ilv_mode) {
+        auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
+        if (!mh->get_mem_attn()->get_v_trans() && mh->get_mem_attn()->get_n_stream() == 1) {
+            static const double frac = getenv("LLAMA_LM_PEER_FRAC") != nullptr ? atof(getenv("LLAMA_LM_PEER_FRAC")) : 0.5;
+            const double target = frac*(double) pl.n;
+            int64_t t = 0;
+            kc = n_chunks - 1;
+            for (int c = 1; c < n_chunks; ++c) {
+                t += pl.widths[c - 1];
+                if ((double) t >= target) {
+                    kc = c;
+                    break;
+                }
+            }
+            if (ilv_mode) {
+                ilv = true;
+                kc  = n_chunks;
+            }
+            link_own.ilv         = ilv;
+            link_own.kc          = kc;
+            link_own.widths      = pl.widths;
+            link_own.lead_kv     = mh->get_mem_attn();
+            link_own.lead_c0     = pl.c0;
+            link_own.p0          = pl.p0;
+            link_own.lead_tokens = 0;
+            for (int c = 0; c < (ilv ? 0 : kc); ++c) {
+                link_own.lead_tokens += pl.widths[c];
+            }
+            link_own.lead_logits   = logits.data;
+            link_own.lead_logits_n = (size_t) model.vocab.n_tokens();
+            link = &link_own;
+            role = 1;
+            S.n_split++;
+            if (!pl.snap_cuts.empty()) {
+                // H107: the follower plans the same chunks (it cuts where the leader does) and keeps the rows of its own recurrent layers
+                S.peer_ctx->lm_state->snap_req.assign(pl.snap_cuts.begin(), pl.snap_cuts.end());   // the request itself is consumed (cleared) by lm_decode_begin; the plan keeps the cuts that became boundaries
+                link_own.fol_snap.assign(pl.snap_cuts.size(), {});
+            }
+            size_t prefix_bytes = 0;
+            if (pl.p0 > 0) {
+                const int64_t t_x0 = ggml_time_us();
+                const size_t  need = llama_state_seq_get_size_ext(this, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                uint8_t *     buf  = S.peer_worker->prefix_reserve(need);
+                if (buf == nullptr) {
+                    throw std::bad_alloc();
+                }
+                prefix_bytes = llama_state_seq_get_data_ext(this, buf, need, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (lm_log_on()) {
+                    LLAMA_LOG_WARN("lm-prefill: split pass: the state of the %d earlier tokens (%.1f MiB) exported in %.0f ms\n", (int) pl.p0, (double) prefix_bytes/1048576.0, (double) (ggml_time_us() - t_x0)/1e3);
+                }
+            }
+            S.peer_worker->kick(link, B, pl.want_logits, prefix_bytes);
+        }
+    }
+    if (role == 2) {
+        if (link == nullptr || link->widths != pl.widths || link->kc <= 0 || (!link->ilv && link->kc >= n_chunks)) {
+            LLAMA_LOG_ERROR("%s: lm-prefill: the follower's chunk plan differs from the leader's\n", __func__);
+            return -3;
+        }
+        kc  = link->kc;
+        ilv = link->ilv;
+        link->joined.store(true);      // from here the follower is in the pass; the worker checks it when the decode returns
+    }
+    // whatever way the leader leaves, the follower must be done with the leader's memory first
+    struct peer_guard_t {
+        llama_lm_link *        link = nullptr;
+        llama_lm_peer_worker * w    = nullptr;
+        bool                   wait_done = false;
+        ~peer_guard_t() {
+            if (link != nullptr && w != nullptr && !wait_done) {
+                link->abort.store(true);
+                link->cv.notify_all();
+                w->wait();
+            }
+        }
+    } peer_guard;
+    if (role == 1) {
+        peer_guard.link = link;
+        peer_guard.w    = S.peer_worker.get();
+    }
+    // H102: pairs of layers alternate between the GPUs (0,1 leader; 2,3 follower; ...), so that il % n_slots still names a slot of the owner's window
+    const bool ilv_run = ilv && (role == 1 || role == 2);
+    auto owner_leader  = [&](int il) { return ((il / 2) % 2) == 0; };
+    auto mine          = [&](int il) { return !ilv_run || ((role == 1) == owner_leader(il)); };
+    struct exec_guard_t {
+        llama_layer_streaming * ls = nullptr;
+        ~exec_guard_t() { if (ls != nullptr) { ls->exec_layers.clear(); } }
+    } exec_guard;
+
     // one result object for every piece of the pass
     llm_graph_result_ptr res(new llm_graph_result(4096));
 
     double t_embed = 0.0, t_build = 0.0, t_alloc = 0.0, t_inputs = 0.0, t_compute = 0.0, t_slotwait = 0.0, t_head = 0.0;
+    double t_hopwait = 0.0, t_hopcopy = 0.0, t_first = -1.0;
+    static const bool ilv_trace = getenv("LLAMA_LM_ILV_TRACE") != nullptr;
+    std::vector<std::array<int, 5>> ilv_tl;      // layer, start, slot ready, hop done, end (ms since the pass began)
     int64_t n_launch = 0;
     int64_t n_recurrent_prep = 0;
 
@@ -624,8 +989,102 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     };
 
     // is layer il computed from the model's own (already device-resident) experts?
-    auto is_native = [&](int il) { return S.native[(size_t) il] != 0; };
+    auto is_native = [&](int il) { return S.native[(size_t) il] != 0 || !mine(il); };
+    if (ilv_run) {
+        // this GPU streams only its own layers: the feed visits them in order, the other GPU's layers count as already there
+        ls.exec_layers.clear();
+        for (int il = 0; il < n_layer; ++il) {
+            if (!is_native(il)) {
+                ls.exec_layers.push_back(il);
+            }
+        }
+        exec_guard.ls = &ls;
+        link->slab_base[role - 1] = slab_base;
+        link->slab_half[role - 1] = S.slab_half;
+        link->dev[role - 1]       = S.p.device;
+    }
     auto layer_of  = [&](int il) -> const llama_layer & { return is_native(il) ? model.layers[il] : ls.slot_layer(il); };
+
+    // H94: the hand-off between the two contexts. Before layer il the follower waits for the leader to finish it and takes the K/V cells of the leader's chunks (attention layers) or the
+    // recurrent cell after them (delta-net layers); after the layer it hands the K/V cells of its own chunks back. The recurrent cells and the logits go back at the very end, so that a
+    // follower that fails half way leaves the leader's state at the end of its own chunks, where the leader's fallback sweep needs it.
+    bool                 split_ok = false;
+    std::vector<uint8_t> peer_stage;
+    static const int peer_fail_layer = getenv("LLAMA_LM_PEER_FAIL") != nullptr ? atoi(getenv("LLAMA_LM_PEER_FAIL")) : -1;   // test hook: the follower fails before this layer
+    // H102: before the first layer of a block that follows the other GPU's, wait for the layer before and bring its output rows over
+    auto ilv_hop_in = [&](int il) -> bool {
+        const int64_t t_h0 = ggml_time_us();
+        {
+            std::unique_lock<std::mutex> lk(link->m);
+            link->cv.wait(lk, [&] { return link->ilv_done.load() >= il || link->abort.load(); });
+        }
+        const int64_t t_h1 = ggml_time_us();
+        t_hopwait += (double) (t_h1 - t_h0);
+        if (link->abort.load()) {
+            return false;
+        }
+        const int other = role == 1 ? 1 : 0;
+        char *       dst = slab_base + (size_t) (il & 1)*S.slab_half;
+        const char * src = link->slab_base[other] + (size_t) (il & 1)*link->slab_half[other];
+        const bool ok = src != nullptr && ggml_backend_cuda_peer_copy(dst, S.p.device, src, link->dev[other], (size_t) pl.n*row_bytes);
+        t_hopcopy += (double) (ggml_time_us() - t_h1);
+        return ok;
+    };
+    auto peer_pull = [&](int il) -> bool {
+        {
+            std::unique_lock<std::mutex> lk(link->m);
+            link->cv.wait(lk, [&] { return link->layers_done.load() > il || link->abort.load(); });
+        }
+        if (link->abort.load()) {
+            return false;
+        }
+        auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
+        if (hparams.is_recr(il)) {
+            const auto * fr = static_cast<const llama_memory_hybrid_context *>(chunks[(size_t) kc].mctx.get())->get_recr();
+            for (int k = 0; k < 2; ++k) {
+                ggml_tensor * src = k == 0 ? link->lead_rc->get_r_l(il) : link->lead_rc->get_s_l(il);
+                ggml_tensor * dst = k == 0 ? fr->get_r_l(il) : fr->get_s_l(il);
+                if (src != nullptr && dst != nullptr) {
+                    lm_copy_rows(src, (int64_t) link->lead_rc->get_head(), dst, (int64_t) fr->get_head(), 1, peer_stage);
+                }
+            }
+        } else if (mh->get_mem_attn()->has_layer(il)) {
+            llama_kv_cache * kvf = mh->get_mem_attn();
+            lm_copy_rows(link->lead_kv->get_k_storage(il), link->lead_c0 + link->p0, kvf->get_k_storage(il), pl.c0 + pl.p0, link->lead_tokens, peer_stage);
+            lm_copy_rows(link->lead_kv->get_v_storage(il), link->lead_c0 + link->p0, kvf->get_v_storage(il), pl.c0 + pl.p0, link->lead_tokens, peer_stage);
+        }
+        return true;
+    };
+    auto peer_push_kv = [&](int il) -> bool {
+        auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
+        if (hparams.is_recr(il) || !mh->get_mem_attn()->has_layer(il)) {
+            return true;
+        }
+        llama_kv_cache * kvf = mh->get_mem_attn();
+        const int64_t n_f = (int64_t) pl.n - link->lead_tokens;
+        lm_copy_rows(kvf->get_k_storage(il), pl.c0 + pl.p0 + link->lead_tokens, link->lead_kv->get_k_storage(il), link->lead_c0 + link->p0 + link->lead_tokens, n_f, peer_stage);
+        lm_copy_rows(kvf->get_v_storage(il), pl.c0 + pl.p0 + link->lead_tokens, link->lead_kv->get_v_storage(il), link->lead_c0 + link->p0 + link->lead_tokens, n_f, peer_stage);
+        return true;
+    };
+    auto peer_push_final = [&]() -> bool {
+        const auto * fr = static_cast<const llama_memory_hybrid_context *>(chunks[(size_t) n_chunks - 1].mctx.get())->get_recr();
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hparams.is_recr(il) || (ilv_run && owner_leader(il))) {
+                continue;
+            }
+            for (int k = 0; k < 2; ++k) {
+                ggml_tensor * src = k == 0 ? fr->get_r_l(il) : fr->get_s_l(il);
+                ggml_tensor * dst = k == 0 ? link->lead_rc->get_r_l(il) : link->lead_rc->get_s_l(il);
+                if (src != nullptr && dst != nullptr) {
+                    lm_copy_rows(src, (int64_t) fr->get_head(), dst, (int64_t) link->lead_rc->get_head(), 1, peer_stage);
+                }
+            }
+        }
+        if (pl.want_logits && link->lead_logits != nullptr) {
+            memcpy(link->lead_logits, logits.data, link->lead_logits_n*sizeof(float));
+        }
+        return true;
+    };
 
     for (int seg = 0; seg < n_segs; ++seg) {
         const int c0 = seg_first[(size_t) seg];
@@ -709,128 +1168,256 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             last_ub   = &chunks[c].mctx->get_ubatch();
         }
 
-        // 2. embed every chunk (slab half 0)
-        {
-            const int64_t t_e0 = ggml_time_us();
-            for (int c = c0; c < c1; ++c) {
-                llm_graph_lm lmi;
-                lmi.kind     = 0;
-                lmi.act_buf  = S.slab.get();
-                lmi.act_type = S.act_type;
-                lmi.act_out  = half_ptr(0, chunks[c].slab_row);
-                double tc = 0.0;
-                if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
-                    return fail("embedding failed", -3);
+        auto sweep = [&](int ca, int cb) -> int {
+            // 2. embed every chunk (slab half 0); in the interleave only the owner of layer 0 does
+            if (!(ilv_run && role == 2)) {
+                const int64_t t_e0 = ggml_time_us();
+                for (int c = ca; c < cb; ++c) {
+                    llm_graph_lm lmi;
+                    lmi.kind     = 0;
+                    lmi.act_buf  = S.slab.get();
+                    lmi.act_type = S.act_type;
+                    lmi.act_out  = half_ptr(0, chunks[c].slab_row);
+                    double tc = 0.0;
+                    if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
+                        return fail("embedding failed", -3);
+                    }
                 }
+                t_embed += (double) (ggml_time_us() - t_e0);
             }
-            t_embed += (double) (ggml_time_us() - t_e0);
-        }
 
-        // 3. preload the first n_slots streamed layers, seed the async feed
-        {
-            std::vector<uint8_t> slot_taken((size_t) ls.n_slots, 0);
-            int preloaded = 0;
-            int last_pre  = -1;
-            for (int il = 0; il < n_layer && preloaded < ls.n_slots; ++il) {
-                if (is_native(il) || slot_taken[(size_t) (il % ls.n_slots)]) {
-                    continue;
+            // 3. preload the first n_slots streamed layers, seed the async feed
+            {
+                std::vector<uint8_t> slot_taken((size_t) ls.n_slots, 0);
+                int preloaded = 0;
+                int last_pre  = -1;
+                for (int il = 0; il < n_layer && preloaded < ls.n_slots; ++il) {
+                    if (is_native(il) || slot_taken[(size_t) (il % ls.n_slots)]) {
+                        continue;
+                    }
+                    slot_taken[(size_t) (il % ls.n_slots)] = 1;
+                    bool copied = false;
+                    if (!ls.load_layer(il, copied)) {
+                        return fail(ls.error_msg.c_str(), -3);
+                    }
+                    last_pre = il;
+                    preloaded++;
                 }
-                slot_taken[(size_t) (il % ls.n_slots)] = 1;
-                bool copied = false;
-                if (!ls.load_layer(il, copied)) {
-                    return fail(ls.error_msg.c_str(), -3);
-                }
-                last_pre = il;
-                preloaded++;
-            }
-            if (ls.af && last_pre >= 0) {
-                const int nxt = ls.af_next_layer(last_pre);
-                if (nxt >= 0) {
-                    ls.af_push(nxt);
-                }
-            }
-        }
-
-        // 4. layers on the outside, chunks on the inside (ascending)
-        for (int il = 0; il < n_layer; ++il) {
-            const bool native = is_native(il);
-            if (!native) {
-                bool copied = false;
-                if (!ls.load_layer(il, copied)) {
-                    return fail(ls.error_msg.c_str(), -3);
-                }
-                double wait_us = 0.0, host_submit_us = 0.0, ready_latency_us = 0.0;
-                if (!ls.wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
-                    return fail(ls.error_msg.c_str(), -3);
-                }
-                t_slotwait += wait_us;
-                {
-                    const int nxt = ls.af_next_layer(il);
-                    if (nxt >= 0 && ls.af) {
+                if (ls.af && last_pre >= 0) {
+                    const int nxt = ls.af_next_layer(last_pre);
+                    if (nxt >= 0) {
                         ls.af_push(nxt);
                     }
                 }
-                ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls.slots[il % ls.n_slots].ev_copy_ready);
             }
 
-            if (fail_run == 2 && il == 1) {
-                return fail("LLAMA_LM_FAIL_RUN=2: injected failure", -3);
-            }
-            for (int c = c0; c < c1; ++c) {
-                llm_graph_lm lmi;
-                lmi.kind       = 1;
-                lmi.il         = il;
-                lmi.layer      = &layer_of(il);
-                lmi.act_buf    = S.slab.get();
-                lmi.act_type   = S.act_type;
-                lmi.act_in     = half_ptr(il & 1, chunks[c].slab_row);
-                lmi.act_out    = half_ptr((il + 1) & 1, chunks[c].slab_row);
-                lmi.q_pos_base = (int32_t) (pl.p0 + chunks[c].t0);
-                lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
-                lmi.kv_cell0   = (int32_t) pl.c0;
-                double tc = 0.0;
-                if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
-                    return fail("layer failed", -3);
+            // 4. layers on the outside, chunks on the inside (ascending)
+            for (int il = 0; il < n_layer; ++il) {
+                if (ilv_run && !mine(il)) {
+                    continue;
                 }
-                if (snap_of_chunk[(size_t) c] >= 0 && hparams.is_recr(il)) {
-                    // G42: the layer's state now is the state at the end of this chunk (the piece is synchronised)
-                    const int64_t t_s0 = ggml_time_us();
-                    const auto * rcs = static_cast<const llama_memory_hybrid_context *>(chunks[c].mctx.get())->get_recr();
-                    const uint32_t hd = rcs->get_head();
-                    auto & sr = snap_rows[(size_t) snap_of_chunk[(size_t) c]];
-                    for (ggml_tensor * t : { rcs->get_r_l(il), rcs->get_s_l(il) }) {
-                        if (t == nullptr) {
-                            continue;
-                        }
-                        const size_t rb = t->nb[1];
-                        sr.rows.emplace_back(t, std::vector<uint8_t>(rb));
-                        ggml_backend_tensor_get(t, sr.rows.back().second.data(), (size_t) hd*rb, rb);
+                if (t_first < 0.0) {
+                    t_first = (double) (ggml_time_us() - t_start);
+                }
+                const bool native = is_native(il);
+                const int  tl_a   = (int) ((ggml_time_us() - t_start)/1000);
+                if (!native) {
+                    bool copied = false;
+                    if (!ls.load_layer(il, copied)) {
+                        return fail(ls.error_msg.c_str(), -3);
                     }
-                    t_snap_copy += (double) (ggml_time_us() - t_s0);
+                    double wait_us = 0.0, host_submit_us = 0.0, ready_latency_us = 0.0;
+                    if (!ls.wait_slot_ready(il, wait_us, host_submit_us, ready_latency_us)) {
+                        return fail(ls.error_msg.c_str(), -3);
+                    }
+                    t_slotwait += wait_us;
+                    {
+                        const int nxt = ls.af_next_layer(il);
+                        if (nxt >= 0 && ls.af) {
+                            ls.af_push(nxt);
+                        }
+                    }
+                    ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls.slots[il % ls.n_slots].ev_copy_ready);
+                    static const bool slot_verify = getenv("LLAMA_LM_SLOT_VERIFY") != nullptr;
+                    if (slot_verify) {
+                        // debug: the slot must hold exactly the source bytes when the layer starts
+                        ggml_backend_synchronize(backend_cuda);
+                        const llama_layer & sl = ls.slot_layer(il);
+                        std::vector<uint8_t> back;
+                        for (const auto & m : ls.pkg_cache[(size_t) il].members) {
+                            const ggml_tensor * d = m.dst_base != nullptr ? sl.*(m.dst_base) : nullptr;
+                            if (d == nullptr || m.src == nullptr || m.src->data == nullptr) {
+                                continue;
+                            }
+                            back.resize(ggml_nbytes(m.src));
+                            ggml_backend_tensor_get(d, back.data(), 0, back.size());
+                            if (std::memcmp(back.data(), m.src->data, back.size()) != 0) {
+                                size_t first = 0;
+                                while (first < back.size() && back[first] == ((const uint8_t *) m.src->data)[first]) {
+                                    first++;
+                                }
+                                LLAMA_LOG_WARN("lm-prefill: SLOT MISMATCH role %d layer %d %s: first differing byte %zu of %zu\n", role, il, ggml_get_name(m.src), first, back.size());
+                            }
+                        }
+                    }
+                }
+
+                const int tl_b = (int) ((ggml_time_us() - t_start)/1000);
+                if (ilv_run && il > 0 && !mine(il - 1) && !ilv_hop_in(il)) {
+                    return fail("the other GPU's layer did not arrive", -3);
+                }
+                const int tl_c = (int) ((ggml_time_us() - t_start)/1000);
+                static std::atomic<int>  peer_fail_seen{0};
+                static std::atomic<bool> peer_fail_fired{false};
+                static const bool        peer_fail_once  = getenv("LLAMA_LM_PEER_FAIL_ONCE") != nullptr;      // test hook: only one pass fails
+                static const int         peer_fail_after = getenv("LLAMA_LM_PEER_FAIL_AFTER") != nullptr ? atoi(getenv("LLAMA_LM_PEER_FAIL_AFTER")) : 0;   // ... after this many follower passes
+                if (role == 2 && il == peer_fail_layer && peer_fail_seen.fetch_add(1) >= peer_fail_after && !(peer_fail_once && peer_fail_fired.exchange(true))) {
+                    return fail("LLAMA_LM_PEER_FAIL: injected failure of the follower", -3);
+                }
+                if (role == 2 && !ilv_run && !peer_pull(il)) {
+                    return fail("the leader's layer did not arrive", -3);
+                }
+                if (fail_run == 2 && il == 1) {
+                    return fail("LLAMA_LM_FAIL_RUN=2: injected failure", -3);
+                }
+                for (int c = ca; c < cb; ++c) {
+                    llm_graph_lm lmi;
+                    lmi.kind       = 1;
+                    lmi.il         = il;
+                    lmi.layer      = &layer_of(il);
+                    lmi.act_buf    = S.slab.get();
+                    lmi.act_type   = S.act_type;
+                    lmi.act_in     = half_ptr(il & 1, chunks[c].slab_row);
+                    lmi.act_out    = half_ptr((il + 1) & 1, chunks[c].slab_row);
+                    lmi.q_pos_base = (int32_t) (pl.p0 + chunks[c].t0);
+                    lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
+                    lmi.kv_cell0   = (int32_t) pl.c0;
+                    double tc = 0.0;
+                    if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
+                        return fail("layer failed", -3);
+                    }
+                    if (snap_of_chunk[(size_t) c] >= 0 && hparams.is_recr(il)) {
+                        // G42: the layer's state now is the state at the end of this chunk (the piece is synchronised)
+                        const int64_t t_s0 = ggml_time_us();
+                        const auto * rcs = static_cast<const llama_memory_hybrid_context *>(chunks[c].mctx.get())->get_recr();
+                        const uint32_t hd = rcs->get_head();
+                        auto & sr = snap_rows[(size_t) snap_of_chunk[(size_t) c]];
+                        int kind = 0;
+                        for (ggml_tensor * t : { rcs->get_r_l(il), rcs->get_s_l(il) }) {
+                            const int this_kind = kind++;
+                            if (t == nullptr) {
+                                continue;
+                            }
+                            const size_t rb = t->nb[1];
+                            sr.rows.emplace_back(t, std::vector<uint8_t>(rb));
+                            ggml_backend_tensor_get(t, sr.rows.back().second.data(), (size_t) hd*rb, rb);
+                            if (role == 2 && link != nullptr && (size_t) snap_of_chunk[(size_t) c] < link->fol_snap.size()) {
+                                link->fol_snap[(size_t) snap_of_chunk[(size_t) c]].push_back({ il, this_kind, sr.rows.back().second });   // handed to the leader, which writes the blobs
+                            }
+                        }
+                        t_snap_copy += (double) (ggml_time_us() - t_s0);
+                    }
+                }
+
+                static const bool act_hash = getenv("LLAMA_LM_ACT_HASH") != nullptr;
+                if (act_hash && cb > ca) {
+                    // debug: FNV-1a of the layer's output rows (the slab half that holds them), to find the first layer where two runs differ
+                    ggml_backend_synchronize(backend_cuda);
+                    const int64_t r0   = chunks[ca].slab_row;
+                    const int64_t rows = chunks[cb - 1].slab_row + chunks[cb - 1].n - r0;
+                    std::vector<uint8_t> h((size_t) rows*row_bytes);
+                    ggml_tensor tmp = {};
+                    tmp.buffer = S.slab.get();
+                    tmp.data   = half_ptr((il + 1) & 1, r0);
+                    tmp.type   = GGML_TYPE_I8;
+                    tmp.ne[0] = (int64_t) h.size();
+                    tmp.ne[1] = tmp.ne[2] = tmp.ne[3] = 1;
+                    tmp.nb[0] = 1;
+                    tmp.nb[1] = tmp.nb[2] = tmp.nb[3] = h.size();
+                    ggml_backend_tensor_get(&tmp, h.data(), 0, h.size());
+                    uint64_t fnv = 1469598103934665603ull;
+                    for (uint8_t b : h) {
+                        fnv = (fnv ^ b)*1099511628211ull;
+                    }
+                    LLAMA_LOG_WARN("lm-prefill: ACT p0 %d n %d layer %d hash %016llx\n", (int) pl.p0, (int) pl.n, il, (unsigned long long) fnv);
+                }
+                if (role == 1 && !ilv_run) {
+                    {
+                        std::lock_guard<std::mutex> lk(link->m);
+                        link->layers_done.store(il + 1);
+                    }
+                    link->cv.notify_all();
+                }
+                if (ilv_run) {
+                    {
+                        std::lock_guard<std::mutex> lk(link->m);
+                        link->ilv_done.store(il + 1);
+                    }
+                    link->cv.notify_all();
+                }
+                if (role == 2 && !peer_push_kv(il)) {
+                    return fail("could not hand the follower's K/V to the leader", -3);
+                }
+                if (ilv_trace) {
+                    ilv_tl.push_back({ il, tl_a, tl_b, tl_c, (int) ((ggml_time_us() - t_start)/1000) });
+                }
+
+                if (!native) {
+                    ls.record_consumer_done(il, backend_cuda);
+                    int next = il + ls.n_slots;
+                    while (next < n_layer && is_native(next)) {
+                        next += ls.n_slots;
+                    }
+                    if (next < n_layer) {
+                        if (ls.af) {
+                            ls.af_push(next);
+                        } else {
+                            bool c2 = false;
+                            if (!ls.load_layer(next, c2)) {
+                                return fail(ls.error_msg.c_str(), -3);
+                            }
+                        }
+                    }
                 }
             }
 
-            if (!native) {
-                ls.record_consumer_done(il, backend_cuda);
-                int next = il + ls.n_slots;
-                while (next < n_layer && is_native(next)) {
-                    next += ls.n_slots;
-                }
-                if (next < n_layer) {
-                    if (ls.af) {
-                        ls.af_push(next);
-                    } else {
-                        bool c2 = false;
-                        if (!ls.load_layer(next, c2)) {
-                            return fail(ls.error_msg.c_str(), -3);
-                        }
-                    }
+            return 0;
+        };
+        {
+            // the follower computes from chunk kc, the leader up to it
+            const int ca = (role == 2 && !ilv_run) ? kc : c0;      // the interleave: both GPUs take every chunk, each through its own layers
+            const int cb = (role == 1 && !ilv_run) ? std::min(kc, c1) : c1;
+            if (role == 1) {
+                link->lead_rc = static_cast<const llama_memory_hybrid_context *>(chunks[(size_t) kc - 1].mctx.get())->get_recr();
+            }
+            const int rc_sw = sweep(ca, cb);
+            if (rc_sw != 0) {
+                return rc_sw;
+            }
+        }
+        if (role == 1) {
+            const int fr = S.peer_worker->wait();
+            peer_guard.wait_done = true;
+            if (fr == 0 && link->fstate.load() == 1) {
+                split_ok = true;
+            } else if (ilv_run) {
+                // the leader's state is advanced on its own layers only: there is nothing to fall back to
+                return fail("the second GPU failed in the layer interleave", -3);
+            } else {
+                // the follower failed: the leader does the follower's chunks itself, layer by layer from the start (its state after its own chunks is intact)
+                LLAMA_LOG_WARN("%s: lm-prefill: the split pass failed on the follower (%d): the leader computes the rest\n", __func__, fr);
+                S.n_split_fallback++;
+                role = 0;
+                link->fol_snap.assign(link->fol_snap.size(), {});   // H108: the follower's partial rows go; the leader's sweep takes the cuts of those chunks itself
+                const int rc_fb = sweep(kc, c1);
+                if (rc_fb != 0) {
+                    return rc_fb;
                 }
             }
         }
 
         // 5. the head of the last token of the last segment
-        if (seg == n_segs - 1 && pl.want_logits) {
+        if (seg == n_segs - 1 && pl.want_logits && !split_ok) {
             const int64_t t_h0 = ggml_time_us();
             const auto & lc = chunks[c1 - 1];
             llm_graph_lm lmi;
@@ -847,6 +1434,9 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             ggml_backend_tensor_get(t_logits, logits.data, 0, ggml_nbytes(t_logits));
             t_head += (double) (ggml_time_us() - t_h0);
         }
+        if (role == 2 && seg == n_segs - 1 && !peer_push_final()) {
+            return fail("could not hand the follower's state to the leader", -3);
+        }
     }
 
     // the feed worker and the copy stream are idle before the slot window goes
@@ -860,10 +1450,23 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
 
     // G42: the snapshots become the blobs the caller stores as checkpoints (the real serializer, the host rows and the cell position substituted)
     S.snaps.clear();
-    if (!snap_rows.empty()) {
+    if (!snap_rows.empty() && role != 2) {
         const int64_t t_b0 = ggml_time_us();
         llama_memory_recurrent * mr = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr();
         bool snap_ok = true;
+        if (link != nullptr && !link->fol_snap.empty()) {
+            // H107/H108: the rows the follower took at the cuts (its recurrent layers in the interleave, every layer of its chunks in the split), onto this memory's tensors of the same layers
+            for (size_t k = 0; k < snap_rows.size() && k < link->fol_snap.size(); ++k) {
+                for (auto & fr : link->fol_snap[k]) {
+                    ggml_tensor * t = fr.kind == 0 ? mr->r_l[(size_t) fr.il] : mr->s_l[(size_t) fr.il];
+                    if (t == nullptr || fr.bytes.size() != (size_t) t->nb[1]) {
+                        snap_ok = false;
+                        break;
+                    }
+                    snap_rows[k].rows.emplace_back(t, std::move(fr.bytes));
+                }
+            }
+        }
         for (size_t k = 0; k < snap_rows.size() && snap_ok; ++k) {
             llama_lm_state::snap_t sn;
             sn.cut = pl.snap_cuts[k];
@@ -910,14 +1513,37 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         output_ids[pl.n - 1] = 0;
     }
 
+    if (getenv("LLAMA_LM_STATE_HASH") != nullptr && !lm_follower) {
+        // debug: the leader's sequence state after the pass (K/V of every layer, recurrent state), hashed per MiB
+        std::vector<uint8_t> blob(llama_state_seq_get_size_ext(this, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+        blob.resize(llama_state_seq_get_data_ext(this, blob.data(), blob.size(), pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+        std::string hs;
+        for (size_t o = 0; o < blob.size(); o += (1u << 20)) {
+            uint64_t fnv = 1469598103934665603ull;
+            for (size_t i = o; i < std::min(blob.size(), o + (1u << 20)); ++i) {
+                fnv = (fnv ^ blob[i])*1099511628211ull;
+            }
+            char b[24];
+            snprintf(b, sizeof b, " %04llx", (unsigned long long) (fnv & 0xffff));
+            hs += b;
+        }
+        LLAMA_LOG_WARN("lm-prefill: STATE p0 %d n %d bytes %zu blocks:%s\n", (int) pl.p0, (int) pl.n, blob.size(), hs.c_str());
+    }
     const double wall_s = (double) (ggml_time_us() - t_start) / 1e6;
     S.n_pass++;
     S.n_tok   += pl.n;
     S.t_total += wall_s;
+    if (ilv_trace && !ilv_tl.empty()) {
+        std::string tl;
+        for (const auto & e : ilv_tl) {
+            tl += " " + std::to_string(e[0]) + ":" + std::to_string(e[1]) + "/" + std::to_string(e[2]) + "/" + std::to_string(e[3]) + "/" + std::to_string(e[4]);
+        }
+        LLAMA_LOG_WARN("lm-prefill: ilv timeline (role %d; layer:start/slot-ready/hop-done/end ms):%s\n", role, tl.c_str());
+    }
     if (lm_log_on()) {
-        LLAMA_LOG_WARN("lm-prefill: pass %lld: %d tokens at position %d in %d chunks / %d segments: %.3f s (%.0f t/s); embed %.0f ms, slot wait %.0f ms, head %.0f ms, %lld launches: build %.0f ms, alloc %.0f ms, inputs %.0f ms, compute %.0f ms (sum), recurrent prep %lld\n",
+        LLAMA_LOG_WARN("lm-prefill: pass %lld: %d tokens at position %d in %d chunks / %d segments: %.3f s (%.0f t/s); embed %.0f ms, slot wait %.0f ms, head %.0f ms, %lld launches: build %.0f ms, alloc %.0f ms, inputs %.0f ms, compute %.0f ms (sum), recurrent prep %lld, hop wait %.0f ms, hop copy %.0f ms, first layer at %.0f ms\n",
                        (long long) S.n_pass, (int) pl.n, (int) pl.p0, n_chunks, n_segs, wall_s, (double) pl.n/wall_s, t_embed/1e3, t_slotwait/1e3, t_head/1e3, (long long) n_launch,
-                       t_build/1e3, t_alloc/1e3, t_inputs/1e3, t_compute/1e3, (long long) n_recurrent_prep);
+                       t_build/1e3, t_alloc/1e3, t_inputs/1e3, t_compute/1e3, (long long) n_recurrent_prep, t_hopwait/1e3, t_hopcopy/1e3, t_first/1e3);
     }
     return 0;
 }
@@ -968,7 +1594,9 @@ bool llama_context::lm_prearm(llama_seq_id seq, int64_t n_tokens) {
     if (S.live && !S.armed) {
         return false;     // a pass is running
     }
-    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn || cparams.n_rs_seq != 0 ||
+    // H106: rollback snapshots (MTP, n_rs_seq > 0) are no reason to refuse: the pass runs the plain graphs on plane 0 (its plan declines a sequence that stands elsewhere), and a recurrent blob
+    // holds the one plane the sequence stands in, so the blobs it keeps are the ones the live state would give
+    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || layer_streaming != nullptr) {
         return false;
     }
@@ -1099,6 +1727,14 @@ int32_t llama_context::lm_snap_cut(int32_t i) const {
     return lm_state != nullptr && i >= 0 && (size_t) i < lm_state->snaps.size() ? lm_state->snaps[(size_t) i].cut : -1;
 }
 
+bool llama_context::lm_snap_take(int32_t i, std::vector<uint8_t> & out) {
+    if (lm_state == nullptr || i < 0 || (size_t) i >= lm_state->snaps.size()) {
+        return false;
+    }
+    out.swap(lm_state->snaps[(size_t) i].blob);
+    return true;
+}
+
 size_t llama_context::lm_snap_data(int32_t i, uint8_t * dst, size_t size) const {
     if (lm_state == nullptr || i < 0 || (size_t) i >= lm_state->snaps.size()) {
         return 0;
@@ -1206,7 +1842,7 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
 
     S->ls.reset(new llama_layer_streaming());
     llama_layer_streaming & ls = *S->ls;
-    if (!ls.init(model, p.n_slots, p.device, nullptr, 64, 256, LLAMA_PP_SCHEDULE_BATCH_MAJOR, 0, false, 10, false, false, S->act_type, 1, true, false)) {
+    if (!ls.init(model, p.n_slots, p.device, nullptr, 64, 256, LLAMA_PP_SCHEDULE_BATCH_MAJOR, 0, false, 10, false, false, S->act_type, 1, true, model.no_hybrid)) {   // H94: the follower registers a layer's host bank only while it is staged (the leader's hybrid engine holds the pin of the whole file: the driver counts a second pin of the same pages)
         err = "layer streaming init failed: " + ls.error_msg;
         return false;
     }
@@ -1254,7 +1890,7 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
     ls.exec_layers = streamed_list;
     int64_t reg_bytes = 0;
     double  reg_us    = 0.0;
-    const bool reg_ok = ls.register_all_pkg_sources(reg_bytes, reg_us);
+    const bool reg_ok = model.no_hybrid ? true : ls.register_all_pkg_sources(reg_bytes, reg_us);   // H94: the follower registers each bank while it is staged (churn mode)
     ls.exec_layers.clear();
     if (!reg_ok) {
         err = "page-locking the expert banks failed: " + ls.error_msg;
@@ -1344,6 +1980,9 @@ int32_t llama_lm_prefill_snap_cut(const struct llama_context * ctx, int32_t i) {
 size_t llama_lm_prefill_snap_data(struct llama_context * ctx, int32_t i, uint8_t * dst, size_t size) {
     return ctx != nullptr ? ctx->lm_snap_data(i, dst, size) : 0;
 }
+bool llama_lm_prefill_snap_take(struct llama_context * ctx, int32_t i, std::vector<uint8_t> & out) {
+    return ctx != nullptr && ctx->lm_snap_take(i, out);
+}
 
 bool llama_lm_prefill_arm(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {
     bool ok = false;
@@ -1394,9 +2033,12 @@ void llama_lm_prefill_snap_request(struct llama_context *, const int32_t *, int3
 int32_t llama_lm_prefill_snap_count(const struct llama_context *) { return 0; }
 int32_t llama_lm_prefill_snap_cut(const struct llama_context *, int32_t) { return -1; }
 size_t llama_lm_prefill_snap_data(struct llama_context *, int32_t, uint8_t *, size_t) { return 0; }
+bool llama_lm_prefill_snap_take(struct llama_context *, int32_t, std::vector<uint8_t> &) { return false; }
 bool llama_lm_prefill_arm(struct llama_context *, llama_seq_id, int32_t) { return false; }
 void llama_lm_prefill_disarm(struct llama_context *) {}
 bool llama_lm_prefill_armed(const struct llama_context *) { return false; }
 int64_t llama_lm_prefill_n_pass(const struct llama_context *) { return 0; }
+void llama_lm_prefill_follower_scope(bool) {}
+bool llama_lm_prefill_set_peer(struct llama_context *, struct llama_context *, int32_t) { return false; }
 
 #endif // LLAMA_LAYER_STREAMING

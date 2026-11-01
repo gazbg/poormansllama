@@ -1005,7 +1005,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int tile_mode, const int rem_lo, const int col_main, const int32_t * __restrict__ tile_offsets) {
 
 #ifdef TURING_MMA_AVAILABLE
     constexpr bool fusion_available = true;
@@ -1025,6 +1025,31 @@ static __global__ void mul_mat_q(
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
 
     const uint32_t nty = (nrows_x + I - 1) / I; // Number of tiles y
+
+    // flat tile list (GGML_CUDA_MMQ_ID_FLAT): blockIdx.x counts the tiles that hold columns, expert after expert (the grid is (tiles, row tiles, 1))
+    int flat_e  = -1;
+    int flat_jt = 0;
+    if constexpr (!has_fusion && !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
+        if (tile_offsets != nullptr) {
+            const int n_experts = nchannels_y.z;
+            const int flat      = blockIdx.x;
+            if (flat >= tile_offsets[n_experts]) {
+                return;
+            }
+            int lo = 0;
+            int hi = n_experts - 1; // the last expert with tile_offsets[e] <= flat: it holds the tile
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) >> 1;
+                if (tile_offsets[mid] <= flat) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            flat_e  = lo;
+            flat_jt = flat - tile_offsets[lo];
+        }
+    }
 
     // Initialize the ids for writing back data with just the index.
     // For regular matrix multiplications this is never changed.
@@ -1048,17 +1073,18 @@ static __global__ void mul_mat_q(
         constexpr int I_dst = has_fusion ? I/2 : I;
 
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.x;
+        const int wt = flat_e >= 0 ? 0       : tmp2.x;
+        const int zt = flat_e >= 0 ? flat_e  : tmp2.y;
+        const int jt = flat_e >= 0 ? flat_jt : blockIdx.x;
         const int it = blockIdx.y;
+        int col0 = jt*J; // first column of the tile within the expert's columns
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
         int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + col0*stride_col_dst;
         int offset_y_scale;
         if constexpr (type == GGML_TYPE_NVFP4) {
             offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1077,8 +1103,15 @@ static __global__ void mul_mat_q(
                 offset_y_scale = 0;
             }
 
-            if (jt*J >= col_diff) {
-                return;
+            if (tile_mode == 2) {
+                // a launch of its own for the columns after the last full col_main tile of the expert, taken when their count is in (rem_lo, J]
+                const int rem = col_diff % col_main;
+                if (rem <= rem_lo || rem > J) {
+                    return;
+                }
+                col0 = col_diff - rem;
+            } else if (col0 >= col_diff || (tile_mode == 1 && col0 + J > col_diff && col_diff - col0 <= rem_lo)) {
+                return; // tile_mode 1: the full tiles, and the partial one unless a remainder launch takes it
             }
 
             // __syncthreads(); // There is no previous tile that could cause a race condition.
@@ -1090,21 +1123,21 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                ids_dst_shared[j] = ids_dst[col_low + col0 + j];
             }
             __syncthreads();
         }
 
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_y   += (col_low + col0)*(sizeof(block_q8_1_mmq)/sizeof(int));
         offset_dst += it*I_dst;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt*J;
+            offset_y_scale += col_low + col0;
             y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
         }
 
         const int tile_x_max_i = nrows_x  - it*I_dst - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
+        const int tile_y_max_j = col_diff - col0 - 1;
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
 
@@ -1449,8 +1482,51 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// tile_mode 1 of the expert launch: the number of tiles an expert has is its full J-column tiles plus the partial one unless a remainder launch takes it.
+// One block: every thread sums a run of experts, a scan over the runs gives each expert's first tile.
+static __global__ void mmq_tile_offsets(const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ offsets, const int n_experts, const int J, const int rem_lo) {
+    __shared__ int runs[256];
+    const int per = (n_experts + blockDim.x - 1) / blockDim.x;
+    const int e0  = min((int) threadIdx.x*per, n_experts);
+    const int e1  = min(e0 + per, n_experts);
+
+    int sum = 0;
+    for (int e = e0; e < e1; ++e) {
+        const int col_diff = expert_bounds[e + 1] - expert_bounds[e];
+        sum += col_diff / J + (col_diff % J > rem_lo ? 1 : 0);
+    }
+    runs[threadIdx.x] = sum;
+    __syncthreads();
+    for (int d = 1; d < (int) blockDim.x; d <<= 1) {
+        const int v = threadIdx.x >= d ? runs[threadIdx.x - d] : 0;
+        __syncthreads();
+        runs[threadIdx.x] += v;
+        __syncthreads();
+    }
+
+    int run = runs[threadIdx.x] - sum;
+    for (int e = e0; e < e1; ++e) {
+        offsets[e] = run;
+        const int col_diff = expert_bounds[e + 1] - expert_bounds[e];
+        run += col_diff / J + (col_diff % J > rem_lo ? 1 : 0);
+    }
+    if (threadIdx.x == blockDim.x - 1) {
+        offsets[n_experts] = runs[threadIdx.x];
+    }
+}
+
+// GGML_CUDA_MMQ_ID_FLAT: 1 on, 0 off. Default: on for NVIDIA GPUs older than Volta (the tile configurations without stream-k). Read at each launch, so a test can switch it.
+static bool mmq_id_flat_enabled(const int cc) {
+    const char * e = getenv("GGML_CUDA_MMQ_ID_FLAT");
+    if (e != nullptr) {
+        return atoi(e) != 0;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+        const int tile_mode = 0, const int rem_lo = 0, const int col_main = 0, const bool single_tile = false) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1463,17 +1539,38 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion>), nbytes_shared);
+    // Both variants are raised together and only once (a static flag per kernel), with the larger of their two needs: the Pascal tiles of a width differ in thread count between
+    // the fallback and the other variant, which moves the padding of the y tile, so the first launch must not fix the limit of the other variant at its own size.
+    size_t nbytes_limit = nbytes_shared;
+    {
+        const ggml_cuda_mmq_config config_other = ggml_cuda_mmq_get_config(type, J, !fallback, cc, prec_src1);
+        if (config_other.type != GGML_TYPE_COUNT) {
+            nbytes_limit = std::max(nbytes_limit, mmq_get_nbytes_shared(config_other, cc));
+        }
+    }
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion>), nbytes_limit);
     if constexpr (!has_fusion) {
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false>), nbytes_limit);
     }
 
     const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.
     const int nty  = (args.nrows_x   + I_dst - 1) / I_dst;
-    const int ntx  = (args.ncols_max + config.J - 1) / config.J;
+    const int ntx  = single_tile ? 1 : (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
+
+    // GGML_CUDA_MMQ_ID_FLAT (MoE, tiles without stream-k, the main launch of the remainder split): instead of ntx tile slots for every expert, of which a prefill chunk
+    // fills about one (an expert gets ncols_dst / n_experts columns), the grid holds a flat list of the tiles that have columns, found by a prefix sum of the experts' tile counts.
+    // The tile arithmetic is untouched (bit-identical), the 96% of the blocks that exited at once are gone.
+    const bool flat_ok = !has_fusion && tile_mode == 1 && args.expert_bounds != nullptr && args.nsamples_y == 1 && !config.stream_k && mmq_id_flat_enabled(cc);
+    const int  n_flat  = flat_ok ? (int) (args.ncols_dst / config.J) + (int) args.nchannels_y : 0; // upper bound of the tiles that hold columns
+    const bool use_flat = flat_ok && n_flat < ntx*ntzw;
+    ggml_cuda_pool_alloc<int32_t> tile_offsets(ctx.pool(id));
+    if (use_flat) {
+        tile_offsets.alloc(args.nchannels_y + 1);
+        mmq_tile_offsets<<<1, 256, 0, stream>>>(args.expert_bounds, tile_offsets.ptr, (int) args.nchannels_y, config.J, rem_lo);
+    }
     // Column tiles innermost so that the concurrently running blocks share the same tile of x and read it from L2.
-    const dim3 block_nums_xy_tiling(ntx, nty, ntzw);
+    const dim3 block_nums_xy_tiling(use_flat ? n_flat : ntx, nty, use_flat ? 1 : ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -1494,7 +1591,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, tile_mode, rem_lo, col_main, use_flat ? tile_offsets.ptr : nullptr);
         return;
     }
 
@@ -1525,7 +1622,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, 0, 0, 0, nullptr);
 
     if (!fixup_needed) {
         return;
@@ -1538,8 +1635,70 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
+// GGML_CUDA_MMQ_REMAINDER (MoE, tiles without stream-k, 64-column tiles): a 64-column tile that holds only the few leftover columns of an expert (about a third of all the columns
+// a prefill chunk computes) is replaced by a tile as wide as the leftover needs. 1: widths 16, 32, 48 and 64; 2: 32 and 64; 3: 24, 40 and 64; 0: off. Every expert still reads its weights once per row tile.
+// The result is bit-identical. Default: mode 1 on NVIDIA GPUs older than Volta (validated on a GTX 1070: +3.6 to +4.3% prefill), off elsewhere. Read at each launch, so a test can switch it.
+static int mmq_remainder_mode(const int cc) {
+    const char * e = getenv("GGML_CUDA_MMQ_REMAINDER");
+    if (e != nullptr) {
+        return atoi(e);
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA ? 1 : 0;
+}
+
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static bool mmq_remainder_ok(const int cc, const size_t smpbo) {
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+    return config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo && !config.stream_k;
+}
+
+template <ggml_type type, bool fallback, ggml_prec prec_src1>
+static bool launch_mul_mat_q_split(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int    mode  = mmq_remainder_mode(cc);
+    if (mode < 1 || mode > 3) {
+        return false;
+    }
+
+    const bool ok64 = mmq_remainder_ok<type, 64, fallback, prec_src1>(cc, smpbo);
+    const bool ok16 = mmq_remainder_ok<type, 16, fallback, prec_src1>(cc, smpbo);
+    const bool ok24 = mmq_remainder_ok<type, 24, fallback, prec_src1>(cc, smpbo);
+    const bool ok32 = mmq_remainder_ok<type, 32, fallback, prec_src1>(cc, smpbo);
+    const bool ok40 = mmq_remainder_ok<type, 40, fallback, prec_src1>(cc, smpbo);
+    const bool ok48 = mmq_remainder_ok<type, 48, fallback, prec_src1>(cc, smpbo);
+    if (!ok64 || (mode == 1 && !(ok16 && ok32 && ok48)) || (mode == 2 && !ok32) || (mode == 3 && !(ok24 && ok40))) {
+        return false;
+    }
+
+    // remainder launches first, one tile per expert; the widths are the upper bounds of the leftover-column classes (rem_lo is the bound below)
+    int lo = 0;
+    if (mode == 1) {
+        launch_mul_mat_q<type, 16, fallback, prec_src1, false>(ctx, args, stream, 2,  0, 64, true);
+        launch_mul_mat_q<type, 32, fallback, prec_src1, false>(ctx, args, stream, 2, 16, 64, true);
+        launch_mul_mat_q<type, 48, fallback, prec_src1, false>(ctx, args, stream, 2, 32, 64, true);
+        lo = 48;
+    } else if (mode == 2) {
+        launch_mul_mat_q<type, 32, fallback, prec_src1, false>(ctx, args, stream, 2,  0, 64, true);
+        lo = 32;
+    } else {
+        launch_mul_mat_q<type, 24, fallback, prec_src1, false>(ctx, args, stream, 2,  0, 64, true);
+        launch_mul_mat_q<type, 40, fallback, prec_src1, false>(ctx, args, stream, 2, 24, 64, true);
+        lo = 40;
+    }
+    // the main launch: the full tiles, and the partial tile when the leftover is wider than the last class
+    launch_mul_mat_q<type, 64, fallback, prec_src1, false>(ctx, args, stream, 1, lo, 64, false);
+    return true;
+}
+
 template <ggml_type type, bool fallback, ggml_prec prec_src1, bool has_fusion>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    if constexpr (!has_fusion && !fallback) {
+        if (args.J_best == 64 && args.expert_bounds != nullptr && args.ncols_max > 64 && launch_mul_mat_q_split<type, fallback, prec_src1>(ctx, args, stream)) {
+            return;
+        }
+    }
     switch (args.J_best) {
         case   8:
             launch_mul_mat_q<type,   8, fallback, prec_src1, has_fusion>(ctx, args, stream);

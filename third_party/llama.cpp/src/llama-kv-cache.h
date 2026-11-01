@@ -169,6 +169,9 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;   // H94: raw V of a layer (rows are cells when the V is not transposed)
+    bool          has_layer(int32_t il) const { return map_layer_ids.count(il) != 0; }
+    bool          get_v_trans() const { return v_trans; }
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
