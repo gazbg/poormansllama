@@ -17,7 +17,7 @@ BASE = ("-dev CUDA0 -sm none -mg 0 -fa on -np 1 -c 262000 -ctk q8_0 -ctv q8_0 --
         "--lm-prefill-ubatch 2048 --lm-prefill-segment 16384 -b 16384 --hybrid-moe-prefill-ubatch 0 --ctx-checkpoints 32 "
         "--fattn-head-tile --lm-prefill-attn-int8 --spec-type draft-mtp --spec-draft-p-min 0.7 --spec-draft-n-min 0 "
         "--spec-draft-n-max 3 -ctkd q8_0 -ctvd q8_0 --spec-mtp-defer -fitt 512 -lv 3")
-TEXT = os.path.join(REPO, "build/ctx100k/base.txt")
+TEXT = os.environ.get("SPLIT_CHECK_TEXT") or os.path.join(REPO, "build/ctx100k/base.txt")      # SPLIT_CHECK_TEXT: another prompt text (the 200k-token ladder of plan H126)
 if not os.path.exists(TEXT):
     TEXT = os.path.expanduser("~/Development/poormansllama/build/ctx100k/base.txt")
 
