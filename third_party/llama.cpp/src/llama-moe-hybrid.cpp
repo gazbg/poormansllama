@@ -487,7 +487,7 @@ struct moe_hybrid_engine {
     void init(const llm_graph_context & g, const llama_model & mdl, ggml_backend_t be, int slots);
     void shutdown();
     void on_token(int n_new);
-    bool resize(int new_slots);
+    bool resize(int new_slots, bool async_fill = false);
 
     void wake() {
         {
@@ -1048,7 +1048,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
 // (host engine idle, nothing queued). The old cache is freed BEFORE the new one is allocated, so the two never coexist; the
 // initial fill is the same frequency-ordered one init() does, and the publish sequence in `state` survives. Returns false
 // and changes nothing when the request is invalid or the engine is not idle.
-bool moe_hybrid_engine::resize(int new_slots) {
+bool moe_hybrid_engine::resize(int new_slots, bool async_fill) {
     if (new_slots == n_slot) {
         return true;
     }
@@ -1075,6 +1075,13 @@ bool moe_hybrid_engine::resize(int new_slots) {
         }
     }
     const auto t0 = moe_clock::now();
+    // H104: (S) a shrink keeps the best of the experts that are on the device and uploads nothing; (G) the uploads of a regrow after a layer-major pass are queued as one batch and published
+    // through `pending` when their copy has completed (until then those experts are misses, computed on the host)
+    const int         old_n_slot       = n_slot;
+    static const bool shrink_keep_only = moe_hybrid_env_int("LLAMA_MOE_HYBRID_SHRINK_KEEP_ONLY", 0) != 0;
+    static const bool regrow_async_on  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_REGROW_ASYNC", 0) != 0;
+    const bool        async            = async_fill && regrow_async_on && new_slots > old_n_slot;
+    std::vector<moe_hybrid_promo> async_pend;
     info_n_slot.store(0);
     ggml_backend_cuda_aux_synchronize(cuda);
     join_scan();
@@ -1114,6 +1121,7 @@ bool moe_hybrid_engine::resize(int new_slots) {
     dma_src.clear();
     dma_size.clear();
     int64_t n_d2d = 0, n_h2d = 0;
+    double  us_alloc = 0.0, us_d2d = 0.0, us_free = 0.0;   // diagnostics: where the layer loop spends its time
     std::vector<int> order(n_expert);
     std::vector<void *>       cp_dst;
     std::vector<const void *> cp_src;
@@ -1131,7 +1139,10 @@ bool moe_hybrid_engine::resize(int new_slots) {
         }
         bool have_old = keep_on_device && old_bufs[(size_t) il] != nullptr;
         ggml_tensor * t[3];
-        if (!alloc_cache_layer(il, cache_ctxs[(size_t) il], cache_bufs[(size_t) il], t)) {
+        const auto t_al0 = moe_clock::now();
+        const bool alloc_first = alloc_cache_layer(il, cache_ctxs[(size_t) il], cache_bufs[(size_t) il], t);
+        us_alloc += moe_hybrid_us(t_al0);
+        if (!alloc_first) {
             // no room for one more layer next to the old cache: give the old layer up (its slots are uploaded from the host)
             if (old_bufs[(size_t) il] != nullptr) {
                 ggml_backend_cuda_aux_synchronize(cuda);
@@ -1153,13 +1164,29 @@ bool moe_hybrid_engine::resize(int new_slots) {
         cp_src.clear();
         cp_size.clear();
         cp_es.clear();
+        if (shrink_keep_only && have_old && new_slots < old_n_slot) {
+            // the experts on the device first (in score order), the rest after them: the first slots_l entries are then device copies whenever the old cache had enough of them
+            std::vector<int> res, rest;
+            for (int k = 0; k < n_expert; ++k) {
+                const int e  = order[k];
+                const int os = old_map[(size_t) il*n_expert + e];
+                ((os >= 0 && os < old_slots[(size_t) il]) ? res : rest).push_back(e);
+            }
+            res.insert(res.end(), rest.begin(), rest.end());
+            order.swap(res);
+        }
         for (int s = 0; s < slots_l[(size_t) il]; ++s) {
             const int e = order[s];
-            map[(size_t) il*n_expert + e]     = s;
+            const int os = have_old ? old_map[(size_t) il*n_expert + e] : -1;
+            const bool on_device = os >= 0 && os < old_slots[(size_t) il];
+            if (!on_device && async) {
+                async_pend.push_back({ il, e, s });
+            } else {
+                map[(size_t) il*n_expert + e] = s;
+            }
             slot_of[(size_t) il*n_expert + e] = s;
             slot_expert[slot_off[(size_t) il] + s] = e;
-            const int os = have_old ? old_map[(size_t) il*n_expert + e] : -1;
-            if (os >= 0 && os < old_slots[(size_t) il]) {
+            if (on_device) {
                 for (int k = 0; k < 3; ++k) {
                     cp_dst.push_back((char *) t[k]->data + (size_t) s*t[k]->nb[2]);
                     cp_src.push_back((const char *) o[k]->data + (size_t) os*o[k]->nb[2]);
@@ -1172,31 +1199,56 @@ bool moe_hybrid_engine::resize(int new_slots) {
                 n_h2d++;
             }
         }
-        if (!cp_dst.empty() && !ggml_backend_cuda_copy_d2d_aux(cuda, cp_dst.data(), cp_src.data(), cp_size.data(), cp_dst.size())) {
+        const auto t_dd0 = moe_clock::now();
+        const bool d2d_failed = !cp_dst.empty() && !ggml_backend_cuda_copy_d2d_aux(cuda, cp_dst.data(), cp_src.data(), cp_size.data(), cp_dst.size());
+        us_d2d += moe_hybrid_us(t_dd0);
+        if (d2d_failed) {
             for (const auto & es : cp_es) {
                 queue_expert(il, es.first, es.second);
                 n_h2d++;
                 n_d2d--;
             }
         }
-        submit_dma();
+        if (!async) {
+            submit_dma();
+        }
         if (old_bufs[(size_t) il] != nullptr) {
+            const auto t_fr0 = moe_clock::now();
             ggml_backend_cuda_aux_synchronize(cuda);   // the copies out of the old layer have finished
             ggml_backend_buffer_free(old_bufs[(size_t) il]);
             ggml_free(old_ctxs[(size_t) il]);
             old_bufs[(size_t) il] = nullptr;
             old_ctxs[(size_t) il] = nullptr;
+            us_free += moe_hybrid_us(t_fr0);
         }
     }
+    const auto t_loop_end = moe_clock::now();
     ggml_backend_cuda_aux_synchronize(cuda);
+    const double us_loop = moe_hybrid_us(t0), us_sync = moe_hybrid_us(t_loop_end);
+    if (async) {
+        pending = std::move(async_pend);   // on_token publishes them when the event has completed
+        static const bool inline_submit = moe_hybrid_env_int("LLAMA_MOE_HYBRID_RESIZE_VERIFY", 0) != 0 || moe_hybrid_env_int("LLAMA_MOE_HYBRID_REGROW_INLINE", 0) != 0;
+        if (inline_submit) {
+            submit_dma();
+            ggml_backend_cuda_event_record_aux(cuda, ev);
+            ggml_backend_cuda_aux_flush(cuda);
+        } else {
+            // the batch (a few thousand regions: ~140 ms of submission) goes out like any promotion batch: the copy thread takes it when the next token's inputs are uploaded,
+            // and on_token settles the state before it looks at the event
+            dma_state.store(1, std::memory_order_release);
+        }
+    }
     info_cache_bytes.store(cache_total_bytes());
     refresh_pfmap();
     info_n_slot.store(n_slot);
-    LLAMA_LOG_INFO("%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host)\n", __func__,
-                   n_slot, n_layer, cache_total_bytes()/1048576.0, moe_hybrid_us(t0)/1e3, (long long) n_d2d, (long long) n_h2d);
+    static const bool resize_diag = getenv("LLAMA_LM_LOG") != nullptr;   // the server drops the INFO lines of the library
+    llama_log_internal(resize_diag ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, "%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host%s; loop %.0f ms = alloc %.0f + d2d queue %.0f + sync/free %.0f, final sync %.0f ms)\n", __func__,
+                       n_slot, n_layer, cache_total_bytes()/1048576.0, moe_hybrid_us(t0)/1e3, (long long) n_d2d, (long long) n_h2d, async ? ", queued: published when copied" : "",
+                       us_loop/1e3, us_alloc/1e3, us_d2d/1e3, us_free/1e3, us_sync/1e3);
 
     // LLAMA_MOE_HYBRID_RESIZE_VERIFY=1 (test): read every slot back and compare it with the host bank it stands for
     if (moe_hybrid_env_int("LLAMA_MOE_HYBRID_RESIZE_VERIFY", 0) != 0) {
+        ggml_backend_cuda_aux_synchronize(cuda);   // queued uploads (H104) have landed
         int64_t checked = 0, bad = 0;
         std::vector<char> buf;
         for (int il = 0; il < n_layer; ++il) {
@@ -2751,6 +2803,24 @@ void moe_hybrid_engine::on_token(int n_new) {
         if (!ggml_backend_cuda_event_ready(ev)) {
             waited = true;
         } else {
+            static const bool pub_verify = moe_hybrid_env_int("LLAMA_MOE_HYBRID_PUBLISH_VERIFY", 0) != 0;
+            if (pub_verify) {
+                // test: whatever is published must already be in the slot, byte for byte (the event has completed, so the copies out of the aux stream are done)
+                int64_t bad = 0;
+                std::vector<char> buf;
+                for (const moe_hybrid_promo & p : pending) {
+                    const ggml_tensor * dst[3] = { c_up[p.l], c_gate[p.l], c_down[p.l] };
+                    const ggml_tensor * src[3] = { h_up[p.l], h_gate[p.l], h_down[p.l] };
+                    for (int k = 0; k < 3; ++k) {
+                        buf.resize(src[k]->nb[2]);
+                        ggml_backend_tensor_get(dst[k], buf.data(), (size_t) p.s*dst[k]->nb[2], src[k]->nb[2]);
+                        bad += memcmp(buf.data(), (const char *) src[k]->data + (size_t) p.e*src[k]->nb[2], src[k]->nb[2]) != 0;
+                    }
+                }
+                if (pending.size() > 64 || bad != 0) {
+                    LLAMA_LOG_WARN("%s: moe_hybrid: publish verify: %lld slots published, %lld banks differ from the host\n", __func__, (long long) pending.size(), (long long) bad);
+                }
+            }
             for (const moe_hybrid_promo & p : pending) {
                 map[(size_t) p.l*n_expert + p.e] = p.s;
             }
@@ -3261,6 +3331,12 @@ bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_b
     return llama_moe_hybrid_resize_impl((int) slots);
 }
 
+static std::atomic<bool> g_moe_hybrid_async_fill{false};
+
+void llama_moe_hybrid_set_async_fill(bool on) {
+    g_moe_hybrid_async_fill.store(on);
+}
+
 bool llama_moe_hybrid_resize_impl(int n_slot) {
     moe_hybrid_engine * eng = nullptr;
     {
@@ -3270,7 +3346,7 @@ bool llama_moe_hybrid_resize_impl(int n_slot) {
         }
         eng = g_moe_hybrid_engines.begin()->second.get();
     }
-    if (!eng->resize(n_slot)) {
+    if (!eng->resize(n_slot, g_moe_hybrid_async_fill.load())) {
         return false;
     }
     char v[16];

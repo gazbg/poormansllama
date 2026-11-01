@@ -164,7 +164,16 @@ static void hybrid_prefill_regrow(llama_context * ctx) {
     g_lm_regrow_pending = false;
     int before = 0, after = 0;
     int64_t free_before = 0;
+    llama_moe_hybrid_set_async_fill(true);   // H104: the regrow after a pass does not wait for its uploads
     llama_moe_hybrid_auto_resize_impl(g_hybrid_keep_free, g_hybrid_safety + g_hybrid_slack, g_hybrid_min_slots, g_hp.max_slots, &before, &after, &free_before);
+    llama_moe_hybrid_set_async_fill(false);
+    static const int stress = getenv("LLAMA_HYBRID_REGROW_STRESS") != nullptr ? atoi(getenv("LLAMA_HYBRID_REGROW_STRESS")) : 0;   // test: shrink and regrow again at once
+    for (int k = 0; k < stress && after > g_hybrid_min_slots + 8; ++k) {
+        llama_moe_hybrid_resize_impl(after - 8);
+        llama_moe_hybrid_set_async_fill(true);
+        llama_moe_hybrid_resize_impl(after);
+        llama_moe_hybrid_set_async_fill(false);
+    }
     ctx->drop_graph_reuse();
     if (hybrid_diag()) {
         LLAMA_LOG_WARN("hybrid-moe: prefill window: expert cache %d -> %d slots (free %lld MiB before)\n", before, after, (long long) (free_before/1048576));
