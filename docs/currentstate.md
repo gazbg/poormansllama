@@ -24,6 +24,31 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-01 (RTX 5090 Laptop, Windows: `flint-UD-Q5_K_XL.gguf`, a MoE the fork's own engine does not serve; stock llama.cpp offload flags measured; the agent's own work, not the owner's acceptance; nothing committed)
+
+**Asked.** "What params to use for an MoE model like `C:\Models\ALL\other\flint\flint-UD-Q5_K_XL.gguf`".
+
+**Model** (GGUF header via `gguf-py`): arch `flint` ("Flint Preview", in the tree since the b12004 sync, `src/models/flint.cpp`), 49 blocks (2 leading dense), 256 routed experts with 6 used plus 2 shared, expert FFN 512, sliding-window attention (513) with 4 KV heads of 128, context 262,144, no MTP head. The routed experts are Q5_K / Q6_K and take 25.92 GiB of the 27.86 GiB (562 MiB per layer), so the file does not fit the card next to a 262k cache.
+
+**The fork's MoE flags do not apply.** `--hybrid-moe` refuses at load ("no hybrid engine in this process"): its hook is called only from `models/qwen35moe.cpp`. `--lm-prefill` refuses ("supports the Qwen3.5/3.6 MoE and the dense Qwen3.5/3.8 architectures only"; adapters exist for `QWEN35MOE` and `QWEN35`). Both are loud, measured refusals (`g0a`, `g0b`). Using them for flint needs a per-architecture adapter, not a flag.
+
+**Measured** (stock `llama-server`, `-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup`, default fit, a 9,667-token cold prompt then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB):
+
+| extra flags | prefill | decode (2 probes) | peak |
+|---|---|---|---|
+| none (ubatch 512) | 397 | 53.4, 55.6 | 22,378 |
+| `-ub 2048 -b 4096` | 1043 / 1048 | 49.7, 52.1 / 49.9, 53.4 | 22,466 |
+| `-ub 4096 -b 8192` | 1369 | 46.6, 49.8 | 22,500 |
+| `-ub 2048 -b 4096 -lm none` | 1507 / 1511 | 54.6, 55.0 / 54.7, 52.8 | 22,466 |
+| `-ub 2048 -b 4096 -lm mlock` | 1509 | 52.7, 51.8 | 22,466 |
+| **`-ub 4096 -b 8192 -lm none`** | **1978** | 48.4, 49.4 | 22,500 |
+| `-ub 8192 -b 16384 -lm none` | 1921 | 42.5, 43.9 | 22,458 |
+| `-ngl 99 --cpu-moe -ub 2048 -b 4096` | 508 | 29.9, 33.8 | 7,732 |
+
+**Reading.** Without the model mapping (`-lm none`) prefill at ubatch 2048 is +44% (1,507 against 1,048) and decode does not suffer; this build replaced `--mlock` / `--no-mmap` with `-lm/--load-mode` (`--mlock` errors). A larger ubatch trades decode for prefill: 4096 gives +31% prefill for about -10% decode, 8192 is worse on both. `--cpu-moe` cuts the peak to 7,732 MiB at about -40% decode. Needle found in every arm. PP-first (the goal charter) picks `-ub 4096 -b 8192 -lm none`; `-ub 2048 -b 4096 -lm none` is the balanced alternative.
+
+**Limits.** One machine, one 10k-token prompt, 2 decodes per arm, 50 greedy tokens. Nothing at 50k-250k (the sliding-window layers make depth behave differently), no quality check beyond the needle, no sampling settings for this model. The server log filters INFO, so the stock fit's expert split was not recorded (only the peak). `-fitt 16000` (the owner's keep-free rule) was not run; it would push experts to the CPU. Batches 1 and 2 exited non-zero only through their deliberately refused or mis-parsed arms (exit 2 and 1, not the provenance gate); batch 3 exited 0.
+
 ## 2026-11-01 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, dense Qwen3.8-27B-Q4_K_M: pull of `main`, an MSVC build break in `fattn-gqa8.cuh` repaired, and a faster opt-in profile for the owner's command; the agent's own work, not the owner's acceptance; nothing committed or pushed)
 
 **Asked.** "Pull the latest main, compile and run with this or better profile if the docs say there is a better new experimental opt-in parameter", then "consider flags that could make speed ups like cpu optimization flags".
