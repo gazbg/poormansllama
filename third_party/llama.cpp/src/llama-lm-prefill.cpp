@@ -786,12 +786,25 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         && (int64_t) pl.p0 + pl.n + 64 <= (int64_t) S.peer_ctx->get_cparams().n_ctx && getenv("LLAMA_LM_PEER_OFF") == nullptr;
     // H108: the split takes a fused pass as well (each GPU captures the rows of the cuts inside its own chunks, for every layer)
     static const bool split_snap = getenv("LLAMA_LM_SPLIT_NOSNAP") == nullptr;
-    const bool split_mode = peer_base && (pl.snap_cuts.empty() || split_snap) && n_chunks >= 2 && pl.n >= S.peer_min;
+    // H122: a deep fused batch below the split threshold goes to the token split: the attention of a deep batch is a serial chain in the interleave (and in the one-GPU pass), the split halves it
+    // (measured at depth 8k-102k, plan H122: 2,900+ tokens from position 8,000 and 1,490+ tokens from position 90,000 are 7-10% faster than the default; everything else keeps its mode)
+    static const auto env_int = [](const char * key, int def) { const char * v = getenv(key); return v != nullptr ? atoi(v) : def; };
+    static const bool deep_rule = env_int("LLAMA_LM_PEER_DEEP_RULE", 1) != 0;
+    static const int  deep_a_n  = env_int("LLAMA_LM_PEER_DEEP_A_N", 2900);
+    static const int  deep_a_p  = env_int("LLAMA_LM_PEER_DEEP_A_P", 8000);
+    static const int  deep_b_n  = env_int("LLAMA_LM_PEER_DEEP_B_N", 1490);
+    static const int  deep_b_p  = env_int("LLAMA_LM_PEER_DEEP_B_P", 90000);
+    const bool deep_split = deep_rule && peer_base && split_snap && !pl.snap_cuts.empty() && n_chunks >= 2 && pl.n < S.peer_min
+        && ((pl.n >= deep_a_n && pl.p0 >= deep_a_p) || (pl.n >= deep_b_n && pl.p0 >= deep_b_p));
+    if (deep_split && lm_log_on()) {
+        LLAMA_LOG_WARN("lm-prefill: deep rule: %d tokens at position %d go to the token split\n", (int) pl.n, (int) pl.p0);
+    }
+    const bool split_mode = peer_base && (pl.snap_cuts.empty() || split_snap) && n_chunks >= 2 && (pl.n >= S.peer_min || deep_split);
     // a fused pass (snapshot cuts) is interleaved up to ILV_SNAP_MAX tokens: the interleave halves the bank stream of each GPU but computes every layer once, so it ties with one GPU
     // where the compute chain reaches the one-GPU stream (measured 2026-11-01: x0.62 at 800 tokens, x0.77 at 2,048, x0.97 at 2,800, x1.02 at 3,000)
     static const bool ilv_snap     = getenv("LLAMA_LM_ILV_NOSNAP") == nullptr;      // set: the interleave refuses a pass with snapshot cuts, as before H107
     static const int  ilv_snap_max = getenv("LLAMA_LM_ILV_SNAP_MAX") != nullptr ? atoi(getenv("LLAMA_LM_ILV_SNAP_MAX")) : 2816;
-    const bool ilv_mode   = (pl.snap_cuts.empty() ? peer_base : (peer_base && ilv_snap && pl.n < ilv_snap_max)) && ilv_min > 0 && pl.n >= ilv_min && pl.n < S.peer_min;
+    const bool ilv_mode   = (pl.snap_cuts.empty() ? peer_base : (peer_base && ilv_snap && pl.n < ilv_snap_max)) && ilv_min > 0 && pl.n >= ilv_min && pl.n < S.peer_min && !deep_split;
     if (split_mode || ilv_mode) {
         auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
         if (!mh->get_mem_attn()->get_v_trans() && mh->get_mem_attn()->get_n_stream() == 1) {
