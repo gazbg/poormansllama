@@ -76,9 +76,13 @@ struct llama_lm_peer_worker {
     std::vector<llama_seq_id>  seq_ids;
     std::vector<llama_seq_id*> seq_id_ptr;
     std::vector<int8_t>        logits_flag;
-    std::vector<uint8_t>       prefix;      // the leader's sequence state before the batch (p0 > 0), imported by the follower first
+    // the leader's sequence state before the batch (p0 > 0), imported by the follower first; the buffer is kept between passes (H121: a fresh zero-filled vector cost 430 ms per GiB)
+    uint8_t *                  prefix_buf = nullptr;
+    size_t                     prefix_cap = 0;
+    size_t                     prefix_n   = 0;
     void start(llama_context * follower);
-    void kick(llama_lm_link * l, const llama_batch & b, bool want_logits, std::vector<uint8_t> && prefix_blob);
+    uint8_t * prefix_reserve(size_t n);         // room for n bytes (not zeroed unless LLAMA_LM_PREFIX_PERSIST=0); null when the allocation fails
+    void kick(llama_lm_link * l, const llama_batch & b, bool want_logits, size_t prefix_bytes);
     int  wait();                                // blocks until the pass is over; its llama_decode result
 };
 

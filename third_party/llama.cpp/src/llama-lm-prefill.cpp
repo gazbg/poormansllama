@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -494,6 +495,35 @@ llama_lm_peer_worker::~llama_lm_peer_worker() {
     if (th.joinable()) {
         th.join();
     }
+    std::free(prefix_buf);
+}
+
+// H121: with the default the buffer is kept between passes and not zeroed (its pages stay resident); LLAMA_LM_PREFIX_PERSIST=0 allocates a zeroed one per pass, as before
+static bool lm_prefix_persist() {
+    static const bool v = getenv("LLAMA_LM_PREFIX_PERSIST") == nullptr || atoi(getenv("LLAMA_LM_PREFIX_PERSIST")) != 0;
+    return v;
+}
+
+uint8_t * llama_lm_peer_worker::prefix_reserve(size_t n) {
+    if (lm_prefix_persist()) {
+        if (n > prefix_cap) {
+            constexpr size_t step = (size_t) 128 << 20;
+            std::free(prefix_buf);
+            prefix_cap = (n + step - 1) / step * step;
+            prefix_buf = static_cast<uint8_t *>(std::malloc(prefix_cap));
+            if (prefix_buf == nullptr) {
+                prefix_cap = 0;
+            }
+        }
+    } else {
+        std::free(prefix_buf);
+        prefix_buf = static_cast<uint8_t *>(std::malloc(n > 0 ? n : 1));
+        prefix_cap = prefix_buf != nullptr ? n : 0;
+        if (prefix_buf != nullptr) {
+            std::memset(prefix_buf, 0, n);      // what a freshly resized vector does: this is the cost the default avoids
+        }
+    }
+    return prefix_buf;
 }
 
 void llama_lm_peer_worker::start(llama_context * follower) {
@@ -518,11 +548,16 @@ void llama_lm_peer_worker::start(llama_context * follower) {
                 b.logits   = logits_flag.data();
                 llama_memory_clear(llama_get_memory(ctx), true);     // the follower holds nothing between passes
                 bool prefix_ok = true;
-                if (!prefix.empty()) {
+                if (prefix_n > 0) {
                     // the batch continues a sequence: the K/V cells and the recurrent state of the earlier batches go over in one piece (plan H93: exact)
-                    prefix_ok = llama_state_seq_set_data_ext(ctx, prefix.data(), prefix.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) == prefix.size();
-                    prefix.clear();
-                    prefix.shrink_to_fit();
+                    const size_t n_in = prefix_n;
+                    prefix_n  = 0;
+                    prefix_ok = llama_state_seq_set_data_ext(ctx, prefix_buf, n_in, 0, LLAMA_STATE_SEQ_FLAGS_NONE) == n_in;
+                    if (!lm_prefix_persist()) {
+                        std::free(prefix_buf);
+                        prefix_buf = nullptr;
+                        prefix_cap = 0;
+                    }
                 }
                 if (prefix_ok) {
                     ctx->lm_role = 2;
@@ -555,7 +590,7 @@ void llama_lm_peer_worker::start(llama_context * follower) {
     });
 }
 
-void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool want_logits, std::vector<uint8_t> && prefix_blob) {
+void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool want_logits, size_t prefix_bytes) {
     const int32_t n = b.n_tokens;
     tokens.assign(b.token, b.token + n);
     pos.assign(b.pos, b.pos + n);
@@ -567,8 +602,8 @@ void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool w
     }
     logits_flag.assign((size_t) n, 0);
     logits_flag[(size_t) n - 1] = want_logits ? 1 : 0;
-    link   = l;
-    prefix = std::move(prefix_blob);
+    link     = l;
+    prefix_n = prefix_bytes;
     {
         std::lock_guard<std::mutex> lk(m);
         done.store(0);
@@ -795,17 +830,20 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                 S.peer_ctx->lm_state->snap_req.assign(pl.snap_cuts.begin(), pl.snap_cuts.end());   // the request itself is consumed (cleared) by lm_decode_begin; the plan keeps the cuts that became boundaries
                 link_own.fol_snap.assign(pl.snap_cuts.size(), {});
             }
-            std::vector<uint8_t> prefix;
+            size_t prefix_bytes = 0;
             if (pl.p0 > 0) {
                 const int64_t t_x0 = ggml_time_us();
-                prefix.resize(llama_state_seq_get_size_ext(this, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE));
-                const size_t got = llama_state_seq_get_data_ext(this, prefix.data(), prefix.size(), pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
-                prefix.resize(got);
+                const size_t  need = llama_state_seq_get_size_ext(this, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                uint8_t *     buf  = S.peer_worker->prefix_reserve(need);
+                if (buf == nullptr) {
+                    throw std::bad_alloc();
+                }
+                prefix_bytes = llama_state_seq_get_data_ext(this, buf, need, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
                 if (lm_log_on()) {
-                    LLAMA_LOG_WARN("lm-prefill: split pass: the state of the %d earlier tokens (%.1f MiB) exported in %.0f ms\n", (int) pl.p0, (double) got/1048576.0, (double) (ggml_time_us() - t_x0)/1e3);
+                    LLAMA_LOG_WARN("lm-prefill: split pass: the state of the %d earlier tokens (%.1f MiB) exported in %.0f ms\n", (int) pl.p0, (double) prefix_bytes/1048576.0, (double) (ggml_time_us() - t_x0)/1e3);
                 }
             }
-            S.peer_worker->kick(link, B, pl.want_logits, std::move(prefix));
+            S.peer_worker->kick(link, B, pl.want_logits, prefix_bytes);
         }
     }
     if (role == 2) {
