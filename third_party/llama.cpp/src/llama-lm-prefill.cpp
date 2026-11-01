@@ -857,6 +857,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     // follower that fails half way leaves the leader's state at the end of its own chunks, where the leader's fallback sweep needs it.
     bool                 split_ok = false;
     std::vector<uint8_t> peer_stage;
+    static const int peer_fail_layer = getenv("LLAMA_LM_PEER_FAIL") != nullptr ? atoi(getenv("LLAMA_LM_PEER_FAIL")) : -1;   // test hook: the follower fails before this layer
     auto peer_pull = [&](int il) -> bool {
         {
             std::unique_lock<std::mutex> lk(link->m);
@@ -1060,6 +1061,9 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                     ggml_backend_event_wait(backend_cuda, (ggml_backend_event_t) ls.slots[il % ls.n_slots].ev_copy_ready);
                 }
 
+                if (role == 2 && il == peer_fail_layer) {
+                    return fail("LLAMA_LM_PEER_FAIL: injected failure of the follower", -3);
+                }
                 if (role == 2 && !peer_pull(il)) {
                     return fail("the leader's layer did not arrive", -3);
                 }

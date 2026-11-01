@@ -1974,7 +1974,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_PEER_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-peer-min"}, "N",
-        "smallest prompt batch (tokens) that is split over the two GPUs (default: 4096)",
+        "smallest prompt batch (tokens) that is split over the two GPUs (default: 8192; below ~8k tokens the split is slower than one GPU)",
         [](common_params & params, int value) {
             params.lm_prefill_peer_min = value;
         }
