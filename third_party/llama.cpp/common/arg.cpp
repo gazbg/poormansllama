@@ -1930,7 +1930,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-fuse-min"}, "N",
-        "fewest prompt tokens left (after the cache hit) that --lm-prefill-fuse sends whole (default: 700; 260 with --lm-prefill-peer-gpu, the smallest pass that the two GPUs interleave)",
+        "fewest prompt tokens left (after the cache hit) that --lm-prefill-fuse sends whole (default: 700; 180 with --lm-prefill-peer-gpu, from where a fused pass interleaved over the two GPUs beats the cut flow by 5% or more)",
         [](common_params & params, int value) {
             params.lm_prefill_fuse_min     = value;
             params.lm_prefill_fuse_min_set = true;

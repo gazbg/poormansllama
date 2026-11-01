@@ -91,7 +91,7 @@ def run_arm(a):
                 if a.edit > 0 and len(res["runs"]) % 2 == 1:
                     prompt = toks[:n - a.edit] + toks[60000:60000 + a.edit]      # the previous prompt with its last `edit` tokens replaced: a follow-up that diverges near the end
                 try:
-                    r = post(a.port, "/completion", {"prompt": prompt, "n_predict": a.ntok, "temperature": 0, "cache_prompt": a.cache, "n_probs": 5, "seed": 1})
+                    r = post(a.port, "/completion", {"prompt": prompt, "n_predict": a.ntok, "temperature": 0, "cache_prompt": a.cache, "n_probs": 5, "seed": 1}, timeout=a.req_timeout)
                 except urllib.error.HTTPError as e:
                     if len(res["runs"]) + 0 >= 0 and a.tolerate > 0:
                         a.tolerate -= 1
@@ -162,6 +162,7 @@ if __name__ == "__main__":
     ap.add_argument("--think", type=float, default=0.0, help="seconds of idle time before every request")
     ap.add_argument("--ntok", type=int, default=32, help="tokens to generate; 1 makes wall_s the time to the first token")
     ap.add_argument("--edit", type=int, default=0, help="every second request replaces the last N tokens of the prompt before it (use with --cache)")
+    ap.add_argument("--req-timeout", type=int, default=1800, help="seconds to wait for one request (a hung pass then ends the run instead of waiting)")
     ap.add_argument("--tolerate", type=int, default=0, help="how many failed requests are expected (fault injection)")
     a = ap.parse_args()
     if a.compare:

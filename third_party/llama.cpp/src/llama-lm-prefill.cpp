@@ -113,13 +113,18 @@ static uint64_t lm_fnv64(const uint8_t * p, size_t n) {
 
 llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     llama_lm_plan pl;
+    if (lm_role == 2 && getenv("LLAMA_LM_PEER_DECLINE") != nullptr) {      // test hook: the follower declines its half of a kicked batch (the leader must fail the request, not wait)
+        pl.why = "LLAMA_LM_PEER_DECLINE";
+        return pl;
+    }
 
     if (lm_state == nullptr) {
         return pl;
     }
     const auto & P = lm_state->p;
 
-    if (b.n_tokens < P.min_tokens && !(lm_state->armed_batch && lm_state->armed_n == b.n_tokens)) {
+    // the follower takes whatever batch the leader kicked (the leader decided; a follower that declined would leave the leader waiting for its hops)
+    if (b.n_tokens < P.min_tokens && lm_role != 2 && !(lm_state->armed_batch && lm_state->armed_n == b.n_tokens)) {
         pl.why = "below --lm-prefill-min";
         return pl;
     }
@@ -522,7 +527,13 @@ void llama_lm_peer_worker::start(llama_context * follower) {
                 if (prefix_ok) {
                     ctx->lm_role = 2;
                     ctx->lm_link = link;
+                    link->joined.store(false);
                     rc = llama_decode(ctx, b);
+                    if (rc == 0 && !link->joined.load()) {
+                        // the follower's decode returned without running the pass (it took the ordinary path): the leader would wait for hops that never come
+                        LLAMA_LOG_ERROR("lm-prefill: the follower did not take the batch into the pass\n");
+                        rc = -9;
+                    }
                 } else {
                     LLAMA_LOG_ERROR("lm-prefill: the follower could not take the sequence state of the earlier batches\n");
                 }
@@ -735,7 +746,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     llama_lm_link * link = lm_link;
     int            kc   = n_chunks;
     bool           ilv  = false;      // H102: the layer interleave (a batch too small for the token split: the pass is bound by the bank stream of one link)
-    static const int ilv_min = getenv("LLAMA_LM_ILV_MIN") != nullptr ? atoi(getenv("LLAMA_LM_ILV_MIN")) : 256;     // 0 = off
+    static const int ilv_min = getenv("LLAMA_LM_ILV_MIN") != nullptr ? atoi(getenv("LLAMA_LM_ILV_MIN")) : 128;     // 0 = off (128 since H114b: a fused pass of 200 tokens is 11% faster interleaved, 140 tokens 2%)
     const bool peer_base = role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1
         && (int64_t) pl.p0 + pl.n + 64 <= (int64_t) S.peer_ctx->get_cparams().n_ctx && getenv("LLAMA_LM_PEER_OFF") == nullptr;
     // H108: the split takes a fused pass as well (each GPU captures the rows of the cuts inside its own chunks, for every layer)
@@ -804,6 +815,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         }
         kc  = link->kc;
         ilv = link->ilv;
+        link->joined.store(true);      // from here the follower is in the pass; the worker checks it when the decode returns
     }
     // whatever way the leader leaves, the follower must be done with the leader's memory first
     struct peer_guard_t {

@@ -684,7 +684,7 @@ struct common_params {
     bool        lm_prefill_canonical = false; // G41: checkpoints only on chunk boundaries and a continuation resumes from one, so that a cache hit is prefilled in the same chunks as a fresh run
     int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule
     bool        lm_prefill_fuse    = false;   // G42 (-np 1): the rest of a prompt goes in one batch, the context checkpoints inside it are taken by the layer-major pass
-    int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole (260 with the peer GPU, unless given)
+    int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole (180 with the peer GPU, unless given)
     bool        lm_prefill_fuse_min_set = false;
     int32_t     lm_prefill_fuse_max = 0;      // H106: most tokens left that are sent whole (0 = no limit)
     bool        lm_prefill_fuse_max_set = false;

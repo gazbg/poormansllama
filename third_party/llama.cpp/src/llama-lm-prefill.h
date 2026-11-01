@@ -40,6 +40,7 @@ struct llama_lm_link {
     // H102: the layer interleave (small batches): the GPUs alternate pairs of layers, each streams only its own banks, the activations hop between them
     bool               ilv           = false;
     std::atomic<int>   ilv_done{0};              // layers 0 .. ilv_done - 1 are complete (on whichever GPU owns them)
+    std::atomic<bool>  joined{false};            // the follower's lm_run has started (a follower that returns without it did not run the pass)
     char *             slab_base[2]  = { nullptr, nullptr };   // [0] the leader's activation slab, [1] the follower's
     size_t             slab_half[2]  = { 0, 0 };
     int                dev[2]        = { 0, 0 };             // CUDA ordinals of the two
