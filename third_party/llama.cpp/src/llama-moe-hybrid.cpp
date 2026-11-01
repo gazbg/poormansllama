@@ -323,6 +323,7 @@ struct moe_hybrid_engine {
     std::vector<void *>           dma_dst;
     std::vector<const void *>     dma_src;
     std::vector<size_t>           dma_size;
+    std::atomic<bool>             bulk_dma{false}; // H104: the batch the copy thread is submitting is a regrow's: on_token does not wait for it
     std::atomic<int>              dma_state{0}; // 0 idle, 1 copies queued by on_token, 2 being submitted
     ggml_backend_event_t          ev = nullptr;
     bool                          batch_ok = true;
@@ -1068,7 +1069,7 @@ bool moe_hybrid_engine::resize(int new_slots, bool async_fill) {
                 dma_state.store(0, std::memory_order_release);
                 break;
             }
-            if (moe_hybrid_us(tw) > 100000.0) {
+            if (moe_hybrid_us(tw) > (bulk_dma.load(std::memory_order_acquire) ? 1000000.0 : 100000.0)) {   // a regrow's batch takes ~140 ms to submit
                 return false;
             }
             MOE_HYBRID_PAUSE();
@@ -1233,9 +1234,16 @@ bool moe_hybrid_engine::resize(int new_slots, bool async_fill) {
             ggml_backend_cuda_event_record_aux(cuda, ev);
             ggml_backend_cuda_aux_flush(cuda);
         } else {
-            // the batch (a few thousand regions: ~140 ms of submission) goes out like any promotion batch: the copy thread takes it when the next token's inputs are uploaded,
-            // and on_token settles the state before it looks at the event
-            dma_state.store(1, std::memory_order_release);
+            // the batch (a few thousand regions: ~140 ms of submission) goes to the copy thread now; state 1 would leave it to the first host request of the next token, and a token without one
+            // makes on_token submit it inline on the decoding thread (measured: 137-225 ms). on_token settles the state before it looks at the event.
+            if (dma_thread_on) {
+                bulk_dma.store(true, std::memory_order_release);
+                dma_state.store(3, std::memory_order_release);
+                { std::lock_guard<std::mutex> lk(dma_mtx); }   // order the notify after the waiter's predicate check
+                dma_cv.notify_one();
+            } else {
+                dma_state.store(1, std::memory_order_release);
+            }
         }
     }
     info_cache_bytes.store(cache_total_bytes());
@@ -2243,6 +2251,7 @@ void moe_hybrid_engine::dma_loop() {
             if (us > 5000.0) {
                 LLAMA_LOG_WARN("moe_hybrid: slow DMA submission #%lld took %.1f ms (dma thread)\n", (long long) n_dma_engine, us/1e3);
             }
+            bulk_dma.store(false, std::memory_order_release);
             dma_state.store(0, std::memory_order_release);
             lk.lock();
             continue;
@@ -2657,7 +2666,11 @@ void moe_hybrid_engine::on_token(int n_new) {
     ggml_backend_synchronize(cuda);
 
     // copies the engine did not take (no host request since they were queued) are submitted here
-    for (int st = dma_state.load(std::memory_order_acquire); st != 0; st = dma_state.load(std::memory_order_acquire)) {
+    const auto t_settle0 = moe_clock::now();
+    const int  settle_st0 = dma_state.load(std::memory_order_acquire);
+    // H104: the copy thread is submitting a regrow's batch (thousands of regions, ~140 ms): this token neither waits for it nor publishes or promotes anything
+    const bool bulk_busy = bulk_dma.load(std::memory_order_acquire) && settle_st0 >= 2;
+    for (int st = bulk_busy ? 0 : dma_state.load(std::memory_order_acquire); st != 0; st = dma_state.load(std::memory_order_acquire)) {
         int queued = 1;
         if (st == 1 && dma_state.compare_exchange_strong(queued, 2, std::memory_order_acquire)) {
             submit_dma();
@@ -2668,6 +2681,13 @@ void moe_hybrid_engine::on_token(int n_new) {
             break;
         }
         MOE_HYBRID_PAUSE();
+    }
+    {
+        static const bool settle_diag = getenv("LLAMA_LM_LOG") != nullptr;
+        const double us_settle = moe_hybrid_us(t_settle0);
+        if (settle_diag && us_settle > 1000.0) {
+            LLAMA_LOG_WARN("%s: moe_hybrid: on_token waited %.1f ms for the DMA state (it was %d)\n", __func__, us_settle/1e3, settle_st0);
+        }
     }
 
     // the helper's scan of the previous token must be finished before the EMA (which it reads) changes
@@ -2799,7 +2819,9 @@ void moe_hybrid_engine::on_token(int n_new) {
     const auto tC = moe_clock::now();
     int  n_prom = 0;
     bool waited = false;
-    if (!pending.empty()) {
+    if (bulk_busy) {
+        waited = true;
+    } else if (!pending.empty()) {
         if (!ggml_backend_cuda_event_ready(ev)) {
             waited = true;
         } else {
@@ -2829,7 +2851,9 @@ void moe_hybrid_engine::on_token(int n_new) {
     }
 
     bool waited1 = false;
-    if (!pending1.empty()) {
+    if (bulk_busy) {
+        waited1 = true;
+    } else if (!pending1.empty()) {
         if (!ggml_backend_cuda_event_ready(ev1)) {
             waited1 = true;
         } else {
