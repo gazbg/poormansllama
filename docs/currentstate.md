@@ -24,6 +24,29 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-01 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, dense Qwen3.8-27B-Q4_K_M: pull of `main`, an MSVC build break in `fattn-gqa8.cuh` repaired, and a faster opt-in profile for the owner's command; the agent's own work, not the owner's acceptance; nothing committed or pushed)
+
+**Asked.** "Pull the latest main, compile and run with this or better profile if the docs say there is a better new experimental opt-in parameter", then "consider flags that could make speed ups like cpu optimization flags".
+
+**Build break.** `main` (170 new commits, head `85829e64`) did not build with MSVC: `fattn.cu` failed with C2912 ("explicit specialization `__wrapper__device_stub_...` is not a specialization of a function template") on the template kernel of `fattn-gqa8.cuh`, which became a template in `31bcfe2d` (exact variant). Cause: `GGML_CUDA_RESTRICT` in its signature is `__restrict__` in the host pass (`__CUDA_ARCH__` is undefined there, so the PDL test in `common.cuh` is false) and empty in the sm_120a device pass; the stub's primary template and its explicit specializations then disagree. Three guesses failed first (namespace scope, `static`, `__launch_bounds__`: each still C2912); a 4 s nvcc repro of a two-line TU (control: the original header fails, the fix compiles) found it. Fix: plain pointer parameters, the macro re-applied on local aliases in the body. Checked: repro for sm_120a and sm_89 compile, the full `llama-server` build passes. The device code for sm_120a is unchanged by reasoning (the macro is empty there); no SASS diff was taken. The Pascal/Linux build was not compiled. Change: `third_party/llama.cpp/ggml/src/ggml-cuda/fattn-gqa8.cuh`, uncommitted.
+
+**Measured** (`tools/dense/win-arm.py` / `win-batch.py`, model Q4_K_M, `-c 262144`, q8_0 KV, `-np 1 -t 16`, `--spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-max 3 --spec-mtp-defer`, dynamic ring with 2 slots, a 9,667-token cold prompt, then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB from the 0.5 s poller):
+
+| host layers | flags | prefill | decode (2 probes) | peak | pass |
+|---|---|---|---|---|---|
+| 0-37 (owner's) | | 1267 / 1247 | 6.66, 6.45 / 6.67, 6.85 | 21,139 | ran |
+| 0-29 | | 1322 / 1295 | 8.36, 8.68 / 8.27, 8.43 | 22,899 | ran |
+| 0-27 | | 625 | 8.46, 9.01 | 22,551 | declined (1,387 free, 1,633 needed) |
+| 0-27 | `--fattn-head-tile` | 1299 | 8.38, 8.90 | 22,535 | ran |
+| 0-25 | `--fattn-head-tile` | 1305 | 8.76, 9.02 | 22,525 | ran |
+| **0-23** | `--fattn-head-tile` | 1316 / 1348 / 1351 | 10.37, 10.90 / 11.13, 11.18 / 11.23, 11.51 | 22,981 | ran |
+| 0-23 | `--fattn-head-tile`, AVX-512 VNNI `ggml-cpu.dll` | 1355 | 11.17, 11.52 | 22,981 | ran |
+| 0-21 | `--fattn-head-tile` | 718 | 13.04, 11.85 | 22,323 | declined (1,605 free, 1,633 needed) |
+
+**Reading.** The owner's `0-37` came from the 25 GB Q6_K_XL file; Q4_K_M (16 GB) leaves about 3.3 GiB idle with it, and every host layer costs about 7 ms of CPU per step, so moving layers to the card is the lever. `--fattn-head-tile` (G-TILE) frees enough scratch for the pass to survive at `0-23`: decode +66% (mean 11.06 of three standard-DLL arms against 6.66 of the two baseline arms), prefill not lower (1,316-1,351 against 1,247-1,267, +4..8%), 1,482 MiB of VRAM free at the peak. The pass needs 1,633 MiB free (slot window 492 + slab 357 + compute buffer 624 + margin 160), so `0-21` and `0-27` without the tile lose it and prefill halves. The AVX-512 VNNI build (`-DGGML_AVX512_VNNI=ON`, `ggml-cpu.dll` only, side copy `build/llama-cuda/bin-vnni`) gave 11.35 against 11.16 and 11.37 for the standard DLL with identical text and MTP acceptance: no gain. Needle found in every arm.
+
+**Limits.** One machine, 10k-token prompt only (nothing at 50k-250k, where the pass and decode depth behave differently), 2 decodes per arm, 50 greedy tokens. The greedy text differs between placements (sha1 differs; a moved layer changes CPU q8_K against device q8_1 numerics, and the head-tile is not bit-identical to the untiled kernel), so this is a speed result, not an equivalence one. MTP acceptance was 50-65% depending on the arm. Session `q4-resident-abba` is UNCERTIFIED (exit 10: the exe was not in the command); `u0-user`, `q4-headtile` and `q4-vnni-depth` passed the provenance gate. The server was left running on port 8034 with host `0-23` + `--fattn-head-tile`.
+
 ## 2026-10-31 (GTX 1070, Linux: `origin/main` merged into the Pascal MoE + MTP branch; the agent's own work, not the owner's acceptance)
 
 **Asked.** "Pull the latest code from github and merge it to the current one, then do a test and then a pr." `origin/main` had the `llama.cpp` sync to b12004 and the doc-size guard (16 commits, 2,215 files).
