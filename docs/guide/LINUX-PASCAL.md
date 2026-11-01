@@ -450,6 +450,8 @@ Measured on the stack of section 3.8 (prefill only, A-B-B-A, no A / B overlap), 
   arithmetic removed), the real loop reaches 13.5-14.9, 8 x 4 and 8 x 8 tiles run out of registers (151 / 183) and are slower, and the exact
   magic-number int-to-float replacement is 5-7% slower than the hardware conversion.
 
+The fused split pass (`--lm-prefill-fuse` with the second GPU, one 8,192-token prompt, nsys, 15.0 s of kernel time over both GPUs; H111) has the same structure: `mmq` Q8_0 23.4%, Q4_K 20.4%, Q5_K 12.5%, flash attention 10.5%, gated delta net 7.6%, hybrid wait 3.1%, everything else 15% over 42,401 launches with no kernel above 2.3%; compute is 83-89% of the pass wall (~1,000 tokens/s per GPU). The checkpoint cuts of a fused pass cost a fixed 0.1-0.15 s each (8-11% of the TTFT for the two of them); their size does not matter (`--lm-prefill-ckpt-chunk 24`: +0.1% / +0.9%).
+
 Where the prefill time goes now (nsys, 16,384-token prompt, the stack, final build; share of kernel time; 26.4 s of kernels, 25.2 s with the int8 PV): flash attention 22.2% (18.9% with
 the int8 PV on the 64-key tile, 5,881 -> 4,748 ms; 19.6% on the 32-key tile), `mmq` Q8_0 17.8%, Q4_K 15.5% (4,664 -> 4,087 ms since the expert-tile change), Q5_K 13.6% (3,759 -> 3,598 ms), gated delta net 10.7%; every other
 category is under 5%. Decode is unchanged (host wait 34%, Q6_K head 9%, cached-expert matvecs 11%). The pass is compute bound: kernel time is 26.9 s of the 27.3 s request, and the
