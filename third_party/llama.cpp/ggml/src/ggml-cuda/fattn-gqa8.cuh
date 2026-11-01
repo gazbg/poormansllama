@@ -36,10 +36,19 @@ static __device__ __forceinline__ int sx8(uint32_t x, int i) {   // signed byte 
 template <bool exact>
 __launch_bounds__(128, 2)
 static __global__ void kernel(
-        const char * GGML_CUDA_RESTRICT Qp, const char * GGML_CUDA_RESTRICT Kp, const char * GGML_CUDA_RESTRICT Vp, const half * GGML_CUDA_RESTRICT mask,
-        float * GGML_CUDA_RESTRICT dst, float2 * GGML_CUDA_RESTRICT dst_meta,
+        const char * Qp_, const char * Kp_, const char * Vp_, const half * mask_,
+        float * dst_, float2 * dst_meta_,
         const float scale, const int N, const int nb01, const int nb02, const int nb11, const int nb12, const int nb21, const int nb22, const int mask_stride, const int n_head) {
 #ifdef FLASH_ATTN_AVAILABLE
+    // No GGML_CUDA_RESTRICT in the signature: with it, the host pass of this TEMPLATE kernel gives nvcc's generated stub a primary template whose
+    // reference parameters carry __restrict__ and explicit specializations that do not, and MSVC rejects that (C2912: "explicit specialization ... is
+    // not a specialization of a function template"). The aliasing hint is kept on locals; the macro is empty on Hopper and newer, as before.
+    const char * GGML_CUDA_RESTRICT Qp = Qp_;
+    const char * GGML_CUDA_RESTRICT Kp = Kp_;
+    const char * GGML_CUDA_RESTRICT Vp = Vp_;
+    const half * GGML_CUDA_RESTRICT mask = mask_;
+    float * GGML_CUDA_RESTRICT dst = dst_;
+    float2 * GGML_CUDA_RESTRICT dst_meta = dst_meta_;
     const int row   = blockIdx.x;                    // G30: the token of the step
     mask += (size_t) row * mask_stride;
     const int lane  = threadIdx.x;
@@ -241,7 +250,7 @@ static __global__ void kernel(
         if (tid == 0) dst_meta[((size_t) row * n_head + head0 + h) * gridDim.y + blockIdx.y] = make_float2(mt, st);
     }
 #else
-    GGML_UNUSED_VARS(Qp, Kp, Vp, mask, dst, dst_meta, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, n_head);
+    GGML_UNUSED_VARS(Qp_, Kp_, Vp_, mask_, dst_, dst_meta_, scale, N, nb01, nb02, nb11, nb12, nb21, nb22, mask_stride, n_head);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

@@ -24,6 +24,54 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-01 (RTX 5090 Laptop, Windows: `flint-UD-Q5_K_XL.gguf`, a MoE the fork's own engine does not serve; stock llama.cpp offload flags measured; the agent's own work, not the owner's acceptance; nothing committed)
+
+**Asked.** "What params to use for an MoE model like `C:\Models\ALL\other\flint\flint-UD-Q5_K_XL.gguf`".
+
+**Model** (GGUF header via `gguf-py`): arch `flint` ("Flint Preview", in the tree since the b12004 sync, `src/models/flint.cpp`), 49 blocks (2 leading dense), 256 routed experts with 6 used plus 2 shared, expert FFN 512, sliding-window attention (513) with 4 KV heads of 128, context 262,144, no MTP head. The routed experts are Q5_K / Q6_K and take 25.92 GiB of the 27.86 GiB (562 MiB per layer), so the file does not fit the card next to a 262k cache.
+
+**The fork's MoE flags do not apply.** `--hybrid-moe` refuses at load ("no hybrid engine in this process"): its hook is called only from `models/qwen35moe.cpp`. `--lm-prefill` refuses ("supports the Qwen3.5/3.6 MoE and the dense Qwen3.5/3.8 architectures only"; adapters exist for `QWEN35MOE` and `QWEN35`). Both are loud, measured refusals (`g0a`, `g0b`). Using them for flint needs a per-architecture adapter, not a flag.
+
+**Measured** (stock `llama-server`, `-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup`, default fit, a 9,667-token cold prompt then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB):
+
+| extra flags | prefill | decode (2 probes) | peak |
+|---|---|---|---|
+| none (ubatch 512) | 397 | 53.4, 55.6 | 22,378 |
+| `-ub 2048 -b 4096` | 1043 / 1048 | 49.7, 52.1 / 49.9, 53.4 | 22,466 |
+| `-ub 4096 -b 8192` | 1369 | 46.6, 49.8 | 22,500 |
+| `-ub 2048 -b 4096 -lm none` | 1507 / 1511 | 54.6, 55.0 / 54.7, 52.8 | 22,466 |
+| `-ub 2048 -b 4096 -lm mlock` | 1509 | 52.7, 51.8 | 22,466 |
+| **`-ub 4096 -b 8192 -lm none`** | **1978** | 48.4, 49.4 | 22,500 |
+| `-ub 8192 -b 16384 -lm none` | 1921 | 42.5, 43.9 | 22,458 |
+| `-ngl 99 --cpu-moe -ub 2048 -b 4096` | 508 | 29.9, 33.8 | 7,732 |
+
+**Reading.** Without the model mapping (`-lm none`) prefill at ubatch 2048 is +44% (1,507 against 1,048) and decode does not suffer; this build replaced `--mlock` / `--no-mmap` with `-lm/--load-mode` (`--mlock` errors). A larger ubatch trades decode for prefill: 4096 gives +31% prefill for about -10% decode, 8192 is worse on both. `--cpu-moe` cuts the peak to 7,732 MiB at about -40% decode. Needle found in every arm. PP-first (the goal charter) picks `-ub 4096 -b 8192 -lm none`; `-ub 2048 -b 4096 -lm none` is the balanced alternative.
+
+**Limits.** One machine, one 10k-token prompt, 2 decodes per arm, 50 greedy tokens. Nothing at 50k-250k (the sliding-window layers make depth behave differently), no quality check beyond the needle, no sampling settings for this model. The server log filters INFO, so the stock fit's expert split was not recorded (only the peak). `-fitt 16000` (the owner's keep-free rule) was not run; it would push experts to the CPU. Batches 1 and 2 exited non-zero only through their deliberately refused or mis-parsed arms (exit 2 and 1, not the provenance gate); batch 3 exited 0.
+
+## 2026-11-01 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, dense Qwen3.8-27B-Q4_K_M: pull of `main`, an MSVC build break in `fattn-gqa8.cuh` repaired, and a faster opt-in profile for the owner's command; the agent's own work, not the owner's acceptance; nothing committed or pushed)
+
+**Asked.** "Pull the latest main, compile and run with this or better profile if the docs say there is a better new experimental opt-in parameter", then "consider flags that could make speed ups like cpu optimization flags".
+
+**Build break.** `main` (170 new commits, head `85829e64`) did not build with MSVC: `fattn.cu` failed with C2912 ("explicit specialization `__wrapper__device_stub_...` is not a specialization of a function template") on the template kernel of `fattn-gqa8.cuh`, which became a template in `31bcfe2d` (exact variant). Cause: `GGML_CUDA_RESTRICT` in its signature is `__restrict__` in the host pass (`__CUDA_ARCH__` is undefined there, so the PDL test in `common.cuh` is false) and empty in the sm_120a device pass; the stub's primary template and its explicit specializations then disagree. Three guesses failed first (namespace scope, `static`, `__launch_bounds__`: each still C2912); a 4 s nvcc repro of a two-line TU (control: the original header fails, the fix compiles) found it. Fix: plain pointer parameters, the macro re-applied on local aliases in the body. Checked: repro for sm_120a and sm_89 compile, the full `llama-server` build passes. The device code for sm_120a is unchanged by reasoning (the macro is empty there); no SASS diff was taken. The Pascal/Linux build was not compiled. Change: `third_party/llama.cpp/ggml/src/ggml-cuda/fattn-gqa8.cuh`, uncommitted.
+
+**Measured** (`tools/dense/win-arm.py` / `win-batch.py`, model Q4_K_M, `-c 262144`, q8_0 KV, `-np 1 -t 16`, `--spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-max 3 --spec-mtp-defer`, dynamic ring with 2 slots, a 9,667-token cold prompt, then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB from the 0.5 s poller):
+
+| host layers | flags | prefill | decode (2 probes) | peak | pass |
+|---|---|---|---|---|---|
+| 0-37 (owner's) | | 1267 / 1247 | 6.66, 6.45 / 6.67, 6.85 | 21,139 | ran |
+| 0-29 | | 1322 / 1295 | 8.36, 8.68 / 8.27, 8.43 | 22,899 | ran |
+| 0-27 | | 625 | 8.46, 9.01 | 22,551 | declined (1,387 free, 1,633 needed) |
+| 0-27 | `--fattn-head-tile` | 1299 | 8.38, 8.90 | 22,535 | ran |
+| 0-25 | `--fattn-head-tile` | 1305 | 8.76, 9.02 | 22,525 | ran |
+| **0-23** | `--fattn-head-tile` | 1316 / 1348 / 1351 | 10.37, 10.90 / 11.13, 11.18 / 11.23, 11.51 | 22,981 | ran |
+| 0-23 | `--fattn-head-tile`, AVX-512 VNNI `ggml-cpu.dll` | 1355 | 11.17, 11.52 | 22,981 | ran |
+| 0-21 | `--fattn-head-tile` | 718 | 13.04, 11.85 | 22,323 | declined (1,605 free, 1,633 needed) |
+
+**Reading.** The owner's `0-37` came from the 25 GB Q6_K_XL file; Q4_K_M (16 GB) leaves about 3.3 GiB idle with it, and every host layer costs about 7 ms of CPU per step, so moving layers to the card is the lever. `--fattn-head-tile` (G-TILE) frees enough scratch for the pass to survive at `0-23`: decode +66% (mean 11.06 of three standard-DLL arms against 6.66 of the two baseline arms), prefill not lower (1,316-1,351 against 1,247-1,267, +4..8%), 1,482 MiB of VRAM free at the peak. The pass needs 1,633 MiB free (slot window 492 + slab 357 + compute buffer 624 + margin 160), so `0-21` and `0-27` without the tile lose it and prefill halves. The AVX-512 VNNI build (`-DGGML_AVX512_VNNI=ON`, `ggml-cpu.dll` only, side copy `build/llama-cuda/bin-vnni`) gave 11.35 against 11.16 and 11.37 for the standard DLL with identical text and MTP acceptance: no gain. Needle found in every arm.
+
+**Limits.** One machine, 10k-token prompt only (nothing at 50k-250k, where the pass and decode depth behave differently), 2 decodes per arm, 50 greedy tokens. The greedy text differs between placements (sha1 differs; a moved layer changes CPU q8_K against device q8_1 numerics, and the head-tile is not bit-identical to the untiled kernel), so this is a speed result, not an equivalence one. MTP acceptance was 50-65% depending on the arm. Session `q4-resident-abba` is UNCERTIFIED (exit 10: the exe was not in the command); `u0-user`, `q4-headtile` and `q4-vnni-depth` passed the provenance gate. The server was left running on port 8034 with host `0-23` + `--fattn-head-tile`.
+
 ## 2026-10-31 (GTX 1070, Linux: `origin/main` merged into the Pascal MoE + MTP branch; the agent's own work, not the owner's acceptance)
 
 **Asked.** "Pull the latest code from github and merge it to the current one, then do a test and then a pr." `origin/main` had the `llama.cpp` sync to b12004 and the doc-size guard (16 commits, 2,215 files).
