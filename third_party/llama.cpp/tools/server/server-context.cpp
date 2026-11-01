@@ -1213,6 +1213,7 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
+    common_init_result_ptr llama_init_peer;   // H94: the second GPU's model and context of the two-GPU prefill
 
     llama_context * ctx_tgt = nullptr;
 
@@ -1285,6 +1286,7 @@ private:
 
         llama_hybrid_shutdown();
         llama_init.reset();
+        llama_init_peer.reset();
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
@@ -1796,6 +1798,51 @@ private:
             }
             SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\n",
                     lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+        }
+
+        if (params_base.lm_prefill && params_base.lm_prefill_peer_gpu >= 0) {
+            // H94: the same model once more, on the other GPU: its context takes the second part of a big prompt batch (see llama_lm_prefill_set_peer)
+            char dn[32];
+            snprintf(dn, sizeof(dn), "CUDA%d", params_base.lm_prefill_peer_gpu);
+            ggml_backend_dev_t pdev = ggml_backend_dev_by_name(dn);
+            if (pdev == nullptr) {
+                SRV_ERR("--lm-prefill-peer-gpu: no device %s\n", dn);
+                return false;
+            }
+            common_params pp = params_base;
+            pp.devices.clear();
+            pp.devices.push_back(pdev);
+            pp.devices.push_back(nullptr);
+            pp.main_gpu    = 0;
+            pp.split_mode  = LLAMA_SPLIT_MODE_NONE;
+            pp.n_ctx       = params_base.lm_prefill_peer_ctx;
+            pp.n_parallel  = 1;
+            pp.kv_unified  = false;
+            pp.hybrid_moe  = false;
+            pp.warmup      = false;
+            pp.fit_params  = false;
+            pp.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            llama_lm_prefill_follower_scope(true);
+            llama_init_peer = common_init_from_params(pp);
+            llama_lm_prefill_follower_scope(false);
+            llama_context * ctx_peer = llama_init_peer ? llama_init_peer->context() : nullptr;
+            if (ctx_peer == nullptr) {
+                SRV_ERR("--lm-prefill-peer-gpu: could not create the model on %s\n", dn);
+                return false;
+            }
+            llama_lm_prefill_params lpp = llama_lm_prefill_default_params();
+            lpp.n_slots    = params_base.lm_prefill_slots;
+            lpp.ubatch     = params_base.lm_prefill_ubatch;
+            lpp.segment    = params_base.lm_prefill_segment;
+            lpp.min_tokens = params_base.lm_prefill_min;
+            lpp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lpp.device     = params_base.lm_prefill_peer_gpu;
+            char perr[512] = { 0 };
+            if (!llama_lm_prefill_enable(ctx_peer, &lpp, perr, sizeof(perr)) || !llama_lm_prefill_set_peer(ctx_tgt, ctx_peer, params_base.lm_prefill_peer_min)) {
+                SRV_ERR("--lm-prefill-peer-gpu: %s\n", perr);
+                return false;
+            }
+            SRV_INF("lm-prefill: two-GPU prefill: batches of >= %d tokens are split with the model on %s (context of %d tokens)\n", params_base.lm_prefill_peer_min, dn, params_base.lm_prefill_peer_ctx);
         }
 
         if (!params_base.lm_decode_stream.empty()) {

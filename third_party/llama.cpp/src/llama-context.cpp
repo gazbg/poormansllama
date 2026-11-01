@@ -2406,11 +2406,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (lm_state != nullptr) {
         lm_scope.on = lm_decode_begin(balloc->get_batch(), lm_plan);
     }
-    llama_lm_prefill_pending = lm_plan.ok;
-    if (llama_hybrid_decode_hook != nullptr) {
-        llama_hybrid_decode_hook(this, (int32_t) balloc->get_n_tokens());
+    if (!lm_follower) {     // H94: the follower of a split pass is another GPU's context: the hybrid hooks and the global pass flag are the leader's
+        llama_lm_prefill_pending = lm_plan.ok;
+        if (llama_hybrid_decode_hook != nullptr) {
+            llama_hybrid_decode_hook(this, (int32_t) balloc->get_n_tokens());
+        }
+        llama_lm_prefill_pending = false;
     }
-    llama_lm_prefill_pending = false;
 #endif
 
     tp1 = ggml_time_us();
@@ -2462,9 +2464,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // nothing was changed: give the pass's resources back and take the ordinary path (the hybrid prefill window opens for it now, as it would have without the pass)
         lm_release();
         lm_scope.on = false;
-        llama_lm_prefill_pending = false;
-        if (llama_hybrid_decode_hook != nullptr) {
-            llama_hybrid_decode_hook(this, (int32_t) balloc->get_n_tokens());
+        if (!lm_follower) {
+            llama_lm_prefill_pending = false;
+            if (llama_hybrid_decode_hook != nullptr) {
+                llama_hybrid_decode_hook(this, (int32_t) balloc->get_n_tokens());
+            }
         }
     }
 #endif

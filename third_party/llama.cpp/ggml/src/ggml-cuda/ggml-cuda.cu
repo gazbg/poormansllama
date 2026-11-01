@@ -1002,18 +1002,19 @@ struct ggml_cuda_input_copy {
     const char * src;
     size_t       size;
 };
-static bool         g_cuda_input_batch_open = false;
-static bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
-static bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
-static char *       g_cuda_input_stage      = nullptr;
-static size_t       g_cuda_input_stage_used = 0;
-static bool         g_cuda_input_failed     = false;
-static cudaStream_t g_cuda_input_stream     = nullptr;
-static cudaEvent_t  g_cuda_input_event      = nullptr;
-static ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
-static size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
-static size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
-static size_t       g_cuda_input_n_direct   = 0;
+// thread_local: a batch is opened and closed by the thread that sets the inputs of a graph; two threads on two GPUs (the second-GPU tier, the two-GPU prefill) must not share it
+static thread_local bool         g_cuda_input_batch_open = false;
+static thread_local bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
+static thread_local bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
+static thread_local char *       g_cuda_input_stage      = nullptr;
+static thread_local size_t       g_cuda_input_stage_used = 0;
+static thread_local bool         g_cuda_input_failed     = false;
+static thread_local cudaStream_t g_cuda_input_stream     = nullptr;
+static thread_local cudaEvent_t  g_cuda_input_event      = nullptr;
+static thread_local ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
+static thread_local size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
+static thread_local size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
+static thread_local size_t       g_cuda_input_n_direct   = 0;
 
 // diagnostics for the hybrid engine's watchdog (read through the exported getters below): how far the main thread got launching this graph's nodes,
 // whether it is inside a graph compute, and which promotion copy the engine thread is submitting

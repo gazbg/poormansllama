@@ -1958,6 +1958,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HYBRID_MOE_FREQ").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lm-prefill-peer-gpu"}, "N",
+        "two-GPU prefill (needs --lm-prefill): load a second copy of the model on CUDA device N and let it compute the second part of every big prompt batch, one layer behind --lm-prefill, "
+        "taking the K/V and recurrent state of each layer from it (default: off)",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_gpu = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_GPU").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-peer-ctx"}, "N",
+        "context size of the second GPU's model: the longest prompt batch it can take (default: 33024)",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-peer-min"}, "N",
+        "smallest prompt batch (tokens) that is split over the two GPUs (default: 4096)",
+        [](common_params & params, int value) {
+            params.lm_prefill_peer_min = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_PEER_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--hybrid-moe-gpu1"}, "N|auto",
         "keep N more experts per layer in the VRAM of a second GPU (device LLAMA_MOE_HYBRID_G1_DEVICE, default 1) and compute them there; auto fills that GPU (default: off)",
         [](common_params & params, const std::string & value) {

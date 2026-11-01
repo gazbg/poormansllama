@@ -27,6 +27,7 @@ struct llama_layer_streaming;
 struct llama_lm_prefill_params;
 struct llama_lm_state;
 struct llama_lm_state_deleter { void operator()(llama_lm_state * s) const; };
+struct llama_lm_link;
 struct llama_dense_stream;
 struct llama_dense_stream_deleter { void operator()(llama_dense_stream * s) const; };
 struct llama_dense_stream_params;
@@ -350,6 +351,12 @@ public:
     bool lm_prefill_enable(const llama_lm_prefill_params & p, std::string & err);
     void lm_prefill_disable();
     bool lm_prefill_is_enabled() const { return lm_state != nullptr; }
+
+    // H94: the sequence split. lm_follower: this context is the second GPU's; lm_role/lm_link: 1 leader, 2 follower while a split pass runs
+    bool            lm_follower = false;
+    bool            lm_set_peer(llama_context * follower, int32_t min_tokens);   // leader side of llama_lm_prefill_set_peer
+    int             lm_role     = 0;
+    llama_lm_link * lm_link     = nullptr;
 
     // dense decode streaming (llama-dense-stream.cpp)
     bool dense_stream_enable(const llama_dense_stream_params & p, std::string & err);

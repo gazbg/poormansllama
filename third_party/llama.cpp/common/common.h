@@ -667,6 +667,11 @@ struct common_params {
     int32_t     lm_evict_layers    = 0;       // with lm_resident_layers: how many of the resident layers are loaded in host memory with a dedicated VRAM slot, released for the layer-major pass; 0 = none
     int32_t     lm_resident_layers = 0;      // dense models: how many layers stay in VRAM, spread evenly (end-aligned); the others are host layers; 0 = off (--lm-prefill-host-layers decides)
     std::string lm_prefill_host_layers;       // dense models: decoder layers whose weights stay in host memory and stream through the slot window ("N" = the first N layers, or ranges "0-21,30"); empty = placement as given by -ngl / -ot
+    // H94 (private fork): the sequence split of the layer-major prefill over two GPUs (needs --lm-prefill): a second context of the model on this CUDA device, with a context of
+    // lm_prefill_peer_ctx tokens, takes the second part of a prompt batch of at least lm_prefill_peer_min tokens
+    int32_t     lm_prefill_peer_gpu = -1;
+    int32_t     lm_prefill_peer_ctx = 33024;
+    int32_t     lm_prefill_peer_min = 4096;
     int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
