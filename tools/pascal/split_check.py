@@ -84,9 +84,11 @@ def run_arm(a):
         post(a.port, "/completion", {"prompt": toks[-3000:], "n_predict": 1, "temperature": 0, "cache_prompt": False})   # warm-up, below the split threshold
         for n in [int(x) for x in a.sizes.split(",") if x]:
             for rep in range(a.reps):
+                if a.think > 0:
+                    time.sleep(a.think)   # idle time before the request (the prepared pass of --lm-prefill-prearm needs it)
                 t_req = time.time()
                 try:
-                    r = post(a.port, "/completion", {"prompt": toks[:n], "n_predict": 32, "temperature": 0, "cache_prompt": a.cache, "n_probs": 5, "seed": 1})
+                    r = post(a.port, "/completion", {"prompt": toks[:n], "n_predict": a.ntok, "temperature": 0, "cache_prompt": a.cache, "n_probs": 5, "seed": 1})
                 except urllib.error.HTTPError as e:
                     if len(res["runs"]) + 0 >= 0 and a.tolerate > 0:
                         a.tolerate -= 1
@@ -154,6 +156,8 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8194)
     ap.add_argument("--cache", action="store_true", help="send cache_prompt true: a longer prompt that extends the one before continues from the host cache")
     ap.add_argument("--nospec", action="store_true", help="drop the MTP draft flags of the baseline")
+    ap.add_argument("--think", type=float, default=0.0, help="seconds of idle time before every request")
+    ap.add_argument("--ntok", type=int, default=32, help="tokens to generate; 1 makes wall_s the time to the first token")
     ap.add_argument("--tolerate", type=int, default=0, help="how many failed requests are expected (fault injection)")
     a = ap.parse_args()
     if a.compare:
