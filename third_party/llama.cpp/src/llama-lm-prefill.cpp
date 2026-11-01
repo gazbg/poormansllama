@@ -500,9 +500,20 @@ void llama_lm_peer_worker::start(llama_context * follower) {
                 b.seq_id   = seq_id_ptr.data();
                 b.logits   = logits_flag.data();
                 llama_memory_clear(llama_get_memory(ctx), true);     // the follower holds nothing between passes
-                ctx->lm_role = 2;
-                ctx->lm_link = link;
-                rc = llama_decode(ctx, b);
+                bool prefix_ok = true;
+                if (!prefix.empty()) {
+                    // the batch continues a sequence: the K/V cells and the recurrent state of the earlier batches go over in one piece (plan H93: exact)
+                    prefix_ok = llama_state_seq_set_data_ext(ctx, prefix.data(), prefix.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) == prefix.size();
+                    prefix.clear();
+                    prefix.shrink_to_fit();
+                }
+                if (prefix_ok) {
+                    ctx->lm_role = 2;
+                    ctx->lm_link = link;
+                    rc = llama_decode(ctx, b);
+                } else {
+                    LLAMA_LOG_ERROR("lm-prefill: the follower could not take the sequence state of the earlier batches\n");
+                }
             } catch (const std::exception & e) {
                 LLAMA_LOG_ERROR("lm-prefill: the follower failed: %s\n", e.what());
             }
@@ -517,7 +528,7 @@ void llama_lm_peer_worker::start(llama_context * follower) {
     });
 }
 
-void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool want_logits) {
+void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool want_logits, std::vector<uint8_t> && prefix_blob) {
     const int32_t n = b.n_tokens;
     tokens.assign(b.token, b.token + n);
     pos.assign(b.pos, b.pos + n);
@@ -529,7 +540,8 @@ void llama_lm_peer_worker::kick(llama_lm_link * l, const llama_batch & b, bool w
     }
     logits_flag.assign((size_t) n, 0);
     logits_flag[(size_t) n - 1] = want_logits ? 1 : 0;
-    link = l;
+    link   = l;
+    prefix = std::move(prefix_blob);
     {
         std::lock_guard<std::mutex> lk(m);
         done.store(0);
@@ -560,6 +572,29 @@ bool llama_context::lm_set_peer(llama_context * follower, int32_t min_tokens) {
     S.peer_min    = min_tokens;
     S.peer_worker = std::make_unique<llama_lm_peer_worker>();
     S.peer_worker->start(follower);
+
+    // warm the follower up with one ordinary pass of its own (kernel loading, first allocations): the first split pass would otherwise pay them
+    {
+        const int32_t n_warm = std::min<int32_t>({ 2*follower->lm_state->p.ubatch + 64, (int32_t) follower->get_cparams().n_batch, (int32_t) follower->get_cparams().n_ctx - 64 });
+        if (n_warm >= follower->lm_state->p.min_tokens) {
+            std::vector<llama_token> toks((size_t) n_warm, 1);
+            std::vector<llama_pos>   pos((size_t) n_warm);
+            std::vector<int32_t>     nsid((size_t) n_warm, 1);
+            std::vector<llama_seq_id> sid((size_t) n_warm, 0);
+            std::vector<llama_seq_id *> sidp((size_t) n_warm);
+            std::vector<int8_t>      lg((size_t) n_warm, 0);
+            for (int32_t i = 0; i < n_warm; ++i) {
+                pos[(size_t) i]  = i;
+                sidp[(size_t) i] = &sid[(size_t) i];
+            }
+            llama_batch b = {};
+            b.n_tokens = n_warm; b.token = toks.data(); b.pos = pos.data(); b.n_seq_id = nsid.data(); b.seq_id = sidp.data(); b.logits = lg.data();
+            const int64_t t_w0 = ggml_time_us();
+            const int rc = llama_decode(follower, b);
+            llama_memory_clear(llama_get_memory(follower), true);
+            LLAMA_LOG_INFO("%s: lm-prefill: the follower's warm-up pass of %d tokens: %d, %.0f ms\n", __func__, (int) n_warm, rc, (double) (ggml_time_us() - t_w0)/1e3);
+        }
+    }
     return true;
 }
 
@@ -655,7 +690,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     llama_lm_link  link_own;
     llama_lm_link * link = lm_link;
     int            kc   = n_chunks;
-    if (role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1 && n_chunks >= 2 && pl.p0 == 0 && pl.snap_cuts.empty()
+    if (role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1 && n_chunks >= 2 && pl.snap_cuts.empty()
         && pl.n >= S.peer_min && getenv("LLAMA_LM_PEER_OFF") == nullptr) {
         auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
         if (!mh->get_mem_attn()->get_v_trans() && mh->get_mem_attn()->get_n_stream() == 1) {
@@ -674,6 +709,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             link_own.widths      = pl.widths;
             link_own.lead_kv     = mh->get_mem_attn();
             link_own.lead_c0     = pl.c0;
+            link_own.p0          = pl.p0;
             link_own.lead_tokens = 0;
             for (int c = 0; c < kc; ++c) {
                 link_own.lead_tokens += pl.widths[c];
@@ -683,7 +719,17 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             link = &link_own;
             role = 1;
             S.n_split++;
-            S.peer_worker->kick(link, B, pl.want_logits);
+            std::vector<uint8_t> prefix;
+            if (pl.p0 > 0) {
+                const int64_t t_x0 = ggml_time_us();
+                prefix.resize(llama_state_seq_get_size_ext(this, pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE));
+                const size_t got = llama_state_seq_get_data_ext(this, prefix.data(), prefix.size(), pl.seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                prefix.resize(got);
+                if (lm_log_on()) {
+                    LLAMA_LOG_WARN("lm-prefill: split pass: the state of the %d earlier tokens (%.1f MiB) exported in %.0f ms\n", (int) pl.p0, (double) got/1048576.0, (double) (ggml_time_us() - t_x0)/1e3);
+                }
+            }
+            S.peer_worker->kick(link, B, pl.want_logits, std::move(prefix));
         }
     }
     if (role == 2) {
@@ -831,8 +877,8 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             }
         } else if (mh->get_mem_attn()->has_layer(il)) {
             llama_kv_cache * kvf = mh->get_mem_attn();
-            lm_copy_rows(link->lead_kv->get_k_storage(il), link->lead_c0, kvf->get_k_storage(il), pl.c0, link->lead_tokens, peer_stage);
-            lm_copy_rows(link->lead_kv->get_v_storage(il), link->lead_c0, kvf->get_v_storage(il), pl.c0, link->lead_tokens, peer_stage);
+            lm_copy_rows(link->lead_kv->get_k_storage(il), link->lead_c0 + link->p0, kvf->get_k_storage(il), pl.c0 + pl.p0, link->lead_tokens, peer_stage);
+            lm_copy_rows(link->lead_kv->get_v_storage(il), link->lead_c0 + link->p0, kvf->get_v_storage(il), pl.c0 + pl.p0, link->lead_tokens, peer_stage);
         }
         return true;
     };
@@ -843,8 +889,8 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         }
         llama_kv_cache * kvf = mh->get_mem_attn();
         const int64_t n_f = (int64_t) pl.n - link->lead_tokens;
-        lm_copy_rows(kvf->get_k_storage(il), pl.c0 + link->lead_tokens, link->lead_kv->get_k_storage(il), link->lead_c0 + link->lead_tokens, n_f, peer_stage);
-        lm_copy_rows(kvf->get_v_storage(il), pl.c0 + link->lead_tokens, link->lead_kv->get_v_storage(il), link->lead_c0 + link->lead_tokens, n_f, peer_stage);
+        lm_copy_rows(kvf->get_k_storage(il), pl.c0 + pl.p0 + link->lead_tokens, link->lead_kv->get_k_storage(il), link->lead_c0 + link->p0 + link->lead_tokens, n_f, peer_stage);
+        lm_copy_rows(kvf->get_v_storage(il), pl.c0 + pl.p0 + link->lead_tokens, link->lead_kv->get_v_storage(il), link->lead_c0 + link->p0 + link->lead_tokens, n_f, peer_stage);
         return true;
     };
     auto peer_push_final = [&]() -> bool {

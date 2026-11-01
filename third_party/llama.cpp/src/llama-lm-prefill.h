@@ -30,6 +30,7 @@ struct llama_lm_link {
     std::atomic<int>   fstate{0};               // follower: 0 running, 1 done, -1 failed
     int                kc          = 0;         // first chunk of the follower
     int64_t            lead_tokens = 0;         // tokens of the leader's chunks
+    int64_t            p0          = 0;         // position of the batch's first token (the earlier batches' state went over at the start)
     std::vector<int32_t> widths;                // the leader's chunk widths (the follower's plan must be the same)
     llama_kv_cache *   lead_kv     = nullptr;
     int64_t            lead_c0     = 0;         // KV cell of position 0 in the leader
@@ -60,8 +61,9 @@ struct llama_lm_peer_worker {
     std::vector<llama_seq_id>  seq_ids;
     std::vector<llama_seq_id*> seq_id_ptr;
     std::vector<int8_t>        logits_flag;
+    std::vector<uint8_t>       prefix;      // the leader's sequence state before the batch (p0 > 0), imported by the follower first
     void start(llama_context * follower);
-    void kick(llama_lm_link * l, const llama_batch & b, bool want_logits);
+    void kick(llama_lm_link * l, const llama_batch & b, bool want_logits, std::vector<uint8_t> && prefix_blob);
     int  wait();                                // blocks until the pass is over; its llama_decode result
 };
 
