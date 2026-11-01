@@ -691,7 +691,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     llama_lm_link * link = lm_link;
     int            kc   = n_chunks;
     if (role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1 && n_chunks >= 2 && pl.snap_cuts.empty()
-        && pl.n >= S.peer_min && getenv("LLAMA_LM_PEER_OFF") == nullptr) {
+        && pl.n >= S.peer_min && (int64_t) pl.p0 + pl.n + 64 <= (int64_t) S.peer_ctx->get_cparams().n_ctx && getenv("LLAMA_LM_PEER_OFF") == nullptr) {
         auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
         if (!mh->get_mem_attn()->get_v_trans() && mh->get_mem_attn()->get_n_stream() == 1) {
             static const double frac = getenv("LLAMA_LM_PEER_FRAC") != nullptr ? atof(getenv("LLAMA_LM_PEER_FRAC")) : 0.5;
