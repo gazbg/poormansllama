@@ -43,6 +43,13 @@ struct llama_lm_link {
     size_t             slab_half[2]  = { 0, 0 };
     int                dev[2]        = { 0, 0 };             // CUDA ordinals of the two
     size_t             lead_logits_n = 0;
+    // H107: a fused pass (snapshot cuts) in the interleave: the rows of the follower's recurrent layers at each cut, [snapshot] -> (layer, 0 = r / 1 = s, bytes); the leader writes the blobs
+    struct snap_row_t {
+        int                  il;
+        int                  kind;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<std::vector<snap_row_t>> fol_snap;
     std::mutex              m;
     std::condition_variable cv;
 };

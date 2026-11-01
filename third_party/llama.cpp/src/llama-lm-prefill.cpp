@@ -731,10 +731,16 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     int            kc   = n_chunks;
     bool           ilv  = false;      // H102: the layer interleave (a batch too small for the token split: the pass is bound by the bank stream of one link)
     static const int ilv_min = getenv("LLAMA_LM_ILV_MIN") != nullptr ? atoi(getenv("LLAMA_LM_ILV_MIN")) : 256;     // 0 = off
-    const bool peer_ok = role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1 && pl.snap_cuts.empty()
+    const bool peer_base = role == 0 && !lm_follower && S.peer_ctx != nullptr && S.peer_worker && S.peer_worker->done.load() == 1 && n_segs == 1
         && (int64_t) pl.p0 + pl.n + 64 <= (int64_t) S.peer_ctx->get_cparams().n_ctx && getenv("LLAMA_LM_PEER_OFF") == nullptr;
+    // H107: the interleave takes a pass with snapshot cuts (a fused pass); the split by token position does not
+    const bool peer_ok    = peer_base && pl.snap_cuts.empty();
     const bool split_mode = peer_ok && n_chunks >= 2 && pl.n >= S.peer_min;
-    const bool ilv_mode   = peer_ok && ilv_min > 0 && pl.n >= ilv_min && pl.n < S.peer_min;
+    // a fused pass (snapshot cuts) is interleaved up to ILV_SNAP_MAX tokens: the interleave halves the bank stream of each GPU but computes every layer once, so it ties with one GPU
+    // where the compute chain reaches the one-GPU stream (measured 2026-11-01: x0.62 at 800 tokens, x0.77 at 2,048, x0.97 at 2,800, x1.02 at 3,000)
+    static const bool ilv_snap     = getenv("LLAMA_LM_ILV_NOSNAP") == nullptr;      // set: the interleave refuses a pass with snapshot cuts, as before H107
+    static const int  ilv_snap_max = getenv("LLAMA_LM_ILV_SNAP_MAX") != nullptr ? atoi(getenv("LLAMA_LM_ILV_SNAP_MAX")) : 2816;
+    const bool ilv_mode   = (pl.snap_cuts.empty() ? peer_base : (peer_base && ilv_snap && pl.n < ilv_snap_max)) && ilv_min > 0 && pl.n >= ilv_min && pl.n < S.peer_min;
     if (split_mode || ilv_mode) {
         auto * mh = static_cast<llama_memory_hybrid *>(memory.get());
         if (!mh->get_mem_attn()->get_v_trans() && mh->get_mem_attn()->get_n_stream() == 1) {
@@ -768,6 +774,11 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             link = &link_own;
             role = 1;
             S.n_split++;
+            if (!pl.snap_cuts.empty()) {
+                // H107: the follower plans the same chunks (it cuts where the leader does) and keeps the rows of its own recurrent layers
+                S.peer_ctx->lm_state->snap_req.assign(pl.snap_cuts.begin(), pl.snap_cuts.end());   // the request itself is consumed (cleared) by lm_decode_begin; the plan keeps the cuts that became boundaries
+                link_own.fol_snap.assign(pl.snap_cuts.size(), {});
+            }
             std::vector<uint8_t> prefix;
             if (pl.p0 > 0) {
                 const int64_t t_x0 = ggml_time_us();
@@ -1223,13 +1234,18 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                         const auto * rcs = static_cast<const llama_memory_hybrid_context *>(chunks[c].mctx.get())->get_recr();
                         const uint32_t hd = rcs->get_head();
                         auto & sr = snap_rows[(size_t) snap_of_chunk[(size_t) c]];
+                        int kind = 0;
                         for (ggml_tensor * t : { rcs->get_r_l(il), rcs->get_s_l(il) }) {
+                            const int this_kind = kind++;
                             if (t == nullptr) {
                                 continue;
                             }
                             const size_t rb = t->nb[1];
                             sr.rows.emplace_back(t, std::vector<uint8_t>(rb));
                             ggml_backend_tensor_get(t, sr.rows.back().second.data(), (size_t) hd*rb, rb);
+                            if (role == 2 && ilv_run && link != nullptr && (size_t) snap_of_chunk[(size_t) c] < link->fol_snap.size()) {
+                                link->fol_snap[(size_t) snap_of_chunk[(size_t) c]].push_back({ il, this_kind, sr.rows.back().second });   // handed to the leader, which writes the blobs
+                            }
                         }
                         t_snap_copy += (double) (ggml_time_us() - t_s0);
                     }
@@ -1365,10 +1381,23 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
 
     // G42: the snapshots become the blobs the caller stores as checkpoints (the real serializer, the host rows and the cell position substituted)
     S.snaps.clear();
-    if (!snap_rows.empty()) {
+    if (!snap_rows.empty() && role != 2) {
         const int64_t t_b0 = ggml_time_us();
         llama_memory_recurrent * mr = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr();
         bool snap_ok = true;
+        if (link != nullptr && link->ilv) {
+            // H107: the rows of the follower's recurrent layers, onto this memory's tensors of the same layers
+            for (size_t k = 0; k < snap_rows.size() && k < link->fol_snap.size(); ++k) {
+                for (auto & fr : link->fol_snap[k]) {
+                    ggml_tensor * t = fr.kind == 0 ? mr->r_l[(size_t) fr.il] : mr->s_l[(size_t) fr.il];
+                    if (t == nullptr || fr.bytes.size() != (size_t) t->nb[1]) {
+                        snap_ok = false;
+                        break;
+                    }
+                    snap_rows[k].rows.emplace_back(t, std::move(fr.bytes));
+                }
+            }
+        }
         for (size_t k = 0; k < snap_rows.size() && snap_ok; ++k) {
             llama_lm_state::snap_t sn;
             sn.cut = pl.snap_cuts[k];
