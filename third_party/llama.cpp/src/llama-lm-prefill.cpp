@@ -1496,7 +1496,9 @@ bool llama_context::lm_prearm(llama_seq_id seq, int64_t n_tokens) {
     if (S.live && !S.armed) {
         return false;     // a pass is running
     }
-    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn || cparams.n_rs_seq != 0 ||
+    // H106: rollback snapshots (MTP, n_rs_seq > 0) are no reason to refuse: the pass runs the plain graphs on plane 0 (its plan declines a sequence that stands elsewhere), and a recurrent blob
+    // holds the one plane the sequence stands in, so the blobs it keeps are the ones the live state would give
+    if (cparams.embeddings || cparams.embeddings_nextn || !sampling.samplers.empty() || !cparams.causal_attn || !cparams.flash_attn ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || layer_streaming != nullptr) {
         return false;
     }

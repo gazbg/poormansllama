@@ -1731,9 +1731,13 @@ private:
                     SRV_ERR("--lm-prefill-fuse / --lm-prefill-prearm need -np 1 (they are for one conversation at a time; got -np %d)\n", params_base.n_parallel);
                     return false;
                 }
-                if (has_spec) {
-                    SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding\n");
+                // H106: MTP with --spec-mtp-defer keeps no prompt positions in the draft cache, so the draft part of a checkpoint is the same inside and after the pass
+                if (has_spec && !(spec_mtp && !has_draft && params_base.speculative.draft.mtp_defer)) {
+                    SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding (except MTP with --spec-mtp-defer)\n");
                     return false;
+                }
+                if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_fuse_max_set) {
+                    params_base.lm_prefill_fuse_max = 6000;   // H106
                 }
                 if (params_base.lm_prefill_fuse_min < 1) {
                     SRV_ERR("%s", "--lm-prefill-fuse-min must be at least 1\n");
@@ -5278,7 +5282,7 @@ private:
                     if (params_base.lm_prefill_fuse && !has_mtmd && !slot.prompt.tokens.has_mtmd && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         batch.size() == 0) {
                         const int64_t left = (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens();
-                        if (left >= params_base.lm_prefill_fuse_min) {
+                        if (left >= params_base.lm_prefill_fuse_min && (params_base.lm_prefill_fuse_max <= 0 || left < params_base.lm_prefill_fuse_max)) {
                             const int64_t t_arm0 = ggml_time_us();
                             fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
                             if (getenv("LLAMA_LM_LOG") != nullptr) {

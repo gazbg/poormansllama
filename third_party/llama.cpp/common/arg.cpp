@@ -1936,6 +1936,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lm-prefill-fuse-max"}, "N",
+        "most prompt tokens left that --lm-prefill-fuse sends whole; a longer rest is cut at the checkpoints as without --lm-prefill-fuse (default: no limit; 6000 with --lm-prefill-peer-gpu, "
+        "because a fused pass runs on one GPU and a split pass over two is faster from ~6000 tokens)",
+        [](common_params & params, int value) {
+            params.lm_prefill_fuse_max     = value;
+            params.lm_prefill_fuse_max_set = true;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_FUSE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lm-prefill-prearm"}, "MODE",
         "with --lm-prefill and -np 1: when the slots go idle after a request, prepare the layer-major pass of the next one (make room, allocate the slot window and the slab, copy the banks of the first layers). "
         "MODE: off (default), always, auto (when at least 3 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode, a used one saves ~0.26 s",

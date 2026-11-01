@@ -43,9 +43,13 @@ def run_arm(a):
     if a.frac:
         env["LLAMA_LM_PEER_FRAC"] = a.frac
     extra = " ".join(a.add)
+    base = BASE
+    if a.nospec:   # no MTP draft: for the experiments that --lm-prefill-fuse refuses to run with
+        for frag in ("--spec-type draft-mtp ", "--spec-draft-p-min 0.7 ", "--spec-draft-n-min 0 ", "--spec-draft-n-max 3 ", "-ctkd q8_0 ", "-ctvd q8_0 ", "--spec-mtp-defer "):
+            base = base.replace(frag, "")
     if a.arm == "peer":
         extra += f" --lm-prefill-peer-gpu 1 --lm-prefill-peer-ctx {a.peer_ctx}" + (f" --lm-prefill-peer-min {a.peer_min}" if a.peer_min else "")
-    cmd = [os.path.join(a.bin, "llama-server"), "--model", MODEL, "--host", "127.0.0.1", "--port", str(a.port)] + shlex.split(BASE + " " + extra)
+    cmd = [os.path.join(a.bin, "llama-server"), "--model", MODEL, "--host", "127.0.0.1", "--port", str(a.port)] + shlex.split(base + " " + extra)
     logp = os.path.join(OUT, a.arm + ".server.log")
     log = open(logp, "w")
     srv = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -149,6 +153,7 @@ if __name__ == "__main__":
     ap.add_argument("--peer-min", dest="peer_min", type=int, default=0, help="--lm-prefill-peer-min; 0 = the server's default")
     ap.add_argument("--port", type=int, default=8194)
     ap.add_argument("--cache", action="store_true", help="send cache_prompt true: a longer prompt that extends the one before continues from the host cache")
+    ap.add_argument("--nospec", action="store_true", help="drop the MTP draft flags of the baseline")
     ap.add_argument("--tolerate", type=int, default=0, help="how many failed requests are expected (fault injection)")
     a = ap.parse_args()
     if a.compare:

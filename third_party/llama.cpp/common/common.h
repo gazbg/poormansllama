@@ -685,6 +685,8 @@ struct common_params {
     int32_t     lm_prefill_ckpt    = 0;       // with --lm-prefill: tokens of the checkpoint chunk at the end of a prompt (< 32 runs on the CPU, no bank copy); 0 = n_ubatch, the stock rule
     bool        lm_prefill_fuse    = false;   // G42 (-np 1): the rest of a prompt goes in one batch, the context checkpoints inside it are taken by the layer-major pass
     int32_t     lm_prefill_fuse_min = 700;    // G42: fewest tokens left in the prompt that are sent whole
+    int32_t     lm_prefill_fuse_max = 0;      // H106: most tokens left that are sent whole (0 = no limit; 6000 with the peer GPU, unless given): a fused pass cannot use the second GPU
+    bool        lm_prefill_fuse_max_set = false;
     int32_t     lm_prefill_prearm  = 0;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle
 
     // llama-connect params
