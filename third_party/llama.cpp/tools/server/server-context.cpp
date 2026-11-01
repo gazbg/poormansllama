@@ -1736,6 +1736,9 @@ private:
                     SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-prearm do not work with speculative decoding (except MTP with --spec-mtp-defer)\n");
                     return false;
                 }
+                if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_fuse_min_set) {
+                    params_base.lm_prefill_fuse_min = 260;   // H114: a fused pass of 256 tokens or more is interleaved over the two GPUs; below that it runs on one GPU and loses to the cut flow
+                }
                 if (params_base.lm_prefill_fuse_min < 1) {
                     SRV_ERR("%s", "--lm-prefill-fuse-min must be at least 1\n");
                     return false;
