@@ -1842,9 +1842,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_DECODE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-min"}, "N",
-        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024)",
+        "smallest prompt batch, in tokens, that --lm-prefill takes (default: 1024; 256 with --lm-prefill-peer-gpu)",
         [](common_params & params, int value) {
-            params.lm_prefill_min = value;
+            params.lm_prefill_min     = value;
+            params.lm_prefill_min_set = true;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -1974,7 +1975,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LM_PREFILL_PEER_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-peer-min"}, "N",
-        "smallest prompt batch (tokens) that is split over the two GPUs (default: 8192; below ~8k tokens the split is slower than one GPU)",
+        "smallest prompt batch (tokens) that is split over the two GPUs by token position (default: 3584); smaller batches, from --lm-prefill-min, alternate the layers between the GPUs instead, "
+        "so that each streams half of the expert banks",
         [](common_params & params, int value) {
             params.lm_prefill_peer_min = value;
         }

@@ -6379,6 +6379,28 @@ void ggml_backend_cuda_aux_flush(ggml_backend_t backend) {
 // window, DMA then at 14.44 GB/s = the pinned ceiling), which is what lets the
 // staging path skip its CPU memcpy hop. Failures fill `err` from
 // cudaGetErrorString so the caller can refuse loudly instead of degrading.
+// H102: a copy between the memories of two GPUs (direct when peer access is possible, else staged by the driver); synchronous for the host
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_peer_copy(void * dst, int dst_dev, const void * src, int src_dev, size_t nbytes) {
+    // cudaMemcpyPeer is ordered only against the legacy default stream, and the compute streams of ggml do not block on it: copy on a stream of our own and wait for it
+    static thread_local cudaStream_t streams[16] = {};
+    if (dst_dev < 0 || dst_dev >= 16) {
+        return false;
+    }
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    if (cudaSetDevice(dst_dev) != cudaSuccess) {
+        return false;
+    }
+    if (streams[dst_dev] == nullptr && cudaStreamCreateWithFlags(&streams[dst_dev], cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaSetDevice(prev);
+        return false;
+    }
+    bool ok = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, nbytes, streams[dst_dev]) == cudaSuccess;
+    ok = ok && cudaStreamSynchronize(streams[dst_dev]) == cudaSuccess;
+    (void) cudaSetDevice(prev);
+    return ok;
+}
+
 bool ggml_backend_cuda_register_host_range(const void * ptr, size_t nbytes, char * err, size_t err_len) {
     if (err != nullptr && err_len > 0) {
         err[0] = '\0';

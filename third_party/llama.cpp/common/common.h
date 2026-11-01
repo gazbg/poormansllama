@@ -671,8 +671,9 @@ struct common_params {
     // lm_prefill_peer_ctx tokens, takes the second part of a prompt batch of at least lm_prefill_peer_min tokens
     int32_t     lm_prefill_peer_gpu = -1;
     int32_t     lm_prefill_peer_ctx = 33024;
-    int32_t     lm_prefill_peer_min = 8192;
-    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken
+    int32_t     lm_prefill_peer_min = 3584;   // batches of 256 .. this - 1 tokens take the layer interleave, larger ones the token split (H102: the crossover is at ~3.5k tokens)
+    int32_t     lm_prefill_min     = 1024;    // smallest batch (tokens) that is taken (256 with the peer GPU, unless given)
+    bool        lm_prefill_min_set = false;   // --lm-prefill-min was given
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window

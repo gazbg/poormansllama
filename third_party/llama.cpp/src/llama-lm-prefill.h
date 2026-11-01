@@ -36,6 +36,12 @@ struct llama_lm_link {
     int64_t            lead_c0     = 0;         // KV cell of position 0 in the leader
     const llama_memory_recurrent_context * lead_rc = nullptr;   // the recurrent cell of the leader's last chunk (valid once layers_done > 0)
     float *            lead_logits   = nullptr;  // the leader's logits row, written by the follower at the end
+    // H102: the layer interleave (small batches): the GPUs alternate pairs of layers, each streams only its own banks, the activations hop between them
+    bool               ilv           = false;
+    std::atomic<int>   ilv_done{0};              // layers 0 .. ilv_done - 1 are complete (on whichever GPU owns them)
+    char *             slab_base[2]  = { nullptr, nullptr };   // [0] the leader's activation slab, [1] the follower's
+    size_t             slab_half[2]  = { 0, 0 };
+    int                dev[2]        = { 0, 0 };             // CUDA ordinals of the two
     size_t             lead_logits_n = 0;
     std::mutex              m;
     std::condition_variable cv;

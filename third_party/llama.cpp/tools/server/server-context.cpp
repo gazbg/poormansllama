@@ -1784,6 +1784,9 @@ private:
         }
 
         if (params_base.lm_prefill) {
+            if (params_base.lm_prefill_peer_gpu >= 0 && !params_base.lm_prefill_min_set) {
+                params_base.lm_prefill_min = 256;   // the layer interleave makes even the 512-token tail of a prompt cheaper in a pass than on the ordinary path (H102)
+            }
             // before the expert cache is sized: the slot window is allocated once here and freed at once, the cache then takes the rest
             llama_lm_prefill_params lp = llama_lm_prefill_default_params();
             lp.n_slots    = params_base.lm_prefill_slots;
@@ -1842,7 +1845,8 @@ private:
                 SRV_ERR("--lm-prefill-peer-gpu: %s\n", perr);
                 return false;
             }
-            SRV_INF("lm-prefill: two-GPU prefill: batches of >= %d tokens are split with the model on %s (context of %d tokens)\n", params_base.lm_prefill_peer_min, dn, params_base.lm_prefill_peer_ctx);
+            SRV_INF("lm-prefill: two-GPU prefill with the model on %s (context of %d tokens): batches of %d .. %d tokens alternate their layers between the GPUs, batches of >= %d are split by token position\n",
+                    dn, params_base.lm_prefill_peer_ctx, params_base.lm_prefill_min, params_base.lm_prefill_peer_min - 1, params_base.lm_prefill_peer_min);
         }
 
         if (!params_base.lm_decode_stream.empty()) {

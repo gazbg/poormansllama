@@ -44,7 +44,7 @@ def run_arm(a):
         env["LLAMA_LM_PEER_FRAC"] = a.frac
     extra = " ".join(a.add)
     if a.arm == "peer":
-        extra += f" --lm-prefill-peer-gpu 1 --lm-prefill-peer-ctx {a.peer_ctx} --lm-prefill-peer-min {a.peer_min}"
+        extra += f" --lm-prefill-peer-gpu 1 --lm-prefill-peer-ctx {a.peer_ctx}" + (f" --lm-prefill-peer-min {a.peer_min}" if a.peer_min else "")
     cmd = [os.path.join(a.bin, "llama-server"), "--model", MODEL, "--host", "127.0.0.1", "--port", str(a.port)] + shlex.split(BASE + " " + extra)
     logp = os.path.join(OUT, a.arm + ".server.log")
     log = open(logp, "w")
@@ -82,7 +82,7 @@ def run_arm(a):
             for rep in range(a.reps):
                 t_req = time.time()
                 try:
-                    r = post(a.port, "/completion", {"prompt": toks[:n], "n_predict": 32, "temperature": 0, "cache_prompt": False, "n_probs": 5, "seed": 1})
+                    r = post(a.port, "/completion", {"prompt": toks[:n], "n_predict": 32, "temperature": 0, "cache_prompt": a.cache, "n_probs": 5, "seed": 1})
                 except urllib.error.HTTPError as e:
                     if len(res["runs"]) + 0 >= 0 and a.tolerate > 0:
                         a.tolerate -= 1
@@ -146,8 +146,9 @@ if __name__ == "__main__":
     ap.add_argument("--add", action="append", default=[])
     ap.add_argument("--frac", default="")
     ap.add_argument("--peer-ctx", dest="peer_ctx", type=int, default=33024)
-    ap.add_argument("--peer-min", dest="peer_min", type=int, default=4096)
+    ap.add_argument("--peer-min", dest="peer_min", type=int, default=0, help="--lm-prefill-peer-min; 0 = the server's default")
     ap.add_argument("--port", type=int, default=8194)
+    ap.add_argument("--cache", action="store_true", help="send cache_prompt true: a longer prompt that extends the one before continues from the host cache")
     ap.add_argument("--tolerate", type=int, default=0, help="how many failed requests are expected (fault injection)")
     a = ap.parse_args()
     if a.compare:
