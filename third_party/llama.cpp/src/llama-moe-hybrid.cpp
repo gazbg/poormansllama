@@ -499,7 +499,9 @@ struct moe_hybrid_engine {
     }
 
     // the three cache tensors of layer il (slots_l[il] experts and the zero slot) in a buffer of their own, zeroed; false when the allocation failed
+    double al_us_ctx = 0.0, al_us_buf = 0.0, al_us_clr = 0.0;   // diagnostics of alloc_cache_layer (printed and reset by resize)
     bool alloc_cache_layer(int il, ggml_context *& ctx, ggml_backend_buffer_t & buf, ggml_tensor * (&t)[3]) {
+        const auto t_a0 = moe_clock::now();
         ggml_init_params ip = { ggml_tensor_overhead()*3, nullptr, true };
         ctx = ggml_init(ip);
         if (ctx == nullptr) {
@@ -511,7 +513,11 @@ struct moe_hybrid_engine {
             GGML_ASSERT(t[k]->nb[1] == src[k]->nb[1] && t[k]->nb[2] == src[k]->nb[2]);
             ggml_format_name(t[k], "moe_hybrid.%d.%d", il, k);
         }
+        const auto t_a1 = moe_clock::now();
         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(cuda));
+        const auto t_a2 = moe_clock::now();
+        al_us_ctx += std::chrono::duration<double, std::micro>(t_a1 - t_a0).count();
+        al_us_buf += std::chrono::duration<double, std::micro>(t_a2 - t_a1).count();
         if (buf == nullptr) {
             ggml_free(ctx);
             ctx = nullptr;
@@ -521,6 +527,7 @@ struct moe_hybrid_engine {
         // H112: only the zero slot (the last one: a miss points at it) must be zero; every other slot is filled by a device copy or an upload before it is published, so clearing the
         // whole buffer (a memset of ~2-3.7 GB per resize) is not needed. LLAMA_MOE_HYBRID_CLEAR_ALL=1 restores it.
         static const bool clear_all = moe_hybrid_env_int("LLAMA_MOE_HYBRID_CLEAR_ALL", 0) != 0;
+        const auto t_a3 = moe_clock::now();
         if (clear_all) {
             ggml_backend_buffer_clear(buf, 0);
         } else {
@@ -528,6 +535,7 @@ struct moe_hybrid_engine {
                 ggml_backend_tensor_memset(t[k], 0, (size_t) slots_l[(size_t) il]*t[k]->nb[2], t[k]->nb[2]);
             }
         }
+        al_us_clr += moe_hybrid_us(t_a3);
         return true;
     }
 
@@ -1131,6 +1139,7 @@ bool moe_hybrid_engine::resize(int new_slots, bool async_fill) {
     dma_src.clear();
     dma_size.clear();
     int64_t n_d2d = 0, n_h2d = 0;
+    al_us_ctx = al_us_buf = al_us_clr = 0.0;
     double  us_alloc = 0.0, us_d2d = 0.0, us_free = 0.0;   // diagnostics: where the layer loop spends its time
     std::vector<int> order(n_expert);
     std::vector<void *>       cp_dst;
@@ -1259,9 +1268,9 @@ bool moe_hybrid_engine::resize(int new_slots, bool async_fill) {
     refresh_pfmap();
     info_n_slot.store(n_slot);
     static const bool resize_diag = getenv("LLAMA_LM_LOG") != nullptr;   // the server drops the INFO lines of the library
-    llama_log_internal(resize_diag ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, "%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host%s; loop %.0f ms = alloc %.0f + d2d queue %.0f + sync/free %.0f, final sync %.0f ms)\n", __func__,
+    llama_log_internal(resize_diag ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, "%s: moe_hybrid: cache resized to %d slots x %d layers (%.1f MiB VRAM) in %.1f ms (%lld slots kept on the device, %lld uploaded from the host%s; loop %.0f ms = alloc %.0f (context %.0f, device buffer %.0f, zero slot %.0f) + d2d queue %.0f + sync/free %.0f, final sync %.0f ms)\n", __func__,
                        n_slot, n_layer, cache_total_bytes()/1048576.0, moe_hybrid_us(t0)/1e3, (long long) n_d2d, (long long) n_h2d, async ? ", queued: published when copied" : "",
-                       us_loop/1e3, us_alloc/1e3, us_d2d/1e3, us_free/1e3, us_sync/1e3);
+                       us_loop/1e3, us_alloc/1e3, al_us_ctx/1e3, al_us_buf/1e3, al_us_clr/1e3, us_d2d/1e3, us_free/1e3, us_sync/1e3);
 
     // LLAMA_MOE_HYBRID_RESIZE_VERIFY=1 (test): read every slot back and compare it with the host bank it stands for
     if (moe_hybrid_env_int("LLAMA_MOE_HYBRID_RESIZE_VERIFY", 0) != 0) {
