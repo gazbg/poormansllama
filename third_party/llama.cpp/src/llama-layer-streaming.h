@@ -177,6 +177,11 @@ LLAMA_API const llama_ls_adapter * llama_ls_qwen35_adapter();
 // complete routed-expert bank for one MoE layer.
 LLAMA_API const llama_ls_adapter * llama_ls_qwen35moe_adapter();
 
+// The Flint MoE adapter (src/models/llama-layer-streaming-flint.cpp). Rolling package = complete
+// routed-expert bank for one MoE layer; the leading dense layers carry their dense FFN as a
+// descriptor only (they are never paged).
+LLAMA_API const llama_ls_adapter * llama_ls_flint_adapter();
+
 // one decoder-layer weight package bound to one device slot
 struct llama_layer_streaming_slot {
     // meta context owning the bundle tensor objects (freed at destruction)

@@ -666,7 +666,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // The mask-free causal-window op (layer-major prefill, GGML_FLASH_ATTN_EXT_CAUSAL_PARAM) generates its mask in-kernel, and only the MMA kernel does that: the vector and tile kernels
+    // read `mask` and would attend to every key of the view, the padding past n_kv_valid (stale cells of an earlier request) and the later tokens of the chunk included. A one- or two-row
+    // chunk (the end of a prompt) would otherwise be routed to the vector kernel by the quantized-KV rule below.
+    const bool causal_window = mask == nullptr && ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_CAUSAL_PARAM) != 0;
+    const bool can_use_vector_kernel = !causal_window && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -793,7 +797,10 @@ static bool ggml_cuda_fattn_head_tile_applies(const best_fattn_kernel kernel, co
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (K->ne[2] < 2 || Q->ne[2] % K->ne[2] != 0 || dst->src[4] != nullptr) {   // sinks are per query head: not tiled
+    if (K->ne[2] < 2 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    if (dst->src[4] != nullptr && (dst->src[4]->type != GGML_TYPE_F32 || dst->src[4]->ne[0] != Q->ne[2])) {   // sinks are per query head: tiled as a view of the heads of one KV head (f32, one per query head)
         return false;
     }
     if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {                  // nothing to convert
@@ -811,7 +818,7 @@ static bool ggml_cuda_fattn_head_tile_applies(const best_fattn_kernel kernel, co
 }
 
 struct ggml_cuda_fattn_head_views {
-    ggml_tensor q, k, v, o;
+    ggml_tensor q, k, v, o, sinks;
 };
 
 // the views of KV head h: Q, K, V of that head and the compact output tensor placed at o_data
@@ -840,6 +847,12 @@ static void ggml_cuda_fattn_head_tile_views(const ggml_tensor * dst, const int64
     w.o.src[0] = &w.q;
     w.o.src[1] = &w.k;
     w.o.src[2] = &w.v;                         // src[3] (the mask) is shared by all heads
+    if (dst->src[4] != nullptr) {              // the attention sinks of the query heads of this KV head
+        w.sinks = *dst->src[4];
+        w.sinks.ne[0] = gqa;
+        w.sinks.data  = (char *) dst->src[4]->data + h*gqa*dst->src[4]->nb[0];
+        w.o.src[4] = &w.sinks;
+    }
 }
 
 static void ggml_cuda_flash_attn_ext_head_tiled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const best_fattn_kernel kernel) {

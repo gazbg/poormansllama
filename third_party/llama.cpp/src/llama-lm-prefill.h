@@ -106,6 +106,17 @@ struct llama_lm_state {
     ggml_backend_buffer_ptr slab;                   // two halves of [n_embd, slab_tokens] activations
     size_t                 slab_half     = 0;
     int64_t                slab_tokens   = 0;
+    // a model with a sliding-window cache (flint): the window mask of every chunk of the running segment, filled once right after the chunk's memory context is applied
+    // (while the ring's cell metadata is exactly the stock state) and read by every window layer. One slot per chunk, `swa_mask_slot` bytes each.
+    ggml_backend_buffer_ptr swa_mask;
+    size_t                 swa_mask_slot = 0;
+    int32_t                swa_mask_slots = 0;
+    // the same buffer, behind the masks: the small per-chunk inputs of the pieces (positions and the cell indices of the two caches; one slot of `swa_inp_slot` bytes per chunk) and the constant
+    // rotation matrices of the two caches (`swa_inp_const`, 4 x 64 KiB)
+    size_t                 swa_inp_off = 0;
+    size_t                 swa_inp_slot = 0;
+    size_t                 swa_inp_const = 0;
+    size_t                 swa_alloc_bytes = 0;     // the whole buffer (what the footprint accounting subtracts)
     ggml_backend_sched_ptr sched_pp;                // while a pass runs: holds the context's own scheduler (the pass's is swapped in); otherwise empty
     size_t                 sched_est     = 0;       // compute buffer the last pass needed (for the next pass's room estimate)
     int64_t                free_pre      = 0;       // device free memory when the room was made for the running pass

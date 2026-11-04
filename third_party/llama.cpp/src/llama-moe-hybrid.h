@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include <vector>
 
 struct llm_graph_context;
 struct llama_model;
@@ -47,6 +48,7 @@ void llama_moe_hybrid_set_keep_stats(bool keep);
 
 // G31s: ids == nullptr: report the engine's geometry; otherwise fold the routing of K prompt tokens (ids [K][n_layer][n_used], -1 = none) into the popularity statistics. False when there is no engine.
 bool llama_moe_hybrid_seed_impl(const int32_t * ids, int K, int * n_layer, int * n_used);
+bool llama_moe_hybrid_layer_map_impl(std::vector<int> & eng_of_abs_out);   // absolute layer -> engine layer (-1: dense)
 
 bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_bytes, int min_slots, bool * shrunk);
 

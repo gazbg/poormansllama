@@ -540,6 +540,8 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    bool lm_persist = false; // a layer-major pass piece: every input is a view of the pass's persistent buffer, filled by the pass; nothing to set here
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -811,6 +813,21 @@ struct llm_graph_lm {
     int32_t              q_pos_base      = 0;
     int32_t              n_kv_valid      = 0;
     int32_t              kv_cell0        = 0;     // cell of position 0 of the sequence
+    // a model with a sliding-window cache (flint): the window layers read the chunk's window mask from the pass's persistent buffer (filled right after the chunk was applied), not from the
+    // current cell metadata (the pass applies all chunks of a segment before it runs a layer, so the ring's metadata is in its END state by then)
+    ggml_backend_buffer_t swa_buf        = nullptr;
+    void *               swa_mask        = nullptr;
+    // the small per-chunk inputs of a piece (positions, the cell indices of the two caches) and the constant rotation matrices also live in that buffer, filled once per chunk (per segment for the
+    // matrices), so that a piece uploads nothing: an upload on the compute stream waits behind the bank copy that is in flight. nullptr: the pieces build ordinary inputs.
+    void *               inp_pos         = nullptr;
+    void *               inp_k_idxs      = nullptr;
+    void *               inp_v_idxs      = nullptr;
+    void *               inp_k_idxs_swa  = nullptr;
+    void *               inp_v_idxs_swa  = nullptr;
+    void *               inp_k_rot       = nullptr;
+    void *               inp_v_rot       = nullptr;
+    void *               inp_k_rot_swa   = nullptr;
+    void *               inp_v_rot_swa   = nullptr;
 };
 
 struct llm_graph_params {
@@ -1425,6 +1442,13 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+
+#ifdef LLAMA_LAYER_STREAMING
+    // G32 for the sliding-window cache: the attention input of ONE layer-major pass piece (params.lm, kind 1). Only the half the layer needs exists: the base cache's indices (the mask is the implicit
+    // causal one) for a full-attention layer, the window cache's indices and the pass's persistent window mask for a window layer.
+    llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa_lm() const;
+    ggml_tensor * build_inp_pos_lm() const;   // the positions of the chunk, a view of the pass's persistent buffer (llm_graph_lm::inp_pos)
+#endif
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 

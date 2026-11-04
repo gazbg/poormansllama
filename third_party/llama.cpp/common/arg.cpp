@@ -1786,6 +1786,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HYBRID_MOE_SEED").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--hybrid-moe-slow-ms"}, "N",
+        "with --hybrid-moe: log a host expert request or DMA submission that takes longer than N ms (default: 5; 0 = never log). Only the log lines are affected, not the decode speed",
+        [](common_params & params, int value) {
+            params.hybrid_moe_slow_ms = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_SLOW_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-threads"}, "N",
+        "with --hybrid-moe: size of the host expert team, the threads that compute the expert misses on the CPU (the last one is the engine thread). Default: the physical cores, at most 8. Set it to the physical core count on a slower CPU",
+        [](common_params & params, int value) {
+            params.hybrid_moe_threads = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_THREADS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--hybrid-moe-prefill-free-all"},
+        "with --hybrid-moe and --lm-prefill: a layer-major prompt pass frees the expert cache to its floor (2 slots per layer) before it starts, whatever it needs, so no KV commit inside the pass shrinks the cache. The cache regrows at the first small decode. Experimental",
+        [](common_params & params) {
+            params.hybrid_moe_prefill_free_all = true;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_MOE_PREFILL_FREE_ALL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lm-prefill"},
         "layer-major prefill (private fork, CUDA, Qwen3.5/3.6 MoE and dense Qwen3.5/3.8): a prompt batch of --lm-prefill-min tokens or more runs layer by layer, every routed-expert bank is copied from the host ONCE into a VRAM slot window while "
         "all chunks of the batch go through the layer (the ordinary path copies all banks once per ubatch). Works with --hybrid-moe (hybrid decode) and without it (stock decode of the placement given by -ncmoe/-cmoe/the fit step: the layers whose experts are on the host stream, the others compute in place). "
@@ -1869,6 +1890,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.lm_prefill_slots = value;
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-copy-piece"}, "MiB",
+        "with --lm-prefill: copy each expert bank to the VRAM window in pieces of this many MiB with at most --lm-prefill-copy-window in flight, so a small copy of the compute stream is not queued behind a whole bank "
+        "(default: Flint 64, other models 0 = one copy per bank; 0 turns it off). Measured on Flint, crowded, 8.6k tokens: 8 / 16 / 32 / 64 / 128 / 256 MiB = 3,698 / 3,712 / 3,736 / 3,755 / 3,710 / 2,827 tok/s",
+        [](common_params & params, int value) {
+            params.lm_prefill_copy_piece = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_COPY_PIECE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lm-prefill-copy-window"}, "N",
+        "with --lm-prefill-copy-piece: pieces of a bank copy in flight at once (default: 2; 1 to 3 measured the same on Flint)",
+        [](common_params & params, int value) {
+            params.lm_prefill_copy_window = value;
+        }
+    ).set_env("LLAMA_ARG_LM_PREFILL_COPY_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lm-prefill-bf16"},
         "keep the activations of the --lm-prefill pass in bf16 (half the slab, not validated against f32)",
@@ -1957,8 +1993,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--lm-prefill-prearm"}, "MODE",
         "with --lm-prefill and -np 1: when the slots go idle after a request, prepare the layer-major pass of the next one (make room, allocate the slot window and the slab, copy the banks of the first layers). "
-        "MODE: off (default), always, auto (when at least 3 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode, a used one saves ~0.26 s",
+        "also once at start-up. MODE: always (default with --hybrid-moe, otherwise off), off, auto (when at least 3 of the last 4 requests used the pass). A prepared pass that the next request does not use costs a cache regrow (~0.4 s) at its first decode, a used one saves ~0.26 s",
         [](common_params & params, const std::string & value) {
+            params.lm_prefill_prearm_set = true;
             if (value == "off" || value == "0") {
                 params.lm_prefill_prearm = 0;
             } else if (value == "always" || value == "1") {

@@ -139,6 +139,8 @@ const llama_ls_adapter * llama_ls_select_adapter(llm_arch arch, std::string & re
             return llama_ls_qwen35_adapter();
         case LLM_ARCH_QWEN35MOE:
             return llama_ls_qwen35moe_adapter();
+        case LLM_ARCH_FLINT:
+            return llama_ls_flint_adapter();
         default:
             reason = "no layer-residency adapter for this architecture";
             return nullptr;
@@ -166,6 +168,12 @@ std::string llama_ls_probe_capability(const char * model_path, llama_ls_capabili
     cap.arch = arch_name;
     std::string sel_reason;
     const llama_ls_adapter * adapter = llama_ls_select_adapter(llm_arch_from_string(arch_name), sel_reason);
+    if (adapter != nullptr && llm_arch_from_string(arch_name) == LLM_ARCH_FLINT) {
+        // the Flint adapter serves the server's --lm-prefill (src/llama-lm-prefill.cpp); the layer-streaming runner has no Flint graph, so it must not report the architecture as supported
+        cap.supported = false;
+        cap.reason = "the Flint adapter serves the server's --lm-prefill only (the layer-streaming runner has no Flint graph)";
+        return "off";
+    }
     if (adapter == nullptr) {
         cap.supported = false;
         cap.reason = sel_reason.empty() ? "no layer-residency adapter for this architecture" : sel_reason;

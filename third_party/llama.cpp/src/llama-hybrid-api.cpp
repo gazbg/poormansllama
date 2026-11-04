@@ -267,6 +267,7 @@ struct hybrid_seed_state {
     int                   filled     = 0;      // tokens captured by the last probed decode (<= K)
     bool                  valid      = false;  // a capture is waiting for the next small decode
     int                   n_layers_seen = 0;
+    std::vector<int>      eng_of_abs;          // absolute layer -> engine layer, -1 for a dense layer
     std::vector<int32_t>  ids;                 // [K][n_layer][n_used]
     std::vector<uint8_t>  tmp;
     ggml_backend_sched_eval_callback orig_cb = nullptr;
@@ -282,7 +283,11 @@ static bool hybrid_probe_cb(ggml_tensor * t, bool ask, void * ud) {
     if (ask) {
         return true;
     }
-    const int il = atoi(t->name + 13);
+    const int il_abs = atoi(t->name + 13);
+    if (il_abs < 0 || il_abs >= (int) g_seed.eng_of_abs.size() || g_seed.eng_of_abs[(size_t) il_abs] < 0) {
+        return true;
+    }
+    const int il = g_seed.eng_of_abs[(size_t) il_abs];
     if (il < 0 || il >= g_seed.n_layer || t->type != GGML_TYPE_I32 || t->ne[0] != g_seed.n_used || t->ne[1] < 1) {
         return true;
     }
@@ -378,6 +383,12 @@ static void hybrid_free_watch(int period_ms) {
     LLAMA_LOG_WARN("hybrid-moe: free-watch: the engine is gone; lowest free device memory %lld MiB\n", (long long) (lowest/1048576));
 }
 
+// --hybrid-moe-prefill-free-all (env LLAMA_MOE_HYBRID_PREFILL_FREE_ALL=1, set by the server): a pass starts from the floor of the expert cache, whatever it needs
+static bool hybrid_prefill_free_all() {
+    static const bool on = [] { const char * v = getenv("LLAMA_MOE_HYBRID_PREFILL_FREE_ALL"); return v != nullptr && atoi(v) > 0; }();
+    return on;
+}
+
 // G32: the layer-major prefill needs the slot window, the slab and the pass's compute buffer: the expert cache gives the room (begin) and takes it back (end)
 static bool hybrid_lm_vram(llama_context * ctx, int64_t need_bytes, int begin) {
     if (ctx != g_hybrid_ctx) {
@@ -398,7 +409,11 @@ static bool hybrid_lm_vram(llama_context * ctx, int64_t need_bytes, int begin) {
         llama_moe_hybrid_cache_info_impl(&cache_b0, &slots0);
         const int64_t free0 = hybrid_free_bytes();
         bool room_ok = true;
-        if (free0 < target_b) {
+        // the floor, whatever the pass needs: no KV commit inside the pass can shrink the cache then, and the cache regrows at the first small decode
+        const bool freed_all = hybrid_prefill_free_all() && slots0 > pass_floor && llama_moe_hybrid_resize_impl(pass_floor);
+        if (freed_all) {
+            shrunk = true;
+        } else if (free0 < target_b) {
             // make_room estimates the freed bytes from the mean row size, so a shrink can land a MiB short of the target: aim above it, the check below stays at the target
             room_ok = llama_moe_hybrid_make_room_impl(target_b + (int64_t) 64*1048576, 0, pass_floor, &shrunk);
             if (hybrid_free_bytes() < target_b) {
@@ -501,6 +516,9 @@ void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens) {
     g_seed.K       = n_tokens;
     g_seed.n_layer = n_layer;
     g_seed.n_used  = n_used;
+    if (!llama_moe_hybrid_layer_map_impl(g_seed.eng_of_abs)) {
+        return;
+    }
     g_seed.ids.assign((size_t) n_tokens*n_layer*n_used, -1);
     g_seed.orig_cb = ctx->get_cparams().cb_eval;
     g_seed.orig_ud = ctx->get_cparams().cb_eval_user_data;

@@ -697,6 +697,10 @@ bool llm_graph_input_attn_k_dsa_iswa::can_reuse(const llm_graph_params & params)
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
+    if (lm_persist) {
+        return;     // a layer-major pass piece: the pass filled the persistent buffers these tensors view
+    }
+
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
@@ -1614,10 +1618,11 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 bool llm_graph_context::use_implicit_causal_mask() const {
 #ifdef LLAMA_LAYER_STREAMING
     if (lm != nullptr) {
-        // G32: the layer-major pass builds its pieces per launch; the window is part of the piece
+        // G32: the layer-major pass builds its pieces per launch; the window is part of the piece.
+        // A model with a sliding-window cache (flint) has the implicit mask on its full-attention layers only: a window layer reads the pass's persistent window mask.
         return lm->implicit_causal &&
             cparams.causal_attn && cparams.flash_attn &&
-            hparams.swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+            (hparams.swa_type == LLAMA_SWA_TYPE_NONE || (lm->kind == 1 && lm->il >= 0 && !hparams.is_swa(lm->il))) && !hparams.use_alibi &&
             ubatch.n_seqs_unq == 1 && ubatch.equal_seqs();
     }
     return layer_streaming != nullptr &&
@@ -4003,6 +4008,74 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
+
+#ifdef LLAMA_LAYER_STREAMING
+llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa_lm() const {
+    GGML_ASSERT(lm != nullptr && lm->kind == 1 && lm->il >= 0);
+
+    const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+
+    auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
+
+    // the pass keeps the small inputs in its persistent buffer: a tensor built by the cache is replaced by a view of it (not a graph input: nothing uploads it)
+    const bool persist = lm->inp_k_idxs != nullptr;
+    auto wrap = [&](ggml_tensor * t, void * addr) -> ggml_tensor * {
+        if (!persist || t == nullptr) {
+            return t;
+        }
+        GGML_ASSERT(addr != nullptr && lm->swa_buf != nullptr);
+        t->flags &= ~GGML_TENSOR_FLAG_INPUT;
+        ggml_backend_tensor_alloc(lm->swa_buf, t, addr);
+        return t;
+    };
+
+    if (!hparams.is_swa(lm->il)) {
+        // a full-attention layer: the base cache; the mask is the implicit causal one when use_implicit_causal_mask() allows it (always in a pass)
+        const auto * base = mctx_cur->get_base();
+
+        inp->self_k_idxs = wrap(base->build_input_k_idxs(ctx0, ubatch), lm->inp_k_idxs);
+        inp->self_v_idxs = wrap(base->build_input_v_idxs(ctx0, ubatch), lm->inp_v_idxs);
+
+        if (!use_implicit_causal_mask()) {
+            inp->self_kq_mask     = build_attn_inp_kq_mask(ctx0, base, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
+
+        inp->self_k_rot = wrap(base->build_input_k_rot(ctx0), lm->inp_k_rot);
+        inp->self_v_rot = wrap(base->build_input_v_rot(ctx0), lm->inp_v_rot);
+    } else {
+        // a window layer: the window cache. Its mask was filled once for this chunk, right after the chunk's memory context was applied, into the pass's persistent buffer; the piece reads it from
+        // there. `self_kq_mask_swa` (the field set_input fills) stays null, so nothing refills it from the cell metadata, which is the END state by now.
+        const auto * swa = mctx_cur->get_swa();
+
+        inp->self_k_idxs_swa = wrap(swa->build_input_k_idxs(ctx0, ubatch), lm->inp_k_idxs_swa);
+        inp->self_v_idxs_swa = wrap(swa->build_input_v_idxs(ctx0, ubatch), lm->inp_v_idxs_swa);
+
+        GGML_ASSERT(lm->swa_buf != nullptr && lm->swa_mask != nullptr && "a window layer needs the pass's window mask");
+        const int64_t n_kv = swa->get_n_kv();
+        ggml_tensor * m = ggml_new_tensor_4d(ctx0, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, ubatch.n_tokens, 1, 1);
+        ggml_set_name(m, "attn_inp_kq_mask_swa_lm");
+        ggml_backend_tensor_alloc(lm->swa_buf, m, lm->swa_mask);
+        inp->self_kq_mask_swa_cnv = m;
+
+        inp->self_k_rot_swa = wrap(swa->build_input_k_rot(ctx0), lm->inp_k_rot_swa);
+        inp->self_v_rot_swa = wrap(swa->build_input_v_rot(ctx0), lm->inp_v_rot_swa);
+    }
+
+    inp->lm_persist = persist;
+
+    return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_inp_pos_lm() const {
+    GGML_ASSERT(lm != nullptr && lm->swa_buf != nullptr && lm->inp_pos != nullptr);
+
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_tokens*hparams.n_pos_per_embd());
+    ggml_set_name(pos, "inp_pos");
+    ggml_backend_tensor_alloc(lm->swa_buf, pos, lm->inp_pos);
+    return pos;
+}
+#endif // LLAMA_LAYER_STREAMING
 
 llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);

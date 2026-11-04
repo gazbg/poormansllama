@@ -1396,6 +1396,34 @@ private:
 #endif
             SRV_INF("MTP draft head restricted to the first %s output rows\n", n.c_str());
         }
+        // read once by the host engine when it is created (with the model below): a parameter that was not given leaves the environment or the default alone
+        if (params.hybrid_moe && params.hybrid_moe_slow_ms >= 0) {
+            const std::string ms = std::to_string(params.hybrid_moe_slow_ms);
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MOE_HYBRID_SLOW_MS", ms.c_str());
+#else
+            setenv("LLAMA_MOE_HYBRID_SLOW_MS", ms.c_str(), 1);
+#endif
+            SRV_INF("hybrid-moe: host requests slower than %s ms are logged (0 = never)\n", ms.c_str());
+        }
+        if (params.hybrid_moe && params.hybrid_moe_threads > 0) {
+            const std::string n = std::to_string(params.hybrid_moe_threads);
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MOE_HYBRID_THREADS", n.c_str());
+#else
+            setenv("LLAMA_MOE_HYBRID_THREADS", n.c_str(), 1);
+#endif
+            SRV_INF("hybrid-moe: expert team of %s threads\n", n.c_str());
+        }
+        if (params.hybrid_moe && params.hybrid_moe_prefill_free_all) {
+            // read by the hybrid engine when a layer-major pass starts (after the model is loaded)
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MOE_HYBRID_PREFILL_FREE_ALL", "1");
+#else
+            setenv("LLAMA_MOE_HYBRID_PREFILL_FREE_ALL", "1", 1);
+#endif
+            SRV_INF("%s", "hybrid-moe: a layer-major pass frees the expert cache to its floor before it starts\n");
+        }
 
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
@@ -1725,6 +1753,21 @@ private:
                 }
                 SRV_INF("lm-prefill: canonical chunks: context checkpoints only at multiples of %d tokens, a continuation resumes from one\n", params_base.lm_prefill_ubatch);
             }
+            if (params_base.lm_prefill_prearm != 0 && !params_base.lm_prefill_prearm_set) {
+                // MP: on by default where it was validated (the hybrid expert cache); where it cannot work the default turns itself off, only an explicit flag refuses
+                const char * why = nullptr;
+                if (!params_base.hybrid_moe) {
+                    why = "no --hybrid-moe";
+                } else if (params_base.n_parallel != 1) {
+                    why = "-np is not 1";
+                } else if (has_spec && !(spec_mtp && !has_draft && params_base.speculative.draft.mtp_defer)) {
+                    why = "speculative decoding";
+                }
+                if (why != nullptr) {
+                    params_base.lm_prefill_prearm = 0;
+                    SRV_INF("lm-prefill: idle preparation of the pass is off (%s)\n", why);
+                }
+            }
             if (params_base.lm_prefill_fuse || params_base.lm_prefill_prearm != 0) {
                 // G42
                 if (params_base.n_parallel != 1) {
@@ -1794,6 +1837,8 @@ private:
             // before the expert cache is sized: the slot window is allocated once here and freed at once, the cache then takes the rest
             llama_lm_prefill_params lp = llama_lm_prefill_default_params();
             lp.n_slots    = params_base.lm_prefill_slots;
+            lp.copy_piece_mib = params_base.lm_prefill_copy_piece;
+            lp.copy_window    = params_base.lm_prefill_copy_window;
             lp.ubatch     = params_base.lm_prefill_ubatch;
             lp.segment    = params_base.lm_prefill_segment;
             lp.min_tokens = params_base.lm_prefill_min;
@@ -1805,6 +1850,12 @@ private:
             }
             SRV_INF("lm-prefill: prompt batches of >= %d tokens run layer-major (chunks of %d tokens, slab segments of %d tokens, %d slots, %s activations)\n",
                     lp.min_tokens, lp.ubatch, lp.segment, lp.n_slots, lp.act_bf16 ? "bf16" : "f32");
+            if (llama_model_n_swa(model_tgt) > 0 && (params_base.lm_prefill_fuse || params_base.lm_prefill_canonical || params_base.lm_prefill_peer_gpu >= 0)) {
+                // a model with a sliding-window cache (flint): its pass runs batch by batch. The fused pass and the canonical chunks keep recurrent-state snapshots inside the
+                // pass, and the second-GPU split hands recurrent cells over; none of that exists for a window cache. The idle preparation keeps no snapshots and is allowed.
+                SRV_ERR("%s", "--lm-prefill-fuse / --lm-prefill-canonical / --lm-prefill-peer-gpu are not available for a model with a sliding-window cache (the pass runs per batch only)\n");
+                return false;
+            }
         }
 
         if (params_base.lm_prefill && params_base.lm_prefill_peer_gpu >= 0) {
@@ -1839,6 +1890,8 @@ private:
             }
             llama_lm_prefill_params lpp = llama_lm_prefill_default_params();
             lpp.n_slots    = params_base.lm_prefill_slots;
+            lpp.copy_piece_mib = params_base.lm_prefill_copy_piece;
+            lpp.copy_window    = params_base.lm_prefill_copy_window;
             lpp.ubatch     = params_base.lm_prefill_ubatch;
             lpp.segment    = params_base.lm_prefill_segment;
             lpp.min_tokens = params_base.lm_prefill_min;
@@ -2388,6 +2441,10 @@ private:
                     SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
                 }
             }
+        }
+
+        if (params_base.lm_prefill && params_base.lm_prefill_prearm != 0 && ctx_tgt != nullptr) {
+            lm_prepare_now("start-up");     // MP: the server waits for its first request in the prefill profile
         }
 
         return true;
@@ -4154,11 +4211,16 @@ private:
         if (!want) {
             return;
         }
+        lm_prepare_now("after a request");
+    }
+
+    // the prefill profile: room, slot window, slab and the banks of the first layers; also called once when the server has started
+    void lm_prepare_now(const char * when) {
         const int32_t hint = params_base.lm_prefill_segment;     // a full segment: the next batch is not known, and a slab that is too small costs a second acquisition
         const int64_t t0 = ggml_time_us();
         const bool ok = llama_lm_prefill_arm(ctx_tgt, -1, hint);
         if (getenv("LLAMA_LM_LOG") != nullptr) {
-            SRV_WRN("lm-prefill: idle preparation for %d tokens (history %x): %s, %.0f ms\n", (int) hint, (unsigned) lm_hist, ok ? "armed" : "not armed", (ggml_time_us() - t0)/1000.0);
+            SRV_WRN("lm-prefill: idle preparation for %d tokens (%s, history %x): %s, %.0f ms\n", (int) hint, when, (unsigned) lm_hist, ok ? "armed" : "not armed", (ggml_time_us() - t0)/1000.0);
         }
     }
 

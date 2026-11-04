@@ -705,6 +705,21 @@ struct llama_model_flint : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+    private:
+        const llama_model & model;
+
+        // layer-view indirection: normal mode returns model.layers[il]; in a layer-major prefill piece (params.lm) the slot-bound bundle of the layer
+        const llama_layer & layer(int il) const;
+
+#ifdef LLAMA_LAYER_STREAMING
+        // G32 for flint: ONE piece of a layer-major prefill pass, per launch (params.lm; llama-lm-prefill.cpp)
+        void build_lm_graph();
+#endif
+
+        // the two halves of a decoder layer, shared by the ordinary graph and the pass's pieces: the attention block (q/k/v, norms, RoPE where the layer has it, sinks) on the normed input,
+        // and the FFN (dense, or routed experts + shared experts) on the normed attention output. Residual adds stay with the caller.
+        ggml_tensor * build_layer_attn(llm_graph_input_attn_kv_iswa * inp_attn, ggml_tensor * cur, ggml_tensor * inp_pos, int il);
+        ggml_tensor * build_layer_ffn(ggml_tensor * cur, int il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
