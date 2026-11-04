@@ -458,13 +458,35 @@ invoke_clone() {
     fi
     REPO="$CLONE_DIR"
     if [ -e "$REPO" ] && [ -n "$(ls -A "$REPO" 2>/dev/null)" ]; then
+        # reuse a valid existing checkout so a re-run (different model, same
+        # day or later) works; anything else is still refused. Valid = a git
+        # repo whose origin is this wizard's repo URL (D58, ported from
+        # setup.ps1: strip a trailing .git, lowercase, trim slashes).
+        if [ -d "$REPO/.git" ]; then
+            local origin onorm unorm
+            origin=$(git -C "$REPO" remote get-url origin 2>/dev/null)
+            onorm=$(printf '%s' "$origin" | sed -e 's/\.git$//' -e 's#/*$##' | tr '[:upper:]' '[:lower:]')
+            unorm=$(printf '%s' "$REPO_URL" | sed -e 's/\.git$//' -e 's#/*$##' | tr '[:upper:]' '[:lower:]')
+            if [ -n "$onorm" ] && [ "$onorm" = "$unorm" ]; then
+                ok "reusing existing checkout: $REPO"
+                return 0
+            fi
+        fi
         fail "clone target $REPO exists and is not empty (use --clone-dir to pick another)" 1
     fi
     local args=(clone)
     [ "$FULL_CLONE" = 0 ] && args+=(--depth 1)
     args+=(--branch "$BRANCH" "$REPO_URL" "$REPO")
     if [ "$DRY_RUN" = 1 ]; then say "(dry-run: git ${args[*]} )"; return 0; fi
-    if ! git "${args[@]}" 2>&1 | sed 's/^/  /'; then
+    # No 'set -o pipefail' in this script, so 'git … | sed' reports sed's exit
+    # status, not git's (measured 2026-11-04: a failed --branch clone printed
+    # [ok] and the fallback below never ran). Capture the output, test $?
+    # directly (decision D59).
+    local clone_out rc
+    clone_out=$(git "${args[@]}" 2>&1)
+    rc=$?
+    [ -n "$clone_out" ] && printf '%s\n' "$clone_out" | sed 's/^/  /'
+    if [ "$rc" -ne 0 ]; then
         if [ "$BRANCH" != "main" ]; then
             # the requested branch is not published (e.g. in-flight work): fall
             # back to the remote default branch; the flag-capability check
@@ -474,11 +496,16 @@ invoke_clone() {
             args=(clone)
             [ "$FULL_CLONE" = 0 ] && args+=(--depth 1)
             args+=("$REPO_URL" "$REPO")
-            git "${args[@]}" 2>&1 | sed 's/^/  /' || fail "git clone failed (branch: $BRANCH)" 1
+            clone_out=$(git "${args[@]}" 2>&1)
+            rc=$?
+            [ -n "$clone_out" ] && printf '%s\n' "$clone_out" | sed 's/^/  /'
+            [ "$rc" -ne 0 ] && fail "git clone failed (branch: $BRANCH)" 1
         else
             fail "git clone failed" 1
         fi
     fi
+    # An incomplete tree must not reach the build step (loud failure).
+    [ -d "$REPO/third_party/llama.cpp" ] || fail "clone at $REPO is incomplete (third_party/llama.cpp missing)" 1
     ok "cloned -> $REPO (branch: $BRANCH or remote default)"
 }
 
