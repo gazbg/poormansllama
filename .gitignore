@@ -86,3 +86,10 @@ desktop.ini
 # Local-only folders: experiment archives and prebuilt release binaries
 /archive/
 /releases/
+
+# Setup wizard artifacts (generated at the repo root by setup.ps1 / setup.sh;
+# see docs/SETUP.md). The one-generation backup is kept as run-server.last.*.
+/run-server.ps1
+/run-server.sh
+/run-server.last.ps1
+/run-server.last.sh

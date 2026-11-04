@@ -49,8 +49,25 @@ Limits:
 
 ## Start here
 
+**Quick start** — the setup wizard checks the environment, installs missing
+toolchain pieces (behind a y/n), builds the server, downloads the chosen
+model, and emits a ready-to-run `run-server.*` with the measured flags:
+
+```powershell
+# Windows
+git clone https://github.com/gazbg/poormansllama.git; cd poormansllama
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+```bash
+# Linux
+git clone https://github.com/gazbg/poormansllama.git && cd poormansllama
+./setup.sh
+```
+
 | Document | Read it for |
 |---|---|
+| [docs/SETUP.md](docs/SETUP.md) | The setup wizard: flags, exit codes, recipes, troubleshooting |
 | [docs/guide/USAGE.md](docs/guide/USAGE.md) | Build, run, first request, measuring, troubleshooting |
 | [docs/guide/LINUX-PASCAL.md](docs/guide/LINUX-PASCAL.md) | Building and running on Linux, and the measured prefill and decode work on a GTX 1070 (8 GiB, no tensor cores) |
 | [docs/guide/DESIGN.md](docs/guide/DESIGN.md) | Why it is built this way, what is on by default, current state and limits |

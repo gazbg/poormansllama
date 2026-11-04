@@ -5,6 +5,12 @@ configuration, sending a first request, measuring, and fixing common problems.
 For the meaning of each flag see [PARAMETERS.md](PARAMETERS.md). For why the
 design is what it is, see [DESIGN.md](DESIGN.md).
 
+> New machine? Run the setup wizard instead of the steps in sections 2-3:
+> `powershell -ExecutionPolicy Bypass -File .\setup.ps1` (Windows) or
+> `./setup.sh` (Linux) — it builds with the required options, downloads the
+> model, and emits the measured launch command. See
+> [../SETUP.md](../SETUP.md).
+
 ## 1. Prerequisites
 
 Tested on Windows 11 with:
