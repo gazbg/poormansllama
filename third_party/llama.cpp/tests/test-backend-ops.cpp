@@ -12273,6 +12273,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true, 384));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 512, 128, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
+    // causal window op at the Flint shape (head size 128, 4 KV heads, GQA 8, per-head attention sinks) as used by the layer-major prefill for its full-attention layers, with an explicit-mask control;
+    // the second pair is a pass-sized chunk (2048 queries at depth 2048)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 128, false, true, 0, 0, GGML_PREC_F32,
+            type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true, 384));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 128, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 2048, false, true, 0, 0, GGML_PREC_F32,
+            type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 2048, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        // the end of a prompt: a chunk of one or two queries (the quantized-KV rule sends 1-2 queries to the vector kernel, which has no in-kernel causal mask: the op must go to the MMA kernel)
+        for (int nb : { 1, 2 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, nb, false, true, 0, 0, GGML_PREC_F32,
+                type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true, 512 - nb));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, nb, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));

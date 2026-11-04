@@ -700,6 +700,8 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,   "q4_K/q4_K"      },
         { GGML_TYPE_Q4_K,   GGML_TYPE_Q6_K,   "q4_K/q6_K"      },
         { GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   "q5_K/q5_K"      },
+        { GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K,   "q5_K/q6_K"      },   // flint: the banks of 46 of 47 MoE layers
+        { GGML_TYPE_Q6_K,   GGML_TYPE_Q8_0,   "q6_K/q8_0"      },   // flint layer 14: gate and up Q6_K, down Q8_0
         { GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   "q8_0/q8_0"      },
         { GGML_TYPE_Q4_0,   GGML_TYPE_Q4_0,   "q4_0/q4_0"      },
         { GGML_TYPE_Q5_1,   GGML_TYPE_Q5_0,   "q5_1/q5_0"      },

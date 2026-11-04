@@ -48,6 +48,8 @@ struct llama_lm_prefill_params {
     int32_t min_tokens;   // smallest batch that is taken (1024)
     int32_t act_bf16;     // 1: bf16 activation slab (half the memory), 0: f32
     int32_t device;       // CUDA device index (0)
+    int32_t copy_piece_mib;  // paced bank copies: piece size in MiB, 0 = off (one copy per bank), -1 = the default (Flint 64, others off; env LLAMA_LM_COPY_PIECE_MIB)
+    int32_t copy_window;     // paced bank copies: pieces in flight, -1 = the default (2; env LLAMA_LM_COPY_WINDOW)
 };
 LLAMA_API struct llama_lm_prefill_params llama_lm_prefill_default_params(void);
 

@@ -49,6 +49,9 @@ These are stock llama.cpp flags. The values below are the ones the record uses.
 | `--hybrid-moe-prefill-ubatch N` | `2048` | Physical batch while a large prompt batch runs under `--hybrid-moe`. `0` turns it off. G42 sets `0` because `--lm-prefill` takes the big batches |
 | `--hybrid-moe-prefill-min N` | `1024` | Smallest batch, in tokens, that opens the hybrid prefill window |
 | `--hybrid-moe-seed N` | `16` | Seed the expert popularity counts with the routing of the last `N` prompt tokens. `0` off |
+| `--hybrid-moe-slow-ms N` | `5` | Log a host expert request or DMA submission that takes longer than `N` ms (`0` = never). Only the log lines change, not the speed. Without the flag, `LLAMA_MOE_HYBRID_SLOW_MS` applies, or 5 |
+| `--hybrid-moe-threads N` | auto | Size of the host expert team: the threads that compute expert misses on the CPU; the last one is the engine thread. Auto = the physical cores, at most 8, on Windows and Linux. Set it to the physical core count on a slower CPU. Takes precedence over `LLAMA_MOE_HYBRID_THREADS`, which is still read when the flag is not given |
+| `--hybrid-moe-prefill-free-all` | off | Experimental. A layer-major pass frees the expert cache to its floor before it starts. Measured on flint on this card (2026-11-03, one session per arm): at `-fitt 8000` (106 slots at start) +3.5% per request, because the regrow re-uploads about 10 GB at the first decode; at `-fitt 16000` +0.4%, inside the replicate band. Keep it off. With `--lm-prefill-prearm always` on flint it is +9.7% per run (2026-11-03), so keep it off there too |
 | `--hybrid-moe-freq FILE` | uniform prior | Expert frequency table (layers by experts, whitespace separated) that fills the cache at start |
 
 ## 4. Layer-major prefill (`--lm-prefill`)
@@ -62,7 +65,7 @@ Acts on prompt batches of at least `--lm-prefill-min` tokens. Works with and wit
 | `--lm-prefill-min N` | `1024` | Smallest prompt batch that takes the pass |
 | `--lm-prefill-ubatch N` | `2048` | Tokens per chunk of the pass |
 | `--lm-prefill-segment N` | `16384` | Tokens per activation-slab segment. Must be a multiple of the chunk. A longer batch repeats the layer sweep per segment. G42 uses `32768` |
-| `--lm-prefill-slots N` | `2` | Layer slots in the VRAM window. With the second GPU, `3` makes the token-split pass of a deep follow-up (98-102k tokens of context) 6-8% shorter in prompt time (the arithmetic is unchanged) for 500 MiB more on GPU 1 and a deeper shrink of the expert cache during the pass; a request that also generates 128 tokens is only 2.7-4.3% shorter, so use it for time to first token (plan H123). `4` makes those follow-ups 20-23% shorter, but it makes the memory guard decline the large batches of a cold prompt deeper than ~80k tokens (they take the ordinary path: the cold 98k prompt took 288 s instead of 132 s) and every small interleaved pass 4-13% slower with 3 slots (the pairs of layers per GPU map badly onto three slots; plan H125), so it suits only a workload of deep follow-ups without deep cold prompts and without many small turns. Two lets the next bank copy while the current layer computes; beyond about 200k tokens of prompt use `1` (H61 / H63: the pass asks for 432 MiB less, so the memory guard declines 4 batches instead of 14 at 250k tokens, 158.2 against 128.1 tok/s, +23.5% in an A-B-B-A) |
+| `--lm-prefill-slots N` | `2` | Layer slots in the VRAM window. With the second GPU, `3` makes the token-split pass of a deep follow-up (98-102k tokens of context) 6-8% shorter in prompt time (the arithmetic is unchanged) for 500 MiB more on GPU 1 and a deeper shrink of the expert cache during the pass; a request that also generates 128 tokens is only 2.7-4.3% shorter, so use it for time to first token (plan H123). `4` makes those follow-ups 20-23% shorter, but it makes the memory guard decline the large batches of a cold prompt deeper than ~80k tokens (they take the ordinary path: the cold 98k prompt took 288 s instead of 132 s) and every small interleaved pass 4-13% slower with 3 slots (the pairs of layers per GPU map badly onto three slots; plan H125), so it suits only a workload of deep follow-ups without deep cold prompts and without many small turns. Two lets the next bank copy while the current layer computes; beyond about 200k tokens of prompt use `1` (H61 / H63: the pass asks for 432 MiB less, so the memory guard declines 4 batches instead of 14 at 250k tokens, 158.2 against 128.1 tok/s, +23.5% in an A-B-B-A). Hybrid decode on one 24 GB card with `-fitt 16000` (flint, 2026-11-03, one session per arm): `3` declined the long passes at depth and their batches ran the ordinary path (turn of 17,990 tokens: 24.4 s); `2` ran every pass (9.4 s). Use `2`. |
 | `--lm-prefill-batch N` | `16384` | Logical batch when `-b` is not given |
 | `--lm-prefill-bf16` | off | Activations in bf16, half the slab. Not validated against f32 for the MoE model; for the dense Qwen3.8 see the KL study in `docs/plans/dense-qwen38-iq3-residency.md`. Do not use for claims elsewhere |
 | `--lm-prefill-attn-int8` | off | The pass's flash attention computes Q.K^T with int8 dot products against the q8_0 K cache (head size 256, a GPU without fast FP16, such as Pascal). About 1.7x faster attention, 22% of an 18k-token pass of the dense Qwen3.8-27B. An APPROXIMATION (Q quantised to int8 per 32 values, as the decode kernel does). Use with the f32 slab (without `--lm-prefill-bf16`): the pair failed the continuation rule on 1 of 8 prompts. Same as `LLAMA_FATTN_TILE_Q8QK=1` |
@@ -73,7 +76,7 @@ Acts on prompt batches of at least `--lm-prefill-min` tokens. Works with and wit
 | `--lm-prefill-fuse-min N` | `700`; `180` with `--lm-prefill-peer-gpu` | Fewest prompt tokens left after a cache hit that `--lm-prefill-fuse` sends whole. With the second GPU a fused pass is interleaved from 128 tokens (`LLAMA_LM_ILV_MIN`); fused against the cut flow, prompt time: 180 tokens -7.5%, 200 -11%, 250 -13%, 300 -10%, 400 -19%, 600 -45%; below 180 it is unchanged, so the cut flow stays |
 | `--lm-prefill-fuse-one-cut` | off | With `--lm-prefill-fuse`: keep only the context checkpoint 4 tokens before the end of a prompt, not the one 4 + ubatch tokens before it. One cut fewer inside the pass: the cold time to the first token is 0.14 s (2,048 tokens, 5.2%) to 0.21 s (8,000 tokens, 4.2%) shorter. The price: a follow-up that differs from the previous prompt within its last ~516 tokens re-processes the whole prompt (3,000 tokens: 3.44 s instead of 2.43 s); append-only follow-ups are unaffected |
 | `--lm-prefill-fuse-max N` | none | Most prompt tokens left that `--lm-prefill-fuse` sends whole; a longer rest is cut at the checkpoints as without the flag. With the second-GPU prefill the fused pass is split over both GPUs (or interleaved below 2,816 tokens), and was faster than the cut flow at every size measured up to 16,384 tokens |
-| `--lm-prefill-prearm MODE` | `off` | With `-np 1`, prepare the next pass while the slots are idle. `off`, `always`, or `auto` (when at least 3 of the last 4 requests used the pass). An unused preparation costs a cache regrow of about 0.4 s |
+| `--lm-prefill-prearm MODE` | `always` with `--hybrid-moe` and `-np 1`, else `off` | With `-np 1`, prepare the next pass while the slots are idle. `off`, `always`, or `auto` (when at least 3 of the last 4 requests used the pass). An unused preparation costs a cache regrow of about 0.4 s. Flint (sliding-window cache): the default is `always` since 2026-11-03 (at `-fitt 8192`: prompt time -3%, wall -2.8%, one session). Do not combine it with `--hybrid-moe-prefill-free-all` |
 
 ### 4.1 Dense models (Qwen3.5 / Qwen3.8, no routed experts)
 
@@ -94,6 +97,31 @@ layer stay on the device. The server refuses loudly when that does not hold. See
 
 The ring and the prefill pass share the VRAM in time: the ring frees its slots while a pass runs
 and takes them back (reloading its first layers, about 50 ms) when the pass ends.
+
+### 4.2 Flint (sliding-window MoE with attention sinks)
+
+`flint-UD-Q5_K_XL.gguf` (49 layers, 35 sliding-window layers with a 513-token window, 14 full-attention layers, 256 experts, 2 dense leading layers) runs with `--lm-prefill` and with `--hybrid-moe`. Evidence and limits: `docs/plans/flint-support-plan.md` section 11. Server only: the layer-streaming runner reports flint as off.
+
+Requirements of the pass, each refused by name at start-up when it does not hold: the K and V caches have the same type; flash attention is on; the window cache (`n_swa + -ub` cells) holds `n_swa + --lm-prefill-ubatch` (so `-ub` >= the pass chunk); every MoE layer has its experts wholly on the device or wholly on the host (`--cpu-moe`, or `-ngl 99 -fit off -ncmoe N`; the stock fit may split a layer, which the pass refuses). `--lm-prefill-fuse`, `-prearm`, `-canonical` and `-peer-gpu` are refused for a sliding-window model.
+
+Crowded recipe (peak 6,649 MiB, inside the 7,376 MiB keep-free ceiling; 3.67k tok/s at 8.6k tokens, 3.49k at 50.7k; add `--lm-prefill-slots 3` for 3.71k / 3.48k at a 7,213 MiB peak (this crowded recipe has no `--hybrid-moe`; with `--hybrid-moe -fitt 16000` use 2, see the row above); `--lm-prefill-ckpt-chunk 1` measured best, 24 gives 3.43k at 8.6k):
+
+```
+set LLAMA_KV_LAZY=1
+set LLAMA_KV_LAZY_ONDEMAND=1
+llama-server -m flint-UD-Q5_K_XL.gguf -c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -ngl 99 --cpu-moe -ub 2048 -b 65536 --lm-prefill --lm-prefill-ckpt-chunk 1
+```
+
+Hybrid decode, with the pass for the prefill (50.7k tokens: prefill about 3.3k tok/s, decode about 60 tok/s, peak 7.3 GB poller): add `--hybrid-moe -fitt 16000 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0` and drop `--cpu-moe`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LLAMA_KV_LAZY` + `LLAMA_KV_LAZY_ONDEMAND` | off | Commit the KV cache's VRAM on demand. Needed for the crowded peak (9,671 MiB without it). Set BOTH: `LLAMA_KV_LAZY` alone crashes the server (`illegal memory access`) |
+| `LLAMA_LM_COPY_PIECE_MIB` / `LLAMA_LM_COPY_WINDOW` | `8` / `2` for flint, `0` (off) for Qwen | Bank copies in pieces with at most WINDOW in flight, so the small input copy of a layer is not queued behind a whole bank. `0` turns it off |
+| `LLAMA_LM_PERSIST_INPUTS` | `1` | The per-chunk inputs of the pass live in one buffer filled once per chunk (bit-identical outputs). `0` restores the per-piece uploads |
+| `LLAMA_FATTN_HEAD_TILE` | off | Head-tiled flash-attention scratch; tiles attention sinks since the flint work. Not in the recipes above |
+| `LLAMA_MOE_HYBRID_ROUTE_CHECK` | off | Debug: the hybrid hook also builds the stock router on the same input and the debug callback logs `ROUTE_CHECK il=N ids=EQ/NE` and `w=EQ/NE` per layer and decode step. Slow (the callback copies tensors to the host) |
+| `LLAMA_DEBUG_LAYER_HASH` | off | Debug: FNV hash of every layer's output, for `tools/flint-layerhash.py` |
 
 ## 5. Environment variables for the engine
 

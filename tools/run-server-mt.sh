@@ -2,7 +2,7 @@
 # usage: tools/run-server-mt.sh <tag> <build-fixture|run> <harness options after --> -- [server-config-gen.py options...]
 #   e.g. tools/run-server-mt.sh g220-fixA build-fixture "--fixture tools/server-fixtures/agentic-A.json --variant A" -- --exe=build/llama-cuda/bin/s0/llama-server.exe --no-hybrid --no-override --arg=-fitt --arg=16000
 # one server run under the GPU mutex; results in build/llama-cuda/<tag>/ (report.json, server.log, free_mib.txt)
-cd /c/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1
+cd "$(dirname "$0")/.."
 tag=$1; cmd=$2; hopts=$3; shift 4
 python tools/server-config-gen.py tools/server-configs/$tag.json "$@" > /dev/null
 mkdir -p build/llama-cuda/$tag

@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2, help="decode probes after the warm-up")
     ap.add_argument("--chars", type=int, default=29000, help="prompt size of the decode probes in characters (29000 = about 10k tokens)")
     ap.add_argument("--pp-chars", type=int, default=0, help="also one cold prompt of this many characters (prefill rate)")
+    ap.add_argument("--prefill2", action="store_true", help="repeat the cold prefill probe once more right after the first (the second request has no first-use costs: lazy KV commit, kernel loading)")
     ap.add_argument("--pp-tokens", type=int, default=4, help="tokens generated after the prefill probe")
     ap.add_argument("--health-timeout", type=int, default=900)
     ap.add_argument("--threads", type=int, default=16)
@@ -66,6 +67,7 @@ def main():
     ap.add_argument("--exe", default="", help="llama-server.exe of this arm (default: DENSE_EXE or build/llama-cuda)")
     ap.add_argument("--gpuproc", action="store_true", help="also sample the server's WDDM dedicated / shared GPU memory every ~2 s (<label>.gpuproc.csv)")
     ap.add_argument("--nsys", default="", help="output base path: run the server under Nsight Systems and capture ONLY the first cached decode probe")
+    ap.add_argument("--nsys-probe", choices=["tg", "prefill"], default="tg", help="with --nsys: which probe to capture (tg = the first cached decode, the default; prefill = the cold prefill probe)")
     a = ap.parse_args()
     nsys_exe = r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.6.3\target-windows-x64\nsys.exe"
 
@@ -138,9 +140,18 @@ def main():
                 result["probes"].append(row)
                 print(json.dumps(row), flush=True)
             probe("warm", 400, 2)
+            cap_pf = bool(a.nsys) and a.nsys_probe == "prefill"
+            if cap_pf:
+                r = subprocess.run([nsys_exe, "start", "--session=dsr", "--output=" + os.path.join(ROOT, a.nsys), "--force-overwrite=true"], capture_output=True, text=True)
+                print("nsys start:", r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200], flush=True)
             probe("prefill", a.chars, 2)                      # cold: the decode probes below reuse this prompt from the cache
+            if a.prefill2:
+                probe("prefill2", a.chars, 2)
+            if cap_pf:
+                r = subprocess.run([nsys_exe, "stop", "--session=dsr"], capture_output=True, text=True)
+                print("nsys stop:", r.returncode, r.stdout.strip()[-300:], r.stderr.strip()[:200], flush=True)
             for i in range(a.reps):
-                cap = bool(a.nsys) and i == 0
+                cap = bool(a.nsys) and a.nsys_probe == "tg" and i == 0
                 if cap:
                     r = subprocess.run([nsys_exe, "start", "--session=dsr", "--output=" + os.path.join(ROOT, a.nsys), "--force-overwrite=true"], capture_output=True, text=True)
                     print("nsys start:", r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200], flush=True)

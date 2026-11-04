@@ -657,6 +657,9 @@ struct common_params {
     int32_t     hybrid_moe_prefill_ubatch = 2048; // physical batch size while a big prompt batch is processed (the expert cache gives the room back afterwards); 0 = off
     int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window
     int32_t     hybrid_moe_seed           = 16;   // tokens of the prompt's tail whose routing seeds the expert cache's popularity (0 = off)
+    int32_t     hybrid_moe_slow_ms        = -1;   // host requests and DMA submissions slower than this (ms) are logged, 0 = never; -1 = not given (LLAMA_MOE_HYBRID_SLOW_MS, default 5)
+    int32_t     hybrid_moe_threads        = 0;    // host expert team size (--hybrid-moe-threads): 0 = auto, the physical cores at most 8
+    bool        hybrid_moe_prefill_free_all = false; // --hybrid-moe-prefill-free-all: a layer-major pass frees the expert cache to its floor before it starts
     bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
     bool        n_batch_set      = false; // -b / LLAMA_ARG_BATCH was given
 
@@ -677,6 +680,8 @@ struct common_params {
     int32_t     lm_prefill_ubatch  = 2048;    // tokens per chunk
     int32_t     lm_prefill_segment = 16384;   // tokens per activation-slab segment (a multiple of the chunk)
     int32_t     lm_prefill_slots   = 2;       // layer slots in the VRAM window
+    int32_t     lm_prefill_copy_piece = -1;   // paced bank copies: piece size in MiB (0 = off, -1 = the default: Flint 64, others off)
+    int32_t     lm_prefill_copy_window = -1;  // paced bank copies: pieces in flight (-1 = the default, 2)
     bool        lm_prefill_bf16    = false;   // bf16 activation slab
     bool        fattn_head_tile = false; // LLAMA_FATTN_HEAD_TILE=1: the CUDA TILE / MMA flash attention converts a quantized K/V cache to f16 one KV head at a time (scratch / n_head_kv)
     bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 or q4_0 K cache, GPU without fast FP16)
@@ -689,7 +694,8 @@ struct common_params {
     int32_t     lm_prefill_fuse_max = 0;      // H106: most tokens left that are sent whole (0 = no limit)
     bool        lm_prefill_fuse_max_set = false;
     bool        lm_prefill_fuse_one_cut = false;  // H112: a fused prompt keeps only the checkpoint 4 tokens before its end (not the one 4 + ubatch tokens before it)
-    int32_t     lm_prefill_prearm  = 0;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle
+    int32_t     lm_prefill_prearm  = 1;       // G42 (-np 1): 0 off, 1 always, 2 auto: prepare the pass of the next request when the slots go idle (and once at start-up); MP: the default is on with --hybrid-moe
+    bool        lm_prefill_prearm_set = false; // --lm-prefill-prearm was given
 
     // llama-connect params
     bool        server_connect      = false;

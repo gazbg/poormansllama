@@ -126,6 +126,76 @@ static void llama_verify_hadamard_graph(
     }
 }
 
+#ifdef LLAMA_LAYER_STREAMING
+// debug only (LLAMA_DEBUG_LAYER_HASH=1): an FNV-1a hash of every layer's output ("l_out-N") of the ordinary decode and of the layer-major pass's pieces, to find the first layer where two paths differ.
+// The callback makes the scheduler run node by node and copies each output to the host: never in a timing run.
+static uint64_t llama_debug_fnv(const struct ggml_tensor * t, std::vector<uint8_t> & buf) {
+    buf.resize(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    uint64_t h = 1469598103934665603ULL;
+    for (const uint8_t b : buf) {
+        h = (h ^ b)*1099511628211ULL;
+    }
+    return h;
+}
+
+// LLAMA_MOE_HYBRID_ROUTE_CHECK (llama-moe-hybrid.cpp): the hook's routing of a decode step against the stock router on the same input, per layer
+static bool llama_debug_route_cb(struct ggml_tensor * t, bool ask, void * /*user*/) {
+    // the hook's routing and the stock router of the same step may run in either order: each side waits for the other
+    static std::map<std::string, uint64_t> pend;
+    const char * nm   = t->name;
+    const char * dash = strrchr(nm, '-');
+    if (ask || dash == nullptr) {
+        return true;
+    }
+    std::string side, kind;
+    if (strncmp(nm, "route_hook_ids-", 15) == 0)             { side = "hook";  kind = "ids"; }
+    else if (strncmp(nm, "route_hook_w-", 13) == 0)          { side = "hook";  kind = "w";   }
+    else if (strncmp(nm, "route_stock_ids-", 16) == 0)      { side = "stock"; kind = "ids"; }
+    else if (strncmp(nm, "route_stock_w-", 14) == 0)        { side = "stock"; kind = "w";   }
+    else                                                    { return true; }
+    const int il = atoi(dash + 1);
+    const std::string key   = kind + "-" + std::to_string(il);
+    const std::string other = (side == "hook" ? "stock" : "hook") + std::string(":") + key;
+    std::vector<uint8_t> buf;
+    const uint64_t h = llama_debug_fnv(t, buf);
+    auto it = pend.find(other);
+    if (it == pend.end()) {
+        pend[side + ":" + key] = h;
+        return true;
+    }
+    const bool eq = it->second == h;
+    pend.erase(it);
+    LLAMA_LOG_WARN("ROUTE_CHECK il=%d %s=%s\n", il, kind.c_str(), eq ? "EQ" : "NE");
+    return true;
+}
+
+static bool llama_debug_layer_hash_cb(struct ggml_tensor * t, bool ask, void * /*user*/) {
+    if (strncmp(t->name, "route_", 6) == 0) {
+        return llama_debug_route_cb(t, ask, nullptr);
+    }
+    if (strncmp(t->name, "l_out-", 6) != 0) {
+        return true;
+    }
+    if (ask) {
+        return true;
+    }
+    if (ggml_nbytes(t) < 3*sizeof(float)) {
+        return true;     // the last layer of a batch without outputs has no rows
+    }
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    uint64_t h = 1469598103934665603ULL;
+    for (const uint8_t b : buf) {
+        h = (h ^ b)*1099511628211ULL;
+    }
+    // the first row's first values too: a readable hint of how far apart two runs are
+    const float * f = (const float *) buf.data();
+    LLAMA_LOG_WARN("LDBG %s rows=%lld fnv=%016llx first=%.6g %.6g %.6g\n", t->name, (long long) t->ne[1], (unsigned long long) h, (double) f[0], (double) f[1], (double) f[2]);
+    return true;
+}
+#endif
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -255,6 +325,11 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+#ifdef LLAMA_LAYER_STREAMING
+    if (cparams.cb_eval == nullptr && (getenv("LLAMA_DEBUG_LAYER_HASH") != nullptr || getenv("LLAMA_MOE_HYBRID_ROUTE_CHECK") != nullptr)) {
+        cparams.cb_eval = llama_debug_layer_hash_cb;
+    }
+#endif
 
     cparams.ctx_other = nullptr;
 

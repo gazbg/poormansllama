@@ -300,6 +300,13 @@ int main() {
         } else {
             fprintf(stderr, "ok   probe: qwen35moe adapter selected (policy %s)\n", a->policy);
         }
+        a = llama_ls_select_adapter(LLM_ARCH_FLINT, reason);
+        if (a == nullptr || std::string(a->name) != "flint" || std::string(a->policy) != "moe-expert-bank") {
+            fprintf(stderr, "FAIL probe: flint adapter not selected (reason=%s)\n", reason.c_str());
+            failures++;
+        } else {
+            fprintf(stderr, "ok   probe: flint adapter selected (policy %s)\n", a->policy);
+        }
         a = llama_ls_select_adapter(LLM_ARCH_LLAMA, reason);
         if (a != nullptr || reason.empty()) {
             fprintf(stderr, "FAIL probe: llama must report unsupported with a reason\n");

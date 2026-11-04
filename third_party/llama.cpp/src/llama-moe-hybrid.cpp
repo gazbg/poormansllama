@@ -91,10 +91,11 @@ void ggml_backend_cuda_moe_hybrid_set_xdump(void * dev_ptr, int n_tok);
 //                             initial cache fill and as the EMA tie-break
 //   LLAMA_MOE_HYBRID_B        max promotions per token (default 16, 0 = static cache, < 0 = unlimited)
 //   LLAMA_MOE_HYBRID_LAMBDA   EMA decay (default 0.97)
-//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default 8)
+//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default: the physical cores, at most 8)
 //   LLAMA_MOE_HYBRID_FIRST    first logical CPU of the engine (default 0)
 //   LLAMA_MOE_HYBRID_STRIDE   logical CPU stride between engine threads (default 2)
 //   LLAMA_MOE_HYBRID_POLL     engine threadpool poll level (default 100)
+//   LLAMA_MOE_HYBRID_SLOW_MS  host request or DMA submission slower than this many ms is logged (default 5, 0 = never)
 //   LLAMA_MOE_HYBRID_LOG      optional JSONL path, one record per decoded token
 //
 // Policy (identical to build/q36-aer-verify/sim_policy.py "ema"): per layer the score of an expert is its
@@ -120,9 +121,35 @@ static int moe_hybrid_env_int(const char * name, int def) {
     return v && *v ? atoi(v) : def;
 }
 
+// The first logical CPU of each physical core, in the order of the OS (Windows; empty elsewhere). The team is pinned to these when the default CPU numbers do not exist.
+static std::vector<int> moe_hybrid_core_cpus() {
+    std::vector<int> cpus;
+#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601)
+    DWORD len = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return cpus;
+    }
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        return cpus;
+    }
+    for (DWORD off = 0; off < len; ) {
+        const PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+        for (int c = 0; c < 64; ++c) {
+            if (info->Processor.GroupMask[0].Mask & ((KAFFINITY) 1 << c)) {
+                cpus.push_back(c);
+                break;
+            }
+        }
+        off += info->Size;
+    }
+#endif
+    return cpus;
+}
+
 // The default size of the expert team. The workers busy-spin, so more of them than the physical cores the process may use makes them preempt each other and the decoding, engine and
 // driver threads for a whole scheduler timeslice (2.4-3.7 ms in the stall log): on a 4-core CPU the flat default of 8 gave 6-8 tok/s where 4 threads gave 30-33. 8 is the size the team
-// was tuned with (a machine with 8 or more physical cores keeps it). Linux only: elsewhere, or when the topology cannot be read, it stays 8.
+// was tuned with (a machine with 8 or more physical cores keeps it). Linux and Windows: when the topology cannot be read, it stays 8.
 static int moe_hybrid_default_threads() {
     int n = 8;
 #if defined(__linux__)
@@ -150,6 +177,11 @@ static int moe_hybrid_default_threads() {
         if (!cores.empty()) {
             n = std::min(n, (int) cores.size());
         }
+    }
+#elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601)
+    const int cores = (int) moe_hybrid_core_cpus().size();
+    if (cores > 0) {
+        n = std::min(n, cores);
     }
 #endif // defined(__linux__)
     return n;
@@ -224,6 +256,9 @@ struct moe_hybrid_engine {
     ggml_backend_t      cuda  = nullptr;
 
     int n_layer  = 0;
+    // T-FL-10: the engine's layers are the MoE layers of the model (a dense leading layer, as in flint, has no routed experts and no engine layer)
+    std::vector<int> abs_of_eng;   // engine layer -> absolute layer [n_layer]
+    std::vector<int> eng_of_abs;   // absolute layer -> engine layer, -1 for a dense layer [model layers]
     int n_expert = 0;
     int n_used   = 0;
     int n_slot   = 0;
@@ -398,6 +433,7 @@ struct moe_hybrid_engine {
     // take keeps the graph. The engine thread is the team's thread 0.
     int                                lean_mode    = 0;
     int                                lean_spin_us = 4000;   // LLAMA_MOE_HYBRID_LEAN_SPIN_US: how long an idle worker spins before it parks
+    int64_t                            slow_us      = 5000;   // LLAMA_MOE_HYBRID_SLOW_MS (default 5): host requests and DMA submissions slower than this (us) are logged, 0 = never
     int                                lean_prof    = 0;      // LLAMA_MOE_HYBRID_LEAN_PROF=1: stage times of the team (thread 0's view)
     std::string                        lean_cpus;             // LLAMA_MOE_HYBRID_LEAN_CPUS=a,b,c: logical CPUs of the team, the last one is the engine thread's (default: the engine's CPUs)
     int64_t                            lean_n_ff    = 0;
@@ -645,7 +681,15 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
 
     model    = &mdl;
     cuda     = be;
-    n_layer  = (int) g.n_layer;
+    eng_of_abs.assign((size_t) g.n_layer, -1);
+    abs_of_eng.clear();
+    for (int il = 0; il < (int) g.n_layer; ++il) {
+        if (mdl.layers[il].ffn_gate_inp != nullptr) {
+            eng_of_abs[(size_t) il] = (int) abs_of_eng.size();
+            abs_of_eng.push_back(il);
+        }
+    }
+    n_layer  = (int) abs_of_eng.size();
     n_expert = (int) g.n_expert;
     n_used   = (int) g.hparams.n_expert_used();
     n_slot   = slots;
@@ -673,6 +717,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     }
     lean_mode    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN", 0);
     lean_spin_us = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_SPIN_US", 4000);
+    slow_us      = (int64_t) moe_hybrid_env_int("LLAMA_MOE_HYBRID_SLOW_MS", 5) * 1000;
     lean_prof    = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_PROF", 0);
     lean_batch   = moe_hybrid_env_int("LLAMA_MOE_HYBRID_LEAN_BATCH", 1);
     if (const char * lc = getenv("LLAMA_MOE_HYBRID_LEAN_CPUS"); lc != nullptr && *lc != '\0') {
@@ -704,7 +749,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
         if (trace_fp == nullptr) {
             GGML_ABORT("moe_hybrid: cannot open routing trace %s", tp_path);
         }
-        const int32_t hdr[4] = { (int32_t) g.n_layer, (int32_t) g.hparams.n_expert_used(), (int32_t) g.n_expert, GGML_MOE_HYBRID_MAX_USED };
+        const int32_t hdr[4] = { (int32_t) n_layer, (int32_t) g.hparams.n_expert_used(), (int32_t) g.n_expert, GGML_MOE_HYBRID_MAX_USED };
         fwrite("MOETRC01", 1, 8, trace_fp);
         fwrite(hdr, sizeof(int32_t), 4, trace_fp);
     }
@@ -754,12 +799,13 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     h_gate.resize(n_layer);
     h_down.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        const llama_layer & L = mdl.layers[il];
+        const int ia = abs_of_eng[(size_t) il];   // the absolute layer of this engine layer
+        const llama_layer & L = mdl.layers[ia];
         if (L.ffn_gate_inp == nullptr || L.ffn_gate_up_exps || L.ffn_up_exps_s || L.ffn_gate_exps_s || L.ffn_down_exps_s ||
             L.ffn_up_exps_b || L.ffn_gate_exps_b || L.ffn_down_exps_b || L.ffn_gate_up_exps_b || L.ffn_gate_inp_b || L.ffn_exp_probs_b) {
             GGML_ABORT("moe_hybrid: layer %d has an unsupported MoE tensor set", il);
         }
-        if (g.hparams.swiglu_clamp_exp[il] > 1e-6f) {
+        if (g.hparams.swiglu_clamp_exp[ia] > 1e-6f) {
             GGML_ABORT("moe_hybrid: layer %d uses a clamped SwiGLU", il);
         }
         moe_hybrid_check_host_tensor(L.ffn_up_exps,   "ffn_up_exps",   il);
@@ -803,7 +849,7 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
             pf_last.assign((size_t) n_layer, pf_rec());
             std::vector<float> rows((size_t) n_expert*n_embd);
             for (int il = 0; il < n_layer && lean_pf_k > 0; ++il) {
-                const ggml_tensor * t = mdl.layers[il].ffn_gate_inp;
+                const ggml_tensor * t = mdl.layers[abs_of_eng[(size_t) il]].ffn_gate_inp;
                 if (t == nullptr || t->ne[0] != n_embd || t->ne[1] != n_expert || t->ne[2] != 1 || t->ne[3] != 1) {
                     LLAMA_LOG_WARN("%s: moe_hybrid: layer %d has no [n_embd, n_expert] router tensor; the lean prefetch is off\n", __func__, il);
                     lean_pf_k = 0;
@@ -1717,6 +1763,7 @@ void moe_hybrid_engine::run(std::promise<std::string> ready) {
     }
     if (err.empty() && lean_mode > 0) {
         std::vector<int> cpus;
+        const int logical = (int) std::thread::hardware_concurrency();
         if (!lean_cpus.empty()) {
             size_t pos = 0;
             while (pos < lean_cpus.size()) {
@@ -1730,13 +1777,25 @@ void moe_hybrid_engine::run(std::promise<std::string> ready) {
         } else {
             // core 0 (logical CPUs 0 and 1) takes the machine's interrupts and held the worker pinned to CPU 0 off for 0.6-100 ms in every stall the diagnostic ever reported (G16)
             const int first_eff = cpu_first == 0 ? 2 : cpu_first;
-            for (int i = 0; i < n_threads; ++i) {
-                cpus.push_back(first_eff + i*cpu_stride);
+            const std::vector<int> cores = moe_hybrid_core_cpus();
+            if (logical <= 0 || cores.empty() || first_eff + (n_threads - 1)*cpu_stride < logical) {
+                for (int i = 0; i < n_threads; ++i) {
+                    cpus.push_back(first_eff + i*cpu_stride);
+                }
+            } else {
+                // the formula runs past the last logical CPU (n physical cores with SMT): one logical CPU per physical core, core 0 left out while the others suffice
+                const size_t skip = cores.size() > (size_t) n_threads ? 1 : 0;
+                for (int i = 0; i < n_threads; ++i) {
+                    cpus.push_back(skip + (size_t) i < cores.size() ? cores[skip + (size_t) i] : -1);
+                }
+                if (skip + (size_t) n_threads > cores.size()) {
+                    LLAMA_LOG_WARN("%s: moe_hybrid: %d team threads but %zu physical cores: the extra threads are not pinned\n", __func__, n_threads, cores.size());
+                }
             }
         }
         if (main_cpu == -2) {
             // with the team off core 0 the scheduler put the decoding thread's wake-up after the logits copy onto it: the gap between two tokens grew by 230 us. Pin it away.
-            main_cpu = (!cpus.empty() && cpus.back() + 2 < 64) ? cpus.back() + 2 : -1;
+            main_cpu = (!cpus.empty() && cpus.back() >= 0 && cpus.back() + 2 < 64 && (logical <= 0 || cpus.back() + 2 < logical)) ? cpus.back() + 2 : -1;
         }
         if (cpus.empty()) {
             err = "LLAMA_MOE_HYBRID_LEAN_CPUS names no CPU";
@@ -2189,7 +2248,7 @@ void moe_hybrid_engine::serve() {
         n_requests += 1 + ng;
         serve_sum  += us*(1 + ng);
         serve_max   = std::max(serve_max, us);
-        if (us > 5000.0) {
+        if (slow_us > 0 && us > (double) slow_us) {
             LLAMA_LOG_WARN("moe_hybrid: slow host request #%lld: layer %d token %d nmiss %d took %.1f ms (copy-in %.1f, graph compute %.1f, rest %.1f), dma_state %d\n",
                            (long long) n_requests, il, j, nmiss, us/1e3, in_us/1e3, comp_us/1e3, (us - in_us - comp_us)/1e3, dma_state.load());
         }
@@ -2266,7 +2325,7 @@ void moe_hybrid_engine::dma_loop() {
             const double us = moe_hybrid_us(t0);
             dma_submit_sum += us;
             dma_submit_max  = std::max(dma_submit_max, us);
-            if (us > 5000.0) {
+            if (slow_us > 0 && us > (double) slow_us) {
                 LLAMA_LOG_WARN("moe_hybrid: slow DMA submission #%lld took %.1f ms (dma thread)\n", (long long) n_dma_engine, us/1e3);
             }
             bulk_dma.store(false, std::memory_order_release);
@@ -3244,6 +3303,19 @@ public:
 
 } // namespace
 
+bool llama_moe_hybrid_layer_map_impl(std::vector<int> & eng_of_abs_out) {
+    moe_hybrid_engine * eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+        if (g_moe_hybrid_engines.size() != 1) {
+            return false;
+        }
+        eng = g_moe_hybrid_engines.begin()->second.get();
+    }
+    eng_of_abs_out = eng->eng_of_abs;
+    return true;
+}
+
 bool llama_moe_hybrid_seed_impl(const int32_t * ids, int K, int * n_layer, int * n_used) {
     moe_hybrid_engine * eng = nullptr;
     {
@@ -3414,6 +3486,18 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
 
     moe_hybrid_engine * eng = moe_hybrid_get(g, model, n_slot);
 
+    // a dense layer (flint's leading layers) has no routed experts: the stock graph runs it
+    if (il >= (int) eng->eng_of_abs.size() || eng->eng_of_abs[(size_t) il] < 0) {
+        return nullptr;
+    }
+    // the router gating of this hook: softmax (Qwen) or sigmoid (flint); any other gating is left to the stock graph
+    const int gating = (int) g.hparams.expert_gating_func;
+    if (gating != 0 && gating != (int) LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && gating != (int) LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) {
+        return nullptr;
+    }
+    // every table of the engine is indexed by its own layer numbering
+    const int ie = eng->eng_of_abs[(size_t) il];
+
     llm_graph_input_moe_hybrid * inp = nullptr;
     for (auto & p : g.res->inputs) {
         if (auto * cand = dynamic_cast<llm_graph_input_moe_hybrid *>(p.get())) {
@@ -3439,7 +3523,7 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     ggml_tensor * logits = g.build_lora_mm(L.ffn_gate_inp, cur); // [n_expert, T]
     g.cb(logits, "ffn_moe_logits", il);
 
-    ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+    ggml_tensor * probs = gating == (int) LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ? ggml_sigmoid(ctx0, logits) : ggml_soft_max(ctx0, logits);
     g.cb(probs, "ffn_moe_probs", il);
 
     ggml_tensor * selected = ggml_argsort_top_k(ctx0, probs, n_expert_used); // [n_expert_used, T]
@@ -3459,6 +3543,23 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     g.cb(weights, "ffn_moe_weights_norm", il);
     weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tok);
 
+    // check mode (LLAMA_MOE_HYBRID_ROUTE_CHECK=1): the stock router of build_moe_ffn on the same input; the debug callback of llama-context.cpp compares it
+    // with the hook's ffn_moe_topk and ffn_moe_weights_norm of the same step (bit identity of ids and weights, the FL-5 gate)
+    static const bool route_check = getenv("LLAMA_MOE_HYBRID_ROUTE_CHECK") != nullptr;
+    if (route_check) {
+        ggml_format_name(selected, "route_hook_ids-%d", il);
+        ggml_format_name(weights, "route_hook_w-%d", il);
+        ggml_tensor * sl = g.build_lora_mm(L.ffn_gate_inp, cur);
+        ggml_tensor * sp = gating == (int) LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ? ggml_sigmoid(ctx0, sl) : ggml_soft_max(ctx0, sl);
+        ggml_tensor * ss = ggml_argsort_top_k(ctx0, sp, n_expert_used);
+        ggml_tensor * sw = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, sp, 1, n_expert, n_tok), ss);
+        sw = ggml_reshape_2d(ctx0, sw, n_expert_used, n_tok);
+        sw = ggml_div(ctx0, sw, ggml_clamp(ctx0, ggml_sum_rows(ctx0, sw), 6.103515625e-5, INFINITY));
+        g.cb(ss, "route_stock_ids", il);
+        g.cb(sw, "route_stock_w", il);
+        ggml_build_forward_expand(g.gf, ss);
+        ggml_build_forward_expand(g.gf, sw);
+    }
     const float w_scale = g.hparams.expert_weights_scale;
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
@@ -3467,8 +3568,8 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
     ggml_build_forward_expand(g.gf, weights);
 
     // cache slots for the selected experts (miss -> zero slot) and the host requests for the misses, one mailbox per token
-    ggml_tensor * p = ggml_moe_hybrid_publish(ctx0, selected, weights, cur, inp->map, eng->state, il,
-                                              (int32_t) n_expert, eng->slots_l[(size_t) il], eng->mb_dev, (int32_t) eng->mb_stride, eng->trace_dev, eng->trace_stride);
+    ggml_tensor * p = ggml_moe_hybrid_publish(ctx0, selected, weights, cur, inp->map, eng->state, ie,
+                                              (int32_t) n_expert, eng->slots_l[(size_t) ie], eng->mb_dev, (int32_t) eng->mb_stride, eng->trace_dev, eng->trace_stride);
     g.cb(p, "ffn_moe_hybrid_pub", il);
     ggml_build_forward_expand(g.gf, p);
 
@@ -3481,13 +3582,24 @@ ggml_tensor * llama_moe_hybrid_build_ffn(const llm_graph_context & g, const llam
         ((int32_t *) mm->op_params)[GGML_MOE_HYBRID_ID_FLAG_IDX] = GGML_MOE_HYBRID_ID_FLAG_DUP;
         return mm;
     };
-    ggml_tensor * up = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_up[il], cur3, ids)); // [n_ff, n_expert_used, T]
+    ggml_tensor * up = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_up[(size_t) ie], cur3, ids)); // [n_ff, n_expert_used, T]
     g.cb(up, "ffn_moe_up", il);
-    ggml_tensor * gate = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_gate[il], cur3, ids));
+    ggml_tensor * gate = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_gate[(size_t) ie], cur3, ids));
     g.cb(gate, "ffn_moe_gate", il);
     ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
     g.cb(act, "ffn_moe_swiglu", il);
-    ggml_tensor * experts = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_down[il], act, ids)); // [n_embd, n_expert_used, T]
+    // flint: the rescale of the down-projection input of llm_graph_context::build_moe_ffn, undone after the down projection (on the device only: the host leg
+    // computes the same product in its own arithmetic, a rounding-level difference that the routing does not see)
+    ggml_tensor * amax_scale = nullptr;
+    if (g.arch == LLM_ARCH_FLINT) {
+        llm_graph_amax_src1 amax = g.build_amax_src1_f16(act);
+        act = amax.res;
+        amax_scale = amax.scale_s;
+    }
+    ggml_tensor * experts = mark_dup_ids(ggml_mul_mat_id(ctx0, eng->c_down[(size_t) ie], act, ids)); // [n_embd, n_expert_used, T]
+    if (amax_scale != nullptr) {
+        experts = ggml_mul(ctx0, experts, amax_scale);
+    }
     g.cb(experts, "ffn_moe_down", il);
     experts = ggml_mul(ctx0, experts, weights);
     g.cb(experts, "ffn_moe_weighted", il);

@@ -24,6 +24,7 @@
 #include "llama-batch.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-layer-streaming.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
@@ -33,6 +34,7 @@
 #include "llama-io.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
@@ -63,6 +65,29 @@ void llama_lm_state_deleter::operator()(llama_lm_state * s) const {
 static bool lm_log_on() {
     static const bool on = getenv("LLAMA_LM_LOG") != nullptr;
     return on;
+}
+
+// The context's memory as the pass sees it. Two shapes are served: the hybrid memory of the Qwen3.5/3.6 models (an attention cache and a recurrent cache) and the interleaved sliding-window memory of
+// flint (a base cache for the full-attention layers and a window cache for the others, no recurrent state). `attn` is the cache whose layout the plan checks and whose cells the pass forces to
+// c0 + position: the attention cache of the hybrid memory, the base cache of the window memory.
+struct lm_mem_t {
+    llama_memory_hybrid *    mh   = nullptr;
+    llama_kv_cache_iswa *    iswa = nullptr;
+    llama_kv_cache *         attn = nullptr;
+    llama_kv_cache *         swa  = nullptr;     // iswa only
+    llama_memory_recurrent * recr = nullptr;     // hybrid only
+};
+
+static lm_mem_t lm_mem_of(llama_memory_i * m) {
+    lm_mem_t r;
+    if ((r.mh = dynamic_cast<llama_memory_hybrid *>(m)) != nullptr) {
+        r.attn = r.mh->get_mem_attn();
+        r.recr = r.mh->get_mem_recr();
+    } else if ((r.iswa = dynamic_cast<llama_kv_cache_iswa *>(m)) != nullptr) {
+        r.attn = r.iswa->get_base();
+        r.swa  = r.iswa->get_swa();
+    }
+    return r;
 }
 
 // G42: the serializer of a snapshot. llama_memory_recurrent::state_write writes the rows through write_tensor(); this writer serves them from the host copies taken inside the pass, so the blob has the format
@@ -167,14 +192,14 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         return pl;
     }
 
-    auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (mh == nullptr) {
+    const lm_mem_t mem = lm_mem_of(memory.get());
+    if (mem.attn == nullptr) {
         pl.why = "no hybrid memory";
         return pl;
     }
 
     // rollback snapshots (MTP): the pass runs in the plain mode (see lm_run), so the state of the seq must stand in the plain plane
-    if (cparams.n_rs_seq != 0 && mh->get_mem_recr()->rs_idx[seq] != 0) {
+    if (cparams.n_rs_seq != 0 && mem.recr != nullptr && mem.recr->rs_idx[seq] != 0) {
         pl.why = "a recurrent rollback is pending";
         return pl;
     }
@@ -228,20 +253,31 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     }
 
     // a pending K-shift would be applied by memory_update after the plan is made
-    if (mh->get_mem_attn()->get_has_shift()) {
+    if (mem.attn->get_has_shift() || (mem.swa != nullptr && mem.swa->get_has_shift())) {
         pl.why = "a K-shift is pending";
         return pl;
     }
 
     // the sequence's cells must be one contiguous block (cell == c0 + position) with room behind it, and the recurrent state must stand exactly at p0
-    const int64_t c0 = mh->get_mem_attn()->lm_block(seq, p0, (uint32_t) n, &pl.why_detail);
+    const int64_t c0 = mem.attn->lm_block(seq, p0, (uint32_t) n, &pl.why_detail);
     if (c0 < 0) {
         pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
         return pl;
     }
-    if (mh->get_mem_recr()->seq_pos_max(seq) != p0 - 1) {
+    if (mem.recr != nullptr && mem.recr->seq_pos_max(seq) != p0 - 1) {
         pl.why = "the recurrent state is not at the batch's first position";
         return pl;
+    }
+    if (mem.swa != nullptr) {
+        // a sliding-window cache is a ring of n_swa + n_ubatch cells: a chunk of the pass plus the window behind its first token must fit, as it does for the ordinary path's ubatch
+        int32_t wmax = 1;
+        for (const int32_t w : pl.widths) {
+            wmax = std::max(wmax, w);
+        }
+        if ((uint64_t) mem.swa->get_size() < (uint64_t) model.hparams.n_swa + (uint64_t) wmax) {
+            pl.why = "the window cache is smaller than the window plus a chunk of the pass (raise -ub to the chunk size)";
+            return pl;
+        }
     }
 
     pl.ok  = true;
@@ -293,7 +329,7 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
             S.armed        = false;
             S.armed_batch  = false;
             S.cur_w        = wmax;
-            S.free_pre     = lm_dev_free(lm_follower ? S.p.device : -1) + S.slot_total + 2*(int64_t) S.slab_half;
+            S.free_pre     = lm_dev_free(lm_follower ? S.p.device : -1) + S.slot_total + 2*(int64_t) S.slab_half + (int64_t) S.swa_alloc_bytes;
             S.t_acquire_us = 0;
             S.n_arm_used++;
             return true;
@@ -329,6 +365,20 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         }
     }
     const int64_t slot_total = (int64_t) (slot_bytes + 4096) * P.n_slots;
+    // a model with a sliding-window cache: one window mask per chunk of a segment (f16 [n_kv, chunk]; n_kv is at most the ring). A resumed pass starts with a short chunk, so one chunk more than
+    // segment/ubatch can share a segment; two more are reserved.
+    const lm_mem_t mem_ = lm_mem_of(memory.get());
+    size_t  swa_slot  = 0;
+    int32_t swa_slots = 0;
+    if (mem_.swa != nullptr) {
+        swa_slots = (int32_t) (P.segment / P.ubatch) + 2;
+        swa_slot  = GGML_PAD((size_t) mem_.swa->get_size() * (size_t) wmax * sizeof(ggml_fp16_t), (size_t) 256);
+    }
+    // behind the masks: per chunk the positions (up to 4 values of 4 bytes per token), four index vectors (I64) and, once, the rotation matrices of the two caches (F32, up to 128 x 128 each)
+    const size_t inp_slot  = mem_.swa != nullptr ? 6*GGML_PAD((size_t) wmax*8, (size_t) 256) : 0;     // six units of 8 bytes per token: the positions take two, each index vector one
+    const size_t inp_const = mem_.swa != nullptr ? (size_t) 4*65536 : 0;
+    const int64_t swa_mask_total = (int64_t) swa_slot * swa_slots;
+    const int64_t swa_total = swa_mask_total + (int64_t) (inp_slot * (size_t) swa_slots + inp_const);
     int64_t sched_est = S.sched_est > 0 ? (int64_t) S.sched_est : (int64_t) ((double) P.ubatch/2048.0*560.0*1048576.0) + (int64_t) 96*1048576;
     const bool dense = model.arch == LLM_ARCH_QWEN35;
     if (dense) {
@@ -347,7 +397,7 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         const int64_t meas = (int64_t) ((double) S.var_meas*scale) + (int64_t) 16*1048576 + (int64_t) 32*1048576;
         sched_est = dense ? meas : std::max(sched_est, meas);
     }
-    const int64_t need = slot_total + 2*(int64_t) half + sched_est + (int64_t) 64*1048576;
+    const int64_t need = slot_total + 2*(int64_t) half + swa_total + sched_est + (int64_t) 64*1048576;
 
     auto * const vram_hook = lm_follower ? nullptr : llama_lm_vram_hook;     // H94: the follower's GPU has no hybrid expert cache
     if (vram_hook != nullptr && !vram_hook(this, need, 1)) {
@@ -390,6 +440,20 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
     }
     S.slab_half   = half;
     S.slab_tokens = seg_tokens;
+    if (swa_total > 0) {
+        S.swa_mask.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(P.device), (size_t) swa_total));
+        if (!S.swa_mask) {
+            LLAMA_LOG_WARN("%s: lm-prefill: the window masks (%.1f MiB) could not be allocated; this batch takes the ordinary path\n", __func__, (double) swa_total/1048576.0);
+            lm_release();
+            return false;
+        }
+        S.swa_mask_slot  = swa_slot;
+        S.swa_mask_slots = swa_slots;
+        S.swa_inp_off    = (size_t) swa_mask_total;
+        S.swa_inp_slot   = inp_slot;
+        S.swa_inp_const  = (size_t) swa_mask_total + inp_slot*(size_t) swa_slots;
+        S.swa_alloc_bytes = (size_t) swa_total;
+    }
     S.t_acquire_us = ggml_time_us() - t_a0;
 
     // the pass runs on its own scheduler: its compute buffer is allocated by the pass and returned with it, and the context's persistent decode graphs keep the buffer they were planned on.
@@ -399,6 +463,9 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         LLAMA_LOG_WARN("%s: lm-prefill: the pass scheduler could not be created; this batch takes the ordinary path\n", __func__);
         lm_release();
         return false;
+    }
+    if (cparams.cb_eval != nullptr) {
+        ggml_backend_sched_set_eval_callback(S.sched_pp.get(), cparams.cb_eval, cparams.cb_eval_user_data);     // the debug hash callback (LLAMA_DEBUG_LAYER_HASH) sees the pass's pieces too
     }
 
     S.live = true;
@@ -411,7 +478,7 @@ void llama_context::lm_release() {
 
     // G40: what this pass really took on the device besides the slot window and the slab (the next pass asks for it)
     if (S.live && S.free_pre > 0) {
-        const int64_t var = S.free_pre - lm_dev_free(lm_follower ? S.p.device : -1) - S.slot_total - 2*(int64_t) S.slab_half;
+        const int64_t var = S.free_pre - lm_dev_free(lm_follower ? S.p.device : -1) - S.slot_total - 2*(int64_t) S.slab_half - (int64_t) S.swa_alloc_bytes;
         // a pass of a few tokens (the 4-token tail behind a checkpoint) measures only the fixed cost; scaled by the width ratio it asked for 2 GB and starved the next pass (found 2026-10-20)
         if (var > 0 && S.cur_w >= 256) {
             S.var_meas = var;
@@ -441,6 +508,10 @@ void llama_context::lm_release() {
         S.slots_live = false;
     }
     S.slab.reset();
+    S.swa_mask.reset();
+    S.swa_mask_slot  = 0;
+    S.swa_mask_slots = 0;
+    S.swa_inp_off = S.swa_inp_slot = S.swa_inp_const = S.swa_alloc_bytes = 0;
     S.live = false;
     S.armed = false;
     S.armed_batch = false;
@@ -733,6 +804,8 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
 
     // A context with rollback snapshots (MTP, n_rs_seq > 0) keeps the state in (1 + n_rs_seq) planes and builds the snapshot-writing graph. The pass writes plane 0 with the plain graph
     // and splits its chunks without the keep-tail rule, so the graphs and the memory see n_rs_seq == 0 until the pass is over (the plan checked that the seq stands in plane 0).
+    const lm_mem_t lmem = lm_mem_of(memory.get());
+    uint32_t       rs_dummy = 0;      // a memory without a recurrent cache (flint) has no snapshot count to make plain
     struct rs_plain_t {
         uint32_t * cp;
         uint32_t * mem;
@@ -740,7 +813,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         uint32_t   mem0;
         rs_plain_t(uint32_t * cp, uint32_t * mem) : cp(cp), mem(mem), cp0(*cp), mem0(*mem) { *cp = 0; *mem = 0; }
         ~rs_plain_t() { *cp = cp0; *mem = mem0; }
-    } rs_plain { &cparams.n_rs_seq, &static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr()->n_rs_seq };
+    } rs_plain { &cparams.n_rs_seq, lmem.recr != nullptr ? &lmem.recr->n_rs_seq : &rs_dummy };
 
     // the outputs the ordinary decode would reserve (and reset), before anything is changed
     if (output_reserve(n_outputs_all) < n_outputs_all || (n_outputs_all > 0 && logits.data == nullptr)) {
@@ -982,7 +1055,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
     struct force_guard_t {
         llama_kv_cache * kv;
         ~force_guard_t() { kv->lm_force(-1); }
-    } force_guard { static_cast<llama_memory_hybrid *>(memory.get())->get_mem_attn() };
+    } force_guard { lmem.attn };
 
     auto half_ptr = [&](int which, int64_t row) -> void * {
         return slab_base + (size_t) which*S.slab_half + (size_t) row*row_bytes;
@@ -1086,6 +1159,15 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         return true;
     };
 
+    // a model with a sliding-window cache (flint): host staging for the window mask of one chunk, which is filled with the cache's own function and uploaded to the pass's persistent buffer
+    ggml_backend_buffer_ptr swa_host;
+    if (lmem.swa != nullptr) {
+        swa_host.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), S.swa_mask_slot));
+        if (!swa_host || !S.swa_mask) {
+            return fail("could not allocate the window mask staging buffer", 1);
+        }
+    }
+
     for (int seg = 0; seg < n_segs; ++seg) {
         const int c0 = seg_first[(size_t) seg];
         const int c1 = seg_first[(size_t) seg + 1];
@@ -1095,8 +1177,54 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             chunks[c].mctx.reset();
         }
 
+        // 0. preload the first n_slots streamed layers, seed the async feed
+        auto preload_banks = [&]() -> bool {
+            std::vector<uint8_t> slot_taken((size_t) ls.n_slots, 0);
+            int preloaded = 0;
+            int last_pre  = -1;
+            for (int il = 0; il < n_layer && preloaded < ls.n_slots; ++il) {
+                if (is_native(il) || slot_taken[(size_t) (il % ls.n_slots)]) {
+                    continue;
+                }
+                slot_taken[(size_t) (il % ls.n_slots)] = 1;
+                if (ls.af && ls.pp_copy_piece_bytes > 0) {
+                    // paced copies: the feed worker stages the first banks (smallest layer first) while the resident layers at the head of the sweep compute; the loop below waits for each bank's event.
+                    // Staged here on the main thread they delayed the first layer by the copy time of n_slots banks (about 100 ms for the Flint banks).
+                    ls.af_push(il);
+                } else {
+                    bool copied = false;
+                    if (!ls.load_layer(il, copied)) {
+                        return false;
+                    }
+                }
+                last_pre = il;
+                preloaded++;
+            }
+            if (ls.af && last_pre >= 0) {
+                const int nxt = ls.af_next_layer(last_pre);
+                if (nxt >= 0) {
+                    ls.af_push(nxt);
+                }
+            }
+            return true;
+        };
+        // with paced copies the feed worker is started BEFORE the chunks are applied: step 1 builds one window mask per chunk on this thread (about 95 ms for the Flint 8.6k prompt) and the copy engine
+        // idled for all of it, although the pass is copy-bound when crowded (nsys fl3b-p8-prefill: the first bank copy started at 95 ms), so those milliseconds were lost one for one (FL-3)
+        const bool banks_early = ls.af && ls.pp_copy_piece_bytes > 0;
+        if (banks_early && lmem.attn != nullptr && lmem.attn->is_lazy()) {
+            // commit the segment's KV rows BEFORE the first bank copy is queued: the driver's map / access calls took 60 ms with the copy engine busy and about 10 ms without (FL-3: layer 0 started
+            // at 157 ms with the banks queued first, at 110 ms after them). The same rows the chunks' apply() would commit one chunk at a time.
+            const int64_t rows_end = (int64_t) pl.c0 + pl.p0 + chunk_t0[c1 - 1] + pl.widths[c1 - 1];
+            lmem.attn->lazy_commit_rows((uint32_t) std::min<int64_t>(rows_end, (int64_t) lmem.attn->get_size()), this);
+        }
+        if (banks_early && !preload_banks()) {
+            return fail(ls.error_msg.c_str(), -3);
+        }
+
         // 1. apply the chunks' memory contexts: the KV cells, the recurrent cell and the inputs of every chunk are fixed here
         int64_t row = 0;
+        const int64_t su_t0 = ggml_time_us();
+        double su_apply = 0.0, su_mask = 0.0, su_up = 0.0;     // LLAMA_LM_LOG: where the setup before the first layer goes
         for (int c = c0; c < c1; ++c) {
             const int32_t n_c = pl.widths[c];
             llama_batch cb = {
@@ -1113,6 +1241,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             if (!vballoc.init(*vcompat.batch_ext, model.vocab, output_all)) {
                 return fail("could not initialise a chunk batch", 1);
             }
+            const int64_t su_a0 = ggml_time_us();
             force_guard.kv->lm_force(pl.c0 + pl.p0 + chunk_t0[c]);
             auto vmctx = memory->init_batch(vballoc, n_c, output_all);
             if (!vmctx || vmctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -1122,8 +1251,89 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             if (!vmctx->apply()) {
                 return fail("the memory could not apply a chunk", -3);
             }
+            su_apply += (double) (ggml_time_us() - su_a0);
 
-            if (c == 0) {
+            if (lmem.swa != nullptr) {
+                // the window mask of this chunk, from the cell metadata as it stands right now (this chunk is applied and no later one is: exactly the state the ordinary path's graph for this ubatch sees),
+                // kept for every window layer. The cells of a later chunk may reuse this chunk's, so the mask cannot be made later.
+                const int slot = c - c0;
+                if (slot < 0 || slot >= S.swa_mask_slots) {
+                    return fail("the window masks of the segment do not fit their buffer", -3);
+                }
+                const auto * ic = static_cast<const llama_kv_cache_iswa_context *>(vmctx.get());
+                const llama_kv_cache_context * sc = ic->get_swa();
+                const int64_t n_kv  = sc->get_n_kv();
+                const size_t  bytes = (size_t) n_kv * (size_t) n_c * sizeof(ggml_fp16_t);
+                if (bytes > S.swa_mask_slot) {
+                    return fail("a window mask is larger than its slot", -3);
+                }
+                ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+                ggml_context_ptr hc(ggml_init(ip));
+                ggml_tensor * ht = ggml_new_tensor_4d(hc.get(), GGML_TYPE_F16, n_kv, n_c, 1, 1);
+                ggml_tensor * dt = ggml_new_tensor_4d(hc.get(), GGML_TYPE_F16, n_kv, n_c, 1, 1);
+                ggml_backend_tensor_alloc(swa_host.get(), ht, ggml_backend_buffer_get_base(swa_host.get()));
+                ggml_backend_tensor_alloc(S.swa_mask.get(), dt, (char *) ggml_backend_buffer_get_base(S.swa_mask.get()) + (size_t) slot*S.swa_mask_slot);
+                const int64_t su_m0 = ggml_time_us();
+                sc->set_input_kq_mask(ht, &vmctx->get_ubatch(), cparams.causal_attn);
+                const int64_t su_m1 = ggml_time_us();
+                ggml_backend_tensor_set(dt, ht->data, 0, bytes);
+                su_mask += (double) (su_m1 - su_m0);
+                su_up   += (double) (ggml_time_us() - su_m1);
+
+                // the small inputs of this chunk (positions, the cell indices of the two caches), once, into the persistent buffer: a piece then uploads nothing, so no bank copy delays it
+                static const bool persist_inputs = getenv("LLAMA_LM_PERSIST_INPUTS") == nullptr || atoi(getenv("LLAMA_LM_PERSIST_INPUTS")) != 0;
+                const llama_ubatch & ub   = vmctx->get_ubatch();
+                if (persist_inputs) {
+                char *               pbase = (char *) ggml_backend_buffer_get_base(S.swa_mask.get());
+                const size_t         unit = S.swa_inp_slot/6;
+                char *               reg  = pbase + S.swa_inp_off + (size_t) slot*S.swa_inp_slot;
+                GGML_ASSERT(ub.token != nullptr && ub.pos != nullptr && (size_t) ub.n_tokens*8 <= unit && (size_t) ub.n_tokens*hparams.n_pos_per_embd()*sizeof(llama_pos) <= 2*unit);
+                ggml_init_params ip2 = { 64*ggml_tensor_overhead(), nullptr, true };
+                ggml_context_ptr hc2(ggml_init(ip2));
+                {
+                    ggml_tensor * pd = ggml_new_tensor_1d(hc2.get(), GGML_TYPE_I32, (int64_t) ub.n_tokens*hparams.n_pos_per_embd());
+                    ggml_backend_tensor_alloc(S.swa_mask.get(), pd, reg);
+                    ggml_backend_tensor_set(pd, ub.pos, 0, ggml_nbytes(pd));
+                }
+                auto fill_idxs = [&](const llama_kv_cache_context * cc, char * k_addr, char * v_addr) {
+                    ggml_tensor * kd = cc->build_input_k_idxs(hc2.get(), ub);
+                    ggml_tensor * vd = cc->build_input_v_idxs(hc2.get(), ub);
+                    GGML_ASSERT(ggml_nbytes(kd) <= unit && ggml_nbytes(vd) <= unit && "the layer-major pass of a window-cache model needs the V cache not transposed");
+                    ggml_tensor * kh = ggml_new_tensor_1d(hc2.get(), GGML_TYPE_I64, kd->ne[0]);
+                    ggml_tensor * vh = ggml_new_tensor_1d(hc2.get(), GGML_TYPE_I64, vd->ne[0]);
+                    ggml_backend_tensor_alloc(swa_host.get(), kh, ggml_backend_buffer_get_base(swa_host.get()));
+                    ggml_backend_tensor_alloc(swa_host.get(), vh, (char *) ggml_backend_buffer_get_base(swa_host.get()) + GGML_PAD(ggml_nbytes(kh), (size_t) 256));
+                    ggml_backend_tensor_alloc(S.swa_mask.get(), kd, k_addr);
+                    ggml_backend_tensor_alloc(S.swa_mask.get(), vd, v_addr);
+                    cc->set_input_k_idxs(kh, &ub);
+                    cc->set_input_v_idxs(vh, &ub);
+                    ggml_backend_tensor_set(kd, kh->data, 0, ggml_nbytes(kd));
+                    ggml_backend_tensor_set(vd, vh->data, 0, ggml_nbytes(vd));
+                };
+                fill_idxs(ic->get_base(), reg + 2*unit, reg + 3*unit);
+                fill_idxs(ic->get_swa(),  reg + 4*unit, reg + 5*unit);
+                if (c == c0) {
+                    // the constant rotation matrices of the two caches (a host-only fill)
+                    auto fill_rot = [&](ggml_tensor * dd, size_t off, bool is_k, const llama_kv_cache_context * cc) {
+                        if (dd == nullptr) {
+                            return;
+                        }
+                        GGML_ASSERT(ggml_nbytes(dd) <= 65536 && S.swa_inp_const + off + ggml_nbytes(dd) <= S.swa_alloc_bytes);
+                        ggml_tensor * hd = ggml_new_tensor_2d(hc2.get(), GGML_TYPE_F32, dd->ne[0], dd->ne[1]);
+                        ggml_backend_tensor_alloc(swa_host.get(), hd, ggml_backend_buffer_get_base(swa_host.get()));
+                        ggml_backend_tensor_alloc(S.swa_mask.get(), dd, pbase + S.swa_inp_const + off);
+                        if (is_k) { cc->set_input_k_rot(hd); } else { cc->set_input_v_rot(hd); }
+                        ggml_backend_tensor_set(dd, hd->data, 0, ggml_nbytes(dd));
+                    };
+                    fill_rot(ic->get_base()->build_input_k_rot(hc2.get()), 0,      true,  ic->get_base());
+                    fill_rot(ic->get_base()->build_input_v_rot(hc2.get()), 65536,  false, ic->get_base());
+                    fill_rot(ic->get_swa()->build_input_k_rot(hc2.get()),  131072, true,  ic->get_swa());
+                    fill_rot(ic->get_swa()->build_input_v_rot(hc2.get()),  196608, false, ic->get_swa());
+                }
+                }   // persist_inputs
+            }
+
+            if (c == 0 && lmem.mh != nullptr) {
                 // the first chunk of the pass: make the recurrent state cell what the in-graph "zero this cell, then gather from src" would have made it, and let every
                 // chunk (this one included) run with the identity gather it will see once all chunks are applied
                 const auto * mh = static_cast<const llama_memory_hybrid_context *>(vmctx.get());
@@ -1169,6 +1379,11 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         }
 
         auto sweep = [&](int ca, int cb) -> int {
+            if (lm_log_on()) {
+                LLAMA_LOG_WARN("%s: lm-prefill: setup of %d chunks: %.1f ms (apply %.1f, window mask fill %.1f, mask upload %.1f)\n", __func__, c1 - c0,
+                               (double) (ggml_time_us() - su_t0)/1000.0, su_apply/1000.0, su_mask/1000.0, su_up/1000.0);
+            }
+
             // 2. embed every chunk (slab half 0); in the interleave only the owner of layer 0 does
             if (!(ilv_run && role == 2)) {
                 const int64_t t_e0 = ggml_time_us();
@@ -1186,29 +1401,9 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                 t_embed += (double) (ggml_time_us() - t_e0);
             }
 
-            // 3. preload the first n_slots streamed layers, seed the async feed
-            {
-                std::vector<uint8_t> slot_taken((size_t) ls.n_slots, 0);
-                int preloaded = 0;
-                int last_pre  = -1;
-                for (int il = 0; il < n_layer && preloaded < ls.n_slots; ++il) {
-                    if (is_native(il) || slot_taken[(size_t) (il % ls.n_slots)]) {
-                        continue;
-                    }
-                    slot_taken[(size_t) (il % ls.n_slots)] = 1;
-                    bool copied = false;
-                    if (!ls.load_layer(il, copied)) {
-                        return fail(ls.error_msg.c_str(), -3);
-                    }
-                    last_pre = il;
-                    preloaded++;
-                }
-                if (ls.af && last_pre >= 0) {
-                    const int nxt = ls.af_next_layer(last_pre);
-                    if (nxt >= 0) {
-                        ls.af_push(nxt);
-                    }
-                }
+            // 3. preload the first n_slots streamed layers, seed the async feed (already done before step 1 when the copies are paced)
+            if (!banks_early && !preload_banks()) {
+                return fail(ls.error_msg.c_str(), -3);
             }
 
             // 4. layers on the outside, chunks on the inside (ascending)
@@ -1232,8 +1427,14 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                     }
                     t_slotwait += wait_us;
                     {
-                        const int nxt = ls.af_next_layer(il);
-                        if (nxt >= 0 && ls.af) {
+                        // one layer ahead; with paced copies (the queue is de-duplicated and served in layer order) as many as there are free slots, so the copy stream does not wait for this thread to see a bank arrive
+                        const int ahead = ls.pp_copy_piece_bytes > 0 ? std::max(1, ls.n_slots - 1) : 1;
+                        int nxt = il;
+                        for (int k = 0; k < ahead && ls.af; ++k) {
+                            nxt = ls.af_next_layer(nxt);
+                            if (nxt < 0) {
+                                break;
+                            }
                             ls.af_push(nxt);
                         }
                     }
@@ -1292,6 +1493,31 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                     lmi.q_pos_base = (int32_t) (pl.p0 + chunks[c].t0);
                     lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
                     lmi.kv_cell0   = (int32_t) pl.c0;
+                    {
+                        // debug (bisecting a difference to the ordinary path): LLAMA_LM_NO_IMPLICIT=1 gives the full-attention layers the ordinary masked attention instead of the mask-free causal op
+                        static const bool no_implicit = getenv("LLAMA_LM_NO_IMPLICIT") != nullptr;
+                        lmi.implicit_causal = !no_implicit;
+                    }
+                    if (lmem.swa != nullptr) {
+                        // the chunk's window mask (see the apply loop): slot (c - first chunk of the segment) of the persistent buffer
+                        lmi.swa_buf  = S.swa_mask.get();
+                        lmi.swa_mask = (char *) ggml_backend_buffer_get_base(S.swa_mask.get()) + (size_t) (c - c0)*S.swa_mask_slot;
+                        static const bool persist_inputs_p = getenv("LLAMA_LM_PERSIST_INPUTS") == nullptr || atoi(getenv("LLAMA_LM_PERSIST_INPUTS")) != 0;
+                        if (persist_inputs_p) {
+                            char *       pbase = (char *) ggml_backend_buffer_get_base(S.swa_mask.get());
+                            const size_t unit  = S.swa_inp_slot/6;
+                            char *       reg   = pbase + S.swa_inp_off + (size_t) (c - c0)*S.swa_inp_slot;
+                            lmi.inp_pos        = reg;
+                            lmi.inp_k_idxs     = reg + 2*unit;
+                            lmi.inp_v_idxs     = reg + 3*unit;
+                            lmi.inp_k_idxs_swa = reg + 4*unit;
+                            lmi.inp_v_idxs_swa = reg + 5*unit;
+                            lmi.inp_k_rot      = pbase + S.swa_inp_const;
+                            lmi.inp_v_rot      = pbase + S.swa_inp_const + 65536;
+                            lmi.inp_k_rot_swa  = pbase + S.swa_inp_const + 131072;
+                            lmi.inp_v_rot_swa  = pbase + S.swa_inp_const + 196608;
+                        }
+                    }
                     double tc = 0.0;
                     if (!run_piece(lmi, chunks[c].mctx->get_ubatch(), chunks[c].mctx.get(), tc)) {
                         return fail("layer failed", -3);
@@ -1450,7 +1676,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
 
     // G42: the snapshots become the blobs the caller stores as checkpoints (the real serializer, the host rows and the cell position substituted)
     S.snaps.clear();
-    if (!snap_rows.empty() && role != 2) {
+    if (!snap_rows.empty() && role != 2 && lmem.mh != nullptr) {
         const int64_t t_b0 = ggml_time_us();
         llama_memory_recurrent * mr = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_recr();
         bool snap_ok = true;
@@ -1601,8 +1827,8 @@ bool llama_context::lm_prearm(llama_seq_id seq, int64_t n_tokens) {
         return false;
     }
     auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (mh == nullptr) {
-        return false;
+    if (mh == nullptr && seq >= 0) {
+        return false;   // the batch arm reads the attention and recurrent layout; the idle arm needs the room, the window and the banks only (lm_acquire_n handles a window cache)
     }
     if (seq >= 0) {
         // the checks lm_make_plan makes for the batch itself
@@ -1768,18 +1994,28 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
         return false;
     }
     const bool dense = model.arch == LLM_ARCH_QWEN35;
-    if (model.arch != LLM_ARCH_QWEN35MOE && !dense) {
-        err = "the layer-major prefill supports the Qwen3.5/3.6 MoE and the dense Qwen3.5/3.8 architectures only";
+    const bool flint = model.arch == LLM_ARCH_FLINT;
+    if (model.arch != LLM_ARCH_QWEN35MOE && !dense && !flint) {
+        err = "the layer-major prefill supports the Qwen3.5/3.6 MoE, the dense Qwen3.5/3.8 and the Flint MoE architectures only";
         return false;
     }
-    auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (mh == nullptr) {
-        err = "the context has no hybrid (attention + recurrent) memory";
+    const lm_mem_t mem = lm_mem_of(memory.get());
+    if (flint ? mem.iswa == nullptr : mem.mh == nullptr) {
+        err = flint ? "the context has no sliding-window (base + window cache) memory" : "the context has no hybrid (attention + recurrent) memory";
         return false;
     }
     if (!cparams.flash_attn || !cparams.causal_attn) {
         err = "flash attention is required (the prefill uses its implicit causal mask)";
         return false;
+    }
+    if (mem.swa != nullptr) {
+        // the window cache is a ring of n_swa + n_ubatch cells: a chunk plus the window behind its first token has to fit
+        const uint64_t need_cells = (uint64_t) model.hparams.n_swa + (uint64_t) std::max<int32_t>(p.ubatch, 1);
+        if ((uint64_t) mem.swa->get_size() < need_cells) {
+            err = "the window cache has " + std::to_string(mem.swa->get_size()) + " cells, the pass needs " + std::to_string(need_cells) + " (the window " + std::to_string(model.hparams.n_swa) +
+                  " + a chunk of " + std::to_string(p.ubatch) + " tokens): raise -ub to at least the chunk size or lower --lm-prefill-ubatch";
+            return false;
+        }
     }
     if (p.n_slots < 1 || p.n_slots > 16 || p.ubatch < 1 || p.segment < p.ubatch || p.segment % p.ubatch != 0 || p.min_tokens < 1) {
         err = "invalid parameters (slots 1..16, ubatch >= 1, segment a multiple of ubatch, min_tokens >= 1)";
@@ -1808,10 +2044,31 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
             err = "layer " + std::to_string(il) + " is not offloaded to the device (its attention weights are on the host): the layer-major pass computes everything but the routed experts on the device";
             return false;
         }
+        if (flint && il < (int) model.hparams.n_layer_dense_lead) {
+            // a leading dense layer has no routed experts: it is resident, nothing to stream
+            S->native[(size_t) il] = 1;
+            native_list.push_back(il);
+            continue;
+        }
         const ggml_tensor * t = ly.ffn_gate_exps != nullptr ? ly.ffn_gate_exps : ly.ffn_gate_up_exps;
         if (t == nullptr || t->buffer == nullptr) {
             err = "layer " + std::to_string(il) + " has no routed-expert bank";
             return false;
+        }
+        if (flint) {
+            // the stock fit may put some tensors of a layer's expert bank on the device and the rest on the host (a partial layer); the pass stages a bank as one package, so a bank must be wholly on one side
+            const ggml_tensor * bank[] = { ly.ffn_gate_exps, ly.ffn_up_exps, ly.ffn_down_exps, ly.ffn_gate_up_exps };
+            int n_host = 0, n_dev = 0;
+            for (const ggml_tensor * b : bank) {
+                if (b != nullptr && b->buffer != nullptr) {
+                    (ggml_backend_buffer_is_host(b->buffer) ? n_host : n_dev)++;
+                }
+            }
+            if (n_host > 0 && n_dev > 0) {
+                err = "layer " + std::to_string(il) + " has " + std::to_string(n_dev) + " routed-expert tensors on the device and " + std::to_string(n_host) +
+                      " on the host (the stock fit split the layer): the layer-major pass needs a bank wholly on one side; place whole layers with -ncmoe N or --cpu-moe and -fit off";
+                return false;
+            }
         }
         if (ggml_backend_buffer_is_host(t->buffer)) {
             streamed_list.push_back(il);
@@ -1825,6 +2082,22 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
         return false;
     }
 
+    if (flint) {
+        // a K cache and a V cache of different types have no device flash-attention kernel (the scheduler would run every attention piece on the CPU): refuse it by name
+        if (mem.attn != nullptr && mem.attn->type_k() != mem.attn->type_v()) {
+            err = std::string("the K cache type (") + ggml_type_name(mem.attn->type_k()) + ") and the V cache type (" + ggml_type_name(mem.attn->type_v()) +
+                  ") differ: the layer-major pass needs one type for both (use -ctk and -ctv with the same value)";
+            return false;
+        }
+        // both caches stay on the device for every layer: a KV buffer in host memory would put the flash attention on the CPU and copy the cache every chunk
+        for (const auto & kv : memory->memory_breakdown()) {
+            if (kv.second > 0 && ggml_backend_buft_is_host(kv.first)) {
+                err = "the KV cache has " + std::to_string(kv.second/1048576) + " MiB in host memory (" + ggml_backend_buft_name(kv.first) +
+                      "): the layer-major pass needs it on the device for every layer (all layers offloaded, no --no-kv-offload, and the stock fit must not have moved layers to the CPU: use -fit off with the experts placed by tensor overrides)";
+                return false;
+            }
+        }
+    }
     if (dense) {
         // the KV cache and the recurrent state are the model context's and stay on the device for every layer: a layer whose weights are streamed computes its attention on the device
         // (a KV buffer in host memory would put the flash attention on the CPU and copy the whole cache every chunk)
@@ -1886,6 +2159,21 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
         err = "layer streaming: " + ls.error_msg;
         return false;
     }
+    {
+        // G22/G23 paced bank copies: a small copy of the compute stream (positions, KV indices) waits for every earlier command on the one copy engine, so an attention layer waits behind the whole
+        // bank that is being copied for the next layer. Cutting the bank into pieces with at most `window` in flight lets it through.
+        // default: on for the Flint pass (whose layers compute for less time than a bank takes to copy: 64 MiB pieces, window 2; 2 MiB pieces left a 20 us gap per piece on the copy engine, 13% of the crowded pass,
+        // and the crowded 8.6k prefill rose from 3,698 (8 MiB) to 3,755 tok/s (64 MiB); 128 MiB is lower and 256 MiB collapses, FL-3), off for the Qwen models (unchanged).
+        // Order: the parameter (--lm-prefill-copy-piece / --lm-prefill-copy-window), then LLAMA_LM_COPY_PIECE_MIB / LLAMA_LM_COPY_WINDOW, then the default. A piece of 0 turns the pacing off.
+        const char * e_piece = getenv("LLAMA_LM_COPY_PIECE_MIB");
+        const char * e_win   = getenv("LLAMA_LM_COPY_WINDOW");
+        const int piece_mib  = p.copy_piece_mib >= 0 ? p.copy_piece_mib : (e_piece != nullptr ? atoi(e_piece) : (flint ? 64 : 0));
+        const int window     = p.copy_window > 0 ? p.copy_window : (e_win != nullptr ? atoi(e_win) : 2);
+        if (piece_mib > 0 && p.n_slots >= 2 && !ls.set_pp_copy_pacing(((size_t) piece_mib) << 20, window)) {
+            err = "layer streaming: " + ls.error_msg;
+            return false;
+        }
+    }
     // the banks are read straight from the host mapping: page-lock the streamed ones once (spans that the hybrid engine pinned already count as pinned)
     ls.exec_layers = streamed_list;
     int64_t reg_bytes = 0;
@@ -1900,11 +2188,11 @@ bool llama_context::lm_prefill_enable(const llama_lm_prefill_params & p, std::st
     ls.lm_release_slots();
 
     LLAMA_LOG_INFO("%s: lm-prefill: %s: %zu streamed layers, %zu with their %s on the device, %d slots, chunks of %d tokens, segments of %d tokens, %s slab, from batches of %d tokens (%.1f MiB page-locked here, %.0f ms)\n",
-                   __func__, dense ? "dense" : "MoE", streamed_list.size(), native_list.size(), dense ? "weights" : "experts", p.n_slots, p.ubatch, p.segment, p.act_bf16 ? "bf16" : "f32", p.min_tokens, (double) reg_bytes/1048576.0, reg_us/1e3);
+                   __func__, dense ? "dense" : (flint ? "Flint MoE" : "MoE"), streamed_list.size(), native_list.size(), dense ? "weights" : "experts", p.n_slots, p.ubatch, p.segment, p.act_bf16 ? "bf16" : "f32", p.min_tokens, (double) reg_bytes/1048576.0, reg_us/1e3);
 
     lm_state = std::move(S);
-    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        mh->get_mem_attn()->lm_set_affinity(true);
+    if (mem.attn != nullptr) {
+        mem.attn->lm_set_affinity(true);
     }
     return true;
 }
@@ -1918,8 +2206,8 @@ void llama_context::lm_prefill_disable() {
     }
     synchronize();
     lm_state.reset();
-    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        mh->get_mem_attn()->lm_set_affinity(false);
+    if (auto * attn = lm_mem_of(memory.get()).attn) {
+        attn->lm_set_affinity(false);
     }
 }
 
@@ -1935,6 +2223,8 @@ struct llama_lm_prefill_params llama_lm_prefill_default_params(void) {
     p.min_tokens = 1024;
     p.act_bf16   = 0;
     p.device     = 0;
+    p.copy_piece_mib = -1;
+    p.copy_window    = -1;
     return p;
 }
 

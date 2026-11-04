@@ -58,6 +58,123 @@ risk tail.
 
 Not validated and not claimed: output quality. The greedy text changes with MAXROWS 4, so the KL and first-token gates of the repo are needed before any default change. The repo's own history: `docs/guide/LINUX-PASCAL.md` records MAXROWS 4 as the default from H48 to H58 and its reversal when H58 failed the pre-registered KL bar on four further texts (a no-tensor-core GPU, so not this path). Recommendation: keep opt-in; validate with KL/first-token matrices on this path before any default change; re-measure with more texts and reps before quoting a decode figure.
 
+## 2026-11-03 (flint default: idle prep on, --lm-prefill-prearm always; the sliding-window guard is removed; checks OK)
+
+**Asked.** Owner: make the prearm switch the default for flint ("Yes, make it the default").
+
+**Done.** The default-off guard for sliding-window models is removed (server-context.cpp), so the default is always with --hybrid-moe and -np 1 for every model. --hybrid-moe-prefill-free-all stays off. Help text and guide rows updated.
+
+**Checked.** Release build zero errors; Linux g++ compile exit 0 for the changed files. tools/check-mp-flags.py: flint default shows 'idle preparation of the pass: always' with the start-up arm armed (mp230); explicit off shows no start-up arm (mp231). Both OK.
+
+**Not done.** No new performance arm: the default equals the measured prearm-always setting (E1, -2.8% wall, -3% prompt time, one session).
+
+## 2026-11-03 (idle prep works on flint: --lm-prefill-prearm always after each request; with free-all it is slower; prearm alone -2.8% wall, -3% prompt time at -fitt 8192)
+
+**Asked.** Owner: after decode, switch to the prefill profile automatically (free all slots and load the first layers), for flint, with the free-all flag.
+
+**Found.** The idle arm refused flint silently: llama_context::lm_prearm required the hybrid memory type, and the window cache is another type. Lifted for the idle arm only (llama-lm-prefill.cpp). The server's refusal of --lm-prefill-prearm on sliding-window models is lifted; the default stays off.
+
+**Measured (flint, -fitt 8192, 2 slots, agentic-A, one session per arm).** prearm off 51.7 s; prearm always 50.3 s (-2.8%, prompt time -3%); prearm always plus free-all 56.7 s (+9.7%). The full regrow lands on the next small batch (+0.55 s per request). Adoption 7 of 7 passes, declines 0.
+
+**Not done.** The default for flint is not changed (owner decision). Single session per arm; no replicate at this margin.
+
+**Recommendation.** --lm-prefill-prearm always for flint; keep --hybrid-moe-prefill-free-all off.
+
+## 2026-11-03 (MP-2b full freeing, built as opt-in `--hybrid-moe-prefill-free-all`: measured not faster; default unchanged; flag off)
+
+**Asked.** Owner: build full freeing (free the expert cache to its floor before a prefill).
+
+**Done.** Opt-in flag (env `LLAMA_MOE_HYBRID_PREFILL_FREE_ALL`), default off. Linux compile checked (g++ 15.2 in WSL). Contract written before the runs (plan MP section). Five flint arms, agentic-A, 2 slots, one session each: -fitt 16000 (29 slots) default 49.9 / 50.3 s, flag 50.1 s (+0.4%, inside the 0.8% replicate band); -fitt 8000 (106 slots, the regime of the pasted log) default 51.9 s, flag 53.7 s (+3.5%), flag with async regrow 53.6 s (+3.2%).
+
+**Result.** The mechanism works: one floor shrink before each pass, 0 KV-pressure shrinks inside passes in every arm. Speed does not: the regrow re-uploads about 10 GB (4,300-4,800 experts) at the first decode, about 1.0 s per pass, against 2.7-4.6 GB per pass for the default partial cycle. Correction: shrink time follows the bytes uploaded, not per-layer overhead (676 ms shrink with 795 uploads; floor shrinks 35-132 ms).
+
+**Superseded.** The earlier advice to cut the pass-start shrink overhead first (its premise was wrong). The lever is the room each pass needs.
+
+**Not done.** One session per arm beyond the replicate. The user's start line is not confirmed (likely -fitt 8000). No Linux runtime test.
+
+## 2026-11-03 (flint MP-2 gate: NOT READY; --lm-prefill-slots 3 declines long passes at -fitt 16000, 2 slots runs them; measurement only, no code change)
+
+**Asked.** Owner: scope MP-2 (free all expert-cache slots when a prefill starts) for flint.
+
+**Done (measured with tools/mp2_gate.py; one agentic-A session per arm; flint at -fitt 16000; the owner's command with --lm-prefill-slots 3, then 2).**
+- Gate (MP-2 ready condition: at least 1 KV-pressure shrink inside a long pass): 0 in both flint arms and in the Qwen MP logs (2 long agentic passes per arm, 11 in the suite). NOT READY, not built.
+- Real loss: with 3 slots the pass declined the two deepest turns ('no room for 2605 / 2819 MiB'; the cache was already at its floor of 2 slots and still 88 / 358 MiB short). Those batches ran the ordinary path: turn 10 (17,990 tokens) took 24.41 s. With 2 slots all 7 passes ran and turn 10 took 9.39 s. Room made per pass: 2484-2887 MiB with 3 slots, 1840-2195 MiB with 2 slots.
+- Log text to fix: 'device memory is short ... (a KV commit)' is printed for every expert-cache shrink, including the pass's own room. Not changed.
+
+**Not done.** One session per arm, not replicated. No Linux run. MP-2 stays draft.
+
+**Recommendation.** --lm-prefill-slots 2 for flint at -fitt 16000 on this card.
+
+## 2026-11-03 (later: `--hybrid-moe-slow-ms`, `--hybrid-moe-threads`; host code and build only, no model run; Windows binaries built; Linux: three units compiled with g++ 15.2, not linked or run)
+
+**Asked.** Owner: make the slow-host-request warning a parameter; then the expert team size as a parameter or from `-t`; whatever is done must work on Linux too.
+
+**Done.**
+- `--hybrid-moe-slow-ms N` (default 5, 0 = never; env `LLAMA_MOE_HYBRID_SLOW_MS`): threshold of the `slow host request` and `slow DMA submission` WARN lines, both hard-coded at 5 ms before. Log lines only, not the speed. The lean stall line keeps `LLAMA_MOE_HYBRID_LEAN_STALL_US` (3 ms).
+- `--hybrid-moe-threads N` (auto = physical cores, at most 8, Windows and Linux; env `LLAMA_MOE_HYBRID_THREADS` still read when the flag is not given). Not `-t`: its default is the physical core count on Windows only in effect (common.cpp:248), it differs by platform (Linux hybrid CPUs count P-cores), and it also sizes the CPU graph threads.
+- Windows only: the default CPU list `2 + 2i` ran past the last logical CPU when the team equals the physical cores on an SMT machine (4C/8T: CPU 8 does not exist; the engine thread's pin failed silently). The list now falls back to one logical CPU per physical core (`GetLogicalProcessorInformationEx`) only when the formula runs past the last logical CPU; the decode thread's auto pin is dropped when its CPU does not exist. Unchanged where the formula was valid.
+- Host check, no model: this machine reports 16 cores, first logical CPUs 0, 2, ..., 30 (adjacent SMT pairs), so the mask parsing returns real cores.
+
+**Build.** Windows `build/llama-cuda/bin/Release` built with zero errors; `--help` shows both flags. Controls: `bin/slow1` (slow-ms only), `bin/thr1` (both flags, before the header fix), `bin/thr2` (final: both flags, after the header fix).
+
+**Linux: compiled, not run.** Ubuntu 26.04 in WSL, g++ 15.2 (build-essential, approved; installed as WSL root, `sudo` asks for a password). `g++ -std=c++17 -O1 -march=native -Wall -Wextra -DLLAMA_LAYER_STREAMING` on `src/llama-moe-hybrid.cpp`, `common/arg.cpp`, `tools/server/server-context.cpp`: exit 0, no warning on a changed line (the `rseq` warning at llama-moe-hybrid.cpp:1969 is in HEAD). Fixed on the way: `src/llama-moe-hybrid.h` lacked `#include <vector>` (in HEAD; libstdc++ rejects it, MSVC accepted it). Not linked, no Linux runtime test. Linux default team = the existing sysfs rule; the CPU list stays Windows-only, as before.
+
+**Not run.** No model, no GPU, no timing. Speed effects of team size and placement are untested.
+
+## 2026-11-03 (RTX 5090 Laptop, Windows: MP-1, the default-on idle preparation of the layer-major pass and the start-up arm; `docs/plans/llama-server-integration.md` section MP; NOT accepted, MP-1f not met as written; nothing committed or pushed)
+
+**Asked.** Owner: optimise the expert-cache memory between the prefill and the decode profile; first step "let's try that out", then (mid-work) the existing `--lm-prefill-prearm` must be on by default, always.
+
+**Done (measured).**
+- `--lm-prefill-prearm` now defaults to `always` with `--hybrid-moe`; it turns itself off with an INFO line when it cannot work (no hybrid, `-np != 1`, speculative decoding, sliding-window model) unless the flag was given, in which case the old loud refusal stands. The preparation also runs once at start-up, so the first request finds the prefill profile armed. Build `build/llama-cuda/bin/mp1`; control `bin/mp-base` (the Nov 2 build).
+- Request-path arm cost: base 86-442 ms per batch, prepared 2 ms (the 150-240 ms arm runs in idle time).
+- Speed, fixture A: `always` 0.961x of base (3.272 s against 3.405 s, two replicates each); `off` 0.997x. Fixture S (small turns): `always` 1.05x (the G42 cost, reported).
+- Memory: watcher minimum 16,297 MiB (bar 16,000).
+- Flag surface: 7 of 7 cases (`tools/check-mp-flags.py`, after three checker fixes).
+- Equivalence: fresh greedy continuations identical in 3 of 4 prompts, the fourth diverges at token 17 with margin 0.161 nats (under 0.25). The hit-versus-fresh suite has one extra miss with `always` (`same-turn01`, 0.389 nats; base passes it at 0.084). The same binary with `off` reproduces base exactly, so the cause is the preparation's expert-cache trajectory (the dynamic cache is not residency-independent), not the pass numerics.
+
+**Not done.** `smoke.json` cannot run here (its prompt files sit under the old worktree path). MP-0 as a separate profile was not run; its data came from the arm logs. MP-2, MP-3, MP-4 stay `draft`. The armed idle VRAM figure was not re-measured. `tools/run-server-mt.sh` and `tools/run-g42-arm.sh` were edited to stop hard-coding the old worktree path.
+
+**Owner decision (2026-11-03): keep `always` as the default.** It costs ~5% on small turns and perturbs the dynamic cache's near-tie path (one extra above-rule miss on the hit-versus-fresh suite; MP-1f stays NOT MET as written). `auto` (3 of the last 4 requests, the G42 answer) stays available with `--lm-prefill-prearm auto`; it was not switched to.
+
+## 2026-11-02 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2: flint layer-major prefill (T-FL-01..05, FL-1..4 and FL-7 of `docs/plans/flint-support-plan.md`); `/goal` autonomous grant, the agent's autonomous acceptance, not the owner's; local commits only, nothing pushed; FL-3 crowded/uncrowded at 8.6k not met)
+
+**Asked.** `/goal`: implement `docs/plans/flint-support-plan.md` without impeding Qwen.
+
+**Done (measured; tables and evidence in plan section 11, owner summary in section 12).**
+- The layer-major pass runs `flint` (MoE, sliding-window cache, sinks) with the window mask filled once per chunk; loud named refusals for mixed K/V types, a too-small ring, no flash attention, and a layer split between device and host. The layer-streaming runner's probe reports flint as off.
+- Bug fixed (D-FL-9): the vector flash-attention kernel was chosen for 1-2-query causal-window ops and attended to every key, making logprobs history-dependent. The op is never sent there now. Found by per-layer hashes (`tools/flint-layerhash.py`).
+- FL-2 (equal chunk shape, device-matched stock reference): 8/8 prompts at 512 and 2048, KL mean 0.0005 / 0.0003. Literal reference at 512: 7/8 (one near-tie, 0.1036 > 0.07): NOT MET on that reading.
+- FL-1 needles PASS at about 4k, 24k and 50k tokens; four refusals checked.
+- FL-3 speed (final configuration, poller peak 6,649 MiB crowded): pass uncrowded 4,055 / 3,756 tok/s (8.6k / 50.7k) = 2.0x / 1.8x the best stock uncrowded; crowded 3,386 / 3,439 = 7.3x the strict stock baseline (`-ub 1024`, 463 / 474). Crowded/uncrowded after D-FL-24 (8 MiB copy pieces, early bank preload, `--lm-prefill-slots 3`): 0.872 (0.882 with 3 slots) at 8.6k (NOT MET: copy-bound at the PCIe floor, plan section 11), 0.92 at 50.7k (met). Crowded 3,713 / 3,480 tok/s (peak 7,213 MiB), uncrowded 4,212 / 3,785. Qwen FL-7 rerun on the final build: ratios 0.998 to 1.020, peaks equal.
+- FL-4: flint stock path bit-identical to the pre-change side copy (8/8); `test-backend-ops` FLASH_ATTN_EXT 4,076/4,076 (also with head-tile); MUL_MAT / MUL_MAT_ID failures only in the iq1/2/3_s family AGENTS.md records as erratic; host layer-streaming ctest 78/78.
+- FL-7 Qwen non-regression, A-B-B-A, 9.7k and 27k prompts (V1) and 9.7k (V2 dense profile): new/control 0.993 to 1.018 on prefill, prompt and decode; VRAM peaks equal (7,345 / 7,347 MiB; 23,015 both); identity 8/8 on V2 stock, V1 stock and V1 with `--hybrid-moe-frozen`. The control legs are UNPROVENANCED (`-AllowUnprovenanced`, D-FL-18): the gate cannot attest the pre-change side copy against the edited sources; its sha256 identity matches the record.
+
+- FL-5 hybrid decode (T-FL-10, T-FL-11): `--hybrid-moe` runs on flint (sigmoid router, amax rescale on the device, engine layers = MoE layers). Hook routing equals the stock router on the same hidden state: 23,679 / 23,679 ids and weights checks (`LLAMA_MOE_HYBRID_ROUTE_CHECK=1`). Lean host tests with the flint quant pairs and dup-ids pass. Decode 82.96 tok/s (8.6k) and 62.74 (50.7k) against 34.22 / 30.55 for the strict crowded stock arm (2.4x, 2.1x) and 22.65 / 12.57 for the stock fit split (3.7x, 5.0x), peaks 7,079 to 7,195 MiB. Combined with the pass at 50.7k: prefill 3,319 tok/s, decode ~60 tok/s, peak 7,307 MiB. The hybrid text differs from the stock text (host rounding, D-FL-21).
+- FL-7 rerun after the hook edits: V1 ratios 0.994 to 1.023, equal peaks, identity 8/8 (stock and frozen hybrid).
+
+**Not done.** `tools/run-tests.ps1 -Suite host` halts at its doc-size guard (pre-existing). Long-prompt speed beyond 50.7k and `-np > 1` unmeasured. FL-3 crowded/uncrowded at 8.6k remains not met. FL-2 at 512 against the literal stock reference exceeds the original 0.07 bar by one prompt (0.1036), inside the stock path's own noise floor (0.1105): accepted under the owner's noise-floor rule (D-FL-23, bit identity is not applied to generated tokens).
+
+**Decisions.** D-FL-8 to D-FL-19 in plan section 10 (reference choice, the causal-window fix, lazy KV as environment opt-in, paced copies and persistent inputs on for flint, runner probe, split-layer refusal, control attestation escape, Phase 2 deferred).
+
+**Operational facts found (for the next person).** `LLAMA_KV_LAZY=1` without `LLAMA_KV_LAZY_ONDEMAND=1` crashes the server with `illegal memory access` in `launch_fattn`, stock arms included. The crowded flint pass peaks at 9,671 MiB without lazy KV. A wrapper's `--exe` must be in the command string or the gate refuses the run (it refused a control leg once); a `@array` splat passes `-AllowUnprovenanced` positionally and breaks (use a hashtable splat). win-batch takes each row's `--exe`, not the top-level one. Nsight Systems: `C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.6.3\target-windows-x64\nsys.exe export` (the `nsys` on PATH is absent).
+
+**Limits.** One GPU and one card (RTX 5090 Laptop, mains). Flint Q5_K_XL only, repo-text prompts, cold prompts, 50 or 64 greedy tokens. Speed claims are the arms named in the tables; the stock baselines differ in batch settings from the pass arms (`-b`), stated in plan section 11.
+
+**Artifacts.** `build/flint/` (equal-shape collections `eq-*`, needles `srv-fl1-*`, identity `eq-id-*`), `build/dense/win/` (`t05*`, `fz*`, `fr*`, `fl7-*` JSON and server logs). All under `build/`, git-ignored.
+
+## 2026-11-02 (RTX 5090 Laptop, Windows: T-FL-00 of the flint plan: stock matrix, crowded baselines, nsys of the prefill, reference outputs; no engine change; the agent's own work, not the owner's acceptance; nothing committed)
+
+**Asked.** "Run T-FL-00" of `docs/plans/flint-support-plan.md` (the go / no-go for layer-major prefill on `flint-UD-Q5_K_XL.gguf`).
+
+**Result: GO.** In the crowded stock prefill of an 8,604-token prompt (ubatch 2048, `--cpu-moe`: every layer and the KV on the GPU, experts on the host) the host-to-device copies take 9.17 s of an 11.2 s wall (81.8%; 123 GiB at 14.4 GB/s, about five sweeps of the 25.9 GiB of expert banks, one per ubatch) while kernels run 1.42 s (12.7%) and no copy overlaps a kernel. The plan's bar was 25%.
+
+**Stock matrix** (the 8.6k / 50.7k-token cold prompts, prefill tok/s): uncrowded ubatch 4096 1,985 / 2,105 (peak 22.5 GiB), ubatch 2048 1,517; crowded `--cpu-moe` ubatch 1024 464 / 475 (7,053 MiB, inside the poller ceiling of 7,376 MiB that the 16,000 MiB keep-free rule gives on this machine), ubatch 512 262 / 259, ubatch 2048 784 / 855 (7,729 MiB, 353 MiB over), ubatch 4096 1,181 / 1,370 (9,091 MiB, invalid). The stock auto-fit at `-fitt 16000` starves and is UNFIT: 43 of 50 layers with 816 MiB of KV on the CPU at ubatch 2048 (777 tok/s, decode 22) and 30 of 50 with 1,632 MiB at ubatch 4096 (1,142 tok/s, decode 17). Crowded decode is 32-35 tok/s against 48-56 uncrowded.
+
+**References.** Flint's stock path is run-to-run deterministic (8 of 8 prompts, first-token difference 0.0000) and very sensitive to the chunk shape: ubatch 512 against ubatch 2048 meets the equivalence rule on 1 of 8 prompts (3 first tokens flip, worst 0.50 nats) and gives a mean KL of 0.076 (max 0.27) over 24 prompts. An LM path has to be judged at an equal chunk shape.
+
+**Also found.** Layer 14's expert bank is 692 MiB (Q6_K, Q6_K, Q8_0), the other 46 are 562 MiB. The probe is 8,604 flint tokens; the 9,667 of the Qwen tokenizer had been quoted for flint (corrected in the 2026-11-01 flint entry below). Tools, uncommitted: `tools/nsys-copy-share.py`, `tools/flint-collect.py`, `tools/dense/win-arm.py --nsys-probe prefill`. Record and decisions D-FL-2 to D-FL-4: `docs/plans/flint-support-plan.md` section 11. Not covered: the uncrowded profile, anything above 50.7k tokens, any layer-major number.
+
 ## 2026-11-01 (RTX 5090 Laptop, Windows: `flint-UD-Q5_K_XL.gguf`, a MoE the fork's own engine does not serve; stock llama.cpp offload flags measured; the agent's own work, not the owner's acceptance; nothing committed)
 
 **Asked.** "What params to use for an MoE model like `C:\Models\ALL\other\flint\flint-UD-Q5_K_XL.gguf`".
@@ -66,7 +183,7 @@ Not validated and not claimed: output quality. The greedy text changes with MAXR
 
 **The fork's MoE flags do not apply.** `--hybrid-moe` refuses at load ("no hybrid engine in this process"): its hook is called only from `models/qwen35moe.cpp`. `--lm-prefill` refuses ("supports the Qwen3.5/3.6 MoE and the dense Qwen3.5/3.8 architectures only"; adapters exist for `QWEN35MOE` and `QWEN35`). Both are loud, measured refusals (`g0a`, `g0b`). Using them for flint needs a per-architecture adapter, not a flag.
 
-**Measured** (stock `llama-server`, `-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup`, default fit, a 9,667-token cold prompt then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB):
+**Measured** (stock `llama-server`, `-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup`, default fit, an 8,604-token cold prompt (the flint tokenizer's count for the 29,000-character probe) then 2 cached decodes of 50 greedy tokens; mains; one session at a time under the GPU mutex; prefill / decode in tok/s, peak VRAM in MiB):
 
 | extra flags | prefill | decode (2 probes) | peak |
 |---|---|---|---|
@@ -81,7 +198,7 @@ Not validated and not claimed: output quality. The greedy text changes with MAXR
 
 **Reading.** Without the model mapping (`-lm none`) prefill at ubatch 2048 is +44% (1,507 against 1,048) and decode does not suffer; this build replaced `--mlock` / `--no-mmap` with `-lm/--load-mode` (`--mlock` errors). A larger ubatch trades decode for prefill: 4096 gives +31% prefill for about -10% decode, 8192 is worse on both. `--cpu-moe` cuts the peak to 7,732 MiB at about -40% decode. Needle found in every arm. PP-first (the goal charter) picks `-ub 4096 -b 8192 -lm none`; `-ub 2048 -b 4096 -lm none` is the balanced alternative.
 
-**Limits.** One machine, one 10k-token prompt, 2 decodes per arm, 50 greedy tokens. Nothing at 50k-250k (the sliding-window layers make depth behave differently), no quality check beyond the needle, no sampling settings for this model. The server log filters INFO, so the stock fit's expert split was not recorded (only the peak). `-fitt 16000` (the owner's keep-free rule) was not run; it would push experts to the CPU. Batches 1 and 2 exited non-zero only through their deliberately refused or mis-parsed arms (exit 2 and 1, not the provenance gate); batch 3 exited 0.
+**Limits.** One machine, one 10k-token prompt, 2 decodes per arm, 50 greedy tokens. Nothing at 50k-250k (the sliding-window layers make depth behave differently), no quality check beyond the needle, no sampling settings for this model. The server log filters INFO, so the stock fit's expert split was not recorded (only the peak). `-fitt 16000` (the owner's keep-free rule) was run afterwards (2026-11-02 entry above): the stock auto-fit starves there (43 of 50 layers, KV partly on the CPU), so it is not a valid crowded baseline. Batches 1 and 2 exited non-zero only through their deliberately refused or mis-parsed arms (exit 2 and 1, not the provenance gate); batch 3 exited 0.
 
 ## 2026-11-01 (RTX 5090 Laptop, Windows, MSVC + CUDA 13.2, dense Qwen3.8-27B-Q4_K_M: pull of `main`, an MSVC build break in `fattn-gqa8.cuh` repaired, and a faster opt-in profile for the owner's command; the agent's own work, not the owner's acceptance; nothing committed or pushed)
 

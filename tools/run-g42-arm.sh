@@ -4,7 +4,7 @@
 #   e.g. tools/run-g42-arm.sh k5201-fuse s49 agentic --arg --lm-prefill-fuse
 # Server flags common to every arm: --hybrid-moe --lm-prefill -fitt 16000, -np 1 (server-config-gen), LLAMA_LM_LOG=1, LLAMA_SRV_PHASE_LOG=1, free-memory watcher 20 ms.
 # Results: build/llama-cuda/<tag>/ (report.json, server.log, wrapper.txt); the per-request timeline: python tools/server_phase_timeline.py build/llama-cuda/<tag>/server.log --brief
-cd /c/Development/AI/qwen38GZI/.claude/worktrees/attribution-handoff-doc-8ed1d1
+cd "$(dirname "$0")/.."
 tag=$1; build=$2; scen=$3; shift 3
 F=tools/server-fixtures
 FIX=agentic-A
