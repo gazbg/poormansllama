@@ -566,6 +566,12 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// Largest query batch (rows) that the packed GQA kernel takes on the quantized-KV path.
+static int ggml_cuda_fattn_gqa8_max_rows() {
+    static const int v = []() { const char * e = getenv("LLAMA_FATTN_GQA8_MAXROWS"); return e != nullptr ? atoi(e) : 2; }();
+    return v;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -679,6 +685,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
+                    // 3-4 rows: packed GQA kernel instead of the MMA kernel, which converts K and V to f16.
+                    if (Q->ne[1] <= ggml_cuda_fattn_gqa8_max_rows() && ggml_cuda_fattn_gqa8_applies(dst)) {
+                        return BEST_FATTN_KERNEL_VEC;
+                    }
                 } else {
                     if (Q->ne[1] == 1) {
                         return BEST_FATTN_KERNEL_VEC;
@@ -751,8 +761,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // the tile kernel would first convert the whole K and V cache to f16 (decode +6..11% at 8k..64k tokens of depth). The packed kernel quantizes Q like the
             // vector path does for 1-2 rows, so its output differs from the tile kernel's by no more than a 1e-6 change of every score does (H47, H48: KL within 1.5x of that
             // floor on two texts, perplexity unchanged). LLAMA_FATTN_GQA8_MAXROWS=2 restores the tile kernel for 3-4 rows.
-            static const int gqa8_max_rows = []() { const char * e = getenv("LLAMA_FATTN_GQA8_MAXROWS"); return e != nullptr ? atoi(e) : 2; }();
-            if (Q->ne[1] <= gqa8_max_rows && ggml_cuda_fattn_gqa8_applies(dst)) {
+            if (Q->ne[1] <= ggml_cuda_fattn_gqa8_max_rows() && ggml_cuda_fattn_gqa8_applies(dst)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
