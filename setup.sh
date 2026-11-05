@@ -141,25 +141,36 @@ confirm() {
     case "$a" in y|Y|yes|YES|'') return 0 ;; *) return 1 ;; esac
 }
 
-# ask_choice "Question" KEY1 KEY2 ... -> echoes the chosen key (default: first)
+# ask_choice "Question" KEY1 KEY2 ...
+# -> echoes the chosen key (default: first key)
+# IMPORTANT: menu prints go to stderr (>&2) so $() command substitution
+# captures only the final selection echo to stdout. If we used stdout for
+# the menu, the user would never see it.
 ask_choice() {
     local q="$1"; shift
-    local keys=("$@"); local def="${keys[0]}"; local i a
-    if [ "$NI" = 1 ]; then echo "$def"; return; fi
+    local keys=("$@")
+    local def="${keys[0]}"
+    if [ "${NI:-0}" = "1" ]; then echo "$def"; return; fi
     for i in "${!keys[@]}"; do
-        printf '    %d) %s\n' "$((i+1))" "${keys[$i]}"
+        printf '    %d) %s\n' "$((i+1))" "${keys[$i]}" >&2
     done
     while :; do
-        printf '  %s (1-%d, default 1) ' "$q" "${#keys[@]}"
+        printf '  %s (1-%d, default 1) ' "$q" "${#keys[@]}" >&2
         read -r a || a=""
         a="${a:-1}"
-        if [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "${#keys[@]}" ]; then
-            echo "${keys[$((a-1))]}"; return
+        # Normalise: if user typed a number, convert to key
+        if [[ "$a" =~ ^[0-9]+$ ]]; then
+            if [ "$a" -ge 1 ] 2>/dev/null && [ "$a" -le "${#keys[@]}" ] 2>/dev/null; then
+                echo "${keys[$((a-1))]}"; return
+            fi
+            a=1
         fi
-        case "$a" in
-            ${keys[*]}) echo "$a"; return ;;
-            *) printf '  (choose a number or one of: %s)\n' "${keys[*]}" ;;
-        esac
+        # Check if user typed one of the keys directly
+        for k in "${keys[@]}"; do
+            if [ "$a" = "$k" ]; then echo "$a"; return; fi
+        done
+        # Default: return the first key
+        echo "${keys[0]}"; return
     done
 }
 
@@ -606,7 +617,7 @@ pick_model() {
     done
     if [ "$NI" = 1 ]; then MI_IDX=1; return 0; fi   # default: qwen36 (the vehicle model)
     local sel
-    sel=$(ask_choice 'Which model?' "${opts[@]}" "$(printf '%s' "${opts[1]}")")
+    sel=$(ask_choice 'Which model?' "${opts[@]}")
     case "$sel" in
         *qwen38*) MI_IDX=0 ;;
         *qwen36*) MI_IDX=1 ;;
