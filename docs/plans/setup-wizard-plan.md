@@ -243,3 +243,27 @@ MSVC 14.50.35717 + Windows SDK 10.0.26100.0, git 2.53.0.windows.1, 62 GiB RAM).
 - **D58** clone reuse rule: an existing non-empty target is reused iff it is a git repo whose `origin` URL equals `$RepoUrl` (suffix-normalized, case-insensitive); anything else still exits 1 with the "use -CloneDir" message. Re-runs (different model, same day or later) must work, not refuse.
 - **D59** (2026-11-04, Linux AC-6-L) `setup.sh` clone bug class: the script runs under `set -u` WITHOUT `set -o pipefail`, so `if ! git clone … 2>&1 | sed …` tests sed's rc — a failed clone printed `[ok]` and the fallback block was dead code (measured: empty tree reached cmake configure). Rules: in `setup.sh`, a native command's exit status must come from a captured `$?` (or `PIPESTATUS[0]`, as the cmake steps already do), never from a trailing filter; and a clone must be verified COMPLETE (`third_party/llama.cpp` exists) before the build step — an incomplete tree fails loudly, it does not build.
 - **D60** (2026-11-04, Linux AC-6-L) `setup.sh` had NO clone reuse (D58 existed only in `setup.ps1`): a non-empty `--clone-dir` always refused, so a same-day "change model" re-run was impossible on Linux (measured exit 1). D58 is now ported to bash with the identical validity rule. The bash/PS twins must stay behaviorally paired — when one gains a flow (reuse, fallback, guard), the other must be checked for it; AC-7's dry-runs cannot catch clone-path gaps because `--dry-run` short-circuits before real clones.
+
+## Post-acceptance change (2026-11-05, owner instruction)
+
+The owner replaced the 8g default recipe (R7) and required a dynamic CUDA
+device index. Changes land in `setup.ps1` / `setup.sh` and are recorded as
+SDD decisions D16-D18 (docs/setup-wizard-sdd.md):
+
+- **R7** (qwen36 / 8g / 262k) now emits the owner's 2026-11-05 command:
+  `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768
+  -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0
+  --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all
+  --lm-prefill-segment 32768 -sm none -mg 0`, bind 0.0.0.0, env
+  `LLAMA_FATTN_TILE_Q8QK=1` kept. The old LINUX-PASCAL §2 fuse/prearm
+  recipe stays in docs/guide/LINUX-PASCAL.md as historical evidence.
+- **D17**: R5 and R7 no longer hard-code `CUDA0`; the wizard appends
+  `--device CUDA<n>` at emission (`-Device N` / `--device N` overrides;
+  auto = largest card for `full`, smallest at/above the row minimum for
+  `16g`/`8g`). The AC-6-L "flags equal the R7 row verbatim" criterion was
+  measured against the old row and is historical; the substitution set
+  (model path, bind, port) is unchanged except the device index.
+- **D18**: because R7 now carries `--hybrid-moe-prefill-free-all`
+  (fork-only), a fresh-clone (origin/main) build's flag gate refuses R7
+  like R4/R5. The AC-6-L smoke (published-main build, R7) does NOT apply
+  to the new row; it certifies the old recipe only.

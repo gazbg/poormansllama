@@ -28,6 +28,7 @@ param(
     [ValidateSet('262k', '128k')][string]$Context = '',
     [string]$Port = '8033',
     [string]$Bind = '',             # default: per-recipe (127.0.0.1 or 0.0.0.0)
+    [int]$Device = -1,           # CUDA index for device-pinned rows (R5/R7); -1 = auto (SDD D17)
     [string]$ModelDir = '',
     [string]$CloneDir = '',
     [string]$Branch = 'claude/flint-support',
@@ -217,21 +218,75 @@ $script:RECIPES = @(
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --lm-prefill-copy-piece 64'
         Bind='0.0.0.0'; Measured='PP 2422.94 t/s, TG 53.80 t/s (owner 2026-11-02, RTX 5090 24 GiB)' },
     [pscustomobject]@{ Id='R5'; Model='qwen36'; Vram='full'; Ctx='262k'
-        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --device CUDA0 --hybrid-moe-prefill-free-all'
-        Bind='0.0.0.0'; Measured='owner working recipe 2026-11-02 (RTX 5090 24 GiB)' },
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all'
+        Device='auto'; Bind='0.0.0.0'; Measured='owner working recipe 2026-11-02 (RTX 5090 24 GiB)' },
     [pscustomobject]@{ Id='R6'; Model='qwen36'; Vram='16g'; Ctx='262k'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         Bind='127.0.0.1'; Measured='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
         Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13)' },
     [pscustomobject]@{ Id='R7'; Model='qwen36'; Vram='8g'; Ctx='262k'
-        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -dev CUDA0 -sm none -mg 0 --hybrid-moe --lm-prefill --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 --ctx-checkpoints 32'
-        Bind='127.0.0.1'; Measured='GTX 1070 8 GiB: TG 32-34 t/s short, ~26.5 t/s @100k, PP 670 t/s @19k (docs/guide/LINUX-PASCAL.md)'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0'
+        Device='auto'; Bind='0.0.0.0'; Measured='owner working recipe 2026-11-05 (8 GiB target, binds 0.0.0.0)'
         Env=@{ 'LLAMA_FATTN_TILE_Q8QK' = '1' }
-        Note='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the LINUX-PASCAL.md row)' }
+        Note='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the 8g row); the old LINUX-PASCAL.md fuse/prearm recipe is historical' }
 )
 
 function RecipeFor([string]$m, [string]$v, [string]$c) {
     return ($script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c } | Select-Object -First 1)
+}
+
+function Get-NvidiaSmiPath {
+    $p = (Get-Command nvidia-smi -ErrorAction SilentlyContinue).Source
+    if (-not $p -and (Test-Path 'C:\Windows\System32\nvidia-smi.exe')) { $p = 'C:\Windows\System32\nvidia-smi.exe' }
+    return $p
+}
+
+function Select-GpuIndex {
+    param([string[]]$Lines, [string]$VramTarget)
+    # SDD D17 (pure): pick the CUDA index from parsed 'index, <MiB>' rows.
+    # 'full' -> the largest card; '16g'/'8g' -> the smallest card at or above
+    # the row minimum (10240/8192 MiB), else the smallest card (the D12
+    # warning then fires). Returns [pscustomobject]@{ Index; Why; Count }.
+    $needMib = 0
+    if ($VramTarget -eq '16g') { $needMib = 10240 }
+    elseif ($VramTarget -eq '8g') { $needMib = 8192 }
+    $largest = -1; $largestMib = -1
+    $smallest = -1; $smallestMib = [long]::MaxValue
+    $fit = -1; $fitMib = [long]::MaxValue
+    $count = 0
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*(\d+)\s*,\s*([\d,]+)\s*MiB') {
+            $idx = [int]$Matches[1]; $mib = [long]($Matches[2].Replace(',', ''))
+            $count++
+            if ($largest -lt 0 -or $mib -gt $largestMib -or ($mib -eq $largestMib -and $idx -lt $largest)) { $largest = $idx; $largestMib = $mib }
+            if ($smallest -lt 0 -or $mib -lt $smallestMib -or ($mib -eq $smallestMib -and $idx -lt $smallest)) { $smallest = $idx; $smallestMib = $mib }
+            if ($needMib -gt 0 -and $mib -ge $needMib -and ($fit -lt 0 -or $mib -lt $fitMib -or ($mib -eq $fitMib -and $idx -lt $fit))) { $fit = $idx; $fitMib = $mib }
+        }
+    }
+    if ($count -eq 0) { return [pscustomobject]@{ Index = 0; Why = 'no rows parsed'; Count = 0 } }
+    if ($count -gt 1) {
+        if ($VramTarget -eq 'full') { $pick = $largest; $why = "largest card, ${largestMib} MiB" }
+        elseif ($fit -ge 0) { $pick = $fit; $why = "smallest card >= $needMib MiB, ${fitMib} MiB" }
+        else { $pick = $smallest; $why = "smallest card, ${smallestMib} MiB (below the row minimum)" }
+    }
+    else { $pick = $largest; $why = "single card, ${largestMib} MiB" }
+    return [pscustomobject]@{ Index = $pick; Why = $why; Count = $count }
+}
+
+function Resolve-GpuIndex {
+    param([string]$VramTarget)
+    # SDD D17: CUDA index for device-pinned rows (R5/R7). -Device N wins.
+    # Auto via Select-GpuIndex. Result is cached in $script:GpuDev.
+    if ($null -ne $script:GpuDev) { return $script:GpuDev }
+    if ($Device -ge 0) { $script:GpuDev = $Device; return $Device }
+    $ns = Get-NvidiaSmiPath
+    $lines = @()
+    if ($ns -and (Test-Path $ns)) { $lines = @(& $ns --query-gpu=index,memory.total --format=csv,noheader 2>$null) }
+    $sel = Select-GpuIndex -Lines $lines -VramTarget $VramTarget
+    if ($sel.Count -eq 0) { Warn 'nvidia-smi failed; pinning --device CUDA0 (override with -Device N)' }
+    if ($sel.Count -gt 1) { Say "multi-GPU system: pinning --device CUDA$($sel.Index) ($($sel.Why); override with -Device N)" }
+    $script:GpuDev = $sel.Index
+    return $sel.Index
 }
 
 # --- environment check (SDD 4.1) ----------------------------------------
@@ -828,7 +883,9 @@ function Emit-RunScript {
     }
     $lines += ''
     $lines += 'if (-not (Split-Path $log -Parent | Test-Path)) { New-Item -ItemType Directory -Path (Split-Path $log -Parent) -Force | Out-Null }'
-    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $r.Flags + ' 2>&1 | Tee-Object -FilePath $log'
+    $flags = $r.Flags
+    if ($r.Device) { $flags = $flags + ' --device CUDA' + (Resolve-GpuIndex -VramTarget $r.Vram) }
+    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $flags + ' 2>&1 | Tee-Object -FilePath $log'
     $lines += ''
     $lines += '# stop: Ctrl-C in this console.  Health: curl.exe http://127.0.0.1:' + $port + '/health'
     $lines += '# Pong test (USAGE.md section 5): see docs/SETUP.md FAQ'
@@ -919,8 +976,19 @@ $r = Pick-Recipe -m $m
 $script:RecipeId = $r.Id
 Say ("recipe $($r.Id): $($r.Measured)")
 if ($r.Note) { Say ("note: $($r.Note)") }
-# D12 (SDD 4.6): warning only, threshold by VRAM target
-if ($script:GpuLine -match '([\d,]+)\s*MiB') {
+# D12 (SDD 4.6): warning only, threshold by VRAM target.
+# D17: for device-pinned rows the check runs against the card the row will
+# actually use (Resolve-GpuIndex), not just nvidia-smi's first line.
+$gpuLine = $script:GpuLine
+if ($r.Device) {
+    $gpuDev = Resolve-GpuIndex -VramTarget $r.Vram
+    $ns = Get-NvidiaSmiPath
+    if ($ns) {
+        $mibs = @(& $ns --query-gpu=memory.total --format=csv,noheader 2>$null)
+        if ($mibs.Count -gt $gpuDev) { $gpuLine = $mibs[$gpuDev] }
+    }
+}
+if ($gpuLine -match '([\d,]+)\s*MiB') {
     $gpuMib = [int]($Matches[1].Replace(',', ''))
     $need = 0
     if ($r.Vram -eq 'full') { $need = 22528 }

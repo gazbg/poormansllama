@@ -94,9 +94,9 @@ file (e.g. a different quant); the recipe is still chosen by `-Model`.
 | R2  | qwen38 | 16g  | 262k | RTX 5090 Laptop 24 GiB               | 48 host layers |
 | R3  | qwen38 | 8g   | 128k | RTX 5090 Laptop 24 GiB (8 g budget)  | 64 host layers, `--lm-prefill-prearm always` |
 | R4  | flint  | full | 262k | RTX 5090 Laptop 24 GiB               | hybrid MoE + 3-slot pass, binds 0.0.0.0 |
-| R5  | qwen36 | full | 262k | RTX 5090 Laptop 24 GiB               | owner working recipe, binds 0.0.0.0 |
+| R5  | qwen36 | full | 262k | RTX 5090 Laptop 24 GiB               | owner working recipe, binds 0.0.0.0, `--device` auto-pinned |
 | R6  | qwen36 | 16g  | 262k | RTX 5090 Laptop 24 GiB (G42)         | TG 3.0-3.7x stock, PP 3.65-4.11x stock (USAGE.md) |
-| R7  | qwen36 | 8g   | 262k | GTX 1070 8 GiB (LINUX-PASCAL.md)     | TG 32-34 t/s short, ~26.5 t/s @100k; sets `LLAMA_FATTN_TILE_Q8QK=1` |
+| R7  | qwen36 | 8g   | 262k | owner recipe 2026-11-05 (8 GiB target)| owner working recipe, binds 0.0.0.0, `--device` auto-pinned, sets `LLAMA_FATTN_TILE_Q8QK=1` |
 
 Full flag text per row: the recipe tables in `setup.ps1` / `setup.sh` and
 [docs/setup-wizard-sdd.md](setup-wizard-sdd.md) section 3.
@@ -127,6 +127,7 @@ uses conventional dashed names.
 | VRAM target                | -Vram          | --vram                |
 | context                    | -Context       | --context             |
 | port / bind                | -Port, -Bind   | --port, --host        |
+| CUDA device (R5/R7)        | -Device        | --device              |
 | model dir / explicit file  | -ModelDir, -ModelFile | --model-dir, --model-file |
 | clone target / branch / url| -CloneDir, -Branch, -RepoUrl | --clone-dir, --branch, --repo-url |
 | full clone / full build    | -FullClone, -FullBuild | --full-clone, --full-build |
@@ -154,9 +155,9 @@ only skips model-file resolution and download. With `-SkipModel` and no
   remote default branch"** — the branch is unpublished (in-flight work). The
   wizard continues on `main` and the **flag-capability check** then refuses to
   emit rows whose flags the built binary does not know (`binary does not
-  support row R4 flags: --lm-prefill-copy-piece …`). R1-R3, R6, R7 work on
-  `main`; R4 and R5 need a build from a branch that contains the two
-  in-flight flags.
+  support row R4 flags: --lm-prefill-copy-piece …`). R1-R3, R6 work on
+  `main`; R4, R5, R7 need a build from a branch that contains the
+  in-flight flags (`--lm-prefill-copy-piece`, `--hybrid-moe-prefill-free-all`).
 - **VRAM warning on a big card** (e.g. choosing R7 on a 24 GiB card) — the row
   was measured on a smaller card with a keep-free margin; the wizard warns and
   proceeds. The `-fitt` value is MiB of VRAM the CUDA runtime must keep free.

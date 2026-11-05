@@ -35,6 +35,7 @@ VRAM=''
 CONTEXT=''
 PORT=8033
 BIND=''
+DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
 MODEL_FILE=''
 MODEL_DIR=''
 CLONE_DIR=''   # empty = in-repo detection / default path (see invoke_clone)
@@ -61,6 +62,7 @@ usage: setup.sh [options]
   --context 262k|128k           context size (asked if omitted)
   --port N                      server port (default 8033)
   --host ADDR                   bind address (default: the recipe row's own)
+  --device N                    CUDA index for device-pinned rows R5/R7 (default: auto)
   --model-file PATH             explicit local GGUF (still needs --model)
   --model-dir DIR               where to look for / download the model
   --clone-dir DIR               clone target (default ~/poormansllama)
@@ -89,6 +91,7 @@ while [ $# -gt 0 ]; do
         --context) CONTEXT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --host) BIND="$2"; shift 2 ;;
+        --device) DEVICE="$2"; shift 2 ;;
         --model-file) MODEL_FILE="$2"; shift 2 ;;
         --model-dir) MODEL_DIR="$2"; shift 2 ;;
         --clone-dir) CLONE_DIR="$2"; shift 2 ;;
@@ -186,7 +189,7 @@ mi() {  # mi KEY -> sets MI_IDX or exits 1
 # recipe_for MODEL VRAM CTX -> sets R_ID, R_FLAGS, R_BIND, R_MEASURED, R_NOTE,
 # R_ENV; returns 1 if the combination is not measured.
 recipe_for() {
-    R_ID=''; R_FLAGS=''; R_BIND=''; R_MEASURED=''; R_NOTE=''; R_ENV=''
+    R_ID=''; R_FLAGS=''; R_BIND=''; R_MEASURED=''; R_NOTE=''; R_ENV=''; R_DEVICE=''
     local m="$1" v="$2" c="$3"
     if [ "$m" = qwen38 ] && [ "$v" = full ] && [ "$c" = 262k ]; then
         R_ID=R1; R_BIND=127.0.0.1
@@ -214,7 +217,8 @@ recipe_for() {
     fi
     if [ "$m" = qwen36 ] && [ "$v" = full ] && [ "$c" = 262k ]; then
         R_ID=R5; R_BIND=0.0.0.0
-        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --device CUDA0 --hybrid-moe-prefill-free-all'
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all'
+        R_DEVICE=auto
         R_MEASURED='owner working recipe 2026-11-02 (RTX 5090 24 GiB)'
         return 0
     fi
@@ -226,11 +230,12 @@ recipe_for() {
         return 0
     fi
     if [ "$m" = qwen36 ] && [ "$v" = 8g ] && [ "$c" = 262k ]; then
-        R_ID=R7; R_BIND=127.0.0.1
-        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -dev CUDA0 -sm none -mg 0 --hybrid-moe --lm-prefill --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 --ctx-checkpoints 32'
-        R_MEASURED='GTX 1070 8 GiB: TG 32-34 t/s short, ~26.5 t/s @100k, PP 670 t/s @19k (docs/guide/LINUX-PASCAL.md)'
+        R_ID=R7; R_BIND=0.0.0.0
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0'
+        R_DEVICE=auto
+        R_MEASURED='owner working recipe 2026-11-05 (8 GiB target, binds 0.0.0.0)'
         R_ENV='LLAMA_FATTN_TILE_Q8QK=1'
-        R_NOTE='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the LINUX-PASCAL.md row)'
+        R_NOTE='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the 8g row); the old LINUX-PASCAL.md fuse/prearm recipe is historical'
         return 0
     fi
     return 1
@@ -749,9 +754,16 @@ pick_recipe() {
     fi
     say "recipe $R_ID: $R_MEASURED"
     [ -n "$R_NOTE" ] && say "note: $R_NOTE"
-    # D12: warning only, threshold by VRAM target
-    local gpu_mib need=0 card='a 24 GiB card'
-    gpu_mib=$(echo "$GPU_LINE" | sed -n 's/^[^,]*,\s*\([0-9,]*\)\s*MiB.*/\1/p' | tr -d ',')
+    # D12: warning only, threshold by VRAM target. D17: device-pinned rows
+    # check the card they will actually use, not nvidia-smi's first line.
+    local gpu_mib need=0 card='a 24 GiB card' gpu_line="$GPU_LINE"
+    if [ -n "$R_DEVICE" ]; then
+        local dev; dev=$(resolve_gpu_index "$VRAM")
+        local mibs; mibs=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null)
+        local sel; sel=$(echo "$mibs" | sed -n "$((dev + 1))p")
+        [ -n "$sel" ] && gpu_line="$sel"
+    fi
+    gpu_mib=$(echo "$gpu_line" | sed -n 's/^[^,]*,\s*\([0-9,]*\)\s*MiB.*/\1/p' | tr -d ',')
     case "$VRAM" in
         full) need=22528 ;;
         16g)  need=10240 ;;
@@ -761,6 +773,46 @@ pick_recipe() {
     if [ -n "$gpu_mib" ] && [ "$gpu_mib" -gt 0 ] && [ "$gpu_mib" -lt "$need" ]; then
         warn "GPU has $gpu_mib MiB; row $R_ID was measured on $card (SDD D12: warning only, the server's memory guard fails loudly)"
     fi
+}
+
+# SDD D17: CUDA index for device-pinned rows (R5/R7). --device N (DEVICE)
+# wins; otherwise auto: full -> largest card, 16g/8g -> smallest card at or
+# above the row minimum (10240/8192 MiB), else the smallest card (the D12
+# warning then fires). Result cached in GPU_DEV.
+resolve_gpu_index() {
+    local vram="$1"
+    if [ -n "$DEVICE" ]; then GPU_DEV="$DEVICE"; echo "$GPU_DEV"; return 0; fi
+    if [ -n "$GPU_DEV" ]; then echo "$GPU_DEV"; return 0; fi
+    local need=0
+    case "$vram" in 16g) need=10240 ;; 8g) need=8192 ;; esac
+    local rows
+    rows=$(nvidia-smi --query-gpu=index,memory.total --format=csv,noheader 2>/dev/null)
+    if [ -z "$rows" ]; then
+        say 'nvidia-smi unavailable; pinning --device CUDA0 (override with --device N)' >&2
+        GPU_DEV=0; echo 0; return 0
+    fi
+    local count=0 largest='' largest_mib=0 smallest='' smallest_mib=0 fit='' fit_mib=0
+    local idx mib
+    while IFS=',' read -r idx mib; do
+        idx=${idx//[!0-9]/}; mib=${mib//[!0-9]/}
+        [ -z "$idx" ] && continue
+        count=$((count + 1))
+        if [ -z "$largest" ] || [ "$mib" -gt "$largest_mib" ] || { [ "$mib" -eq "$largest_mib" ] && [ "$idx" -lt "$largest" ]; }; then largest=$idx; largest_mib=$mib; fi
+        if [ -z "$smallest" ] || [ "$mib" -lt "$smallest_mib" ] || { [ "$mib" -eq "$smallest_mib" ] && [ "$idx" -lt "$smallest" ]; }; then smallest=$idx; smallest_mib=$mib; fi
+        if [ "$need" -gt 0 ] && [ "$mib" -ge "$need" ] && { [ -z "$fit" ] || [ "$mib" -lt "$fit_mib" ] || { [ "$mib" -eq "$fit_mib" ] && [ "$idx" -lt "$fit" ]; }; }; then fit=$idx; fit_mib=$mib; fi
+    done <<< "$rows"
+    local pick=0 why=''
+    if [ "$count" -gt 1 ]; then
+        if [ "$vram" = full ]; then pick=$largest; why="largest card, ${largest_mib} MiB"
+        elif [ -n "$fit" ]; then pick=$fit; why="smallest card >= ${need} MiB, ${fit_mib} MiB"
+        else pick=$smallest; why="smallest card, ${smallest_mib} MiB (below the row minimum)"; fi
+        # >&2: the index goes to stdout for command substitution (D17)
+        say "multi-GPU system: pinning --device CUDA$pick ($why; override with --device N)" >&2
+    else
+        pick=$largest
+    fi
+    GPU_DEV=$pick
+    echo "$pick"
 }
 
 git_short() {
@@ -805,7 +857,9 @@ emit_run_script() {
             echo "export $R_ENV"
         fi
         echo 'mkdir -p "$(dirname "$LOG")"'
-        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $R_FLAGS 2>&1 | tee \"\$LOG\""
+        local flags="$R_FLAGS"
+        [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
+        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $flags 2>&1 | tee \"\$LOG\""
         echo
         echo '# stop: Ctrl-C in this console.  Health: curl http://127.0.0.1:'"$PORT"'/health'
         echo '# Pong test (USAGE.md section 5):'
