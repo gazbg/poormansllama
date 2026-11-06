@@ -704,7 +704,7 @@ struct common_params {
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
-    std::vector<std::string> hostnames = {"127.0.0.1"};
+    std::vector<std::string> hostnames = {"0.0.0.0"};  // (private fork) listen on all interfaces by default; pass -H 127.0.0.1 to restrict to loopback
     bool use_jinja = true;                                                                                  // NOLINT
 
     // server CORS params

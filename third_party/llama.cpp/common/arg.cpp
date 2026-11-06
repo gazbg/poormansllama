@@ -1751,7 +1751,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_HYBRID_MOE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--hybrid-moe-frozen"},
-        "deterministic hybrid decode: a fixed expert cache of --hybrid-moe-slots slots (default 16 here) and no promotions, so which experts run on the GPU never changes and identical requests give identical output "
+        "deterministic hybrid decode: a fixed expert cache of --hybrid-moe-slots slots (default 32 here) and no promotions, so which experts run on the GPU never changes and identical requests give identical output "
         "(a cache-hit continuation equals a fresh one); the decode is slower than with the dynamic cache",
         [](common_params & params) {
             params.hybrid_moe_frozen = true;
