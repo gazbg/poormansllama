@@ -1,5 +1,25 @@
 # Yet another optimized llama cpp for 8GB and 16 GPUS for 262k context
 
+## What it is
+
+I used black magic to make it run almost as fast as it would if the model is fully in the VRAM.
+
+The main goal was to have max context on a q5 model for agentic work on an old PC with a GTX 1070
+
+Qwen3.8-27B-UD-Q5_K_XL : 
+```
+prompt eval time (Prefill)   =    51886 tokens (    1.64 ms per token,   610.73 tokens per second)
+eval time (token generation) =    2328 tokens (    36.31 ms per token,    27.54 tokens per second)
+```
+
+This repository is the research record and the code. The llama.cpp fork is
+vendored in `third_party/llama.cpp/` as plain files (no submodule). Experiment
+history is in `docs/` and in the archive branches listed in
+[docs/reference/HISTORY.md](docs/reference/HISTORY.md).
+
+Status as of 2026-10-18. The record ends with entry G42 in
+[docs/currentstate.md](docs/currentstate.md).
+
 ## Start here
 
 **Quick start** — the setup wizard checks the environment, installs missing
@@ -28,27 +48,6 @@ Choose the model only:
    5) qwen36: MoE - Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf, 24.7 GiB [Q: q5k_xl (alt)]
 
 You should not see a difference in speed between Q4 and Q5 models , the main difference is how much free RAM will it leave when loaded for your needs. 
-
-
-## What it is
-
-I used black magic to make it run almost as fast as it would if the model is fully in the VRAM.
-
-The main goal was to have max context on a q5 model for agentic work on an old PC with a GTX 1070
-
-Qwen3.8-27B-UD-Q5_K_XL : 
-```
-prompt eval time (Prefill)   =    51886 tokens (    1.64 ms per token,   610.73 tokens per second)
-eval time (token generation) =    2328 tokens (    36.31 ms per token,    27.54 tokens per second)
-```
-
-This repository is the research record and the code. The llama.cpp fork is
-vendored in `third_party/llama.cpp/` as plain files (no submodule). Experiment
-history is in `docs/` and in the archive branches listed in
-[docs/reference/HISTORY.md](docs/reference/HISTORY.md).
-
-Status as of 2026-10-18. The record ends with entry G42 in
-[docs/currentstate.md](docs/currentstate.md).
 
 ## What it does
 
