@@ -26,22 +26,24 @@ $repo = Split-Path -Parent $repo
 $emit = Join-Path $repo 'run-server.ps1'
 $exe  = Join-Path $repo 'build\llama-cuda\bin\Release\llama-server.exe'
 
-# row -> model key (the recipe table is per-model; R5/R6/R7 are qwen36, R1/R2 qwen38, R3 qwen38, R4 flint)
+# row -> model key and quant (SDD D21; R5/R6/R7/R8 are qwen36, R1/R2 qwen38, R3 qwen38, R4 flint)
+$quant = ''
 $modelKey = ''
 switch ($Row) {
     'R1' { $modelKey = 'qwen38'; $vram = 'full'; $ctx = '262k' }
     'R2' { $modelKey = 'qwen38'; $vram = '16g';  $ctx = '262k' }
     'R3' { $modelKey = 'qwen38'; $vram = '8g';   $ctx = '128k' }
     'R4' { $modelKey = 'flint';  $vram = 'full'; $ctx = '262k' }
-    'R5' { $modelKey = 'qwen36'; $vram = 'full'; $ctx = '262k' }
-    'R6' { $modelKey = 'qwen36'; $vram = '16g';  $ctx = '262k' }
-    'R7' { $modelKey = 'qwen36'; $vram = '8g';   $ctx = '262k' }
+    'R5' { $modelKey = 'qwen36'; $vram = 'full'; $ctx = '262k'; $quant = 'q8k_xl' }
+    'R6' { $modelKey = 'qwen36'; $vram = '16g';  $ctx = '262k'; $quant = 'q8k_xl' }
+    'R7' { $modelKey = 'qwen36'; $vram = '8g';   $ctx = '262k'; $quant = 'q4k_m' }
+    'R8' { $modelKey = 'qwen36'; $vram = '16g';  $ctx = '262k'; $quant = 'q4k_m' }
     default { Write-Host "smoke: unknown row $Row" -ForegroundColor Red; exit 2 }
 }
 
 Write-Host "== smoke: emit run-server.ps1 ($Row, $modelKey, $vram, $ctx)" -ForegroundColor Cyan
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'setup.ps1') `
-    -NonInteractive -SkipBuild -Model $modelKey -Vram $vram -Context $ctx `
+    -NonInteractive -SkipBuild -Model $modelKey -Quant $quant -Vram $vram -Context $ctx `
     -ModelFile $Model -Port $Port -NoStart
 if ($LASTEXITCODE -ne 0) { Write-Host "smoke: emit failed (exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
 if (-not (Test-Path $emit)) { Write-Host 'smoke: run-server.ps1 was not written' -ForegroundColor Red; exit 1 }

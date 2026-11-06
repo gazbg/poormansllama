@@ -91,7 +91,7 @@ layer stay on the device. The server refuses loudly when that does not hold. See
 | `--lm-prefill-host-layers SPEC` | off | The layers whose weights stay in host memory (page-locked once). `SPEC` is a count `N` (the first `N` layers) or layers and ranges such as `0-30,34`. Sets `-ngl` to all layers unless given and turns the fit step off. Works without `--lm-prefill` too (the ordinary path then computes or offloads them) |
 | `--lm-decode-stream SPEC` | off | Layers (a subset of the host layers, given as layers and ranges) that a DECODE step computes on the device from a ring of VRAM slots, which a copy stream refills while the CPU computes the other host layers. Their number must be a multiple of `--lm-decode-slots`. `tools/dense_plan.py` proposes a plan for the card. Spread the layers evenly over the host layers (bunched layers cannot hide their copies); 4 to 8 is the useful range on the 24 GiB Windows laptop (`docs/plans/dense-decode-ring-windows.md`). `dynamic` or `dynamic:P` lets the statistics of the previous decode steps choose the ring layers (any host layer can be one), instead of a fixed spread: the copy time of a layer (percentile P, default 95, measured by the copy worker), the CPU time between two ring layers and the GPU time of a ring layer (CUDA timing events) tell how many CPU layers the copy of the next ring layer must hide behind. The plan changes only between decode steps, with hysteresis; a changed plan rebuilds the decode graph once. Needs `--lm-prefill-host-layers` or `--lm-resident-layers`. Tuning by environment: `LLAMA_DS_MARGIN` (0.25), `LLAMA_DS_OVERHEAD_MS` (2), `LLAMA_DS_WINDOW_TOKENS` (16), `LLAMA_DS_REPLAN` (2). `lookahead:L` / `spaced:L` pick the ring layers by formula from `--lm-prefill-host-layers` (the first slots' worth of host layers, then after L CPU-computed host layers the next ring layer; `spaced` counts from the previous ring layer, `lookahead` from each ring layer that ends). Measured on that laptop: `spaced:5` / `spaced:6` (6 ring layers of 32) match the best spread plan (+7..11%), `spaced:3` is flat, `spaced:2` and `lookahead:2/3` lose 29..45% |
 | `--lm-resident-layers N` | off | Dense models: how many decoder layers stay in VRAM. They are spread evenly over the model and end-aligned (layer ((i+1)*n_layer)/N - 1: 8 of 64 = 7,15,23,...,63; 2 of 64 = 31,63; 16 of 64 = the attention layers), so the last layer, which feeds the output head, is always one of them; all the others are host layers, as if `--lm-prefill-host-layers` listed them (an explicit `--lm-prefill-host-layers` wins). The layer count is read from the GGUF header (block_count minus the NextN layers). KV cache and recurrent state of every layer stay on the device. Unless `--lm-decode-stream` is given, it also starts the dynamic decode ring over the host layers (`--lm-decode-stream off` keeps them all on the CPU) |
-| `--lm-evict-layers N` | off | With `--lm-resident-layers`: N of the resident layers (spread evenly over them, never the last layer) are loaded in HOST memory and get a VRAM slot of their own for decode steps: they are computed on the device like resident layers. The layer-major pass (`--lm-prefill`) frees those slots, which gives it the room it needs on a full card, and streams the layers from host memory like any host layer; the first decode step fills the slots again (~40 ms per layer). Costs N x 345 MiB of RAM. Choose N from the pass's own refusal message (`... MiB of device memory are free, the pass needs ... MiB`): each evictable layer adds ~345 MiB. Measured on the 24 GiB laptop: 24 resident + 5 evictable, MTP + `--spec-mtp-defer`: 974 tok/s prefill against ~370 on the ordinary path |
+| `--lm-evict-layers N` | `--lm-resident-layers - 2` | With `--lm-resident-layers`: N of the resident layers (spread evenly over them, never the last layer) are loaded in HOST memory and get a VRAM slot of their own for decode steps: they are computed on the device like resident layers. The layer-major pass (`--lm-prefill`) frees those slots, which gives it the room it needs on a full card, and streams the layers from host memory like any host layer; the first decode step fills the slots again (~40 ms per layer). Costs N x 345 MiB of RAM. Not set: defaults to `--lm-resident-layers - 2`, so two resident layers stay in VRAM permanently (the last layer is never evicted). Set N lower (for example from the pass's refusal message, `... MiB of device memory are free, the pass needs ... MiB`) to keep more resident layers on the device: each evictable layer adds ~345 MiB. Measured on the 24 GiB laptop: 24 resident + 5 evictable, MTP + `--spec-mtp-defer`: 974 tok/s prefill against ~370 on the ordinary path |
 | `--lm-decode-slots N` | `2` | Slots of that ring. More than two did not help in any measurement |
 | env `LLAMA_DS_PIECE_KIB` / `LLAMA_DS_WINDOW` / `LLAMA_DS_POLL_US` | `1024` / `2` / `20` on Windows, `0` (one piece) elsewhere | Ring copy in pieces of that size with at most WINDOW in flight, issued by a worker thread: on Windows an unpaced layer copy blocks the CPU->GPU activation hops of the CPU layers for its whole duration (22 ms) and made the ring slower than no ring. `LLAMA_DS_PIECE_KIB=0` = old behaviour. `LLAMA_DS_FLUSH=0` turns off the submit flush after each queued copy; `LLAMA_DS_NOCOPY=1` never fills the slots (timing only, wrong output). `LLAMA_DS_HOP_KERNEL` (default on with the ring, `0` off) and `LLAMA_CUDA_HOP_KERNEL=1` (any run): small CPU->GPU buffer copies as a kernel on pinned memory instead of a copy-engine copy |
 
@@ -189,6 +189,78 @@ tests fail without it, and the CMake cache keeps the value from configure time.
 | Deterministic | canonical plus `--hybrid-moe-frozen` | Reproducible answers; hit-versus-fresh checks | Decode is slower |
 | Stock baseline | unmodified llama-server with `-c`, `-ctk`, `-ctv`, `-fa`, `-np`, `-fitt 16000` | Comparison numbers | Slower; no expert offload |
 | Two slots | `-np 2` with the layer-major prefill | Concurrent clients | Big batches decline under concurrency; needs the unified KV cache |
+
+### 6.1 Tuned start commands for MoE models (by VRAM tier)
+
+Shared environment for every MoE profile below (set before starting the server):
+
+```bash
+export LLAMA_MOE_HYBRID_LEAN_STALL_US=10000
+export LLAMA_FATTN_GQA8_MAXROWS=4
+```
+
+`LLAMA_FATTN_GQA8_MAXROWS=4` is the opt-in row count of section 5; the 8 GB profile sets it inline as well.
+
+**8 GB VRAM profile, all experts (GTX 1070)**
+
+Measured: pp 590 tok/s, tg 33 tok/s, context 20k.
+
+```bash
+LLAMA_FATTN_GQA8_MAXROWS=4 ./build/llama-cuda/bin/llama-server \
+  -m /home/gzhel/models/qwen-3.6/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+  --host 0.0.0.0 --port 8033 -c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 \
+  --hybrid-moe -fitt 16 \
+  --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 \
+  --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 \
+  --lm-prefill-slots 2 -lv 4 --device CUDA0 \
+  --hybrid-moe-prefill-free-all --lm-prefill-segment 16384
+```
+
+**Larger than 16 GB, all-MoE models (Qwen3.6-35B-A3B MTP Q8_K_XL, with MTP draft)**
+
+Measured on a GTX 5090 (mobile), which the owner reports performs the same as a GTX 3090 for this profile:
+
+| Context | pp (tok/s) | tg (tok/s) |
+|---|---|---|
+| 50k | 3600 | 77 |
+| 200k | 2350 | 66 |
+
+```bash
+C:\Development\AI\poormansllama\build\llama-cuda\bin\Release\llama-server.exe \
+  -m C:\Models\ALL\other\qwen-3.6\Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL.gguf \
+  --host 0.0.0.0 --port 8033 -c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 \
+  --hybrid-moe -fitt 16 \
+  --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 \
+  --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 \
+  --lm-prefill-slots 3 -lv 4 --device CUDA0 --hybrid-moe-prefill-free-all \
+  --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 \
+  --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 \
+  --lm-prefill-fuse --no-warmup
+```
+
+**16 GB all-MoE models (same MTP model)**
+
+Measured on the same GTX 5090 (mobile) / GTX 3090 equivalence: pp 2000 tok/s, tg 51 tok/s, context 200k.
+
+```bash
+C:\Development\AI\poormansllama\build\llama-cuda\bin\Release\llama-server.exe \
+  -m C:\Models\ALL\other\qwen-3.6\Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL.gguf \
+  --host 0.0.0.0 --port 8033 -c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 \
+  --hybrid-moe -fitt 8 \
+  --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 \
+  --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 --hybrid-moe-prefill-ubatch 0 \
+  --lm-prefill-slots 3 -lv 4 --device CUDA0 --hybrid-moe-prefill-free-all \
+  --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 \
+  --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 \
+  --lm-prefill-fuse
+```
+
+Notes on these numbers:
+
+- The 8 GB and 16 GB profiles use different `-fitt` values (16 and 8). Check the unit of `-fitt` in section 3 before copying one profile onto another card.
+- The stats are the owner's own measurements in the listed sessions, not checked against the recorded evidence files. Treat them as observed, not as guaranteed on other hardware.
+- The 8 GB profile runs the Q4_K_M quant on a GTX 1070; the two 16 GB+ profiles run the Q8_K_XL quant with MTP.
+- The 16 GB profile lists `--hybrid-moe-prefill-free-all`. Section 3 recommends keeping that flag off, because it measured +0.4% to +3.5% per request. Verify it on your card before keeping it.
 
 ## 7. Multi-token prediction (`--mtp`)
 

@@ -27,7 +27,7 @@ param(
     [switch]$DryRun,
     [switch]$NonInteractive,
     [string]$Model = '',            # qwen38 | qwen36 | flint | 1-5
-    [string]$Quant = '',            # q4k_m | q5k_xl (SDD D19); default = the model's row quant
+    [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl (SDD D19); default = the model's row quant
     [ValidateSet('full', '16g', '8g')][string]$Vram = '',
     [ValidateSet('262k', '128k')][string]$Context = '',
     [string]$Port = '8033',
@@ -262,41 +262,67 @@ $script:MODELS = @(
         DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$false },
     [pscustomobject]@{ Key='qwen36'; Quant='q5k_xl'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q5_K_XL)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf'; SizeGib=24.7
-        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$false }
+        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$false },
+    [pscustomobject]@{ Key='qwen36'; Quant='q8k_xl'; Label='Qwen3.6-35B-A3B MoE + MTP (unsloth UD Q8_K_XL, MTP repo)'
+        Repo='unsloth/Qwen3.6-35B-A3B-MTP-GGUF'; File='Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf'; SizeGib=36.4
+        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe-mtp'; Default=$false }
 )
 
 # Recipe rows: MEASURED, verbatim (SDD section 4.6, decision D4/D11).
+# SDD D21: a row is keyed on (model, VRAM, context, quant). A quant with no row
+# of its own falls back to the model's default-quant row (Check-RecipeQuant warns).
 # Flags = the exact command from the source run, minus the exe path, -m, and
 # the host/port the wizard re-asks (defaults keep the row's own values).
 $script:RECIPES = @(
-    [pscustomobject]@{ Id='R1'; Model='qwen38'; Vram='full'; Ctx='262k'
+    [pscustomobject]@{ Id='R1'; Model='qwen38'; Vram='full'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-37 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
         Bind='127.0.0.1'; Measured='PP 1093.25 t/s, TG 14.95 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
-    [pscustomobject]@{ Id='R2'; Model='qwen38'; Vram='16g'; Ctx='262k'
+    [pscustomobject]@{ Id='R2'; Model='qwen38'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
         Bind='127.0.0.1'; Measured='PP 1007.87 t/s, TG 9.96 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
-    [pscustomobject]@{ Id='R3'; Model='qwen38'; Vram='8g'; Ctx='128k'
+    [pscustomobject]@{ Id='R3'; Model='qwen38'; Vram='8g'; Ctx='128k'; Quant='q4k_m'
         Flags='-c 128000 -ctk q4_0 -ctv q4_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --lm-prefill-prearm always -lv 4'
         Bind='127.0.0.1'; Measured='PP 36.95 t/s, TG 9.92 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
-    [pscustomobject]@{ Id='R4'; Model='flint'; Vram='full'; Ctx='262k'
+    [pscustomobject]@{ Id='R4'; Model='flint'; Vram='full'; Ctx='262k'; Quant='q5k_xl'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --lm-prefill-copy-piece 64'
         Bind='0.0.0.0'; Measured='PP 2422.94 t/s, TG 53.80 t/s (owner 2026-11-02, RTX 5090 24 GiB)' },
-    [pscustomobject]@{ Id='R5'; Model='qwen36'; Vram='full'; Ctx='262k'
-        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all'
-        Device='auto'; Bind='0.0.0.0'; Measured='owner working recipe 2026-11-02 (RTX 5090 24 GiB)' },
-    [pscustomobject]@{ Id='R6'; Model='qwen36'; Vram='16g'; Ctx='262k'
+    [pscustomobject]@{ Id='R5'; Model='qwen36'; Vram='full'; Ctx='262k'; Quant='q8k_xl'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
+        Device='auto'; Bind='0.0.0.0'; Measured='PP 3600 t/s @50k, 2350 t/s @200k; TG 77 t/s @50k, 66 t/s @200k (owner, GTX 5090 Laptop, Windows)'
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Note='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags' },
+    [pscustomobject]@{ Id='R6'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q8k_xl'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 8 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse'
+        Device='auto'; Bind='0.0.0.0'; Measured='PP 2000 t/s, TG 51 t/s @200k (owner, GTX 5090 Laptop, Windows)'
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Note='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags' },
+    [pscustomobject]@{ Id='R7'; Model='qwen36'; Vram='8g'; Ctx='262k'; Quant='q4k_m'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384'
+        Device='auto'; Bind='0.0.0.0'; Measured='PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows)'
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Note='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command' },
+    [pscustomobject]@{ Id='R8'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         Bind='127.0.0.1'; Measured='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
-        Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13)' },
-    [pscustomobject]@{ Id='R7'; Model='qwen36'; Vram='8g'; Ctx='262k'
-        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0'
-        Device='auto'; Bind='0.0.0.0'; Measured='owner working recipe 2026-11-05 (8 GiB target, binds 0.0.0.0)'
-        Env=@{ 'LLAMA_FATTN_TILE_Q8QK' = '1' }
-        Note='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the 8g row); the old LINUX-PASCAL.md fuse/prearm recipe is historical' }
+        Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13). Kept as R8 (the former R6)' }
 )
 
-function RecipeFor([string]$m, [string]$v, [string]$c) {
-    return ($script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c } | Select-Object -First 1)
+function DefaultQuant([string]$m) {
+    $d = $script:MODELS | Where-Object { $_.Key -eq $m -and $_.Default } | Select-Object -First 1
+    if ($d) { return $d.Quant }
+    return ''
+}
+
+function RecipeFor([string]$m, [string]$v, [string]$c, [string]$q) {
+    # SDD D21: an exact (model, VRAM, ctx, quant) row first; otherwise the model's
+    # default-quant row (the caller warns that it was measured on another file)
+    $hit = $script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $q } | Select-Object -First 1
+    if ($hit) { return $hit }
+    $dq = DefaultQuant $m
+    if ($dq -and $dq -ne $q) {
+        return ($script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $dq } | Select-Object -First 1)
+    }
+    return $null
 }
 
 function Get-NvidiaSmiPath {
@@ -993,19 +1019,13 @@ function Pick-Recipe {
     param([object]$m)
     # D20: recipe selection is part of the settings phase (no step number).
     Say 'recipe (measured rows only):'
-    # SDD D19: the rows were measured on each model's Default quant; picking
-    # the alt build runs the row's flags against a file nobody measured.
-    if (-not $m.Default) {
-        $d = $script:MODELS | Where-Object { $_.Key -eq $m.Key -and $_.Default } | Select-Object -First 1
-        Warn "row was measured on $($d.File); you chose $($m.File) (quant $($m.Quant)) - the row's speed/VRAM numbers are for the default quant"
-    }
     # promote the -Vram/-Context parameters into script scope so main can see them
     if ($Vram) { $script:Vram = $Vram }
     if ($Context) { $script:Context = $Context }
     $avail = $script:RECIPES | Where-Object { $_.Model -eq $m.Key }
     if ($script:Vram -and $script:Context) {
-        $r = RecipeFor $m.Key $script:Vram $script:Context
-        if ($r) { return $r }
+        $r = RecipeFor $m.Key $script:Vram $script:Context $m.Quant
+        if ($r) { return (Check-RecipeQuant $r $m) }
     }
     if (-not $script:Vram) {
         $opts = @(
@@ -1022,13 +1042,22 @@ function Pick-Recipe {
         )
         $script:Context = AskChoice 'Context size?' $opts '262k'
     }
-    $r = RecipeFor $m.Key $script:Vram $script:Context
+    $r = RecipeFor $m.Key $script:Vram $script:Context $m.Quant
     if (-not $r) {
-        Warn "no measured recipe for $($m.Key) / $($script:Vram) / $($script:Context) - available rows for $($m.Key):"
+        Warn "no measured recipe for $($m.Key) / $($m.Quant) / $($script:Vram) / $($script:Context) - available rows for $($m.Key):"
         foreach ($a in $avail) {
-            Write-Host ("    {0}  {1,-5} {2,-6} {3}" -f $a.Id, $a.Vram, $a.Ctx, $a.Measured)
+            Write-Host ("    {0}  {1,-5} {2,-6} {3,-7} {4}" -f $a.Id, $a.Vram, $a.Ctx, $a.Quant, $a.Measured)
         }
-        ExitCode 3 'no measured recipe for the chosen model/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)'
+        ExitCode 3 'no measured recipe for the chosen model/quant/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)'
+    }
+    return (Check-RecipeQuant $r $m)
+}
+
+function Check-RecipeQuant {
+    param([object]$r, [object]$m)
+    # SDD D21/D19: a fallback row (the model's default quant) was measured on a different file
+    if ($r.Quant -ne $m.Quant) {
+        Warn "row $($r.Id) was measured on quant $($r.Quant); you chose $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for $($r.Quant)"
     }
     return $r
 }
