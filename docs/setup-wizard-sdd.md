@@ -217,11 +217,15 @@ Questions and rules:
 
 Every row is **verbatim** from its source command. The wizard substitutes
 only: the model path (question 6), the bind address (default = the row's own
-value: 127.0.0.1 for R1-R3/R6/R7, 0.0.0.0 for R4/R5), and the port (default
-8033, all rows). When the resolved host is 0.0.0.0 the wizard prints the
-USAGE.md §5 security note once. Recorded decision D11: the wizard does not
-add, drop, or re-tune any flag of a row (`-t 16` appears only where the row
-has it).
+value: 127.0.0.1 for R1-R3/R6, 0.0.0.0 for R4/R5/R7), the port (default
+8033, all rows), and - for the device-pinned rows (R5, R7) - the CUDA device
+index, appended as `--device CUDA<n>` (D17: `-Device N` / `--device N`
+overrides; auto = the largest card for `full`, the smallest card at or above
+the row minimum for `16g`/`8g`, else the smallest card). When the resolved
+host is 0.0.0.0 the wizard prints the USAGE.md §5 security note once.
+Recorded decision D11: the wizard does not add, drop, or re-tune any flag of
+a row (`-t 16` appears only where the row has it); D17 is the single recorded
+exception (a device index, never a tuning value).
 
 VRAM targets (question): `full` (use all card VRAM), `16g` (keep ~8 GB
 class), `8g` (keep ~16 GB class on a 24 GB card). Context: `262k` / `128k`.
@@ -235,20 +239,22 @@ commands and docs/guide; tok/s as measured in those runs):
 | R2 | qwen38 | 16g | 262k | q8_0 | as R1 with `--lm-prefill-host-layers 0-63` | PP 1008 t/s, TG 9.96 t/s |
 | R3 | qwen38 | 8g | 128k | q4_0 | `--lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --lm-prefill-prearm always` (no spec flags) | TG 9.92 t/s |
 | R4 | flint | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 --lm-prefill-copy-piece 64` | PP 2423 t/s, TG 53.8 t/s |
-| R5 | qwen36 | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 --device CUDA0 --hybrid-moe-prefill-free-all` | (owner's working recipe; tok/s not recorded in the paste — printed as "owner recipe, unmeasured in wizard records") |
+| R5 | qwen36 | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 --hybrid-moe-prefill-free-all` (device auto-pinned, D17) | (owner's working recipe; tok/s not recorded in the paste — printed as "owner recipe, unmeasured in wizard records") |
 | R6 | qwen36 | 16g | 262k | q8_0 | G42 canonical (USAGE.md §4): `--hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32` | TG 3.0–3.7x stock, PP 3.65–4.11x stock (G31 record) |
-| R7 | qwen36 | 8g | 262k | q8_0 | LINUX-PASCAL §2 recipe: `-dev CUDA0 -sm none -mg 0 --hybrid-moe --lm-prefill --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 --ctx-checkpoints 32` (no `-fitt`), plus env `LLAMA_FATTN_TILE_Q8QK=1` on pre-Volta | TG 32–34 t/s short / ~26.5 t/s @100k; PP 670 t/s @19k (GTX 1070) |
+| R7 | qwen36 | 8g | 262k | q8_0 | owner recipe 2026-11-05: `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0` (device auto-pinned, D17), plus env `LLAMA_FATTN_TILE_Q8QK=1` (int8 attention; pre-Volta row) | owner working recipe (tok/s not recorded in the wizard records); the prior LINUX-PASCAL §2 fuse/prearm recipe (TG 32–34 t/s short / ~26.5 t/s @100k; PP 670 t/s @19k, GTX 1070) is historical in that doc |
 
 Refusal rule (owner decision A): any (model, target, ctx) triple not in the
 matrix → the wizard prints the table of available rows for that model and
 exits 3. Examples refused: qwen36 128k, flint 16g/8g, qwen38 16g+128k.
 
-GPU sanity check (warning only, recorded decision D12): if `nvidia-smi`
-total VRAM < the target implies (full ≥ 22 GiB / 16g ≥ 10 GiB / 8g ≥ 8 GiB
-for these models) the row is still emitted with a warning that the recipe
-was measured on a 24 GiB card (R7 excepted, measured on 8 GiB). No refusal:
-`-fitt` and the memory guard fail loudly in the server itself, and the
-owner explicitly wants the 16g/8g rows usable on smaller cards.
+GPU sanity check (warning only, recorded decision D12): if the card the run
+will use (nvidia-smi's first line; for the device-pinned rows R5/R7 the
+card selected per D17) has total VRAM below the target implies (full ≥
+22 GiB / 16g ≥ 10 GiB / 8g ≥ 8 GiB for these models) the row is still
+emitted with a warning that the recipe was measured on a 24 GiB card (R7
+excepted, measured on 8 GiB). No refusal: `-fitt` and the memory guard fail
+loudly in the server itself, and the owner explicitly wants the 16g/8g rows
+usable on smaller cards.
 
 ### 4.7 Emitted artifacts (step 8)
 
@@ -357,3 +363,6 @@ See the acceptance contract in plans/setup-wizard-plan.md. In short:
 | D13 | R6 model substitution: G42 row uses `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (the MTP file the G42 record used is not on HF) | auto-download requirement (owner); closest available quant; risk flagged in SETUP.md | yes |
 | D14 | Exit codes 0/1/2/3/4/5/6 as in §5 | machine-readable outcomes for automation | yes |
 | D15 | `SETUP_WIZARD_FORCE_MISSING` test hook | mirrors the repo's existing fault-injection test-hook pattern (`LLAMA_LM_PEER_FAIL`) | yes |
+| D16 | (2026-11-05, owner decision) R7 recipe replaced by the owner's current 8g command: `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0`, bind 0.0.0.0, env `LLAMA_FATTN_TILE_Q8QK=1` kept; the LINUX-PASCAL §2 fuse/prearm recipe becomes history in that doc | owner instruction; the old recipe's measured numbers stay in LINUX-PASCAL.md as evidence | yes (restore the old row) |
+| D17 | (2026-11-05) device-pinned rows (R5, R7) no longer hard-code `CUDA0` in the row flags; the wizard appends `--device CUDA<n>` at emission: `-Device N` / `--device N` overrides, else auto (largest card for `full`; smallest card at/above the row minimum for `16g`/`8g`, else smallest card). The D12 VRAM warning runs against the selected card | `CUDA0` is not guaranteed on multi-GPU or reordered systems; the row's recipe is unchanged apart from which card runs it | yes (re-pin the index in the row) |
+| D18 | Consequence of D16: R7 now uses `--hybrid-moe-prefill-free-all`, which exists only in the fork (not origin/main), so a fresh-clone build's flag gate refuses R7 like R4/R5 (SETUP.md troubleshooting updated) | recorded so the refusal is not read as a new defect | yes (follows D16) |
