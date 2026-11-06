@@ -36,6 +36,7 @@ CONTEXT=''
 PORT=8033
 BIND=''
 DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
+QUANT=''      # q4k_m|q5k_xl for qwen38/qwen36 (SDD D19); empty = the model's default
 MODEL_FILE=''
 MODEL_DIR=''
 CLONE_DIR=''   # empty = in-repo detection / default path (see invoke_clone)
@@ -58,6 +59,7 @@ usage() {
     cat <<'EOF'
 usage: setup.sh [options]
   --model qwen38|qwen36|flint   model to use (asked if omitted)
+  --quant q4k_m|q5k_xl          quant build for qwen38/qwen36 (default: the row's own)
   --vram full|16g|8g            VRAM target (asked if omitted)
   --context 262k|128k           context size (asked if omitted)
   --port N                      server port (default 8033)
@@ -87,6 +89,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
+        --quant) QUANT="$2"; shift 2 ;;
         --vram) VRAM="$2"; shift 2 ;;
         --context) CONTEXT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
@@ -144,55 +147,65 @@ confirm() {
     case "$a" in y|Y|yes|YES|'') return 0 ;; *) return 1 ;; esac
 }
 
-# ask_choice "Question" KEY1 KEY2 ...
-# -> echoes the chosen key (default: first key)
-# IMPORTANT: menu prints go to stderr (>&2) so $() command substitution
-# captures only the final selection echo to stdout. If we used stdout for
-# the menu, the user would never see it.
+# ask_choice "Question" DEFAULT KEY1 KEY2 ... -> echoes the chosen key.
+# The menu prints go to stderr (>&2) so a $(...) call captures ONLY the final
+# selection echoed to stdout; on stdout the user would never see the menu
+# (PR #16 fix, preserved). The explicit DEFAULT (SDD D19) fixes the old first-key
+# default, which made the model menu's interactive default qwen38 while the
+# non-interactive default was qwen36 - the two disagreed.
 ask_choice() {
-    local q="$1"; shift
-    local keys=("$@")
-    local def="${keys[0]}"
-    if [ "${NI:-0}" = "1" ]; then echo "$def"; return; fi
+    local q="$1" def="$2"; shift 2
+    local keys=("$@") local i a dno=1
+    if [ "$NI" = 1 ]; then echo "$def"; return; fi
     for i in "${!keys[@]}"; do
-        printf '    %d) %s\n' "$((i+1))" "${keys[$i]}" >&2
+        printf '    %d) %s%s\n' "$((i+1))" "${keys[$i]}" "$( [ "${keys[$i]}" = "$def" ] && echo ' (default)' )" >&2
+        [ "${keys[$i]}" = "$def" ] && dno=$((i+1))
     done
     while :; do
-        printf '  %s (1-%d, default 1) ' "$q" "${#keys[@]}" >&2
+        printf '  %s (1-%d, default %d) ' "$q" "${#keys[@]}" "$dno" >&2
         read -r a || a=""
-        a="${a:-1}"
-        # Normalise: if user typed a number, convert to key
-        if [[ "$a" =~ ^[0-9]+$ ]]; then
-            if [ "$a" -ge 1 ] 2>/dev/null && [ "$a" -le "${#keys[@]}" ] 2>/dev/null; then
-                echo "${keys[$((a-1))]}"; return
-            fi
-            a=1
+        a="${a:-$dno}"   # empty/EOF returns the marked default (a key NAME would not match the case patterns)
+        if [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "${#keys[@]}" ]; then
+            echo "${keys[$((a-1))]}"; return
         fi
-        # Check if user typed one of the keys directly
         for k in "${keys[@]}"; do
-            if [ "$a" = "$k" ]; then echo "$a"; return; fi
+            [ "$a" = "$k" ] && { echo "$k"; return; }
         done
-        # Default: return the first key
-        echo "${keys[0]}"; return
+        printf '  (choose a number or one of: %s)\n' "${keys[*]}" >&2
     done
 }
 
-# --- model table (SDD 4.5; links verified 2026-11-04) -----------------------
-MODEL_KEYS=(qwen38 qwen36 flint)
-MODEL_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF')
-MODEL_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf')
-MODEL_SIZES_GIB=(15.4 20.6 27.9)
-MODEL_SIZES_GIB_INT=(16 21 28)
-MODEL_KINDS=('dense hybrid' 'MoE' 'SWA MoE')
-MODEL_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint")
+# --- model table (SDD 4.5; links verified 2026-11-04, Q5_K_XL 2026-11-05) ----
+# SDD D19: flat over (model, quant); the Default entries are the files the
+# recipe rows were measured on. MI_IDX indexes this flat list.
+M_KEYS=(qwen38 qwen36 flint qwen38 qwen36)
+M_QUANTS=(q4k_m q4k_m q5k_xl q5k_xl q5k_xl)
+M_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF' 'unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF')
+M_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf' 'Qwen3.8-27B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf')
+M_SIZES_GIB=(15.4 20.6 27.9 19.4 24.7)
+M_SIZES_GIB_INT=(16 21 28 20 25)
+M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE')
+M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6")
+M_DEFAULTS=(1 1 1 0 0)
 
-mi() {  # mi KEY -> sets MI_IDX or exits 1
+mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
     case "$1" in
-        qwen38) MI_IDX=0 ;;
-        qwen36) MI_IDX=1 ;;
-        flint)  MI_IDX=2 ;;
-        1|2|3)  MI_IDX=$(( $1 - 1 )) ;;
-        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, or 1-3)" 1 ;;
+        1|2|3|4|5) MI_IDX=$(( $1 - 1 )) ;;
+        qwen38|qwen36|flint)
+            local k="$1" i q="${2:-}" avail=''
+            for i in 0 1 2 3 4; do
+                [ "${M_KEYS[$i]}" = "$k" ] || continue
+                if [ -z "$q" ]; then
+                    [ "${M_DEFAULTS[$i]}" = 1 ] && { MI_IDX=$i; return 0; }
+                elif [ "${M_QUANTS[$i]}" = "$q" ]; then MI_IDX=$i; return 0; fi
+                avail="$avail ${M_QUANTS[$i]}"
+            done
+            if [ -z "$q" ]; then
+                fail "unknown model '$k' (choose qwen38, qwen36, flint, or 1-5)" 1
+            else
+                fail "no '$q' build for $k (available:$avail)" 1
+            fi ;;
+        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, or 1-5)" 1 ;;
     esac
 }
 
@@ -613,17 +626,21 @@ invoke_build() {
 # --- step 5: model (SDD 4.5) -------------------------------------------------
 pick_model() {
     if [ -n "$MODEL" ]; then
-        mi "$MODEL"
+        if [ -n "$QUANT" ]; then mi "$MODEL" "$QUANT"; else mi "$MODEL"; fi
         return 0
     fi
-    local i opts=()
-    for i in 0 1 2; do
-        opts+=("$(printf '%d) %s: %s - %s, %s GiB' "$((i+1))" "${MODEL_KEYS[$i]}" "${MODEL_KINDS[$i]}" "${MODEL_FILES[$i]}" "${MODEL_SIZES_GIB[$i]}")")
+    local i qtag opts=()
+    for i in 0 1 2 3 4; do
+        qtag="${M_QUANTS[$i]}"
+        [ "${M_DEFAULTS[$i]}" = 1 ] || qtag="$qtag (alt)"
+        opts+=("$(printf '%d) %s: %s - %s, %s GiB [Q: %s]' "$((i+1))" "${M_KEYS[$i]}" "${M_KINDS[$i]}" "${M_FILES[$i]}" "${M_SIZES_GIB[$i]}" "$qtag")")
     done
-    if [ "$NI" = 1 ]; then MI_IDX=1; return 0; fi   # default: qwen36 (the vehicle model)
+    if [ "$NI" = 1 ]; then MI_IDX=1; return 0; fi   # default: qwen36 q4k_m (the vehicle model)
     local sel
-    sel=$(ask_choice 'Which model?' "${opts[@]}")
+    sel=$(ask_choice 'Which model (and quant)?' "$(printf '%s' "${opts[1]}")" "${opts[@]}")
     case "$sel" in
+        *qwen38*Q5_K_XL*) MI_IDX=3 ;;
+        *qwen36*Q5_K_XL*) MI_IDX=4 ;;
         *qwen38*) MI_IDX=0 ;;
         *qwen36*) MI_IDX=1 ;;
         *flint*)  MI_IDX=2 ;;
@@ -634,8 +651,8 @@ pick_model() {
 resolve_model_file() {
     # sets LOCAL_FILE; downloads when missing
     local dir="$MODEL_DIR"
-    [ -z "$dir" ] && dir="${MODEL_DIRS[$MI_IDX]}"
-    local file="$dir/${MODEL_FILES[$MI_IDX]}"
+    [ -z "$dir" ] && dir="${M_DIRS[$MI_IDX]}"
+    local file="$dir/${M_FILES[$MI_IDX]}"
     if [ -n "$MODEL_FILE" ]; then
         [ -f "$MODEL_FILE" ] || fail "-model-file does not exist: $MODEL_FILE" 1
         LOCAL_FILE="$MODEL_FILE"
@@ -656,7 +673,7 @@ resolve_model_file() {
         [ -f "$f" ] && others+=("$f")
     done
     if [ ${#others[@]} -gt 0 ]; then
-        say "no ${MODEL_FILES[$MI_IDX]} in $dir, but found:"
+        say "no ${M_FILES[$MI_IDX]} in $dir, but found:"
         local i
         for i in "${!others[@]}"; do say "    $((i+1))) $(basename "${others[$i]}")"; done
         local a
@@ -678,10 +695,10 @@ resolve_model_file() {
 
 download_model() {
     local dir="$1"
-    local file="$dir/${MODEL_FILES[$MI_IDX]}"
+    local file="$dir/${M_FILES[$MI_IDX]}"
     local part="$file.part"
-    local url="https://huggingface.co/${MODEL_REPOS[$MI_IDX]}/resolve/main/${MODEL_FILES[$MI_IDX]}"
-    step "5. Download model (${MODEL_SIZES_GIB[$MI_IDX]} GiB) from Hugging Face"
+    local url="https://huggingface.co/${M_REPOS[$MI_IDX]}/resolve/main/${M_FILES[$MI_IDX]}"
+    step "5. Download model (${M_SIZES_GIB[$MI_IDX]} GiB) from Hugging Face"
     say "$url"
     if [ "$SKIP_DOWNLOAD" = 1 ]; then fail '--skip-download set but no local model found (expected $file)' 5; fi
     if [ "$DRY_RUN" = 1 ]; then say '(dry-run: not downloading)'; LOCAL_FILE="$file"; return 0; fi
@@ -711,7 +728,7 @@ download_model() {
         got=$(stat -c %s "$part" 2>/dev/null || echo 0)
         [ "$got" -gt "$maxbytes" ] && truncate -s "$maxbytes" "$part" && got="$maxbytes"
         [ "$got" -gt 0 ] || fail "test hook download failed before $MAX_DL_MIB MiB (manual: $url)" 5
-        warn "test hook stopped transfer at $(( got / 1048576 )) MiB (expected full ${MODEL_SIZES_GIB[$MI_IDX]} GiB)"
+        warn "test hook stopped transfer at $(( got / 1048576 )) MiB (expected full ${M_SIZES_GIB[$MI_IDX]} GiB)"
         say 'leaving .part in place to verify resume; NOT renaming to the final name.'
         LOCAL_FILE="$part"
         return 0
@@ -737,7 +754,7 @@ download_model() {
 check_disk() {
     # SDD 4.1: disk >= model size + 15 GiB, confirm to proceed (default no)
     local dir="${1:-$LOCAL_FILE}"
-    local need_gib=$(( ${MODEL_SIZES_GIB_INT[$MI_IDX]} + 15 ))
+    local need_gib=$(( ${M_SIZES_GIB_INT[$MI_IDX]} + 15 ))
     local avail_k
     avail_k=$(df --output=avail -k "$dir" 2>/dev/null | tail -1 | tr -d ' ')
     [ -z "$avail_k" ] && return 0
@@ -753,14 +770,23 @@ check_disk() {
 # --- steps 6-8: recipe, emission, start (SDD 4.6/4.7) ------------------------
 pick_recipe() {
     step '6. Recipe (measured only)'
+    # SDD D19: the rows were measured on each model's Default quant; picking
+    # the alt build runs the row's flags against a file nobody measured.
+    if [ "${M_DEFAULTS[$MI_IDX]}" != 1 ]; then
+        local i_d df=''
+        for i_d in 0 1 2 3 4; do
+            if [ "${M_KEYS[$i_d]}" = "${M_KEYS[$MI_IDX]}" ] && [ "${M_DEFAULTS[$i_d]}" = 1 ]; then df=${M_FILES[$i_d]}; fi
+        done
+        warn "row was measured on $df; you chose ${M_FILES[$MI_IDX]} (quant ${M_QUANTS[$MI_IDX]}) - the row's speed/VRAM numbers are for the default quant"
+    fi
     if [ -z "$VRAM" ]; then
-        VRAM=$(ask_choice 'VRAM target?' 'full' '16g' '8g')
+        VRAM=$(ask_choice 'VRAM target?' 'full' 'full' '16g' '8g')
     fi
     if [ -z "$CONTEXT" ]; then
-        CONTEXT=$(ask_choice 'Context size?' '262k' '128k')
+        CONTEXT=$(ask_choice 'Context size?' '262k' '262k' '128k')
     fi
-    if ! recipe_for "${MODEL_KEYS[$MI_IDX]}" "$VRAM" "$CONTEXT"; then
-        recipe_avail "${MODEL_KEYS[$MI_IDX]}"
+    if ! recipe_for "${M_KEYS[$MI_IDX]}" "$VRAM" "$CONTEXT"; then
+        recipe_avail "${M_KEYS[$MI_IDX]}"
         fail 'no measured recipe for the chosen model/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)' 3
     fi
     say "recipe $R_ID: $R_MEASURED"
@@ -789,18 +815,19 @@ pick_recipe() {
 # SDD D17: CUDA index for device-pinned rows (R5/R7). --device N (DEVICE)
 # wins; otherwise auto: full -> largest card, 16g/8g -> smallest card at or
 # above the row minimum (10240/8192 MiB), else the smallest card (the D12
-# warning then fires). Result cached in GPU_DEV.
+# warning then fires). Pure: echoes the index (the --device option wins).
+# NOTE: no global cache - callers invoke it via $(...) subshells, where
+# global assignments would die with the subshell (measured 2026-11-05).
 resolve_gpu_index() {
     local vram="$1"
-    if [ -n "$DEVICE" ]; then GPU_DEV="$DEVICE"; echo "$GPU_DEV"; return 0; fi
-    if [ -n "$GPU_DEV" ]; then echo "$GPU_DEV"; return 0; fi
+    if [ -n "$DEVICE" ]; then echo "$DEVICE"; return 0; fi
     local need=0
     case "$vram" in 16g) need=10240 ;; 8g) need=8192 ;; esac
     local rows
     rows=$(nvidia-smi --query-gpu=index,memory.total --format=csv,noheader 2>/dev/null)
     if [ -z "$rows" ]; then
         say 'nvidia-smi unavailable; pinning --device CUDA0 (override with --device N)' >&2
-        GPU_DEV=0; echo 0; return 0
+        echo 0; return 0
     fi
     local count=0 largest='' largest_mib=0 smallest='' smallest_mib=0 fit='' fit_mib=0
     local idx mib
@@ -822,7 +849,6 @@ resolve_gpu_index() {
     else
         pick=$largest
     fi
-    GPU_DEV=$pick
     echo "$pick"
 }
 
@@ -936,7 +962,7 @@ if [ "$SKIP_MODEL" = 1 ] && [ -z "$MODEL" ]; then
 fi
 pick_model
 if [ "$SKIP_MODEL" = 1 ]; then
-    LOCAL_FILE="${MODEL_DIR:-${MODEL_DIRS[$MI_IDX]}}/${MODEL_FILES[$MI_IDX]}"
+    LOCAL_FILE="${MODEL_DIR:-${M_DIRS[$MI_IDX]}}/${M_FILES[$MI_IDX]}"
     warn "--skip-model: assuming the model is at $LOCAL_FILE (not checked)"
 else
     resolve_model_file

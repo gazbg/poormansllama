@@ -179,14 +179,25 @@ Linux:
 
 ### 4.5 Model (step 6)
 
-Model table (all links verified 2026-11-04 against the HF API; sizes are
-`Content-Length` of the resolve endpoint):
+Model table, flat over (model, quant) — D19 (all links verified 2026-11-04
+against the HF API, Q5_K_XL entries 2026-11-05; sizes are `Content-Length`
+of the resolve endpoint):
 
-| Key | Kind | HF file | Size |
-|---|---|---|---|
-| `qwen38` | dense hybrid | `unsloth/Qwen3.8-27B-GGUF` / `Qwen3.8-27B-UD-Q4_K_M.gguf` | 15.4 GiB |
-| `qwen36` | MoE | `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 20.6 GiB |
-| `flint` | SWA MoE | `unsloth/flint-GGUF` / `flint-UD-Q5_K_XL.gguf` | 27.9 GiB |
+| # | Key | Quant | Kind | HF file | Size |
+|---|---|---|---|---|---|
+| 1 | `qwen38` | `q4k_m` (default) | dense hybrid | `unsloth/Qwen3.8-27B-GGUF` / `Qwen3.8-27B-UD-Q4_K_M.gguf` | 15.4 GiB |
+| 2 | `qwen36` | `q4k_m` (default) | MoE | `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | 20.6 GiB |
+| 3 | `flint` | `q5k_xl` (only) | SWA MoE | `unsloth/flint-GGUF` / `flint-UD-Q5_K_XL.gguf` | 27.9 GiB |
+| 4 | `qwen38` | `q5k_xl` (alt) | dense hybrid | `unsloth/Qwen3.8-27B-GGUF` / `Qwen3.8-27B-UD-Q5_K_XL.gguf` | 19.4 GiB |
+| 5 | `qwen36` | `q5k_xl` (alt) | MoE | `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf` | 24.7 GiB |
+
+`-Quant`/`--quant` selects the quant for `qwen38`/`qwen36` (default = the
+model's default entry); numeric picks `1-5` address the flat list directly.
+Recipe rows are keyed on the MODEL only (a row's flags do not depend on the
+quant); the rows were measured on the default entries, so picking an alt
+quant prints an `[assumption]`-style note: the row's speed/VRAM numbers are
+for the default build. An unknown quant for a model fails loudly with the
+available list.
 
 Recorded decision D7: the owner's dense profile used
 `Qwen3.8-27B-Q4_K_M.gguf`, which does **not** exist on HF under that name;
@@ -366,3 +377,4 @@ See the acceptance contract in plans/setup-wizard-plan.md. In short:
 | D16 | (2026-11-05, owner decision) R7 recipe replaced by the owner's current 8g command: `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0`, bind 0.0.0.0, env `LLAMA_FATTN_TILE_Q8QK=1` kept; the LINUX-PASCAL §2 fuse/prearm recipe becomes history in that doc | owner instruction; the old recipe's measured numbers stay in LINUX-PASCAL.md as evidence | yes (restore the old row) |
 | D17 | (2026-11-05) device-pinned rows (R5, R7) no longer hard-code `CUDA0` in the row flags; the wizard appends `--device CUDA<n>` at emission: `-Device N` / `--device N` overrides, else auto (largest card for `full`; smallest card at/above the row minimum for `16g`/`8g`, else smallest card). The D12 VRAM warning runs against the selected card | `CUDA0` is not guaranteed on multi-GPU or reordered systems; the row's recipe is unchanged apart from which card runs it | yes (re-pin the index in the row) |
 | D18 | Consequence of D16: R7 now uses `--hybrid-moe-prefill-free-all`, which exists only in the fork (not origin/main), so a fresh-clone build's flag gate refuses R7 like R4/R5 (SETUP.md troubleshooting updated) | recorded so the refusal is not read as a new defect | yes (follows D16) |
+| D19 | (2026-11-05, owner request "add choice for 5k_xl models") the model table is flat over (model, quant) with a `q5k_xl` entry for qwen38 (19.4 GiB) and qwen36 (24.7 GiB); `-Quant`/`--quant q4k_m\|q5k_xl` plus numeric picks 1-5; recipe rows stay keyed on model only and picking an alt quant prints a measured-quant note. Two defects found and fixed while validating: (a) setup.ps1 silently DROPS hyphenated dashed flags (`--dry-run`, `--non-interactive`, `--skip-model` land unbound in `$args` and PowerShell discards them - a `--dry-run` invocation downloaded the model), so setup.ps1 now normalizes the known dashed names up front and refuses anything unrecognized; (b) setup.sh's `resolve_gpu_index` cached its result in a global that dies with the `$(...)` subshell and its cache read died under `set -u`, so the sh side is now a pure function echoing the index | owner asked for the quant choice; the two fixes turn silent misconfiguration into loud failure (measured 2026-11-05) | yes (drop the quant entries / the normalization block) |
