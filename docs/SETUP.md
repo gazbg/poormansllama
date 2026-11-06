@@ -56,20 +56,28 @@ Run the wizard from outside a checkout and it clones the repository itself
    on the remote (in-flight work), it falls back to the remote default branch
    and tells you; the flag-capability check below then decides which rows the
    resulting binary can run.
-3. **Build** — `llama-server` with `GGML_CUDA=ON` and `LLAMA_LAYER_STREAMING=ON`
-   into `build/llama-cuda/` (Windows: MSVC via the detected VS instance;
-   Linux: CUDA arch list detected from `nvidia-smi`, refused when unknown).
-   Skipped when the binary is newer than the sources (`-FullBuild` forces a
-   rebuild). Build logs: `build/llama-cuda/setup-wizard-cmake-*.log`.
-4. **Model** — qwen38 / qwen36 / flint (each in its default quant, or a
-   `q5k_xl` alt build via `-Quant`/`--quant`), from disk if the table file is
-   already there, otherwise downloaded from Hugging Face (resumable; partial
-   data kept on interruption; the `HF_TOKEN` env var is honored and never
-   printed).
-5. **Recipe** — exactly the measured combinations (table below). Anything else
-   is refused with the available rows (exit 3). Small-VRAM rows print a
-   warning on a card that is bigger than the one they were measured on; they
-   are never refused.
+3. **Settings (asked BEFORE anything heavy runs)** — model + quant
+   (qwen38 / qwen36 / flint, each in its default quant or a `q5k_xl` alt build
+   via `-Quant`/`--quant`), the local model path (other `*.gguf` files in the
+   directory are offered), a disk-space check, the VRAM target, and the
+   context. **An unmeasured model/VRAM/context combination is refused HERE
+   (exit 3) — no build and no download have started yet.** Small-VRAM rows
+   print a warning on a card that is bigger than the one they were measured
+   on; they are never refused.
+4. **Build + download (in parallel)** — `llama-server` with `GGML_CUDA=ON`
+   and `LLAMA_LAYER_STREAMING=ON` into `build/llama-cuda/` (Windows: MSVC via
+   the detected VS instance; Linux: CUDA arch list detected from
+   `nvidia-smi`, refused when unknown) runs at the same time as the model
+   download from Hugging Face (resumable; partial data kept on interruption;
+   the `HF_TOKEN` env var is honored and never printed). One combined status
+   line tracks both; the first hard failure stops the other leg (build
+   failure → exit 4, download failure → exit 5, Ctrl-C → exit 6 with the
+   `.part` kept). Skipped when the binary is newer than the sources
+   (`-FullBuild` forces a rebuild); if the model file is already on disk only
+   the build runs, and vice versa. Build logs:
+   `build/llama-cuda/setup-wizard-cmake-*.log`.
+5. **Flag-capability gate** — every `--flag` of the chosen row must appear in
+   the built binary's `--help` (host-only; refuses rows the binary cannot run).
 6. **Emit** — `run-server.ps1` / `run-server.sh` in the repository root: the
    row's flags verbatim with only the model path, bind default, and port
    substituted; one-generation `run-server.last.*` backup; server log under

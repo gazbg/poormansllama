@@ -5,9 +5,12 @@
 #
 # What it does: checks the environment (git, CMake, CUDA, MSVC, NVIDIA GPU),
 # offers to install missing tools via winget, clones the repository if not
-# already inside one, builds llama-server with the fork's options, downloads
-# the chosen GGUF model from Hugging Face if absent, and emits a ready-to-run
-# run-server.ps1 built from a MEASURED recipe (no unmeasured flag combos).
+# already inside one, then asks ALL settings up front (model + quant, local
+# path, VRAM target, context; SDD D20) - the unmeasured-combo refusal (exit 3)
+# happens BEFORE any build or download. The build and the model download then
+# run IN PARALLEL as two legs with one combined status line, fail-fast. It
+# emits a ready-to-run run-server.ps1 built from a MEASURED recipe (no
+# unmeasured flag combos).
 #
 # Mirror for Linux: setup.sh (keep behavior in sync; see docs/SETUP.md).
 #
@@ -102,6 +105,10 @@ $DR = $DryRun
 $script:AbortExit = 6
 
 trap {
+    # D20: a Ctrl-C in the parallel phase must not leave the build .bat running
+    if ($script:BUILD_LEG_ACTIVE) {
+        try { Stop-BuildLeg -leg $script:BUILD_LEG_ACTIVE } catch { }
+    }
     $msg = if ($_.Exception) { $_.Exception.Message } else { "$_" }
     Write-Host ''
     if ($msg -match 'cancel|break') {
@@ -361,7 +368,7 @@ function Test-ForceMissing([string]$name) {
 }
 
 function Check-Environment {
-    Step '1. Environment check'
+    Step 'Environment check'
     $script:EnvTools = @()   # reset: re-checks must not accumulate duplicate rows
     $rows = @()
 
@@ -492,7 +499,7 @@ function Install-Missing {
     param([object[]]$bad)
     $toInstall = $bad | Where-Object { $_.Name -ne 'nvidia-smi' -and $_.State -match 'MISSING|TOO-OLD|INCOMPLETE' }
     if (-not $toInstall) { return }
-    Step '2. Install missing tools (winget)'
+    Step 'Install missing tools (winget)'
     foreach ($t in $toInstall) {
         $plan = $script:INSTALL_PLAN[$t.Name]
         $pkgArgs = @('--id', $plan[0], '--accept-source-agreements', '--accept-package-agreements')
@@ -554,7 +561,7 @@ function Get-RepoRoot {
 
 function Invoke-Clone {
     param([string]$destRoot)
-    Step '3. Repository'
+    Step 'Repository'
     if (-not $destRoot) {
         # no explicit target: running inside the repo means nothing to clone
         $inRepo = Get-RepoRoot
@@ -645,8 +652,11 @@ function Test-BinaryFresh {
 }
 
 function Invoke-Build {
+    # SEQUENTIAL form (SDD D20): used for the -SkipModel-without-Model run and
+    # for single-leg (build-only) phases. The parallel phase (step 5) uses
+    # Start-BuildLeg + the download tick instead.
     param([string]$repo)
-    Step '4. Build llama-server'
+    Step 'Build llama-server'
     $bin = Join-Path $repo 'build\llama-cuda\bin\Release\llama-server.exe'
     if ($SkipBuild) { Say '(skipped: -SkipBuild)'; return $bin }
     if (-not $FullBuild -and (Test-BinaryFresh $repo $bin)) {
@@ -705,7 +715,122 @@ function Invoke-Build {
     return $bin
 }
 
+# --- parallel phase (SDD D20): non-blocking build leg ---------------------
+# Same .bat + rc-file design as Invoke-NativeCmd (D50/D53: both streams live
+# inside the .bat, the rc is written on a SECOND physical line), but launched
+# WITHOUT waiting: Start-Process -WindowStyle Hidden -PassThru creates no
+# redirected handle in this process, so the long-lived MSBuild/vctip
+# descendants (the D49 trap) cannot block us, and the rc file appears when
+# each cmake stage exits. The download's progress tick (step 5) polls both rc
+# files and prints the combined status line; Wait-BuildLeg is the blocking
+# collector (single-leg runs, dry-run, failure tails).
+function Start-BuildLeg {
+    param([string]$repo)
+    $bin = Join-Path $repo 'build\llama-cuda\bin\Release\llama-server.exe'
+    $bld = Join-Path $repo 'build\llama-cuda'
+    if (-not (Test-Path $bld)) { $null = New-Item -ItemType Directory -Path $bld -Force }
+    $src = Join-Path $repo 'third_party\llama.cpp'
+    $nproc = [Environment]::ProcessorCount
+    $qArg = { param($s) if ($s -match '\s' -or ($s -match '["&<>|,]')) { '"' + ($s -replace '"','""') } else { $s } }
+    $mkBat = {
+        param([string]$Bat, [string]$Rc, [string]$OutL, [string]$ErrL, [string]$Exe, [string[]]$Argl)
+        $argStr = ($Argl | ForEach-Object { & $qArg ([string]$_) }) -join ' '
+        # cmd quoting for the exe (same convention as Invoke-NativeCmd). NO
+        # leading '&': a command line that STARTS with '&' is a syntax error
+        # for cmd ('& was unexpected at this time') and the whole .bat aborts
+        # before the rc line runs (measured 2026-11-06: the parallel build
+        # legs sat at 'configuring' forever with no logs and no rc files).
+        $exeQ = $Exe
+        if ($Exe -match '\s' -or ($Exe -match '"')) { $exeQ = '"' + ($Exe -replace '"','""') + '"' }
+        $lines = @(
+            '@echo off',
+            "$exeQ $argStr > `"$OutL`" 2> `"$ErrL`"",
+            "echo %ERRORLEVEL% > `"$Rc`""
+        )
+        [System.IO.File]::WriteAllLines($Bat, $lines, [System.Text.Encoding]::Default)
+    }
+    $cfgBat = Join-Path $bld 'swz-parallel-cfg.bat'
+    $cfgRc  = Join-Path $bld 'swz-parallel-cfg.rc'
+    $bldBat = Join-Path $bld 'swz-parallel-build.bat'
+    $bldRc  = Join-Path $bld 'swz-parallel-build.rc'
+    $cfgOut = Join-Path $bld 'setup-wizard-cmake-configure.log'
+    $cfgErr = Join-Path $bld 'setup-wizard-cmake-configure.err.log'
+    $bldOut = Join-Path $bld 'setup-wizard-cmake-build.log'
+    $bldErr = Join-Path $bld 'setup-wizard-cmake-build.err.log'
+    Remove-Item $cfgRc, $bldRc, $cfgOut, $cfgErr, $bldOut, $bldErr -Force -ErrorAction SilentlyContinue
+    # named arguments: a positional @() would UNROLL into $Argl's first
+    # element (PS scriptblock positional array behavior)
+    & $mkBat -Bat $cfgBat -Rc $cfgRc -OutL $cfgOut -ErrL $cfgErr -Exe 'cmake' -Argl @('-S', $src, '-B', $bld, '-DGGML_CUDA=ON', '-DLLAMA_LAYER_STREAMING=ON')
+    & $mkBat -Bat $bldBat -Rc $bldRc -OutL $bldOut -ErrL $bldErr -Exe 'cmake' -Argl @('--build', $bld, '--config', 'Release', '--target', 'llama-server', '--parallel', ([string]$nproc), '--', '/nodeReuse:false')
+    $p1 = Start-Process -FilePath $cfgBat -WindowStyle Hidden -PassThru
+    $p2 = Start-Process -FilePath $bldBat -WindowStyle Hidden -PassThru
+    return [pscustomobject]@{ Bin=$bin; P1=$p1; P2=$p2; CfgRc=$cfgRc; BldRc=$bldRc; CfgOut=$cfgOut; CfgErr=$cfgErr; BldOut=$bldOut; BldErr=$bldErr }
+}
+
+function Test-BuildLegRunning {
+    # true while the build leg can still fail (configure bat alive, or the
+    # rc missing, or the build stage not yet reported). The rc file is the
+    # completion signal, NOT the process handle: the .bat's cmd may linger on
+    # MSBuild/vctip descendants holding no handles of ours (D49).
+    param([object]$leg)
+    $rc1Done = Test-Path $leg.CfgRc
+    if (-not $rc1Done) { return $true }
+    $rc2Done = Test-Path $leg.BldRc
+    return (-not $rc2Done)
+}
+
+function Stop-BuildLeg {
+    # fail-fast / Ctrl-C: kill the cmake tree. The .bat's cmd is the process
+    # group leader for its children; taskkill /T takes the whole tree.
+    param([object]$leg)
+    foreach ($p in @($leg.P1, $leg.P2)) {
+        if ($null -ne $p -and -not $p.HasExited) {
+            try { $null = & taskkill /PID $p.Id /T /F 2>$null } catch { }
+        }
+    }
+}
+
+function Wait-BuildLeg {
+    param([object]$leg)
+    $leg.P1.WaitForExit() | Out-Null
+    if (-not (Test-Path $leg.CfgRc)) { ExitCode 4 'build configure did not report an exit code (logs: ' + $leg.CfgOut + ' / ' + $leg.CfgErr + ')' }
+    $rc1 = [int](Get-Content $leg.CfgRc | Select-Object -First 1)
+    if ($rc1 -ne 0) {
+        Get-Content $leg.CfgErr -Tail 50 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+        ExitCode 4 "cmake configure failed (exit $rc1; logs: $($leg.CfgOut) / $($leg.CfgErr))"
+    }
+    $leg.P2.WaitForExit() | Out-Null
+    if (-not (Test-Path $leg.BldRc)) { ExitCode 4 'build did not report an exit code (logs: ' + $leg.BldOut + ' / ' + $leg.BldErr + ')' }
+    $rc2 = [int](Get-Content $leg.BldRc | Select-Object -First 1)
+    if ($rc2 -ne 0) {
+        Get-Content $leg.BldErr -Tail 50 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+        Get-Content $leg.BldOut -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+        ExitCode 4 "build failed (exit $rc2; logs: $($leg.BldOut) / $($leg.BldErr))"
+    }
+    if (-not (Test-Path $leg.Bin)) { ExitCode 4 "build finished but $($leg.Bin) was not produced" }
+    Ok ("built " + $leg.Bin)
+    return $leg.Bin
+}
+
 # --- model (SDD 4.5) ------------------------------------------------------
+function Test-DiskSpace {
+    # SDD 4.1: disk >= model size + 15 GiB, confirm to proceed (default no).
+    # The PS twin of the sh check_disk (D20: moved into the settings phase,
+    # where the model size is known, BEFORE the download starts).
+    param([string]$dir, [double]$sizeGib)
+    $drive = [System.IO.Path]::GetPathRoot($dir)
+    $needGib = [math]::Ceiling($sizeGib) + 15
+    try {
+        $freeGib = [math]::Round((Get-PSDrive -Name $drive.TrimEnd('\')).Free / 1GB, 0)
+    } catch { return }
+    if ($freeGib -lt $needGib) {
+        Warn "disk has $freeGib GiB free, the model plus build wants ~$needGib GiB"
+        if (-not (Confirm 'proceed anyway?' $false)) {
+            ExitCode 6 'aborted: not enough disk space'
+        }
+    }
+}
+
 function Pick-Model {
     param([string]$key)
     # SDD D19: flat (model, quant) entries. -Model picks the model; -Quant
@@ -737,33 +862,48 @@ function Pick-Model {
 }
 
 function Resolve-ModelFile {
+    # D20: settings phase - decides LOCAL_FILE (an existing local file) or
+    # DOWNLOAD_TARGET (the table file, to be fetched by Download-Model in the
+    # parallel phase). Nothing is downloaded here.
     param([object]$m, [string]$dir)
     if (-not $dir) { $dir = $m.DefaultDir }
     if (-not (Test-Path $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
     $local = Join-Path $dir $m.File
-    if (Test-Path $local) { return $local }
+    if (Test-Path $local) { $script:LOCAL_FILE = $local; $script:DOWNLOAD_TARGET = $null; return }
     # offer other ggufs in the dir
     $others = Get-ChildItem -Path $dir -Filter *.gguf -File -ErrorAction SilentlyContinue
     if ($others -and $others.Count -gt 0) {
         Say "no $($m.File) in $dir, but found:"
         for ($i = 0; $i -lt $others.Count; $i++) { Say "    $($i + 1)) $($others[$i].Name)" }
         $a = Ask "use one of these (number), 'y' to download $($m.File), or type a full path" 'y'
-        if ($a -match '^[0-9]+$' -and [int]$a -ge 1 -and [int]$a -le $others.Count) { return $others[[int]$a - 1].FullName }
-        if ($a -match '^y' -or $a -eq '') { return $null }   # null => download
-        if ($a -match '\.gguf$' -and (Test-Path $a)) { return $a }
-        return $null
+        if ($a -match '^[0-9]+$' -and [int]$a -ge 1 -and [int]$a -le $others.Count) {
+            $script:LOCAL_FILE = $others[[int]$a - 1].FullName; $script:DOWNLOAD_TARGET = $null; return
+        }
+        if ($a -match '^y' -or $a -eq '') {
+            $script:LOCAL_FILE = $null; $script:DOWNLOAD_TARGET = $local; return
+        }
+        if ($a -match '\.gguf$' -and (Test-Path $a)) { $script:LOCAL_FILE = $a; $script:DOWNLOAD_TARGET = $null; return }
+        $script:LOCAL_FILE = $null; $script:DOWNLOAD_TARGET = $local
+        return
     }
-    return $null
+    $script:LOCAL_FILE = $null
+    $script:DOWNLOAD_TARGET = $local
 }
 
 function Download-Model {
-    param([object]$m, [string]$dir)
+    param([object]$m, [string]$dir, [scriptblock]$Status = $null)
     $file = Join-Path $dir $m.File
     $part = "$file.part"
     $url = "https://huggingface.co/$($m.Repo)/resolve/main/$($m.File)"
-    Step "5. Download model ($($m.SizeGib) GiB) from Hugging Face"
+    # D20: called from the parallel phase (step 5) - the phase header already
+    # announced this leg; no Step() here. When a -Status callback is supplied
+    # (the parallel phase), the combined build|model status line is rendered
+    # by it; otherwise this function prints its own progress line.
+    Say ("model: downloading " + $m.File + " (" + $m.SizeGib + " GiB) from Hugging Face")
     Say $url
     if ($SkipDownload) { ExitCode 5 "-SkipDownload set but no local model found (expected $file)" }
+    $script:DL_DONE = $false
+    $script:DL_FAILMSG = $null
     $maxBytes = 0
     if ($MaxDownloadMib -gt 0) { $maxBytes = [int64]$MaxDownloadMib * 1MB; Say "(test hook: -MaxDownloadMib $MaxDownloadMib, stopping at $MaxDownloadMib MiB)" }
     if ($DR) { Say '(dry-run: not downloading)'; return $file }
@@ -812,15 +952,20 @@ function Download-Model {
                 $fs.Write($buf, 0, $n)
                 $read += $n
                 $done = $have + $read
-                $pct = if ($len -gt 0) { [math]::Floor($done * 100 / $len) } else { 0 }
-                $kb = [math]::Floor($done / 1MB)
-                Write-Host ("`r    {0,8} MiB  {1,3}%" -f $kb, $pct) -NoNewline
+                if ($Status) { & $Status }
+                else {
+                    $pct = if ($len -gt 0) { [math]::Floor($done * 100 / $len) } else { 0 }
+                    $kb = [math]::Floor($done / 1MB)
+                    Write-Host ("`r    {0,8} MiB  {1,3}%" -f $kb, $pct) -NoNewline
+                }
                 Start-Sleep -Milliseconds 500
             }
             $fs.Close()
             Write-Host ''
+            $script:DL_DONE = $true
         } catch {
-            ExitCode 5 "download failed: $($_.Exception.Message) (manual: $url)"
+            $script:DL_FAILMSG = "download failed: $($_.Exception.Message) (manual: $url)"
+            ExitCode 5 $script:DL_FAILMSG
         }
 
     # integrity: complete transfer expected
@@ -846,7 +991,8 @@ function Download-Model {
 # --- recipe + emission (SDD 4.6/4.7) --------------------------------------
 function Pick-Recipe {
     param([object]$m)
-    Step '6. Recipe (measured only)'
+    # D20: recipe selection is part of the settings phase (no step number).
+    Say 'recipe (measured rows only):'
     # SDD D19: the rows were measured on each model's Default quant; picking
     # the alt build runs the row's flags against a file nobody measured.
     if (-not $m.Default) {
@@ -920,7 +1066,7 @@ function Test-RowFlags {
 
 function Emit-RunScript {
     param([object]$r, [string]$modelFile, [string]$repo, [string]$exe)
-    Step '7. Emit run-server.ps1'
+    Step 'Emit run-server.ps1'
     $bind = $Bind
     if (-not $bind) { $bind = $r.Bind }
     $port = $Port
@@ -989,6 +1135,11 @@ function Start-ServerNow {
 }
 
 # --- main ------------------------------------------------------------------
+# D20 flow: env -> install -> clone -> SETTINGS (all questions up front,
+# refusal exit 3 BEFORE any build or download) -> PARALLEL PHASE (build leg
+# and model download in background, one combined status line, fail-fast)
+# -> flag gate -> emit -> start. Invoke-Build (the legacy sequential form)
+# stays as the documented command shape for fresh-clone/-SkipModel runs.
 Write-Host ''
 Write-Host '  poormansllama setup wizard (Windows)' -ForegroundColor Cyan
 Write-Host ''
@@ -1010,43 +1161,53 @@ if ($bad.Count -gt 0) {
 }
 
 $repo = Invoke-Clone -destRoot $destRoot
-$exe = Invoke-Build -repo $repo
-
 $script:GitShort = Get-GitShort -repo $repo
 
+# --- settings (SDD D20): every question BEFORE the heavy work --------------
+$noAsk = $false
 if ($SkipModel -and -not $Model) {
-    # AC-5 shape: env + clone + build only, nothing to ask
+    $noAsk = $true
+}
+if ($ModelFile -and -not $Model -and -not $noAsk) {
+    ExitCode 1 '-ModelFile requires -Model (qwen38|qwen36|flint) for recipe selection'
+}
+
+if ($noAsk) {
+    # AC-5 shape: env + clone + build only, nothing to ask. The build runs
+    # sequentially here (there is no download leg to run in parallel with).
+    $exe = Invoke-Build -repo $repo
     Ok "done: environment + repository + build (model/recipe steps skipped: -SkipModel without -Model)"
     Ok "next: re-run with -Model qwen38|qwen36|flint to pick a recipe and emit run-server.ps1"
     exit 0
 }
 
-if ($ModelFile -and -not $Model) { ExitCode 1 '-ModelFile requires -Model (qwen38|qwen36|flint) for recipe selection' }
+Step 'Settings (asked before the build and the download)'
 $m = Pick-Model -key $Model
 $mdir = $ModelDir
 if (-not $mdir) { $mdir = $m.DefaultDir }
-if (-not $SkipModel) {
-    if ($ModelFile) {
-        if (-not (Test-Path $ModelFile)) { ExitCode 1 "-ModelFile does not exist: $ModelFile" }
-        $local = $ModelFile
-        Ok "model: $local (-ModelFile)"
-    }
-    else {
-        $local = Resolve-ModelFile -m $m -dir $mdir
-        if ($local) {
-            Ok "model: $local"
-            if ($local -notmatch [regex]::Escape($m.File)) {
-                Warn "using a different file than the table's $($m.File); recipe rows assume the table file (SDD D7/D13 risks)"
-            }
-        }
-        else {
-            $local = Download-Model -m $m -dir $mdir
-        }
-    }
-}
-else {
+$local = $null
+if ($SkipModel) {
     $local = Join-Path $mdir $m.File
     Warn "-SkipModel: assuming the model is at $local (not checked)"
+}
+elseif ($ModelFile) {
+    if (-not (Test-Path $ModelFile)) { ExitCode 1 "-ModelFile does not exist: $ModelFile" }
+    $local = $ModelFile
+    $script:DOWNLOAD_TARGET = $null
+    Ok "model: $local (-ModelFile)"
+}
+else {
+    Resolve-ModelFile -m $m -dir $mdir
+    $local = $script:LOCAL_FILE
+    if ($local) {
+        Ok "model: $local"
+        if ($local -notmatch [regex]::Escape($m.File)) {
+            Warn "using a different file than the table's $($m.File); recipe rows assume the table file (SDD D7/D13 risks)"
+        }
+    }
+    # disk check needs the model size; it runs here, before the download
+    # starts, and only when a download is actually going to happen
+    if ($script:DOWNLOAD_TARGET) { Test-DiskSpace -dir $mdir -sizeGib $m.SizeGib }
 }
 $r = Pick-Recipe -m $m
 $script:RecipeId = $r.Id
@@ -1076,6 +1237,125 @@ if ($gpuLine -match '([\d,]+)\s*MiB') {
         Warn "GPU has $gpuMib MiB; row $($r.Id) was measured on $card (SDD D12: warning only, the server's memory guard fails loudly)"
     }
 }
+
+# --- parallel phase (SDD D20): build leg and download leg ------------------
+$binPath = Join-Path $repo 'build\llama-cuda\bin\Release\llama-server.exe'
+$buildNeeded = $true
+if ($SkipBuild) {
+    $buildNeeded = $false
+    Say '(skipped: -SkipBuild)'
+} elseif (-not $FullBuild -and (Test-BinaryFresh $repo $binPath)) {
+    $buildNeeded = $false
+    Ok "build skipped (binary newer than sources): $binPath"
+}
+
+if ($DR) {
+    # dry-run: no processes. The documented commands stay visible (same text
+    # as the sequential Invoke-Build prints, so AC-2 output is unchanged).
+    if ($buildNeeded) {
+        Step 'Build llama-server'
+        Say ('(dry-run: cmake -S ' + (Join-Path $repo 'third_party\llama.cpp') + ' -B ' + (Join-Path $repo 'build\llama-cuda') + ' -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON)')
+        Say ('(dry-run: cmake --build ' + (Join-Path $repo 'build\llama-cuda') + ' --config Release --target llama-server --parallel ' + [Environment]::ProcessorCount + ')')
+    }
+    if ($script:DOWNLOAD_TARGET) {
+        Say '(dry-run: not downloading)'
+        # the emitted script must name the file the real run would produce
+        if (-not $script:LOCAL_FILE) { $script:LOCAL_FILE = $script:DOWNLOAD_TARGET }
+    }
+    $exe = $binPath
+}
+elseif ($buildNeeded -and $script:DOWNLOAD_TARGET) {
+    Step 'Build + download (in parallel; Ctrl-C keeps the .part for resume)'
+    $script:BUILD_LEG = Start-BuildLeg -repo $repo
+    $script:BUILD_LEG_ACTIVE = $script:BUILD_LEG
+    $t0 = Get-Date
+    # the download runs in the foreground (resume/Range/token logic as
+    # before); its 500 ms tick doubles as the combined status line. The
+    # callback takes no parameters: it reads $script:BUILD_LEG / .part size
+    # itself (script-scope references from a nested scriptblock are resolved
+    # against the GLOBAL scope, so no-parameter access to $script: vars is
+    # the reliable form on PS 5.1).
+    $script:DL_STATUS = {
+        if ($script:DL_DONE) { return }
+        $part = Join-Path $script:DL_DIR ($script:DL_NAME + '.part')
+        if (Test-Path $part) {
+            $kb = [math]::Floor((Get-Item $part).Length / 1MB)
+            $el = (Get-Date) - $script:DL_T0
+            $leg = $script:BUILD_LEG
+            $btxt = 'not running (fresh or -SkipBuild)'
+            if ($leg) {
+                if (Test-Path $leg.CfgRc) { $btxt = 'building (cmake --build) ... ' + [string][math]::Floor($el.TotalMinutes) + ' min' }
+                else { $btxt = 'configuring ... ' + [string][math]::Floor($el.TotalMinutes) + ' min' }
+            }
+            Write-Host ("`r  build: " + $btxt + "   |   model: " + $kb + " MiB downloaded") -NoNewline
+        }
+        # fail-fast (D20): a cmake stage that exited nonzero stops the phase
+        # now, without waiting for the download. Wait-BuildLeg prints the log
+        # tail and exits 4.
+        $leg = $script:BUILD_LEG
+        if ($leg) {
+            if (Test-Path $leg.CfgRc) {
+                $rc1 = [int](Get-Content $leg.CfgRc | Select-Object -First 1)
+                if ($rc1 -ne 0) { Write-Host ''; Wait-BuildLeg -leg $leg }
+            }
+            if (Test-Path $leg.BldRc) {
+                $rc2 = [int](Get-Content $leg.BldRc | Select-Object -First 1)
+                if ($rc2 -ne 0) { Write-Host ''; Wait-BuildLeg -leg $leg }
+            }
+        }
+    }
+    $script:DL_DIR = $mdir
+    $script:DL_NAME = $m.File
+    $script:DL_T0 = $t0
+    try {
+        Download-Model -m $m -dir $mdir -Status $script:DL_STATUS
+    } finally {
+        # download failure already exits 5 (fail-fast); stop the build leg so
+        # a 22-minute build does not keep running after an aborted download.
+        if ($script:DL_FAILMSG -and $script:BUILD_LEG) { Stop-BuildLeg -leg $script:BUILD_LEG }
+    }
+    # the download succeeded (a failure already exited 5 with the build leg
+    # stopped); collect the build result now - Wait-BuildLeg tails + exits 4
+    # on a failed stage, prints 'built' on success.
+    if ($script:BUILD_LEG) {
+        $rcBad = $false
+        if (Test-Path $script:BUILD_LEG.CfgRc) {
+            $rc1 = [int](Get-Content $script:BUILD_LEG.CfgRc | Select-Object -First 1)
+            if ($rc1 -ne 0) { $rcBad = $true }
+        }
+        if (-not $rcBad -and (Test-Path $script:BUILD_LEG.BldRc)) {
+            $rc2 = [int](Get-Content $script:BUILD_LEG.BldRc | Select-Object -First 1)
+            if ($rc2 -ne 0) { $rcBad = $true }
+        }
+        if ($rcBad -or (Test-BuildLegRunning $script:BUILD_LEG)) {
+            Wait-BuildLeg -leg $script:BUILD_LEG
+        }
+        elseif (Test-Path $script:BUILD_LEG.Bin) { Ok 'built ' + $script:BUILD_LEG.Bin }
+        else { Wait-BuildLeg -leg $script:BUILD_LEG }
+    }
+    $script:BUILD_LEG_ACTIVE = $null
+    $exe = $binPath
+}
+elseif ($buildNeeded) {
+    if ($script:DOWNLOAD_TARGET -and $SkipDownload) {
+        ExitCode 5 '-SkipDownload set but no local model found (expected ' + $script:DOWNLOAD_TARGET + ')'
+    }
+    # no download leg: build sequentially in the foreground (the documented
+    # command shape of Invoke-Build; same logs, same failure tails)
+    $exe = Invoke-Build -repo $repo
+}
+else {
+    # build fresh/skipped; download only (no combined line needed)
+    if ($script:DOWNLOAD_TARGET) {
+        if ($SkipDownload) {
+            ExitCode 5 '-SkipDownload set but no local model found (expected ' + $script:DOWNLOAD_TARGET + ')'
+        }
+        Step 'Download model (Hugging Face; Ctrl-C keeps the .part for resume)'
+        Download-Model -m $m -dir $mdir
+    }
+    $exe = $binPath
+}
+
 Test-RowFlags -r $r -exe $exe
 Emit-RunScript -r $r -modelFile $local -repo $repo -exe $exe
 Start-ServerNow -script (Join-Path $repo 'run-server.ps1') -repo $repo
