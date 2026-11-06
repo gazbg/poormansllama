@@ -1,4 +1,4 @@
-# qwen38GZI
+# Yet another optimized llama cpp for 8GB and 16 GPUS
 
 Layer-residency inference for llama.cpp: running Mixture-of-Experts Qwen models
 on a GPU with less VRAM than the model needs, and faster prompt processing and
