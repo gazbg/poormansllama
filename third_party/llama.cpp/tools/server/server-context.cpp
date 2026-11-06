@@ -1625,7 +1625,7 @@ private:
             }
             if (params_base.hybrid_moe_frozen) {
                 if (params_base.hybrid_moe_slots <= 0) {
-                    params_base.hybrid_moe_slots = 16;
+                    params_base.hybrid_moe_slots = 32;
                 }
                 // no promotions: the residency of the experts never changes after the start (the engine environment variable is the one the isolating tests used)
 #if defined(_WIN32)
