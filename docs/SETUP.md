@@ -61,9 +61,11 @@ Run the wizard from outside a checkout and it clones the repository itself
    Linux: CUDA arch list detected from `nvidia-smi`, refused when unknown).
    Skipped when the binary is newer than the sources (`-FullBuild` forces a
    rebuild). Build logs: `build/llama-cuda/setup-wizard-cmake-*.log`.
-4. **Model** — qwen38 / qwen36 / flint, from disk if the table file is already
-   there, otherwise downloaded from Hugging Face (resumable; partial data kept
-   on interruption; the `HF_TOKEN` env var is honored and never printed).
+4. **Model** — qwen38 / qwen36 / flint (each in its default quant, or a
+   `q5k_xl` alt build via `-Quant`/`--quant`), from disk if the table file is
+   already there, otherwise downloaded from Hugging Face (resumable; partial
+   data kept on interruption; the `HF_TOKEN` env var is honored and never
+   printed).
 5. **Recipe** — exactly the measured combinations (table below). Anything else
    is refused with the available rows (exit 3). Small-VRAM rows print a
    warning on a card that is bigger than the one they were measured on; they
@@ -75,13 +77,24 @@ Run the wizard from outside a checkout and it clones the repository itself
    rewrites the file byte-identically.
 7. **Start?** — asks whether to start the server now (or `-NoStart`).
 
-## Models (SDD table D7/D13)
+## Models (SDD table D7/D13/D19)
 
-| key      | Hugging Face repo            | file                                | size    | type        |
-|----------|------------------------------|-------------------------------------|---------|-------------|
-| qwen38   | unsloth/Qwen3.8-27B-GGUF     | Qwen3.8-27B-UD-Q4_K_M.gguf          | 15.4 GiB| dense       |
-| qwen36   | unsloth/Qwen3.6-35B-A3B-GGUF | Qwen3.6-35B-A3B-UD-Q4_K_M.gguf      | 20.6 GiB| MoE (A3B)   |
-| flint    | unsloth/flint-GGUF           | flint-UD-Q5_K_XL.gguf               | 27.9 GiB| SWA MoE     |
+Flat (model, quant) table; `-Model` picks the model, `-Quant`/`--quant`
+(`q4k_m` or `q5k_xl`) picks the quant for qwen38/qwen36 (default = the model's
+default entry), and numeric picks `1-5` address the rows directly:
+
+| #  | key    | quant       | Hugging Face repo            | file                                | size    | type        |
+|----|--------|-------------|------------------------------|-------------------------------------|---------|-------------|
+| 1  | qwen38 | q4k_m (def) | unsloth/Qwen3.8-27B-GGUF     | Qwen3.8-27B-UD-Q4_K_M.gguf          | 15.4 GiB| dense       |
+| 2  | qwen36 | q4k_m (def) | unsloth/Qwen3.6-35B-A3B-GGUF | Qwen3.6-35B-A3B-UD-Q4_K_M.gguf      | 20.6 GiB| MoE (A3B)   |
+| 3  | flint  | q5k_xl (only)| unsloth/flint-GGUF          | flint-UD-Q5_K_XL.gguf               | 27.9 GiB| SWA MoE     |
+| 4  | qwen38 | q5k_xl (alt)| unsloth/Qwen3.8-27B-GGUF     | Qwen3.8-27B-UD-Q5_K_XL.gguf         | 19.4 GiB| dense       |
+| 5  | qwen36 | q5k_xl (alt)| unsloth/Qwen3.6-35B-A3B-GGUF | Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf     | 24.7 GiB| MoE (A3B)   |
+
+Recipe rows are keyed on the MODEL only (their flags do not depend on the
+quant) and were measured on the default entries; picking an alt quant prints
+a note that the row's speed/VRAM numbers are for the default build. An
+unknown quant for a model fails loudly with the available list.
 
 `-ModelFile` / `--model-file` points at a local GGUF that is not the table
 file (e.g. a different quant); the recipe is still chosen by `-Model`.
@@ -116,14 +129,19 @@ Full flag text per row: the recipe tables in `setup.ps1` / `setup.sh` and
 ## Flags
 
 PowerShell parameter names cannot contain hyphens, so `setup.ps1` uses
-single-dash names (a double leading dash, `--Model`, also works); `setup.sh`
-uses conventional dashed names.
+single-dash names; `setup.sh` uses conventional dashed names. Since 2026-11-05
+(SDD D19) `setup.ps1` also accepts the dashed forms listed below - it
+normalizes them up front, because PowerShell used to DROP hyphenated flags
+silently (a `--dry-run` invocation ran for real and started the model
+download); unrecognized arguments now fail loudly. `setup.sh` also fails
+loudly on unknown options.
 
 | purpose                    | setup.ps1      | setup.sh              |
 |----------------------------|----------------|-----------------------|
 | dry run (no writes)        | -DryRun        | --dry-run             |
 | never ask                  | -NonInteractive| --non-interactive     |
 | model key                  | -Model         | --model               |
+| quant build                | -Quant         | --quant               |
 | VRAM target                | -Vram          | --vram                |
 | context                    | -Context       | --context             |
 | port / bind                | -Port, -Bind   | --port, --host        |

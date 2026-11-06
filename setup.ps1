@@ -23,7 +23,8 @@
 param(
     [switch]$DryRun,
     [switch]$NonInteractive,
-    [string]$Model = '',            # qwen38 | qwen36 | flint | 1/2/3
+    [string]$Model = '',            # qwen38 | qwen36 | flint | 1-5
+    [string]$Quant = '',            # q4k_m | q5k_xl (SDD D19); default = the model's row quant
     [ValidateSet('full', '16g', '8g')][string]$Vram = '',
     [ValidateSet('262k', '128k')][string]$Context = '',
     [string]$Port = '8033',
@@ -45,6 +46,54 @@ param(
     [string]$ModelFile = '',        # full path to a local gguf (overrides the table file)
     [int]$MaxDownloadMib = 0        # 0 = full file; test hook, see docs/SETUP.md
 )
+
+# --- dashed-arg normalization (SDD D19) ----------------------------------
+# PS parameter names cannot contain hyphens, so Linux-style dashed flags
+# (--dry-run, --non-interactive, --skip-model, ...) arrive unbound in $args.
+# PowerShell DROPS them silently - a '--dry-run' invocation then runs for
+# real (measured 2026-11-05: it started downloading the model). Normalize
+# the known dashed names here; anything unrecognized fails loudly.
+if ($args.Count -gt 0) {
+    $rest = @()
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        $a = $args[$i]
+        switch -Regex ($a) {
+            '^--?dry-run$'          { $DryRun = $true }
+            '^--?non-interactive$'  { $NonInteractive = $true }
+            '^--?skip-model$'       { $SkipModel = $true }
+            '^--?skip-build$'       { $SkipBuild = $true }
+            '^--?skip-download$'    { $SkipDownload = $true }
+            '^--?full-clone$'       { $FullClone = $true }
+            '^--?full-build$'       { $FullBuild = $true }
+            '^--?yes-install$'      { $YesInstall = $true }
+            '^--?no-start$'         { $NoStart = $true }
+            '^--?start$'            { $Start = $true }
+            default {
+                $wantVal = $a -match '^--?(quant|model|vram|context|port|host|device|model-file|model-dir|clone-dir|branch|repo-url|hf-token|max-download-mib)$'
+                if (-not $wantVal) { $rest += $a; break }
+                if ($i + 1 -ge $args.Count) { Write-Host "  [FAIL] missing value for $a"; exit 1 }
+                $v = $args[++$i]
+                switch -Regex ($a) {
+                    '^--?quant$'            { $Quant = $v }
+                    '^--?model$'            { $Model = $v }
+                    '^--?vram$'             { $Vram = $v }
+                    '^--?context$'          { $Context = $v }
+                    '^--?port$'             { $Port = $v }
+                    '^--?host$'             { $Bind = $v }
+                    '^--?device$'           { $Device = [int]$v }
+                    '^--?model-file$'       { $ModelFile = $v }
+                    '^--?model-dir$'        { $ModelDir = $v }
+                    '^--?clone-dir$'        { $CloneDir = $v }
+                    '^--?branch$'           { $Branch = $v }
+                    '^--?repo-url$'         { $RepoUrl = $v }
+                    '^--?hf-token$'         { $HfToken = $v }
+                    '^--?max-download-mib$' { $MaxDownloadMib = [int]$v }
+                }
+            }
+        }
+    }
+    if ($rest.Count -gt 0) { Write-Host "  [FAIL] unrecognized argument(s): $($rest -join ' ') (PS parameters are single-dash, e.g. -DryRun)"; exit 1 }
+}
 
 # --- state -------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
@@ -189,16 +238,24 @@ function AskChoice([string]$q, [object[]]$opts, [string]$defKey) {
 # --- data tables -------------------------------------------------------
 # Verified against the Hugging Face API on 2026-11-04 (Content-Length of the
 # resolve endpoint). Sizes are GiB to one decimal.
+# SDD D19: the table is flat over (model, quant) entries; the entry marked
+# Default is the row's own file (the one the recipe rows were measured on).
 $script:MODELS = @(
-    [pscustomobject]@{ Key='qwen38'; Label='Qwen3.8-27B dense hybrid (unsloth UD Q4_K_M)'
+    [pscustomobject]@{ Key='qwen38'; Quant='q4k_m'; Label='Qwen3.8-27B dense hybrid (unsloth UD Q4_K_M)'
         Repo='unsloth/Qwen3.8-27B-GGUF'; File='Qwen3.8-27B-UD-Q4_K_M.gguf'; SizeGib=15.4
-        DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense' },
-    [pscustomobject]@{ Key='qwen36'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q4_K_M)'
+        DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$true },
+    [pscustomobject]@{ Key='qwen36'; Quant='q4k_m'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q4_K_M)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'; SizeGib=20.6
-        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe' },
-    [pscustomobject]@{ Key='flint'; Label='Flint SWA MoE (unsloth UD Q5_K_XL)'
+        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$true },
+    [pscustomobject]@{ Key='flint'; Quant='q5k_xl'; Label='Flint SWA MoE (unsloth UD Q5_K_XL)'
         Repo='unsloth/flint-GGUF'; File='flint-UD-Q5_K_XL.gguf'; SizeGib=27.9
-        DefaultDir='C:/Models/ALL/other/flint'; Kind='moe-swa' }
+        DefaultDir='C:/Models/ALL/other/flint'; Kind='moe-swa'; Default=$true },
+    [pscustomobject]@{ Key='qwen38'; Quant='q5k_xl'; Label='Qwen3.8-27B dense hybrid (unsloth UD Q5_K_XL)'
+        Repo='unsloth/Qwen3.8-27B-GGUF'; File='Qwen3.8-27B-UD-Q5_K_XL.gguf'; SizeGib=19.4
+        DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$false },
+    [pscustomobject]@{ Key='qwen36'; Quant='q5k_xl'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q5_K_XL)'
+        Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf'; SizeGib=24.7
+        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$false }
 )
 
 # Recipe rows: MEASURED, verbatim (SDD section 4.6, decision D4/D11).
@@ -651,19 +708,32 @@ function Invoke-Build {
 # --- model (SDD 4.5) ------------------------------------------------------
 function Pick-Model {
     param([string]$key)
+    # SDD D19: flat (model, quant) entries. -Model picks the model; -Quant
+    # picks the quant (default = the model's Default entry); numeric keys 1-5
+    # address the flat list directly.
     if ($key) {
-        $m = $script:MODELS | Where-Object { $_.Key -eq $key } | Select-Object -First 1
-        if ($m) { return $m }
-        if ($key -match '^[1-3]$') { return $script:MODELS[[int]$key - 1] }
-        ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, or 1-3)"
+        $pool = $script:MODELS | Where-Object { $_.Key -eq $key }
+        if (-not $pool) {
+            if ($key -match '^[1-5]$') { return $script:MODELS[[int]$key - 1] }
+            ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, or 1-5)"
+        }
+        if ($Quant) {
+            $m = $pool | Where-Object { $_.Quant -eq $Quant } | Select-Object -First 1
+            if (-not $m) {
+                ExitCode 1 "no '$Quant' build for $key (available: $(@($pool | ForEach-Object { $_.Quant }) -join ', '))"
+            }
+            return $m
+        }
+        return ($pool | Where-Object { $_.Default } | Select-Object -First 1)
     }
     $opts = @()
     for ($i = 0; $i -lt $script:MODELS.Count; $i++) {
         $m = $script:MODELS[$i]
-        $opts += [pscustomobject]@{ Key=$m.Key; Label="$($m.Key): $($m.Label) - $($m.File), $($m.SizeGib) GiB" }
+        $q = if ($m.Default) { $m.Quant } else { "$($m.Quant) (alt)" }
+        $opts += [pscustomobject]@{ Key=($m.Key + '-' + $m.Quant); Label="$($m.Key): $($m.Label), $($m.SizeGib) GiB [Q: $q]" }
     }
-    $sel = AskChoice 'Which model?' $opts 'qwen36'
-    return $script:MODELS | Where-Object { $_.Key -eq $sel } | Select-Object -First 1
+    $sel = AskChoice 'Which model (and quant)?' $opts 'qwen36-q4k_m'
+    return $script:MODELS | Where-Object { ($_.Key + '-' + $_.Quant) -eq $sel } | Select-Object -First 1
 }
 
 function Resolve-ModelFile {
@@ -777,6 +847,12 @@ function Download-Model {
 function Pick-Recipe {
     param([object]$m)
     Step '6. Recipe (measured only)'
+    # SDD D19: the rows were measured on each model's Default quant; picking
+    # the alt build runs the row's flags against a file nobody measured.
+    if (-not $m.Default) {
+        $d = $script:MODELS | Where-Object { $_.Key -eq $m.Key -and $_.Default } | Select-Object -First 1
+        Warn "row was measured on $($d.File); you chose $($m.File) (quant $($m.Quant)) - the row's speed/VRAM numbers are for the default quant"
+    }
     # promote the -Vram/-Context parameters into script scope so main can see them
     if ($Vram) { $script:Vram = $Vram }
     if ($Context) { $script:Context = $Context }

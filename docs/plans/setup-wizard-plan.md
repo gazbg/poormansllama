@@ -267,3 +267,43 @@ SDD decisions D16-D18 (docs/setup-wizard-sdd.md):
   (fork-only), a fresh-clone (origin/main) build's flag gate refuses R7
   like R4/R5. The AC-6-L smoke (published-main build, R7) does NOT apply
   to the new row; it certifies the old recipe only.
+
+### SDD D19 addendum (2026-11-05, owner request: "add choice for 5k_xl models")
+
+Owner asked for a Q5_K_XL build choice for qwen38 and qwen36 (flint was
+already Q5_K_XL). Recorded as **SDD D19** in `docs/setup-wizard-sdd.md`
+(the SDD's own decision series; NOT this plan's D19 "emitted header" —
+different numbering spaces, disambiguated by the "SDD" prefix).
+
+- The model table in `setup.ps1` / `setup.sh` is now **flat over
+  (model, quant)** with 5 entries: (1) qwen38 Q4_K_M [default], (2) qwen36
+  Q4_K_M [default], (3) flint Q5_K_XL [only], (4) qwen38 Q5_K_XL [alt],
+  (5) qwen36 Q5_K_XL [alt]. A new `-Quant` / `--quant q4k_m|q5k_xl` option
+  selects the build; numeric picks 1-5 cover the flat list.
+- **Recipe rows stay keyed on MODEL only** (R1-R7 unchanged): the alt-quant
+  rows run the model's measured row's flags, and picking a non-default
+  quant prints a warning that the row's speed/VRAM numbers are for the
+  default (measured) build. This is an [assumption]-style disclosure, not
+  a new measured row (SDD D19; the wizard only *emits* measured rows, it
+  does not fabricate numbers for the alt build).
+- Two defects found and fixed while validating (both turn silent
+  misconfiguration into loud failure):
+  - (a) `setup.ps1` silently **DROPS** hyphenated dashed flags
+    (`--dry-run`, `--non-interactive`, `--skip-model` land unbound in
+    `$args` and PowerShell discards them) — a `--dry-run` invocation
+    actually downloaded the 24.7 GiB model. `setup.ps1` now normalizes the
+    known dashed names up front and refuses anything unrecognized (exit 1).
+  - (b) `setup.sh`'s `resolve_gpu_index` cached its result in a global that
+    dies with the `$(...)` subshell and its cache read died under `set -u`
+    (emitted `--device CUDA ` empty). It is now a **pure function** echoing
+    the index; the `--device N` option still wins.
+- **Validated (host-only, Windows):** PS parse + the `mi()` 14-case and
+  `ask_choice` 7-case harnesses; `bash -n` + the 7-case `ask_choice`
+  harness; E2E dry-runs for (qwen36/8g → R7 + `--device CUDA0`),
+  (qwen36/8g/q5k_xl → R7 + Q5_K_XL file + alt-quant note), (flint/q4k_m →
+  loud refusal), (qwen38/full/q5k_xl → R1 + alt-quant note). No GPU run, no
+  tok/s claim for the alt-quant rows.
+- **Linux E2E** (`./setup.sh --dry-run --non-interactive --model qwen36
+  --vram 8g --context 262k --skip-model --no-start` on the 1070 box) is the
+  remaining live-hardware confirmation of the D17 auto-device selection on a
+  real 2-GPU system; run via ssh-mcp when the box is reachable.
