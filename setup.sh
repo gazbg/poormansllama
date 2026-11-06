@@ -4,12 +4,14 @@
 #
 # Purpose: check the environment (git, cmake, CUDA toolkit, gcc, NVIDIA GPU),
 # auto-install missing toolchain pieces via apt (y/n confirmed), clone the
-# repo if not already inside a checkout, build llama-server with the fork's
-# required options (GGML_CUDA=ON, LLAMA_LAYER_STREAMING=ON), ask a few
-# questions (model, VRAM target, context), download the selected GGUF from
-# Hugging Face if missing (resume-capable), pick one of the seven MEASURED
-# recipe rows (R1-R7, unmeasured combinations are refused), and emit a
-# ready-to-run run-server.sh in the repo root. Optionally starts the server.
+# repo if not already inside a checkout, then ask ALL settings up front
+# (model, quant, local path, VRAM target, context; SDD D20) - the unmeasured-
+# combo refusal (exit 3) happens BEFORE any build or download. The build
+# (llama-server with GGML_CUDA=ON, LLAMA_LAYER_STREAMING=ON) and the model
+# download (Hugging Face, resume-capable) then run IN PARALLEL with one
+# combined status line, fail-fast. One of the seven MEASURED recipe rows
+# (R1-R7) is emitted as a ready-to-run run-server.sh in the repo root.
+# Optionally starts the server.
 #
 # Mirror of setup.ps1 (Windows). Design: docs/setup-wizard-sdd.md
 # Plan + acceptance: docs/plans/setup-wizard-plan.md
@@ -54,6 +56,11 @@ NI=0
 YES_INSTALL=0
 HF_TOKEN="${HF_TOKEN:-}"
 MAX_DL_MIB=0
+# D20 state: set by resolve_model_file (settings phase), consumed by the
+# parallel phase. Initialized so set -u is happy on every path.
+LOCAL_FILE=''
+MODEL_FILE_TARGET=''
+BUILD_PID=''
 
 usage() {
     cat <<'EOF'
@@ -293,7 +300,7 @@ ver_ge() {  # ver_ge A B  (A and B like "4.2" or "2.43.0")
 }
 
 check_env() {
-    step '1. Environment check'
+    step 'Environment check'
     ENV_BAD=()
 
     # git >= 2.30
@@ -411,7 +418,7 @@ install_missing() {
         case "$b" in git|cmake|cuda|gcc) todo+=("$b") ;; esac
     done
     [ ${#todo[@]} -eq 0 ] && return 0
-    step '2. Install missing tools (apt)'
+    step 'Install missing tools (apt)'
     local pkgs=()
     for b in "${todo[@]}"; do
         case "$b" in
@@ -473,7 +480,7 @@ get_repo_root() {
 }
 
 invoke_clone() {
-    step '3. Repository'
+    step 'Repository'
     local in_repo
     if [ -z "$CLONE_DIR" ]; then
         # no explicit target: running inside the repo means nothing to clone
@@ -579,7 +586,10 @@ binary_fresh() {
 }
 
 invoke_build() {
-    step '4. Build llama-server'
+    # SEQUENTIAL form (SDD D20): used for the --skip-model-without-model run
+    # and for single-leg (build-only) phases. The parallel phase (step 5)
+    # uses build_start + poll_download instead.
+    step 'Build llama-server'
     local bin="$REPO/build/llama-cuda/bin/llama-server"
     if [ "$SKIP_BUILD" = 1 ]; then say '(skipped: --skip-build)'; BUILD_BIN="$bin"; return 0; fi
     if [ "$FULL_BUILD" != 1 ] && binary_fresh "$REPO" "$bin"; then
@@ -649,10 +659,13 @@ pick_model() {
 }
 
 resolve_model_file() {
-    # sets LOCAL_FILE; downloads when missing
+    # D20: settings phase - decides LOCAL_FILE (an existing local file) or
+    # MODEL_FILE_TARGET (the table file to fetch in the parallel phase).
+    # Nothing is downloaded here.
     local dir="$MODEL_DIR"
     [ -z "$dir" ] && dir="${M_DIRS[$MI_IDX]}"
     local file="$dir/${M_FILES[$MI_IDX]}"
+    MODEL_FILE_TARGET=''
     if [ -n "$MODEL_FILE" ]; then
         [ -f "$MODEL_FILE" ] || fail "-model-file does not exist: $MODEL_FILE" 1
         LOCAL_FILE="$MODEL_FILE"
@@ -688,56 +701,176 @@ resolve_model_file() {
         case "$a" in
             *.gguf) [ -f "$a" ] && { LOCAL_FILE="$a"; return 0; } ;;
         esac
-        # fall through: download
+        # fall through: download target
     fi
-    download_model "$dir"
+    LOCAL_FILE=''
+    MODEL_FILE_TARGET="$file"
 }
 
-download_model() {
+# --- parallel phase (SDD D20): build leg + download leg -------------------
+# Both legs run in the background; poll_download() renders the combined
+# status line (~1 s tick) and fails fast on the first hard failure. The
+# download's resume/Range/verify logic is unchanged (curl -C -); the build
+# keeps the documented cmake commands (D9 arch, D10 freshness checked by
+# the caller before build_start is ever called).
+build_start() {
+    # one variable per statement: 'local a=$x b=$a' expands $a before it is
+    # set and set -u dies (D44)
+    local arch="$CUDA_ARCH"
+    if [ -z "$arch" ]; then
+        if ! arch=$(detect_cuda_arch); then
+            fail 'could not detect the CUDA architecture from nvidia-smi; pass --cuda-arch NNN (e.g. 61 for Pascal, 89 for Ada; the LINUX-PASCAL build uses an explicit list)' 2
+        fi
+        say "detected CUDA arch: $arch"
+    fi
+    local src="$REPO/third_party/llama.cpp"
+    local bld="$REPO/build/llama-cuda"
+    BUILD_CFG_LOG="$bld/setup-wizard-cmake-configure.log"
+    BUILD_BLD_LOG="$bld/setup-wizard-cmake-build.log"
+    BUILD_RC1="$bld/setup-wizard-rc1.tmp"
+    BUILD_RC2="$bld/setup-wizard-rc2.tmp"
+    rm -f "$BUILD_RC1" "$BUILD_RC2"
+    (
+        cmake -S "$src" -B "$bld" -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="$arch" -DCMAKE_BUILD_TYPE=Release \
+            > "$BUILD_CFG_LOG" 2>&1
+        echo "$?" > "$BUILD_RC1"
+        cmake --build "$bld" --target llama-server --parallel "$(nproc 2>/dev/null || echo 4)" \
+            > "$BUILD_BLD_LOG" 2>&1
+        echo "$?" > "$BUILD_RC2"
+    ) &
+    BUILD_PID=$!
+    ok "build started (configure log: $BUILD_CFG_LOG, build log: $BUILD_BLD_LOG)"
+}
+
+build_wait() {
+    # blocking collector: waits for the leg, checks both stage rcs, prints
+    # the log tail and fails 4 on any stage failure (same tails as
+    # invoke_build). Sets BUILD_BIN on success.
+    local bld="$REPO/build/llama-cuda"
+    local bin="$bld/bin/llama-server"
+    wait "$BUILD_PID" 2>/dev/null
+    [ -f "$BUILD_RC1" ] || fail 'cmake configure did not report an exit code (log: '$BUILD_CFG_LOG')' 4
+    local rc1; rc1=$(head -1 "$BUILD_RC1")
+    if [ "$rc1" != 0 ]; then
+        tail -50 "$BUILD_CFG_LOG" | sed 's/^/    /'
+        fail "cmake configure failed (exit $rc1; full log: $BUILD_CFG_LOG)" 4
+    fi
+    [ -f "$BUILD_RC2" ] || fail 'cmake build did not report an exit code (log: '$BUILD_BLD_LOG')' 4
+    local rc2; rc2=$(head -1 "$BUILD_RC2")
+    if [ "$rc2" != 0 ]; then
+        tail -50 "$BUILD_BLD_LOG" | sed 's/^/    /'
+        fail "build failed (exit $rc2; full log: $BUILD_BLD_LOG)" 4
+    fi
+    [ -f "$bin" ] || fail 'build finished but '$bin' was not produced' 4
+    ok "built $bin"
+    BUILD_BIN="$bin"
+}
+
+build_kill() {
+    # fail-fast / Ctrl-C: take the whole cmake tree (make/ninja descendants)
+    if [ -n "${BUILD_PID:-}" ]; then
+        pkill -TERM -P "$BUILD_PID" 2>/dev/null
+        kill -TERM "$BUILD_PID" 2>/dev/null
+        sleep 1
+        pkill -KILL -P "$BUILD_PID" 2>/dev/null
+        kill -KILL "$BUILD_PID" 2>/dev/null
+    fi
+}
+
+download_start() {
     local dir="$1"
-    local file="$dir/${M_FILES[$MI_IDX]}"
-    local part="$file.part"
-    local url="https://huggingface.co/${M_REPOS[$MI_IDX]}/resolve/main/${M_FILES[$MI_IDX]}"
-    step "5. Download model (${M_SIZES_GIB[$MI_IDX]} GiB) from Hugging Face"
-    say "$url"
-    if [ "$SKIP_DOWNLOAD" = 1 ]; then fail '--skip-download set but no local model found (expected $file)' 5; fi
-    if [ "$DRY_RUN" = 1 ]; then say '(dry-run: not downloading)'; LOCAL_FILE="$file"; return 0; fi
-    command -v curl >/dev/null 2>&1 || fail 'curl is required for the download (install it: sudo apt install curl; manual: $url)' 5
+    DL_FILE="$dir/${M_FILES[$MI_IDX]}"
+    DL_PART="$DL_FILE.part"
+    DL_URL="https://huggingface.co/${M_REPOS[$MI_IDX]}/resolve/main/${M_FILES[$MI_IDX]}"
+    DL_MAXBYTES=0
+    [ "$MAX_DL_MIB" -gt 0 ] && DL_MAXBYTES=$(( MAX_DL_MIB * 1048576 ))
+    if [ "$SKIP_DOWNLOAD" = 1 ]; then fail '--skip-download set but no local model found (expected '$DL_FILE')' 5; fi
+    command -v curl >/dev/null 2>&1 || fail 'curl is required for the download (install it: sudo apt install curl; manual: '$DL_URL')' 5
+    say "model: downloading ${M_FILES[$MI_IDX]} (${M_SIZES_GIB[$MI_IDX]} GiB) from Hugging Face"
+    say "$DL_URL"
+    if [ -s "$DL_PART" ]; then
+        say "resuming: $(( $(stat -c %s "$DL_PART" 2>/dev/null || echo 0) / 1048576 )) MiB already in .part"
+    fi
+    if [ "$DL_MAXBYTES" -gt 0 ]; then say "(test hook: --max-download-mib $MAX_DL_MIB, stopping at $MAX_DL_MIB MiB)"; fi
     local auth=()
     if [ -n "$HF_TOKEN" ]; then auth=(-H "Authorization: Bearer $HF_TOKEN"); say '(using HF token from --hf-token/HF_TOKEN; never printed)'; fi
-    if [ "$MAX_DL_MIB" -gt 0 ]; then say "(test hook: --max-download-mib $MAX_DL_MIB, stopping at $MAX_DL_MIB MiB)"; fi
     say 'downloading ... (Ctrl-C aborts; partial data is kept for resume)'
-    local maxbytes=0
-    [ "$MAX_DL_MIB" -gt 0 ] && maxbytes=$(( MAX_DL_MIB * 1048576 ))
-    if [ -s "$part" ]; then
-        say "resuming: $(( $(stat -c %s "$part" 2>/dev/null || echo 0) / 1048576 )) MiB already in .part"
+    # curl's stderr goes to a log: the combined status line is the console
+    # presentation, and the progress meter must not interleave it (measured
+    # 2026-11-06, d20-parallel: the meter interleaved with the status line).
+    DL_ERRLOG="${DL_PART}.curl-err.log"
+    curl -fL -C - --retry 3 --retry-delay 5 ${auth[@]+"${auth[@]}"} -o "$DL_PART" "$DL_URL" 2> "$DL_ERRLOG" &
+    DL_CURL_PID=$!
+    DL_RC=0
+}
+
+poll_download() {
+    # combined status line (~1 s tick) + fail-fast. Returns 0 when the
+    # transfer completed, 2 when the --max-download-mib test hook tripped
+    # (LOCAL_FILE is the .part, D33 semantics), or exits the wizard on a
+    # hard failure of either leg.
+    local t0 got btxt rc1f rc2f
+    rc1f="${BUILD_RC1:-}"; rc2f="${BUILD_RC2:-}"
+    # rc1f/rc2f are empty on the download-only path (build_start never ran);
+    # '${...:-}' keeps 'set -u' happy (measured 2026-11-06: a bare $BUILD_RC2
+    # died the wizard mid-download and orphaned the curl).
+    t0=$(date +%s)
+    while :; do
+        if [ -z "$rc1f" ] && [ -z "$rc2f" ]; then
+            # download-only path: the build was fresh or -SkipBuild
+            btxt='not running (fresh or -SkipBuild)'
+        elif [ -n "$rc2f" ] && [ -f "$rc2f" ]; then
+            btxt='done'
+        elif [ -n "$rc1f" ] && [ -f "$rc1f" ]; then
+            btxt="building (cmake --build) ... $(( ( $(date +%s) - t0 ) / 60 )) min"
+        else
+            btxt="configuring ... $(( ( $(date +%s) - t0 ) / 60 )) min"
+        fi
+        got=$(stat -c %s "$DL_PART" 2>/dev/null || echo 0)
+        printf '\r  build: %s   |   model: %s MiB downloaded      ' "$btxt" "$(( got / 1048576 ))"
+        # fail-fast: a cmake stage exited nonzero
+        if [ -n "$rc1f" ] && [ -f "$rc1f" ] && [ "$(head -1 "$rc1f")" != 0 ]; then
+            printf '\n'; kill "$DL_CURL_PID" 2>/dev/null; wait "$DL_CURL_PID" 2>/dev/null
+            build_kill; build_wait
+        fi
+        if [ -n "$rc2f" ] && [ -f "$rc2f" ] && [ "$(head -1 "$rc2f")" != 0 ]; then
+            printf '\n'; kill "$DL_CURL_PID" 2>/dev/null; wait "$DL_CURL_PID" 2>/dev/null
+            tail -50 "$BUILD_BLD_LOG" | sed 's/^/    /'
+            fail "build failed (exit $(head -1 "$rc2f"); full log: $BUILD_BLD_LOG); the download was stopped (re-run resumes the .part)" 4
+        fi
+        # the test hook cap
+        if [ "$DL_MAXBYTES" -gt 0 ] && [ "$got" -ge "$DL_MAXBYTES" ]; then
+            kill "$DL_CURL_PID" 2>/dev/null
+            wait "$DL_CURL_PID" 2>/dev/null
+            got=$(stat -c %s "$DL_PART" 2>/dev/null || echo 0)
+            if [ "$got" -gt "$DL_MAXBYTES" ]; then truncate -s "$DL_MAXBYTES" "$DL_PART"; got=$DL_MAXBYTES; fi
+            printf '\n'
+            warn "test hook stopped transfer at $(( got / 1048576 )) MiB (expected full ${M_SIZES_GIB[$MI_IDX]} GiB)"
+            say 'leaving .part in place to verify resume; NOT renaming to the final name.'
+            LOCAL_FILE="$DL_PART"
+            return 2
+        fi
+        # curl finished?
+        if ! kill -0 "$DL_CURL_PID" 2>/dev/null; then
+            wait "$DL_CURL_PID"
+            DL_RC=$?
+            break
+        fi
+        sleep 1
+    done
+    printf '\n'
+    if [ "$DL_RC" -ne 0 ]; then
+        [ -f "$DL_ERRLOG" ] && tail -10 "$DL_ERRLOG" | sed 's/^/    /'
+        fail "download failed (curl exit $DL_RC; manual: $DL_URL; log: $DL_ERRLOG); re-run resumes the .part" 5
     fi
-    local rc=0 got
-    if [ "$maxbytes" -gt 0 ]; then
-        # test hook: run curl in the background and stop it once the transfer
-        # reaches the cap, simulating an interrupted download.
-        curl -fsSL -C - --retry 3 --retry-delay 5 ${auth[@]+"${auth[@]}"} -o "$part" "$url" &
-        local curlpid=$!
-        while kill -0 "$curlpid" 2>/dev/null; do
-            got=$(stat -c %s "$part" 2>/dev/null || echo 0)
-            [ "$got" -ge "$maxbytes" ] && break
-            sleep 0.2
-        done
-        kill "$curlpid" 2>/dev/null
-        wait "$curlpid" 2>/dev/null
-        got=$(stat -c %s "$part" 2>/dev/null || echo 0)
-        [ "$got" -gt "$maxbytes" ] && truncate -s "$maxbytes" "$part" && got="$maxbytes"
-        [ "$got" -gt 0 ] || fail "test hook download failed before $MAX_DL_MIB MiB (manual: $url)" 5
-        warn "test hook stopped transfer at $(( got / 1048576 )) MiB (expected full ${M_SIZES_GIB[$MI_IDX]} GiB)"
-        say 'leaving .part in place to verify resume; NOT renaming to the final name.'
-        LOCAL_FILE="$part"
-        return 0
-    fi
-    curl -fL -C - --retry 3 --retry-delay 5 ${auth[@]+"${auth[@]}"} -o "$part" "$url" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        fail "download failed (curl exit $rc; manual: $url)" 5
-    fi
-    got=$(stat -c %s "$part" 2>/dev/null || echo 0)
+    return 0
+}
+
+download_finalize() {
+    # integrity + rename (unchanged from the original download tail)
+    local file="$DL_FILE" part="$DL_PART"
+    local got; got=$(stat -c %s "$part" 2>/dev/null || echo 0)
     [ "$got" -gt 0 ] || fail 'download produced an empty file' 5
     # a file of identical size is verified byte-identical before rename
     if [ -f "$file" ]; then
@@ -749,6 +882,13 @@ download_model() {
     mv "$part" "$file"
     ok "model ready: $file"
     LOCAL_FILE="$file"
+}
+
+wait_build() {
+    # collect the build leg after the download finished (a download failure
+    # has already exited 5 with the build killed)
+    [ -n "${BUILD_PID:-}" ] || return 0
+    build_wait
 }
 
 check_disk() {
@@ -769,7 +909,8 @@ check_disk() {
 
 # --- steps 6-8: recipe, emission, start (SDD 4.6/4.7) ------------------------
 pick_recipe() {
-    step '6. Recipe (measured only)'
+    # D20: recipe selection is part of the settings phase (no step number).
+    say 'recipe (measured rows only):'
     # SDD D19: the rows were measured on each model's Default quant; picking
     # the alt build runs the row's flags against a file nobody measured.
     if [ "${M_DEFAULTS[$MI_IDX]}" != 1 ]; then
@@ -860,7 +1001,7 @@ git_short() {
 }
 
 emit_run_script() {
-    step '7. Emit run-server.sh'
+    step 'Emit run-server.sh'
     local bind="$BIND"
     [ -z "$bind" ] && bind="$R_BIND"
     local out="$REPO/run-server.sh" last="$REPO/run-server.last.sh"
@@ -935,6 +1076,27 @@ echo
 echo '  poormansllama setup wizard (Linux)'
 echo
 
+# D20: Ctrl-C in the parallel phase must stop both legs; the .part stays for
+# resume. (The terminal already signals the whole process group; this is the
+# safety net for the build subshell's children.)
+on_interrupt() {
+    [ -n "${BUILD_PID:-}" ] && { kill "$BUILD_PID" 2>/dev/null; pkill -P "$BUILD_PID" 2>/dev/null; }
+    [ -n "${DL_CURL_PID:-}" ] && kill "$DL_CURL_PID" 2>/dev/null
+    printf '\n'
+    fail '[aborted by user]' 6
+}
+trap on_interrupt INT TERM
+
+# EXIT net: if the wizard dies MID-DOWNLOAD for any reason (an internal error,
+# a refusal, Ctrl-C handled elsewhere), the background curl must not be left
+# orphaned (measured 2026-11-06: a set -u death left curl running for 97 s).
+cleanup_download() {
+    if [ -n "${DL_CURL_PID:-}" ] && kill -0 "$DL_CURL_PID" 2>/dev/null; then
+        kill "$DL_CURL_PID" 2>/dev/null
+    fi
+}
+trap cleanup_download EXIT
+
 check_env
 if [ ${#ENV_BAD[@]} -gt 0 ]; then
     install_missing
@@ -949,26 +1111,87 @@ for b in "${ENV_BAD[@]:-}"; do
 done
 
 invoke_clone
-invoke_build
 
-if [ -n "$MODEL_FILE" ] && [ -z "$MODEL" ]; then
-    fail '--model-file requires --model (qwen38|qwen36|flint) for recipe selection' 1
+if [ -n "$MODEL_FILE" ] && [ -z "$MODEL" ] && { [ "$SKIP_MODEL" != 1 ] || [ -n "$MODEL" ]; }; then
+    : # MODEL_FILE without MODEL is refused below unless the no-ask shape holds
 fi
 if [ "$SKIP_MODEL" = 1 ] && [ -z "$MODEL" ]; then
-    # env + clone + build only, nothing to ask
+    # AC-5 shape: env + clone + build only, nothing to ask. Sequential build:
+    # there is no download leg to run in parallel with.
+    invoke_build
     ok "done: environment + repository + build (model/recipe steps skipped: --skip-model without --model)"
     ok "next: re-run with --model qwen38|qwen36|flint to pick a recipe and emit run-server.sh"
     exit 0
 fi
+if [ -n "$MODEL_FILE" ] && [ -z "$MODEL" ]; then
+    fail '--model-file requires --model (qwen38|qwen36|flint) for recipe selection' 1
+fi
+
+# --- settings (SDD D20): every question BEFORE the heavy work --------------
+step 'Settings (asked before the build and the download)'
 pick_model
 if [ "$SKIP_MODEL" = 1 ]; then
     LOCAL_FILE="${MODEL_DIR:-${M_DIRS[$MI_IDX]}}/${M_FILES[$MI_IDX]}"
     warn "--skip-model: assuming the model is at $LOCAL_FILE (not checked)"
 else
     resolve_model_file
-    check_disk
+    # disk check needs the model size; it runs here, before the download
+    check_disk "${MODEL_DIR:-${M_DIRS[$MI_IDX]}}"
 fi
 pick_recipe
+
+# --- parallel phase (SDD D20): build leg and download leg ------------------
+BUILD_BIN="$REPO/build/llama-cuda/bin/llama-server"
+build_needed=1
+if [ "$SKIP_BUILD" = 1 ]; then
+    build_needed=0
+    say '(skipped: --skip-build)'
+elif [ "$FULL_BUILD" != 1 ] && binary_fresh "$REPO" "$BUILD_BIN"; then
+    build_needed=0
+    ok "build skipped (binary newer than sources): $BUILD_BIN"
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    # dry-run: no processes. Same command text as the sequential build.
+    if [ "$build_needed" = 1 ]; then
+        if [ -z "$CUDA_ARCH" ]; then
+            if ! CUDA_ARCH=$(detect_cuda_arch); then CUDA_ARCH='? (nvidia-smi unavailable)'; fi
+            say "detected CUDA arch: $CUDA_ARCH"
+        fi
+        say "(dry-run: cmake -S $REPO/third_party/llama.cpp -B $REPO/build/llama-cuda -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH -DCMAKE_BUILD_TYPE=Release)"
+        say "(dry-run: cmake --build $REPO/build/llama-cuda --target llama-server --parallel $(nproc 2>/dev/null || echo 4))"
+    fi
+    if [ -n "$MODEL_FILE_TARGET" ]; then
+        say '(dry-run: not downloading)'
+        # the emitted script must name the file the real run would produce
+        LOCAL_FILE="$MODEL_FILE_TARGET"
+    fi
+elif [ "$build_needed" = 1 ] && [ -n "$MODEL_FILE_TARGET" ]; then
+    step 'Build + download (in parallel; Ctrl-C keeps the .part for resume)'
+    build_start
+    download_start "${MODEL_DIR:-${M_DIRS[$MI_IDX]}}"
+    poll_download
+    prc=$?
+    if [ "$prc" = 0 ]; then
+        download_finalize
+    fi
+    # prc = 2: test-hook cap tripped, LOCAL_FILE is the .part (D33 semantics)
+    wait_build
+elif [ "$build_needed" = 1 ]; then
+    # no download leg: build sequentially in the foreground (live output)
+    invoke_build
+else
+    # build fresh/skipped; download only (no combined line needed)
+    if [ -n "$MODEL_FILE_TARGET" ]; then
+        step 'Download model (Hugging Face; Ctrl-C keeps the .part for resume)'
+        local_dir="${MODEL_DIR:-${M_DIRS[$MI_IDX]}}"
+        download_start "$local_dir"
+        poll_download
+        prc=$?
+        if [ "$prc" = 0 ]; then download_finalize; fi
+    fi
+fi
+
 check_row_flags "$BUILD_BIN" "$R_FLAGS" "$R_ID"
 emit_run_script
 start_server_now

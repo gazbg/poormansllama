@@ -74,11 +74,21 @@ next to it), the clone step is skipped and that checkout is used.
  3. Auto-install missing       (winget on Windows, apt on Linux; y/n confirm;
                                 PATH re-hashed after install)
  4. Clone (if not in a repo)   (shallow by default; branch claude/flint-support)
- 5. Build llama-server         (skip when the target is newer than the sources)
- 6. Model                      (pick model → local path check → HF download)
- 7. Recipe                     (VRAM target × context × model → measured row)
+ 5. Settings (D20)             (ALL questions up front: model + quant → local
+                                path → disk check → VRAM target × context →
+                                the unmeasured-combo refusal (exit 3) happens
+                                BEFORE any build or download; the D12 GPU VRAM
+                                warning runs here)
+ 6. Build + download (parallel)(D20: the build leg and the model download
+                                (when missing) run at the same time, one
+                                combined status line, fail-fast; see §4.8)
+ 7. Flag-capability gate       (D38: reads the BUILT binary, so it stays
+                                after the parallel phase)
  8. Emit run-server script     (+ "start it now? (y/n)")
 ```
+
+Console step headers are unnumbered (the numbering above documents the flow,
+it is not printed).
 
 Each step is idempotent: re-running never re-clones, re-downloads, or
 re-builds work that is already valid.
@@ -145,7 +155,7 @@ the registry / `hash -r`) and the check re-runs; a tool still missing
 - Windows only, after clone: `git config core.longpaths true` (per USAGE.md;
   the repo sets it locally on every checkout).
 
-### 4.4 Build (step 5)
+### 4.4 Build (step 6, parallel leg or sequential fallback)
 
 Exactly the documented commands (docs/guide/USAGE.md §3, LINUX-PASCAL §1):
 
@@ -168,16 +178,17 @@ Linux:
   (`build/llama-cuda/bin/Release/llama-server.exe` or
   `build/llama-cuda/bin/llama-server`) is newer than every source file under
   `third_party/llama.cpp/{src,ggml,common,tools/llama-server}` (recursive
-  mtime scan). Skip → step 6. The scan is the only freshness signal; there is
-  no cache of source hashes (recorded: a digest would be a cross-process
-  comparison, and this repo has measured such comparisons to be unreliable —
-  AGENTS.md "A digest compared across wrapper invocations can differ for an
-  UNCHANGED tree").
-- `--no-build` / `-SkipBuild`: emit the build commands and stop (dry build).
+  mtime scan). Skip → step 6 (the parallel phase simply runs no build leg).
+  The scan is the only freshness signal; there is no cache of source hashes
+  (recorded: a digest would be a cross-process comparison, and this repo has
+  measured such comparisons to be unreliable — AGENTS.md "A digest compared
+  across wrapper invocations can differ for an UNCHANGED tree").
+- `--no-build` / `-SkipBuild`: no build leg (the download still runs).
 - Build failure → exit 4 with the last 50 lines of the build log
-  (`build/llama-cuda/setup-wizard-build.log`).
+  (`build/llama-cuda/setup-wizard-build.log`); in the parallel phase the
+  polling loop reports it (same tail, same exit, D20 fail-fast).
 
-### 4.5 Model (step 6)
+### 4.5 Model (step 5: selection; step 6: download leg)
 
 Model table, flat over (model, quant) — D19 (all links verified 2026-11-04
 against the HF API, Q5_K_XL entries 2026-11-05; sizes are `Content-Length`
@@ -224,7 +235,7 @@ Questions and rules:
   `Authorization: Bearer` for gated repos; never printed.
 - Download failure → exit 5 with the exact URL and a manual fallback line.
 
-### 4.6 Recipe (step 7)
+### 4.6 Recipe (step 5, inside the settings phase)
 
 Every row is **verbatim** from its source command. The wizard substitutes
 only: the model path (question 6), the bind address (default = the row's own
@@ -287,6 +298,43 @@ matches; one script per OS):
 The emitted script is executable standalone (no wizard needed to re-run it),
 and re-running the wizard overwrites it (the previous one is moved to
 `run-server.last.ps1` / `.sh`, one generation of history).
+
+### 4.8 The parallel phase (decision D20)
+
+```
+settings done:
+   model missing AND build needed  →  build leg ∥ download leg
+   exactly one of the two          →  that leg alone (no combined line)
+   neither                         →  nothing to do
+```
+
+- **Windows.** The build leg is the two documented cmake calls (configure,
+  then build), each wrapped in the D50/D53 `.bat` + rc-file shape and started
+  with `Start-Process -WindowStyle Hidden -PassThru` WITHOUT `-Wait`: both
+  streams live inside the `.bat`, so no redirected handle is ever created by
+  the wizard process and the long-lived MSBuild/vctip descendants (the D49
+  trap) cannot block it. The rc files (`swz-parallel-cfg.rc` /
+  `swz-parallel-build.rc` under `build/llama-cuda`) are the completion
+  signal, not the process handle. The download keeps the foreground
+  `HttpWebRequest` Range loop (resume / token / sha-256 verify unchanged);
+  its 500 ms tick renders the combined status line and fail-fasts the moment
+  a stage rc appears nonzero.
+- **Linux.** cmake configure + build run in ONE background subshell writing
+  the same two rc files; `curl -fL -C - --retry 3 --retry-delay 5` runs in
+  the background. A single 1 s polling loop renders the combined line, enforces
+  the `--max-download-mib` test hook (D33), and fail-fasts: a nonzero cmake
+  stage rc kills curl and exits 4 (`.part` kept), a dead curl kills the cmake
+  tree and exits 5. An INT/TERM trap kills both legs and exits 6 (`.part`
+  kept for resume).
+- **Failure semantics.** First hard failure wins; the other leg is killed.
+  Exit codes are unchanged (4 build, 5 download); a re-run resumes both (the
+  binary-freshness scan and `.part` resume). A download failure prints a
+  resume hint.
+- **Edges.** Model already local → build only (the documented sequential
+  `Invoke-Build` / `invoke_build` form, with its live log tails). Binary
+  fresh or `-SkipBuild` → download only. `-SkipModel` without `-Model`
+  (the AC-5 unattended shape) → sequential build, no settings questions.
+  `--dry-run` prints the documented command text and starts no processes.
 
 ## 5. Exit codes (both OSes)
 
@@ -378,3 +426,4 @@ See the acceptance contract in plans/setup-wizard-plan.md. In short:
 | D17 | (2026-11-05) device-pinned rows (R5, R7) no longer hard-code `CUDA0` in the row flags; the wizard appends `--device CUDA<n>` at emission: `-Device N` / `--device N` overrides, else auto (largest card for `full`; smallest card at/above the row minimum for `16g`/`8g`, else smallest card). The D12 VRAM warning runs against the selected card | `CUDA0` is not guaranteed on multi-GPU or reordered systems; the row's recipe is unchanged apart from which card runs it | yes (re-pin the index in the row) |
 | D18 | Consequence of D16: R7 now uses `--hybrid-moe-prefill-free-all`, which exists only in the fork (not origin/main), so a fresh-clone build's flag gate refuses R7 like R4/R5 (SETUP.md troubleshooting updated) | recorded so the refusal is not read as a new defect | yes (follows D16) |
 | D19 | (2026-11-05, owner request "add choice for 5k_xl models") the model table is flat over (model, quant) with a `q5k_xl` entry for qwen38 (19.4 GiB) and qwen36 (24.7 GiB); `-Quant`/`--quant q4k_m\|q5k_xl` plus numeric picks 1-5; recipe rows stay keyed on model only and picking an alt quant prints a measured-quant note. Two defects found and fixed while validating: (a) setup.ps1 silently DROPS hyphenated dashed flags (`--dry-run`, `--non-interactive`, `--skip-model` land unbound in `$args` and PowerShell discards them - a `--dry-run` invocation downloaded the model), so setup.ps1 now normalizes the known dashed names up front and refuses anything unrecognized; (b) setup.sh's `resolve_gpu_index` cached its result in a global that dies with the `$(...)` subshell and its cache read died under `set -u`, so the sh side is now a pure function echoing the index | owner asked for the quant choice; the two fixes turn silent misconfiguration into loud failure (measured 2026-11-05) | yes (drop the quant entries / the normalization block) |
+| D20 | (2026-11-06, owner request "optimize the setup flow: the user chooses all settings first, then the compile and the model download run in parallel at the end") the flow is now env → install → clone → **SETTINGS** (model + quant, local path, disk check, VRAM target × context; the unmeasured-combo refusal with exit 3 and the D12 GPU VRAM warning now happen BEFORE any build or download) → **PARALLEL PHASE** (build leg ∥ model download when missing; one combined status line `build: configuring/building … N min | model: M MiB downloaded`; fail-fast on the first hard failure) → flag gate → emit → start. The disk check (SDD §4.1) moved into the settings phase (it needs the model size) and gained its PowerShell twin (sh had it, PS did not). See §4.8 for the per-OS mechanics (PS: non-blocking `.bat` build legs in the D50/D53 shape + the foreground download loop's tick as the combined line; sh: both legs backgrounded under one polling loop + an INT/TERM trap). Bat-writing trap (plan D61, measured 2026-11-06): a cmd line that STARTS with `&` (`& cmake …`) aborts the whole batch before the rc-file line — write `<exe> <args> > log 2> err` with cmd-style exe quoting, never the PowerShell call-operator form. The flag-capability gate (D38) still runs after the build because it reads the built binary's `--help`. Console step headers are unnumbered | a refused combo previously paid the full build (up to ~22 min) and possibly a 20+ GiB download before exit 3; build and download share no state, so the phase's wall time is max(build, download) instead of their sum | yes (restore the sequential build → download order) |

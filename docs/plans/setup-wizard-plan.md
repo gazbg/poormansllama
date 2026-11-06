@@ -161,6 +161,62 @@ if any engine file is touched it is (none planned).
   contract §: decision log D1–D15, acceptance per criterion with evidence,
   scope limits, risks).
 
+### T-SW-7: settings-first flow + parallel build/download (2026-11-06)
+
+- Status: in-progress (2026-11-06, owner request: "the user 1st chooses all
+  settings and then at the end do the compiling and the model download in
+  parallel"). Design: SDD D20 + SDD §4.8. Files: `setup.ps1`, `setup.sh`,
+  `docs/setup-wizard-sdd.md` (flow §4, §4.8, D20), `docs/SETUP.md`,
+  `docs/currentstate.md`. **2026-11-07 validation state:** S7-1..S7-6 all
+  demonstrated on the LINUX twin over ssh-mcp (gogo-big, the 2x GTX 1070
+  box) plus the real capped-download parallel run, the resume run and a
+  fail-fast run (evidence below); three further defects found and fixed
+  while validating (D61 cmd leading-`&` bat trap on Windows, D62 `set -u`
+  unbound rc refs + EXIT-trap orphan curl on sh, D63 curl meter to log).
+  Remaining: re-run the Windows real-parallel leg (S7-5) on the owner's
+  machine once the other llama.cpp workload leaves it (the owner asked for
+  Linux-only testing in the meantime); commit is pending the owner's
+  instruction (working-tree change so far).
+- Goal: all questions (model + quant, local path, disk check, VRAM target,
+  context) are asked BEFORE any heavy work, so the unmeasured-combo refusal
+  (exit 3) can no longer follow a paid build or a started download. The build
+  and the model download then run in parallel as two legs with one combined
+  status line; first hard failure kills the other leg (fail-fast). Exit-code
+  table and the emitted script are unchanged.
+- Non-goals: no new settings questions (device stays a flag, `start now?`
+  stays the final action); no change to the recipe rows, the model table,
+  the download protocol (resume/Range/sha-256), or the build commands.
+- Acceptance (host-side; written before the runs):
+  - **S7-1 static.** PS parse (`[scriptblock]::Create`) + `bash -n` +
+    `wsl bash -n` all clean.
+  - **S7-2 order + idempotence.** In-repo `-DryRun --non-interactive --model
+    qwen36 --vram full` → exit 0; the `Settings` header is printed BEFORE any
+    `(dry-run: cmake …)` / download line; two consecutive runs print
+    byte-identical output.
+  - **S7-3 refusal-first.** `--model qwen36 --vram full --context 128k` →
+    exit 3, the R5/R6/R7 table printed, and NO build command line and NO
+    download line anywhere in the output.
+  - **S7-4 install path unchanged.** `SETUP_WIZARD_FORCE_MISSING=cmake` +
+    `-DryRun --non-interactive` → exit 0 with the winget plan and
+    `(dry-run: nothing installed)`.
+  - **S7-5 real parallel leg (the load-bearing one).** Fresh clone + full
+    build + a real capped download (`--max-download-mib 2048`) in ONE
+    invocation: `-CloneDir <temp> -Model qwen36 --vram 16g --context 262k
+    --max-download-mib 2048 -ModelDir <temp> --non-interactive -NoStart` →
+    the combined `build: … | model: …` line is visible in the output, the
+    real build completes (`[ok] built …llama-server.exe`, build log tail
+    clean, err log empty), the 2048 MiB `.part` stop fires with its warning,
+    and the run exits with the D33 test-hook semantics (`.part` kept, no
+    rename). Fresh-clone caveats (D37/D18): the branch is unpublished →
+    fallback to the remote default branch (loud warning); `--vram 16g`
+    selects R6, whose flags are all in origin/main, so the fork-only flag
+    gate passes on the fresh binary (verified against its `--help`).
+  - **S7-6 sh twin.** `bash -n` + WSL `--dry-run --non-interactive` full
+    flow → exit 0 (settings header before the dry cmake lines).
+- Escalation: a hang of the `.bat` legs (rc file missing > 30 min while the
+  process is alive) → capture logs, diagnose per the D49/D50 traps before
+  any design change.
+
 ## Evidence log
 
 Recorded 2026-11-03/04, autonomous mode (agent acceptance under the owner's
@@ -195,6 +251,15 @@ MSVC 14.50.35717 + Windows SDK 10.0.26100.0, git 2.53.0.windows.1, 62 GiB RAM).
 - **AC-8 docs + registration** — `docs/SETUP.md` written; README quick-start + table row; USAGE.md pointer block; `.gitignore` gains `/run-server.ps1`, `/run-server.sh`, `/run-server.last.ps1`, `/run-server.last.sh` (server logs land under `build/`, already ignored).
 - **Flag-capability gate (D38)** — `Test-RowFlags` (PS) / `check_row_flags` (sh) run `<binary> --help` and require every `--flag` of the chosen row; verified against the in-repo binary: `binary supports all R5 row flags`. Fresh-clone consequence (recorded): a `main`-based build supports R1-R3/R6/R7 fully; R4 (`--lm-prefill-copy-piece`) and R5 (`--hybrid-moe-prefill-free-all`) exist only in uncommitted working-tree changes, so a fresh-clone build refuses exactly those two rows with exit 1 and a flag list. VERIFIED against the actual fresh-clone binary (2026-11-04): its `--help` (978 lines) contains `--hybrid-moe`, `--lm-prefill*`, and NOT `prefill-free-all`, NOT `lm-prefill-copy-piece` — exactly the origin/main flag set; R4/R5 emission is therefore refused on a fresh clone, R1-R3/R6/R7 pass.
 - **Clone reuse (D58)** — measured 2026-11-04: a re-run on an existing target previously refused (`clone target … exists and is not empty`); a valid existing checkout (`.git` + `git remote get-url origin` == `$RepoUrl`) is now reused. First attempt keyed on `setup.ps1` presence and failed on a fresh clone (setup.ps1 is uncommitted/local-only); the origin-URL check is the robust test.
+- **S7-1 static** (2026-11-06/07) — `PS-PARSE-OK` (re-verified 2026-11-07 after all edits), `bash -n` clean locally AND on gogo-big after every remote patch (`SH-PARSE-OK`), remote `setup.sh` md5 `eae53e9ff505ba116a3f2902e13b625f` byte-identical to the local file in the final state.
+- **S7-2 order + idempotence (PS)** (2026-11-06) — in-repo `-DryRun --non-interactive --model qwen36 --vram 16g --context 262k` → **exit 0**; the `== Settings (asked before the build and the download) ==` header precedes every `(dry-run: cmake …)` line; two consecutive runs byte-identical (AC-2 style re-check). The emitted `run-server.ps1` carries `# Model: C:\Models\ALL\other\qwen-3.6\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (local file found in the settings phase) and the full R6 flag line.
+- **S7-3 refusal-first (sh)** (2026-11-06, gogo-big) — `bash setup.sh --non-interactive --model qwen36 --vram full --context 128k` → the R5/R6/R7 table printed under `== Settings … ==`, `[FAIL] no measured recipe for qwen36 / full / 128k`, **EXIT=3**, and ZERO build/cmake/download lines in the output (grep-verified).
+- **S7-4 install path (PS)** (2026-11-06) — `SETUP_WIZARD_FORCE_MISSING=cmake` + `-DryRun --non-interactive` → winget plan + `(dry-run: nothing installed)`, exit 0 (re-run after the restructure).
+- **S7-5 real parallel leg — LINUX twin** (2026-11-06, gogo-big; the Windows S7-5 is PENDING machine contention, see D61 and the Status above). The contract's load-bearing scenario, executed on the Linux twin in the existing clone `/home/gzhel/Development/wiz-ac6-clone` (fresh-clone variant already proven on this box by AC-5/AC-6-L): `--non-interactive --model qwen36 --vram 16g --context 262k --model-dir /home/gzhel/models/d20-test --max-download-mib 2048 --full-build --no-start` → both legs in ONE invocation; combined line visible every tick (`build: configuring/building … N min   |   model: M MiB downloaded`); real 8-thread build to completion (~4 min, `Built target llama-server`); the 2048 MiB cap fired with its `[warn] test hook stopped transfer at 2048 MiB (expected full 20.6 GiB)` and `[ok] leaving .part in place to verify resume; NOT renaming`; flag gate `[ok] binary supports all R6 row flags` against the FRESH binary; `run-server.sh` emitted (with the 2048 MiB `.part` as MODEL — recorded deviation, see below); **EXIT=0**. Download speed observed ~90 MiB/s against the real HF URL (the Windows box showed a throttled ~32 KiB/s in the same run shape — box/network specific, not script).
+- **S7-6 sh twin dry-run** (2026-11-06, gogo-big) — `--dry-run --non-interactive --model qwen36 --vram 16g --context 262k --model-dir <fresh> --no-start` → **EXIT=0**; Settings header before the dry cmake lines; emitted preview carries `MODEL="/home/gzhel/models/d20-test/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"` (the D20 dry-run fix: download-target recorded so the script is complete).
+- **S7-resume** (2026-11-06, gogo-big) — with a 4 GiB `.part` in place and `--max-download-mib 4300`: `[ok] resuming: 4096 MiB already in .part`, download continues 4096 → 4362 MiB, cap truncates to EXACTLY 4,508,876,800 B = 4300 MiB, **EXIT=0** (interactive `y` past the disk check — see S7-disk). This run also caught the D62 `set -u` defect (pre-fix it died on the first tick and orphaned the curl, which then ran the full 20.6 GiB to completion unprompted — the orphan's file is the size-verified model now in `~/models/qwen-3.6/`).
+- **S7-fail-fast** (2026-11-06, gogo-big) — fake `cmake` shim on PATH (valid `--version`, exit 3 at configure) + `--full-build` + fresh model dir: parallel phase started both legs, configure rc=3 detected → `[FAIL] cmake configure failed (exit 3; full log: …)`, **EXIT=4**, the download curl KILLED (no leftover process, no .part data file), and the fake cmake's invocation log shows BOTH configure and build attempts (the build stage ran because the subshell continues — the wizard's fail-fast then waited for and reported the configure failure; recorded: the rc files are checked in the poll, configure first). Note: the fake shim initially failed the ENV CHECK (`cmake TOO-OLD` → install path → exit 2), which is itself correct wizard behavior; the refined shim answers `--version`.
+- **S7-disk (bonus)** (2026-11-06, gogo-big) — the settings-phase disk check (moved there by D20) is live on the 224 GiB disk with ~20 GiB free: `[warn] disk has 19 GiB free, the model plus build wants ~36 GiB` → non-interactive: `[FAIL] aborted: not enough disk space`, **EXIT=6** BEFORE the parallel phase; interactive: `proceed anyway? [Y/n]` and `y` proceeds (used by S7-resume/S7-fail-fast).
 
 ## Decision log (additions beyond D1-D15 in the SDD)
 
@@ -243,6 +308,32 @@ MSVC 14.50.35717 + Windows SDK 10.0.26100.0, git 2.53.0.windows.1, 62 GiB RAM).
 - **D58** clone reuse rule: an existing non-empty target is reused iff it is a git repo whose `origin` URL equals `$RepoUrl` (suffix-normalized, case-insensitive); anything else still exits 1 with the "use -CloneDir" message. Re-runs (different model, same day or later) must work, not refuse.
 - **D59** (2026-11-04, Linux AC-6-L) `setup.sh` clone bug class: the script runs under `set -u` WITHOUT `set -o pipefail`, so `if ! git clone … 2>&1 | sed …` tests sed's rc — a failed clone printed `[ok]` and the fallback block was dead code (measured: empty tree reached cmake configure). Rules: in `setup.sh`, a native command's exit status must come from a captured `$?` (or `PIPESTATUS[0]`, as the cmake steps already do), never from a trailing filter; and a clone must be verified COMPLETE (`third_party/llama.cpp` exists) before the build step — an incomplete tree fails loudly, it does not build.
 - **D60** (2026-11-04, Linux AC-6-L) `setup.sh` had NO clone reuse (D58 existed only in `setup.ps1`): a non-empty `--clone-dir` always refused, so a same-day "change model" re-run was impossible on Linux (measured exit 1). D58 is now ported to bash with the identical validity rule. The bash/PS twins must stay behaviorally paired — when one gains a flow (reuse, fallback, guard), the other must be checked for it; AC-7's dry-runs cannot catch clone-path gaps because `--dry-run` short-circuits before real clones.
+- **D61** (2026-11-06, Windows, found by the first real S7-5 attempt) a
+  `.bat` command line that STARTS with `&` (as in `& cmake … > log 2> err`) is
+  a syntax error for cmd - it prints `& was unexpected at this time.` and the
+  whole batch aborts BEFORE the `%ERRORLEVEL%` line runs, so no log and no rc
+  file ever appear: the parallel build legs sat at "configuring" forever with
+  no processes and no output. The proven `Invoke-NativeCmd` bat never had a
+  leading `&` (that shape was a misremembering). `Start-BuildLeg`'s bats now
+  write `<exe> <args> > log 2> err` with cmd-style exe quoting (same convention
+  as `Invoke-NativeCmd`). Verified: the fixed bat shape runs via
+  `Start-Process -WindowStyle Hidden` and reports a real rc (cmake failing on
+  an empty fake repo wrote rc=1).
+- **D62** (2026-11-06, Linux, found by the resume run) `poll_download` read
+  `$BUILD_RC1`/`$BUILD_RC2` unguarded; on the download-only path (build fresh
+  or `-SkipBuild`) those were never set, and `set -u` DIED the wizard mid-
+  download (first tick), leaving the background curl ORPHANED: it then ran for
+  ~97 s and finished the whole 20.6 GiB model file unprompted (the .part ended
+  at exactly the full size). Fixed: rc refs go through `${BUILD_RC1:-}` guards
+  (empty on the download-only path, where the status line now says
+  `not running (fresh or -SkipBuild)`), plus an EXIT trap that kills a still-
+  running download curl so no future internal death can orphan a multi-GB
+  transfer. The rescued 20.6 GiB file was size-verified and moved to
+  `~/models/qwen-3.6/` on gogo-big (kept, not deleted).
+- **D63** (2026-11-06, Linux, measured in the d20-parallel run) curl's own
+  progress meter (stderr) interleaved with the combined status line on the
+  console. The background curl now redirects stderr to `<part>.curl-err.log`;
+  on a download failure the wizard tails that log before the exit-5 message.
 
 ## Post-acceptance change (2026-11-05, owner instruction)
 
