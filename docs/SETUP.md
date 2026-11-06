@@ -35,9 +35,9 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1 -NonInteractive -YesInstall
 ```bash
 git clone https://github.com/gazbg/poormansllama.git
 cd poormansllama
-./setup.sh                    # interactive
+bash setup.sh                 # interactive
 # or unattended:
-./setup.sh --non-interactive --yes-install --model qwen36 --vram full --context 262k
+bash setup.sh --non-interactive --yes-install --model qwen36 --vram full --context 262k
 ```
 
 Run the wizard from outside a checkout and it clones the repository itself

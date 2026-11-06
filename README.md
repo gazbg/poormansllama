@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```bash
 # Linux
 git clone https://github.com/gazbg/poormansllama.git && cd poormansllama
-./setup.sh
+bash setup.sh
 ```
 
 | Document | Read it for |
