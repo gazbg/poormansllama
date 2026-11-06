@@ -1,8 +1,46 @@
-# Yet another optimized llama cpp for 8GB and 16 GPUS
+# Yet another optimized llama cpp for 8GB and 16 GPUS for 262k context
 
-Layer-residency inference for llama.cpp: running Mixture-of-Experts Qwen models
-on a GPU with less VRAM than the model needs, and faster prompt processing and
-token generation than the stock `llama-server` on the same card.
+## Start here
+
+**Quick start** — the setup wizard checks the environment, installs missing
+toolchain pieces (behind a y/n), builds the server, downloads the chosen
+model, and emits a ready-to-run `run-server.*` with the measured flags:
+
+```powershell
+# Windows
+git clone https://github.com/gazbg/poormansllama.git; cd poormansllama
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+```bash
+# Linux
+git clone https://github.com/gazbg/poormansllama.git && cd poormansllama
+bash setup.sh
+```
+
+There is as wizard when you run the setup. You can go with the default. Min RAM 32gb. Never tested on lower as the model you choose has to fit in the system RAM. Maybe it would work on 16gb but never tested.
+
+Choose the model only:
+   1) qwen38: dense hybrid - Qwen3.8-27B-UD-Q4_K_M.gguf, 15.4 GiB [Q: q4k_m]
+   2) qwen36: MoE - Qwen3.6-35B-A3B-UD-Q4_K_M.gguf, 20.6 GiB [Q: q4k_m] (default)
+   3) flint: SWA MoE - flint-UD-Q5_K_XL.gguf, 27.9 GiB [Q: q5k_xl]
+   4) qwen38: dense hybrid - Qwen3.8-27B-UD-Q5_K_XL.gguf, 19.4 GiB [Q: q5k_xl (alt)]
+   5) qwen36: MoE - Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf, 24.7 GiB [Q: q5k_xl (alt)]
+
+You should not see a difference in speed between Q4 and Q5 models , the main difference is how much free RAM will it leave when loaded for your needs. 
+
+
+## What it is
+
+I used black magic to make it run almost as fast as it would if the model is fully in the VRAM.
+
+The main goal was to have max context on a q5 model for agentic work on an old PC with a GTX 1070
+
+Qwen3.8-27B-UD-Q5_K_XL : 
+```
+prompt eval time (Prefill)   =    51886 tokens (    1.64 ms per token,   610.73 tokens per second)
+eval time (token generation) =    2328 tokens (    36.31 ms per token,    27.54 tokens per second)
+```
 
 This repository is the research record and the code. The llama.cpp fork is
 vendored in `third_party/llama.cpp/` as plain files (no submodule). Experiment
@@ -47,23 +85,7 @@ Limits:
   turns are not helped. Decoding is handled by `--hybrid-moe`. See
   [DESIGN](docs/guide/DESIGN.md#6-limits) for the full list.
 
-## Start here
 
-**Quick start** — the setup wizard checks the environment, installs missing
-toolchain pieces (behind a y/n), builds the server, downloads the chosen
-model, and emits a ready-to-run `run-server.*` with the measured flags:
-
-```powershell
-# Windows
-git clone https://github.com/gazbg/poormansllama.git; cd poormansllama
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
-```
-
-```bash
-# Linux
-git clone https://github.com/gazbg/poormansllama.git && cd poormansllama
-bash setup.sh
-```
 
 | Document | Read it for |
 |---|---|
