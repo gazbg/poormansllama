@@ -3,8 +3,9 @@
 Status: done (validated 2026-11-07; AC-1..AC-10 all pass, see evidence below)
 Branch: `claude/setup-wizard-d20-parallel` (the wizard's branch)
 Dependencies: none (engine flags/env already exist; verified below)
-Commit: (pending owner authorization — the worktree also carries the uncommitted
-2026-11-06 `--lm-evict-layers` default work; commit separately)
+Commit: f19ff144 (owner authorized 2026-11-07; one commit per the owner's
+"commit all for the current tree": the 2026-11-06 evict-defaults work and the
+D22 wizard corrections landed together; `.playwright-mcp/` left untracked)
 
 ## Validation evidence (2026-11-07)
 
