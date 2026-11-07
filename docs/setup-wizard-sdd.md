@@ -201,6 +201,7 @@ of the resolve endpoint):
 | 3 | `flint` | `q5k_xl` (only) | SWA MoE | `unsloth/flint-GGUF` / `flint-UD-Q5_K_XL.gguf` | 27.9 GiB |
 | 4 | `qwen38` | `q5k_xl` (alt) | dense hybrid | `unsloth/Qwen3.8-27B-GGUF` / `Qwen3.8-27B-UD-Q5_K_XL.gguf` | 19.4 GiB |
 | 5 | `qwen36` | `q5k_xl` (alt) | MoE | `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf` | 24.7 GiB |
+| 6 | `qwen36` | `q8k_xl` (alt, MTP) | MoE + MTP | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` / `Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf` | 36.4 GiB |
 
 `-Quant`/`--quant` selects the quant for `qwen38`/`qwen36` (default = the
 model's default entry); numeric picks `1-5` address the flat list directly.
@@ -240,14 +241,40 @@ Questions and rules:
 Every row is **verbatim** from its source command. The wizard substitutes
 only: the model path (question 6), the bind address (default = the row's own
 value: 127.0.0.1 for R1-R3/R6, 0.0.0.0 for R4/R5/R7), the port (default
-8033, all rows), and - for the device-pinned rows (R5, R7) - the CUDA device
-index, appended as `--device CUDA<n>` (D17: `-Device N` / `--device N`
-overrides; auto = the largest card for `full`, the smallest card at or above
-the row minimum for `16g`/`8g`, else the smallest card). When the resolved
-host is 0.0.0.0 the wizard prints the USAGE.md §5 security note once.
+8090, all rows; asked in the settings phase, D22), and - for the
+device-pinned rows (R5, R7) - the CUDA device index, appended as
+`--device CUDA<n>` (D17: `-Device N` / `--device N` overrides; auto = the
+largest card for `full`, the smallest card at or above the row minimum for
+`16g`/`8g`, else the smallest card). When the resolved host is 0.0.0.0 the
+wizard prints the USAGE.md §5 security note once.
 Recorded decision D11: the wizard does not add, drop, or re-tune any flag of
-a row (`-t 16` appears only where the row has it); D17 is the single recorded
-exception (a device index, never a tuning value).
+a row (`-t 16` appears only where the row has it); D17 and D22 are the
+recorded exceptions (a device index; the `--lm-prefill-prearm always`
+normalization and the Pascal-or-lower `--lm-prefill-attn-int8` addition -
+performance switches, never a tuning value of a measured flag).
+
+**D22 flag completion (2026-11-07, owner request).** Applied once, after
+the recipe is picked, as a pure function of (row flags, row env, compute
+capability of the card the run will use - nvidia-smi's first line, the
+D12/D17 convention; `SETUP_WIZARD_GPU_CC` overrides for testing):
+
+- `--lm-prefill-prearm always` in every emitted profile: an existing
+  occurrence (R3's `always`, R8's `auto`) is replaced, otherwise the flag
+  is appended. Consequence: on the dense rows R1-R3 the idle pass
+  preparation actually runs now - the server auto-turns the IMPLICIT
+  default off without `--hybrid-moe`, but an explicit flag is honored (all
+  rows carry `-np 1`; R1/R2/R5/R6's MTP-with-`--spec-mtp-defer` is the
+  exempt spec case).
+- Pascal and lower (compute capability <= 6.1): the pass's flash attention
+  takes the int8 Q.K^T tile. If the row's env already sets
+  `LLAMA_FATTN_TILE_Q8QK=1`, that env is kept (it is the emitted config,
+  nothing to add - the flag is literally `setenv(LLAMA_FATTN_TILE_Q8QK,1)`
+  in the server, "Same as LLAMA_FATTN_TILE_Q8QK=1"); otherwise
+  `--lm-prefill-attn-int8` is appended and the emitted script carries a
+  `# D22:` note line marking it as an arch-added APPROXIMATION (int8 Q per
+  32 values; KL vs the exact pass in docs/plans/dense-qwen38-iq3-residency.md).
+  Compute-capability detection failure is not fatal: the row is emitted as
+  measured with a warning.
 
 VRAM targets (question): `full` (use all card VRAM), `16g` (keep ~8 GB
 class), `8g` (keep ~16 GB class on a 24 GB card). Context: `262k` / `128k`.
@@ -261,9 +288,10 @@ commands and docs/guide; tok/s as measured in those runs):
 | R2 | qwen38 | 16g | 262k | q8_0 | as R1 with `--lm-prefill-host-layers 0-63` | PP 1008 t/s, TG 9.96 t/s |
 | R3 | qwen38 | 8g | 128k | q4_0 | `--lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --lm-prefill-prearm always` (no spec flags) | TG 9.92 t/s |
 | R4 | flint | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 --lm-prefill-copy-piece 64` | PP 2423 t/s, TG 53.8 t/s |
-| R5 | qwen36 | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 --hybrid-moe-prefill-free-all` (device auto-pinned, D17) | (owner's working recipe; tok/s not recorded in the paste — printed as "owner recipe, unmeasured in wizard records") |
-| R6 | qwen36 | 16g | 262k | q8_0 | G42 canonical (USAGE.md §4): `--hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32` | TG 3.0–3.7x stock, PP 3.65–4.11x stock (G31 record) |
-| R7 | qwen36 | 8g | 262k | q8_0 | owner recipe 2026-11-05: `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0` (device auto-pinned, D17), plus env `LLAMA_FATTN_TILE_Q8QK=1` (int8 attention; pre-Volta row) | owner working recipe (tok/s not recorded in the wizard records); the prior LINUX-PASCAL §2 fuse/prearm recipe (TG 32–34 t/s short / ~26.5 t/s @100k; PP 670 t/s @19k, GTX 1070) is historical in that doc |
+| R5 | qwen36 | full | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all` + MTP draft (`--spec-type draft-mtp`, `--mtp-draft-vocab 32768`) + `--lm-prefill-fuse --no-warmup`; quant q8k_xl (MTP file); env `LLAMA_MOE_HYBRID_LEAN_STALL_US=10000 LLAMA_FATTN_GQA8_MAXROWS=4` | PP 3600 t/s @50k, 2350 @200k; TG 77 @50k, 66 @200k (owner, GTX 5090 Laptop, Windows, one MoE model) |
+| R6 | qwen36 | 16g | 262k | q8_0 | as R5 with `-fitt 8 -b 32768 --lm-prefill-segment 32768` (no `--no-warmup`); quant q8k_xl (MTP file) | PP 2000 t/s, TG 51 t/s @200k (owner, GTX 5090 Laptop, Windows, one MoE model) |
+| R7 | qwen36 | 8g | 262k | q8_0 | `--hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384`; quant q4k_m; env as R5 | PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows, one MoE model) |
+| R8 | qwen36 | 16g | 262k | q8_0 | G42 canonical (USAGE.md §4, the former R6); quant q4k_m | TG 3.0–3.7x stock, PP 3.65–4.11x stock (G31 record) |
 
 Refusal rule (owner decision A): any (model, target, ctx) triple not in the
 matrix → the wizard prints the table of available rows for that model and
@@ -292,7 +320,9 @@ matches; one script per OS):
   server writes to the console and to `build/llama-cuda/server-<row>.log`
   (redirection), so a dead server leaves a readable tail.
 - A trailing comment block with: the `/health` curl one-liner, the pong
-  chat request (USAGE.md §5, port 8033), and the stop command (Ctrl-C).
+  chat request (USAGE.md §5, port 8090), and the stop command (Ctrl-C).
+  - A `# D22:` note line when `--lm-prefill-attn-int8` was added for the
+    card (see §4.6).
 - `--no-launch` / `-NoStart` skips the "start it now?" prompt entirely.
 
 The emitted script is executable standalone (no wizard needed to re-run it),
@@ -427,3 +457,5 @@ See the acceptance contract in plans/setup-wizard-plan.md. In short:
 | D18 | Consequence of D16: R7 now uses `--hybrid-moe-prefill-free-all`, which exists only in the fork (not origin/main), so a fresh-clone build's flag gate refuses R7 like R4/R5 (SETUP.md troubleshooting updated) | recorded so the refusal is not read as a new defect | yes (follows D16) |
 | D19 | (2026-11-05, owner request "add choice for 5k_xl models") the model table is flat over (model, quant) with a `q5k_xl` entry for qwen38 (19.4 GiB) and qwen36 (24.7 GiB); `-Quant`/`--quant q4k_m\|q5k_xl` plus numeric picks 1-5; recipe rows stay keyed on model only and picking an alt quant prints a measured-quant note. Two defects found and fixed while validating: (a) setup.ps1 silently DROPS hyphenated dashed flags (`--dry-run`, `--non-interactive`, `--skip-model` land unbound in `$args` and PowerShell discards them - a `--dry-run` invocation downloaded the model), so setup.ps1 now normalizes the known dashed names up front and refuses anything unrecognized; (b) setup.sh's `resolve_gpu_index` cached its result in a global that dies with the `$(...)` subshell and its cache read died under `set -u`, so the sh side is now a pure function echoing the index | owner asked for the quant choice; the two fixes turn silent misconfiguration into loud failure (measured 2026-11-05) | yes (drop the quant entries / the normalization block) |
 | D20 | (2026-11-06, owner request "optimize the setup flow: the user chooses all settings first, then the compile and the model download run in parallel at the end") the flow is now env → install → clone → **SETTINGS** (model + quant, local path, disk check, VRAM target × context; the unmeasured-combo refusal with exit 3 and the D12 GPU VRAM warning now happen BEFORE any build or download) → **PARALLEL PHASE** (build leg ∥ model download when missing; one combined status line `build: configuring/building … N min | model: M MiB downloaded`; fail-fast on the first hard failure) → flag gate → emit → start. The disk check (SDD §4.1) moved into the settings phase (it needs the model size) and gained its PowerShell twin (sh had it, PS did not). See §4.8 for the per-OS mechanics (PS: non-blocking `.bat` build legs in the D50/D53 shape + the foreground download loop's tick as the combined line; sh: both legs backgrounded under one polling loop + an INT/TERM trap). Bat-writing trap (plan D61, measured 2026-11-06): a cmd line that STARTS with `&` (`& cmake …`) aborts the whole batch before the rc-file line — write `<exe> <args> > log 2> err` with cmd-style exe quoting, never the PowerShell call-operator form. The flag-capability gate (D38) still runs after the build because it reads the built binary's `--help`. Console step headers are unnumbered | a refused combo previously paid the full build (up to ~22 min) and possibly a 20+ GiB download before exit 3; build and download share no state, so the phase's wall time is max(build, download) instead of their sum | yes (restore the sequential build → download order) |
+| D21 | (2026-11-07, owner request "apply these profiles for the setup wizard for the appropriate VRAM profiles and models") the three MoE profiles measured by the owner (8 GB GTX 1070; >16 GB; 16 GB, all on Windows with one MoE model, Qwen3.6-35B-A3B) replace the qwen36 rows R5/R6/R7 (`full`/`16g`/`8g`, all 262k). Recipe rows are now keyed on (model, VRAM, ctx, **quant**): the >16 GB and 16 GB profiles need the MTP build (`unsloth/Qwen3.6-35B-A3B-MTP-GGUF` / `Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf`, 36.4 GiB, new model-table entry 6, Q8_K_XL), so keying on the model alone would run MTP flags on a Q4 file. A quant with no row of its own falls back to the model's default-quant row with a warning (the D19 note). The former G42 row is kept as R8 (q4k_m, 16g), so the default qwen36 16g still resolves. The former owner recipes R5 (full) and R7 (8g, with `LLAMA_FATTN_TILE_Q8QK=1`) are replaced; qwen36 full on q4k_m now refuses with the table. Every new row sets the env pair of the owner's MoE profile. Scope: measured on Windows only, one MoE model; Linux, other MoE models and flint (R4) are not covered by these profiles and were not changed. The stats are the owner's, not re-measured by the wizard | owner asked for the tested commands to be applied; the quant key is needed so MTP flags never run on a non-MTP file (measured 2026-11-07 by the dry-run selection on both OSes) | yes (restore the model-only keying and the old R5/R7 rows) |
+| D22 | (2026-11-07, owner request: int8 attention for Pascal and lower, `--lm-prefill-prearm always` for all profiles, a port input with default 8090) the wizard completes every row at emission (pure over the row, §4.6): (1) `--lm-prefill-prearm always` everywhere - an existing occurrence (R3 `always`, R8 `auto`) is replaced, otherwise appended; on the dense rows this turns the idle pass preparation ON where the server would auto-turn the implicit default off; (2) on a card with compute capability <= 6.1 (nvidia-smi `compute_cap`, first line; `SETUP_WIZARD_GPU_CC` test hook), the int8 flash-attention tile is enabled: row env `LLAMA_FATTN_TILE_Q8QK=1` stays as-is when present (it is the emitted config), otherwise `--lm-prefill-attn-int8` is appended with a `# D22:` note in the emitted script (the flag is literally `setenv(LLAMA_FATTN_TILE_Q8QK,1)` in the server, "Same as LLAMA_FATTN_TILE_Q8QK=1", target "a GPU without fast FP16, such as Pascal"; it is an approximation - int8 Q per 32 values); detection failure emits the row as measured with a warning; (3) the server port is asked in the settings phase, default **8090** (was 8033), explicit `-Port`/`--port` suppresses the question; `smoke.ps1`'s default follows. All rows accepted by the engine's prearm checks were verified per row (`-np 1` everywhere; MTP `--spec-mtp-defer` is the exempt spec case) | owner instruction; the int8 tile is the measured remedy for old architectures (AGENTS.md dense Qwen3.8 note: 1.19x at 15.7k with the flag) | yes (drop the completion function; port default is a one-liner) |

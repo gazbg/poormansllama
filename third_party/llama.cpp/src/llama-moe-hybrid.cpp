@@ -2325,9 +2325,6 @@ void moe_hybrid_engine::dma_loop() {
             const double us = moe_hybrid_us(t0);
             dma_submit_sum += us;
             dma_submit_max  = std::max(dma_submit_max, us);
-            if (slow_us > 0 && us > (double) slow_us) {
-                LLAMA_LOG_WARN("moe_hybrid: slow DMA submission #%lld took %.1f ms (dma thread)\n", (long long) n_dma_engine, us/1e3);
-            }
             bulk_dma.store(false, std::memory_order_release);
             dma_state.store(0, std::memory_order_release);
             lk.lock();

@@ -35,10 +35,10 @@ set -u
 MODEL=''
 VRAM=''
 CONTEXT=''
-PORT=8033
+PORT=''   # empty = ask (default 8090); an explicit --port suppresses the question (D22)
 BIND=''
 DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
-QUANT=''      # q4k_m|q5k_xl for qwen38/qwen36 (SDD D19); empty = the model's default
+QUANT=''      # q4k_m|q5k_xl|q8k_xl for qwen38/qwen36 (SDD D19); empty = the model's default
 MODEL_FILE=''
 MODEL_DIR=''
 CLONE_DIR=''   # empty = in-repo detection / default path (see invoke_clone)
@@ -66,10 +66,10 @@ usage() {
     cat <<'EOF'
 usage: setup.sh [options]
   --model qwen38|qwen36|flint   model to use (asked if omitted)
-  --quant q4k_m|q5k_xl          quant build for qwen38/qwen36 (default: the row's own)
+  --quant q4k_m|q5k_xl|q8k_xl          quant build for qwen38/qwen36 (default: the row's own)
   --vram full|16g|8g            VRAM target (asked if omitted)
   --context 262k|128k           context size (asked if omitted)
-  --port N                      server port (default 8033)
+  --port N                      server port (default 8090, asked if omitted; D22)
   --host ADDR                   bind address (default: the recipe row's own)
   --device N                    CUDA index for device-pinned rows R5/R7 (default: auto)
   --model-file PATH             explicit local GGUF (still needs --model)
@@ -185,22 +185,22 @@ ask_choice() {
 # --- model table (SDD 4.5; links verified 2026-11-04, Q5_K_XL 2026-11-05) ----
 # SDD D19: flat over (model, quant); the Default entries are the files the
 # recipe rows were measured on. MI_IDX indexes this flat list.
-M_KEYS=(qwen38 qwen36 flint qwen38 qwen36)
-M_QUANTS=(q4k_m q4k_m q5k_xl q5k_xl q5k_xl)
-M_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF' 'unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF')
-M_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf' 'Qwen3.8-27B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf')
-M_SIZES_GIB=(15.4 20.6 27.9 19.4 24.7)
-M_SIZES_GIB_INT=(16 21 28 20 25)
-M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE')
-M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6")
-M_DEFAULTS=(1 1 1 0 0)
+M_KEYS=(qwen38 qwen36 flint qwen38 qwen36 qwen36)
+M_QUANTS=(q4k_m q4k_m q5k_xl q5k_xl q5k_xl q8k_xl)
+M_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF' 'unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF')
+M_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf' 'Qwen3.8-27B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf')
+M_SIZES_GIB=(15.4 20.6 27.9 19.4 24.7 36.4)
+M_SIZES_GIB_INT=(16 21 28 20 25 37)
+M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE' 'MoE + MTP')
+M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/qwen-3.6")
+M_DEFAULTS=(1 1 1 0 0 0)
 
 mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
     case "$1" in
-        1|2|3|4|5) MI_IDX=$(( $1 - 1 )) ;;
+        1|2|3|4|5|6) MI_IDX=$(( $1 - 1 )) ;;
         qwen38|qwen36|flint)
             local k="$1" i q="${2:-}" avail=''
-            for i in 0 1 2 3 4; do
+            for i in 0 1 2 3 4 5; do
                 [ "${M_KEYS[$i]}" = "$k" ] || continue
                 if [ -z "$q" ]; then
                     [ "${M_DEFAULTS[$i]}" = 1 ] && { MI_IDX=$i; return 0; }
@@ -208,79 +208,113 @@ mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
                 avail="$avail ${M_QUANTS[$i]}"
             done
             if [ -z "$q" ]; then
-                fail "unknown model '$k' (choose qwen38, qwen36, flint, or 1-5)" 1
+                fail "unknown model '$k' (choose qwen38, qwen36, flint, or 1-6)" 1
             else
                 fail "no '$q' build for $k (available:$avail)" 1
             fi ;;
-        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, or 1-5)" 1 ;;
+        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, or 1-6)" 1 ;;
     esac
 }
 
 # --- recipe table (SDD 4.6; rows verbatim from the measured commands) -------
-# recipe_for MODEL VRAM CTX -> sets R_ID, R_FLAGS, R_BIND, R_MEASURED, R_NOTE,
-# R_ENV; returns 1 if the combination is not measured.
-recipe_for() {
+# recipe_exact MODEL VRAM CTX QUANT -> sets R_ID, R_FLAGS, R_BIND, R_MEASURED,
+# R_NOTE, R_ENV, R_DEVICE; returns 1 if that exact row is not measured (SDD D21:
+# rows are keyed on the quant too). recipe_for adds the default-quant fallback.
+recipe_exact() {
     R_ID=''; R_FLAGS=''; R_BIND=''; R_MEASURED=''; R_NOTE=''; R_ENV=''; R_DEVICE=''
-    local m="$1" v="$2" c="$3"
-    if [ "$m" = qwen38 ] && [ "$v" = full ] && [ "$c" = 262k ]; then
+    local m="$1" v="$2" c="$3" q="$4"
+    if [ "$m" = qwen38 ] && [ "$v" = full ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then
         R_ID=R1; R_BIND=127.0.0.1
         R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-37 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
         R_MEASURED='PP 1093.25 t/s, TG 14.95 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
         return 0
     fi
-    if [ "$m" = qwen38 ] && [ "$v" = 16g ] && [ "$c" = 262k ]; then
+    if [ "$m" = qwen38 ] && [ "$v" = 16g ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then
         R_ID=R2; R_BIND=127.0.0.1
         R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
         R_MEASURED='PP 1007.87 t/s, TG 9.96 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
         return 0
     fi
-    if [ "$m" = qwen38 ] && [ "$v" = 8g ] && [ "$c" = 128k ]; then
+    if [ "$m" = qwen38 ] && [ "$v" = 8g ] && [ "$c" = 128k ] && [ "$q" = q4k_m ]; then
         R_ID=R3; R_BIND=127.0.0.1
         R_FLAGS='-c 128000 -ctk q4_0 -ctv q4_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --lm-prefill-prearm always -lv 4'
         R_MEASURED='PP 36.95 t/s, TG 9.92 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
         return 0
     fi
-    if [ "$m" = flint ] && [ "$v" = full ] && [ "$c" = 262k ]; then
+    if [ "$m" = flint ] && [ "$v" = full ] && [ "$c" = 262k ] && [ "$q" = q5k_xl ]; then
         R_ID=R4; R_BIND=0.0.0.0
         R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --lm-prefill-copy-piece 64'
         R_MEASURED='PP 2422.94 t/s, TG 53.80 t/s (owner 2026-11-02, RTX 5090 24 GiB)'
         return 0
     fi
-    if [ "$m" = qwen36 ] && [ "$v" = full ] && [ "$c" = 262k ]; then
+    if [ "$m" = qwen36 ] && [ "$v" = full ] && [ "$c" = 262k ] && [ "$q" = q8k_xl ]; then
         R_ID=R5; R_BIND=0.0.0.0
-        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all'
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
         R_DEVICE=auto
-        R_MEASURED='owner working recipe 2026-11-02 (RTX 5090 24 GiB)'
+        R_MEASURED='PP 3600 t/s @50k, 2350 t/s @200k; TG 77 t/s @50k, 66 t/s @200k (owner, GTX 5090 Laptop, Windows)'
+        R_ENV='LLAMA_MOE_HYBRID_LEAN_STALL_US=10000 LLAMA_FATTN_GQA8_MAXROWS=4'
+        R_NOTE='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags'
         return 0
     fi
-    if [ "$m" = qwen36 ] && [ "$v" = 16g ] && [ "$c" = 262k ]; then
-        R_ID=R6; R_BIND=127.0.0.1
+    if [ "$m" = qwen36 ] && [ "$v" = 16g ] && [ "$c" = 262k ] && [ "$q" = q8k_xl ]; then
+        R_ID=R6; R_BIND=0.0.0.0
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 8 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse'
+        R_DEVICE=auto
+        R_MEASURED='PP 2000 t/s, TG 51 t/s @200k (owner, GTX 5090 Laptop, Windows)'
+        R_ENV='LLAMA_MOE_HYBRID_LEAN_STALL_US=10000 LLAMA_FATTN_GQA8_MAXROWS=4'
+        R_NOTE='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags'
+        return 0
+    fi
+    if [ "$m" = qwen36 ] && [ "$v" = 8g ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then
+        R_ID=R7; R_BIND=0.0.0.0
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384'
+        R_DEVICE=auto
+        R_MEASURED='PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows)'
+        R_ENV='LLAMA_MOE_HYBRID_LEAN_STALL_US=10000 LLAMA_FATTN_GQA8_MAXROWS=4'
+        R_NOTE='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command'
+        return 0
+    fi
+    if [ "$m" = qwen36 ] && [ "$v" = 16g ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then
+        R_ID=R8; R_BIND=127.0.0.1
         R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         R_MEASURED='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
-        R_NOTE='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13)'
-        return 0
-    fi
-    if [ "$m" = qwen36 ] && [ "$v" = 8g ] && [ "$c" = 262k ]; then
-        R_ID=R7; R_BIND=0.0.0.0
-        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 32 -b 32768 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 32768 -sm none -mg 0'
-        R_DEVICE=auto
-        R_MEASURED='owner working recipe 2026-11-05 (8 GiB target, binds 0.0.0.0)'
-        R_ENV='LLAMA_FATTN_TILE_Q8QK=1'
-        R_NOTE='the emitted script sets env LLAMA_FATTN_TILE_Q8QK=1 (int8 attention; part of the 8g row); the old LINUX-PASCAL.md fuse/prearm recipe is historical'
+        R_NOTE='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13). Kept as R8 (the former R6)'
         return 0
     fi
     return 1
 }
 
-recipe_avail() {  # recipe_avail MODEL -> prints the available rows
-    local m="$1"
-    say "no measured recipe for $m / $VRAM / $CONTEXT - available rows for $m:"
-    local v c
+# recipe_for MODEL VRAM CTX [QUANT] -> recipe_exact, else the model's default-quant
+# row (R_QUANT_FALLBACK=1; the caller warns). Sets R_QUANT to the quant of the row.
+recipe_for() {
+    local m="$1" v="$2" c="$3" q="${4:-}" dq
+    R_QUANT_FALLBACK=0
+    if recipe_exact "$m" "$v" "$c" "$q"; then R_QUANT="$q"; return 0; fi
+    dq=$(default_quant "$m")
+    if [ -n "$dq" ] && [ "$dq" != "$q" ] && recipe_exact "$m" "$v" "$c" "$dq"; then
+        R_QUANT="$dq"; R_QUANT_FALLBACK=1; return 0
+    fi
+    return 1
+}
+
+default_quant() {  # default_quant MODEL -> the model's default-quant (SDD D19)
+    local i
+    for i in 0 1 2 3 4 5; do
+        if [ "${M_KEYS[$i]}" = "$1" ] && [ "${M_DEFAULTS[$i]}" = 1 ]; then echo "${M_QUANTS[$i]}"; return 0; fi
+    done
+    return 1
+}
+
+recipe_avail() {  # recipe_avail MODEL -> prints the available rows (all quants)
+    local m="$1" v c q
+    say "no measured recipe for $m / $VRAM / $CONTEXT / ${QUANT:-default quant} - available rows for $m:"
     for v in full 16g 8g; do
         for c in 262k 128k; do
-            if recipe_for "$m" "$v" "$c"; then
-                printf '    %-3s %-5s %-6s %s\n' "$R_ID" "$v" "$c" "$R_MEASURED"
-            fi
+            for q in q4k_m q5k_xl q8k_xl; do
+                if recipe_exact "$m" "$v" "$c" "$q"; then
+                    printf '    %-3s %-5s %-6s %-7s %s\n' "$R_ID" "$v" "$c" "$q" "$R_MEASURED"
+                fi
+            done
         done
     done
 }
@@ -563,6 +597,65 @@ check_row_flags() {
 }
 
 # --- step 4: build (SDD 4.4, decisions D9/D10) ------------------------------
+# --- D22: row-flag completion -------------------------------------------------
+# The wizard's one place that changes what a row emits, beyond the D11/D17
+# substitutions (model path, bind, port, device index). Pure over the row:
+# the same (flags, env, compute cap) always gives the same output, so the
+# same-day byte-identical re-run (SDD AC-2) still holds.
+detect_gpu_arch() {
+    # D22: compute capability of the card the run will use (nvidia-smi's
+    # first line, the D12/D17 convention) as 'M.m'. SETUP_WIZARD_GPU_CC
+    # overrides for testing (SETUP_WIZARD_FORCE_MISSING is the precedent).
+    # Returns 1 when unavailable; the caller then emits the row as measured.
+    if [ -n "${SETUP_WIZARD_GPU_CC:-}" ]; then echo "$SETUP_WIZARD_GPU_CC"; return 0; fi
+    local cc
+    cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+    [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    echo "$cc"
+}
+
+complete_row_flags() {
+    # D22-B: every profile emits --lm-prefill-prearm always. An existing
+    # occurrence (R3's 'always', R8's 'auto') is REPLACED, otherwise the
+    # flag is appended - two occurrences would be a parse hazard.
+    # D22-A: on Pascal and lower (compute cap <= 6.1) the pass's flash
+    # attention takes the int8 Q.K^T tile (the flag is literally
+    # setenv(LLAMA_FATTN_TILE_Q8QK,1) in the server, help: 'Same as
+    # LLAMA_FATTN_TILE_Q8QK=1', target 'a GPU without fast FP16, such as
+    # Pascal'). If the row's env already sets that env, the env is the
+    # emitted config - it stays, and nothing is appended; otherwise the
+    # flag is appended. AN APPROXIMATION (int8 Q per 32 values): the
+    # caller prints a D22 note when the flag was added.
+    # $1 flags, $2 row env (KEY=V ...), $3 compute cap ('' = unavailable).
+    # Echoes the completed flags; sets D22_ADDED_INT8=1 when the flag was
+    # say goes to stderr: the caller runs this in a command substitution, so
+    # the caller derives 'was the flag added' from the output itself.
+    local f="$1" env="$2" cc="${3:-}" maj min
+    case "$f" in
+        *'--lm-prefill-prearm off'*)   f="${f/--lm-prefill-prearm off/--lm-prefill-prearm always}" ;;
+        *'--lm-prefill-prearm always'*) f="${f/--lm-prefill-prearm always/--lm-prefill-prearm always}" ;;
+        *'--lm-prefill-prearm auto'*)  f="${f/--lm-prefill-prearm auto/--lm-prefill-prearm always}" ;;
+        *) f="$f --lm-prefill-prearm always" ;;
+    esac
+    if [[ "$cc" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"
+        if [ "$maj" -lt 6 ] || { [ "$maj" -eq 6 ] && [ "$min" -le 1 ]; }; then
+            local has_env=0 tok
+            for tok in $env; do
+                [ "$tok" = 'LLAMA_FATTN_TILE_Q8QK=1' ] && has_env=1
+            done
+            if [ "$has_env" -eq 1 ]; then
+                say "row env already sets LLAMA_FATTN_TILE_Q8QK=1 (compute capability $cc); the env is the emitted config, no flag added" >&2
+            else
+                # already present (idempotence: a re-completed output must not
+                # gain a second copy)
+                case " $f " in *' --lm-prefill-attn-int8 '*) ;; *) f="$f --lm-prefill-attn-int8" ;; esac
+            fi
+        fi
+    fi
+    echo "$f"
+}
+
 detect_cuda_arch() {
     # nvidia-smi compute_cap -> CMAKE_CUDA_ARCHITECTURES entry (6.1 -> 61)
     local cc
@@ -640,7 +733,7 @@ pick_model() {
         return 0
     fi
     local i qtag opts=()
-    for i in 0 1 2 3 4; do
+    for i in 0 1 2 3 4 5; do
         qtag="${M_QUANTS[$i]}"
         [ "${M_DEFAULTS[$i]}" = 1 ] || qtag="$qtag (alt)"
         opts+=("$(printf '%d) %s: %s - %s, %s GiB [Q: %s]' "$((i+1))" "${M_KEYS[$i]}" "${M_KINDS[$i]}" "${M_FILES[$i]}" "${M_SIZES_GIB[$i]}" "$qtag")")
@@ -651,6 +744,7 @@ pick_model() {
     case "$sel" in
         *qwen38*Q5_K_XL*) MI_IDX=3 ;;
         *qwen36*Q5_K_XL*) MI_IDX=4 ;;
+        *qwen36*Q8_K_XL*) MI_IDX=5 ;;
         *qwen38*) MI_IDX=0 ;;
         *qwen36*) MI_IDX=1 ;;
         *flint*)  MI_IDX=2 ;;
@@ -913,22 +1007,19 @@ pick_recipe() {
     say 'recipe (measured rows only):'
     # SDD D19: the rows were measured on each model's Default quant; picking
     # the alt build runs the row's flags against a file nobody measured.
-    if [ "${M_DEFAULTS[$MI_IDX]}" != 1 ]; then
-        local i_d df=''
-        for i_d in 0 1 2 3 4; do
-            if [ "${M_KEYS[$i_d]}" = "${M_KEYS[$MI_IDX]}" ] && [ "${M_DEFAULTS[$i_d]}" = 1 ]; then df=${M_FILES[$i_d]}; fi
-        done
-        warn "row was measured on $df; you chose ${M_FILES[$MI_IDX]} (quant ${M_QUANTS[$MI_IDX]}) - the row's speed/VRAM numbers are for the default quant"
-    fi
     if [ -z "$VRAM" ]; then
         VRAM=$(ask_choice 'VRAM target?' 'full' 'full' '16g' '8g')
     fi
     if [ -z "$CONTEXT" ]; then
         CONTEXT=$(ask_choice 'Context size?' '262k' '262k' '128k')
     fi
-    if ! recipe_for "${M_KEYS[$MI_IDX]}" "$VRAM" "$CONTEXT"; then
+    if ! recipe_for "${M_KEYS[$MI_IDX]}" "$VRAM" "$CONTEXT" "${M_QUANTS[$MI_IDX]}"; then
         recipe_avail "${M_KEYS[$MI_IDX]}"
-        fail 'no measured recipe for the chosen model/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)' 3
+        fail 'no measured recipe for the chosen model/quant/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)' 3
+    fi
+    # SDD D21/D19: a fallback row (the model's default quant) was measured on another file
+    if [ "$R_QUANT" != "${M_QUANTS[$MI_IDX]}" ]; then
+        warn "row $R_ID was measured on quant $R_QUANT; you chose ${M_QUANTS[$MI_IDX]} (${M_FILES[$MI_IDX]}) - its speed/VRAM numbers are for $R_QUANT"
     fi
     say "recipe $R_ID: $R_MEASURED"
     [ -n "$R_NOTE" ] && say "note: $R_NOTE"
@@ -1004,6 +1095,7 @@ emit_run_script() {
     step 'Emit run-server.sh'
     local bind="$BIND"
     [ -z "$bind" ] && bind="$R_BIND"
+    [ -z "$PORT" ] && PORT=8090   # D22: the settings phase normally fills PORT; this keeps the emitter self-contained
     local out="$REPO/run-server.sh" last="$REPO/run-server.last.sh"
     local log="$REPO/build/llama-cuda/server-$R_ID.log"
     if [ -f "$out" ]; then mv "$out" "$last"; say "previous run-server.sh saved as run-server.last.sh"; fi
@@ -1035,8 +1127,9 @@ emit_run_script() {
             echo "export $R_ENV"
         fi
         echo 'mkdir -p "$(dirname "$LOG")"'
-        local flags="$R_FLAGS"
+        local flags="${R_FLAGS_OUT:-$R_FLAGS}"
         [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
+        [ "$D22_ADDED_INT8" = 1 ] && echo '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
         echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $flags 2>&1 | tee \"\$LOG\""
         echo
         echo '# stop: Ctrl-C in this console.  Health: curl http://127.0.0.1:'"$PORT"'/health'
@@ -1140,6 +1233,43 @@ else
 fi
 pick_recipe
 
+# D22-C: the server port, asked with the other settings (before the heavy
+# work). Default 8090; an explicit --port skips the question.
+if [ -z "$PORT" ]; then
+    if [ "$NI" = 1 ]; then
+        PORT=8090
+    else
+        local_port=''
+        while :; do
+            printf '  Server port? ' >&2
+            read -r local_port || local_port=''
+            local_port="${local_port:-8090}"
+            if [[ "$local_port" =~ ^[0-9]+$ ]] && [ "$local_port" -ge 1 ] && [ "$local_port" -le 65535 ]; then
+                PORT="$local_port"; break
+            fi
+            printf '  (port must be a number 1-65535; got %s)\n' "$local_port" >&2
+        done
+    fi
+fi
+
+# D22-A/B: complete the row's flags (pure; see complete_row_flags). The
+# compute capability is for the card the run will use; on failure the row
+# is emitted as measured (the int8 tile is a performance approximation, not
+# a correctness requirement).
+GPU_CC=''
+if GPU_CC=$(detect_gpu_arch); then
+    say "card compute capability: $GPU_CC"
+else
+    say 'compute capability unavailable (nvidia-smi); the row flags stay as measured (no D22 additions)'
+fi
+R_FLAGS_OUT=$(complete_row_flags "$R_FLAGS" "$R_ENV" "$GPU_CC")
+# the note is about the flag being ADDED (the subshell above cannot set
+# globals): present in the output and absent from the measured row
+D22_ADDED_INT8=0
+case "$R_FLAGS_OUT" in *'--lm-prefill-attn-int8'*)
+    case "$R_FLAGS" in *'--lm-prefill-attn-int8'*) ;; *) D22_ADDED_INT8=1 ;; esac ;;
+esac
+
 # --- parallel phase (SDD D20): build leg and download leg ------------------
 BUILD_BIN="$REPO/build/llama-cuda/bin/llama-server"
 build_needed=1
@@ -1192,7 +1322,7 @@ else
     fi
 fi
 
-check_row_flags "$BUILD_BIN" "$R_FLAGS" "$R_ID"
+check_row_flags "$BUILD_BIN" "${R_FLAGS_OUT:-$R_FLAGS}" "$R_ID"
 emit_run_script
 start_server_now
 

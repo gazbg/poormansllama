@@ -128,7 +128,7 @@ static int lm_gguf_n_decoder_layers(const std::string & path) {
     return n;
 }
 
-// --lm-evict-layers N: which N of the resident layers become evictable: spread evenly over the resident ones, never the last layer
+// --lm-evict-layers N (the server defaults it to --lm-resident-layers minus 2 when it is not set): which N of the resident layers become evictable: spread evenly over the resident ones, never the last layer
 static std::vector<int> lm_pick_evict(const std::vector<int> & resident, int n_evict, int n_layer) {
     std::vector<int> pool = resident;
     if (!pool.empty() && pool.back() == n_layer - 1) {
@@ -1679,6 +1679,14 @@ private:
                     }
                     // --lm-evict-layers N: N of the resident layers are loaded in HOST memory and get a VRAM slot of their own for decode (computed on the device like resident layers); the layer-major pass releases
                     // the slots and streams those layers like any host layer, the first decode step fills the slots again. The placement list is then the host layers plus these.
+                    // Not set (and a decode ring is on -- with --lm-decode-stream off the dedicated slots would not exist, so the old default of none stands): default to --lm-resident-layers minus 2,
+                    // so two resident layers stay in VRAM permanently (the last layer is never evicted, and lm_pick_evict leaves one more of the pool unevicted) and the layer-major pass can take the rest of the VRAM.
+                    if (!ds_off && params_base.lm_evict_layers == 0) {
+                        params_base.lm_evict_layers = std::max(0, params_base.lm_resident_layers - 2);
+                        if (params_base.lm_evict_layers > 0) {
+                            SRV_INF("lm-evict-layers: not set, defaulting to %d (= --lm-resident-layers %d minus 2)\n", params_base.lm_evict_layers, params_base.lm_resident_layers);
+                        }
+                    }
                     std::vector<int> placement = host;
                     if (params_base.lm_evict_layers > 0) {
                         lm_evict_soft = lm_pick_evict(resident, params_base.lm_evict_layers, n_layer);
@@ -1694,7 +1702,12 @@ private:
                         host_list += (host_list.empty() ? "" : ",") + std::to_string(il);
                     }
                     params_base.lm_prefill_host_layers = host_list;
-                    SRV_INF("lm-resident-layers: %zu of %d layers resident in VRAM (%s), %zu on the host\n", resident.size(), n_layer, res_list.c_str(), host.size());
+                    if (lm_evict_soft.empty()) {
+                        SRV_INF("lm-resident-layers: %zu of %d layers resident in VRAM (%s), %zu on the host\n", resident.size(), n_layer, res_list.c_str(), host.size());
+                    } else {
+                        SRV_INF("lm-resident-layers: %zu of %d layers resident in VRAM (%s), %zu on the host (%zu host layers + %zu evictable)\n",
+                                resident.size(), n_layer, res_list.c_str(), placement.size(), host.size(), lm_evict_soft.size());
+                    }
                     if (params_base.lm_decode_stream.empty() && !ds_off) {
                         // the layers that are not resident are the CPU's; the dynamic ring puts some of them on the device during decode (--lm-decode-stream off to keep them all on the CPU)
                         params_base.lm_decode_stream = "dynamic";
