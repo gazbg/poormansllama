@@ -202,10 +202,10 @@ only skips model-file resolution and download. With `-SkipModel` and no
 **How do I know the server works?** (USAGE.md section 5, verbatim)
 
 ```
-curl http://127.0.0.1:8033/health
+curl http://127.0.0.1:8090/health
 # {"status":"ok"}
 
-curl http://127.0.0.1:8033/v1/chat/completions -H "Content-Type: application/json" \
+curl http://127.0.0.1:8090/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Reply with exactly one word: pong"}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 

@@ -30,7 +30,7 @@ param(
     [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl (SDD D19); default = the model's row quant
     [ValidateSet('full', '16g', '8g')][string]$Vram = '',
     [ValidateSet('262k', '128k')][string]$Context = '',
-    [string]$Port = '8033',
+    [string]$Port = '',            # '' = ask (default 8090); an explicit value suppresses the question (D22)
     [string]$Bind = '',             # default: per-recipe (127.0.0.1 or 0.0.0.0)
     [int]$Device = -1,           # CUDA index for device-pinned rows (R5/R7); -1 = auto (SDD D17)
     [string]$ModelDir = '',
@@ -377,6 +377,65 @@ function Resolve-GpuIndex {
     if ($sel.Count -gt 1) { Say "multi-GPU system: pinning --device CUDA$($sel.Index) ($($sel.Why); override with -Device N)" }
     $script:GpuDev = $sel.Index
     return $sel.Index
+}
+
+# --- row-flag completion (D22) --------------------------------------------
+# The wizard's one place that changes what a row emits, beyond the D11/D17
+# substitutions (model path, bind, port, device index). Pure over the row:
+# the same (flags, env, compute cap) always gives the same output, so the
+# same-day byte-identical re-run (SDD AC-2) still holds.
+function Detect-GpuArch {
+    # D22: compute capability of the card the run will use (nvidia-smi's
+    # first line, the D12/D17 convention) as 'M.m'. SETUP_WIZARD_GPU_CC
+    # overrides for testing (SETUP_WIZARD_FORCE_MISSING is the precedent).
+    # '' = unavailable; the caller then emits the row as measured.
+    if ($env:SETUP_WIZARD_GPU_CC) { return $env:SETUP_WIZARD_GPU_CC }
+    $ns = Get-NvidiaSmiPath
+    if (-not $ns -or -not (Test-Path $ns)) { return '' }
+    $cap = (& $ns --query-gpu=compute_cap --format=csv,noheader 2>$null | Select-Object -First 1)
+    if ($cap -match '^(\d+)\.(\d+)$') { return $Matches[0] }
+    return ''
+}
+
+function Complete-RowFlags {
+    param([string]$Flags, $EnvText, [string]$ComputeCap)
+    # D22-B: every profile emits --lm-prefill-prearm always. An existing
+    # occurrence (R3's 'always', R8's 'auto') is REPLACED, otherwise the
+    # flag is appended - two occurrences would be a parse hazard.
+    # D22-A: on Pascal and lower (compute cap <= 6.1) the pass's flash
+    # attention takes the int8 Q.K^T tile (the flag is literally
+    # setenv(LLAMA_FATTN_TILE_Q8QK,1) in the server, help: 'Same as
+    # LLAMA_FATTN_TILE_Q8QK=1', target 'a GPU without fast FP16, such as
+    # Pascal'). If the row's env already sets that env, the env is the
+    # emitted config - it stays, and nothing is appended; otherwise the
+    # flag is appended. AN APPROXIMATION (int8 Q per 32 values): the
+    # caller prints a D22 note when the flag was added.
+    # Returns [pscustomobject]@{ Flags; AddedInt8 }.
+    $f = $Flags
+    if ($f -match '(?<!-)--lm-prefill-prearm\s+(?:off|always|auto)') {
+        $f = $f -replace '(?<!-)--lm-prefill-prearm\s+(?:off|always|auto)', '--lm-prefill-prearm always'
+    } else {
+        $f = $f + ' --lm-prefill-prearm always'
+    }
+    $addedInt8 = $false
+    if ($ComputeCap -match '^([0-9]+)\.([0-9]+)$') {
+        $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+        if ($maj -lt 6 -or ($maj -eq 6 -and $min -le 1)) {
+            $envHas = $false
+            if ($EnvText) {
+                if ($EnvText -is [hashtable] -or $EnvText -is [System.Collections.Specialized.OrderedDictionary]) {
+                    $envHas = $EnvText.ContainsKey('LLAMA_FATTN_TILE_Q8QK') -and ([string]$EnvText['LLAMA_FATTN_TILE_Q8QK']) -eq '1'
+                } else {
+                    $envHas = (([string]$EnvText) -split '\s+') -contains 'LLAMA_FATTN_TILE_Q8QK=1'
+                }
+            }
+            if (-not $envHas -and -not (@($f -split '\s+') -contains '--lm-prefill-attn-int8')) {
+                $f = $f + ' --lm-prefill-attn-int8'; $addedInt8 = $true
+            }
+            else { Say "row env already sets LLAMA_FATTN_TILE_Q8QK=1 (compute capability $ComputeCap); the env is the emitted config, no flag added" }
+        }
+    }
+    return [pscustomobject]@{ Flags = $f; AddedInt8 = $addedInt8 }
 }
 
 # --- environment check (SDD 4.1) ----------------------------------------
@@ -1098,7 +1157,7 @@ function Emit-RunScript {
     Step 'Emit run-server.ps1'
     $bind = $Bind
     if (-not $bind) { $bind = $r.Bind }
-    $port = $Port
+    if (-not $port) { $port = '8090' }   # D22: the settings phase normally fills $Port; this keeps the emitter self-contained
     $out = Join-Path $repo 'run-server.ps1'
     $last = Join-Path $repo 'run-server.last.ps1'
     if (Test-Path $out) { Move-Item $out $last -Force; Say "previous run-server.ps1 saved as run-server.last.ps1" }
@@ -1132,9 +1191,12 @@ function Emit-RunScript {
             $lines += '$env:' + $k + ' = "' + $r.Env[$k] + '"'
         }
     }
+    if ($script:RowFlagsAddedInt8) {
+        $lines += '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
+    }
     $lines += ''
     $lines += 'if (-not (Split-Path $log -Parent | Test-Path)) { New-Item -ItemType Directory -Path (Split-Path $log -Parent) -Force | Out-Null }'
-    $flags = $r.Flags
+    $flags = $script:RowFlags.Flags
     if ($r.Device) { $flags = $flags + ' --device CUDA' + (Resolve-GpuIndex -VramTarget $r.Vram) }
     $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $flags + ' 2>&1 | Tee-Object -FilePath $log'
     $lines += ''
@@ -1242,6 +1304,24 @@ $r = Pick-Recipe -m $m
 $script:RecipeId = $r.Id
 Say ("recipe $($r.Id): $($r.Measured)")
 if ($r.Note) { Say ("note: $($r.Note)") }
+# D22-C: the server port, asked with the other settings (before the heavy
+# work). Default 8090; an explicit -Port/--port skips the question.
+if (-not $Port) {
+    $Port = (Ask 'Server port?' '8090').Trim()
+    while ($Port -notmatch '^\d+$' -or [int]$Port -lt 1 -or [int]$Port -gt 65535) {
+        Warn "port must be a number 1-65535 (got '$Port')"
+        $Port = (Ask 'Server port?' '8090').Trim()
+    }
+}
+# D22-A/B: complete the row's flags (pure; see Complete-RowFlags). The
+# compute capability is for the card the run will use; on failure the row
+# is emitted as measured (the int8 tile is a performance approximation, not
+# a correctness requirement).
+$script:GpuCc = Detect-GpuArch
+if (-not $script:GpuCc) { Warn 'compute capability unavailable (nvidia-smi); the row flags stay as measured (no D22 additions)' }
+else { Say "card compute capability: $script:GpuCc" }
+$script:RowFlags = Complete-RowFlags -Flags $r.Flags -EnvText $r.Env -ComputeCap $script:GpuCc
+$script:RowFlagsAddedInt8 = $script:RowFlags.AddedInt8
 # D12 (SDD 4.6): warning only, threshold by VRAM target.
 # D17: for device-pinned rows the check runs against the card the row will
 # actually use (Resolve-GpuIndex), not just nvidia-smi's first line.

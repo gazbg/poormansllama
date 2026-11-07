@@ -35,7 +35,7 @@ set -u
 MODEL=''
 VRAM=''
 CONTEXT=''
-PORT=8033
+PORT=''   # empty = ask (default 8090); an explicit --port suppresses the question (D22)
 BIND=''
 DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
 QUANT=''      # q4k_m|q5k_xl|q8k_xl for qwen38/qwen36 (SDD D19); empty = the model's default
@@ -69,7 +69,7 @@ usage: setup.sh [options]
   --quant q4k_m|q5k_xl|q8k_xl          quant build for qwen38/qwen36 (default: the row's own)
   --vram full|16g|8g            VRAM target (asked if omitted)
   --context 262k|128k           context size (asked if omitted)
-  --port N                      server port (default 8033)
+  --port N                      server port (default 8090, asked if omitted; D22)
   --host ADDR                   bind address (default: the recipe row's own)
   --device N                    CUDA index for device-pinned rows R5/R7 (default: auto)
   --model-file PATH             explicit local GGUF (still needs --model)
@@ -597,6 +597,65 @@ check_row_flags() {
 }
 
 # --- step 4: build (SDD 4.4, decisions D9/D10) ------------------------------
+# --- D22: row-flag completion -------------------------------------------------
+# The wizard's one place that changes what a row emits, beyond the D11/D17
+# substitutions (model path, bind, port, device index). Pure over the row:
+# the same (flags, env, compute cap) always gives the same output, so the
+# same-day byte-identical re-run (SDD AC-2) still holds.
+detect_gpu_arch() {
+    # D22: compute capability of the card the run will use (nvidia-smi's
+    # first line, the D12/D17 convention) as 'M.m'. SETUP_WIZARD_GPU_CC
+    # overrides for testing (SETUP_WIZARD_FORCE_MISSING is the precedent).
+    # Returns 1 when unavailable; the caller then emits the row as measured.
+    if [ -n "${SETUP_WIZARD_GPU_CC:-}" ]; then echo "$SETUP_WIZARD_GPU_CC"; return 0; fi
+    local cc
+    cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+    [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    echo "$cc"
+}
+
+complete_row_flags() {
+    # D22-B: every profile emits --lm-prefill-prearm always. An existing
+    # occurrence (R3's 'always', R8's 'auto') is REPLACED, otherwise the
+    # flag is appended - two occurrences would be a parse hazard.
+    # D22-A: on Pascal and lower (compute cap <= 6.1) the pass's flash
+    # attention takes the int8 Q.K^T tile (the flag is literally
+    # setenv(LLAMA_FATTN_TILE_Q8QK,1) in the server, help: 'Same as
+    # LLAMA_FATTN_TILE_Q8QK=1', target 'a GPU without fast FP16, such as
+    # Pascal'). If the row's env already sets that env, the env is the
+    # emitted config - it stays, and nothing is appended; otherwise the
+    # flag is appended. AN APPROXIMATION (int8 Q per 32 values): the
+    # caller prints a D22 note when the flag was added.
+    # $1 flags, $2 row env (KEY=V ...), $3 compute cap ('' = unavailable).
+    # Echoes the completed flags; sets D22_ADDED_INT8=1 when the flag was
+    # say goes to stderr: the caller runs this in a command substitution, so
+    # the caller derives 'was the flag added' from the output itself.
+    local f="$1" env="$2" cc="${3:-}" maj min
+    case "$f" in
+        *'--lm-prefill-prearm off'*)   f="${f/--lm-prefill-prearm off/--lm-prefill-prearm always}" ;;
+        *'--lm-prefill-prearm always'*) f="${f/--lm-prefill-prearm always/--lm-prefill-prearm always}" ;;
+        *'--lm-prefill-prearm auto'*)  f="${f/--lm-prefill-prearm auto/--lm-prefill-prearm always}" ;;
+        *) f="$f --lm-prefill-prearm always" ;;
+    esac
+    if [[ "$cc" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"
+        if [ "$maj" -lt 6 ] || { [ "$maj" -eq 6 ] && [ "$min" -le 1 ]; }; then
+            local has_env=0 tok
+            for tok in $env; do
+                [ "$tok" = 'LLAMA_FATTN_TILE_Q8QK=1' ] && has_env=1
+            done
+            if [ "$has_env" -eq 1 ]; then
+                say "row env already sets LLAMA_FATTN_TILE_Q8QK=1 (compute capability $cc); the env is the emitted config, no flag added" >&2
+            else
+                # already present (idempotence: a re-completed output must not
+                # gain a second copy)
+                case " $f " in *' --lm-prefill-attn-int8 '*) ;; *) f="$f --lm-prefill-attn-int8" ;; esac
+            fi
+        fi
+    fi
+    echo "$f"
+}
+
 detect_cuda_arch() {
     # nvidia-smi compute_cap -> CMAKE_CUDA_ARCHITECTURES entry (6.1 -> 61)
     local cc
@@ -1036,6 +1095,7 @@ emit_run_script() {
     step 'Emit run-server.sh'
     local bind="$BIND"
     [ -z "$bind" ] && bind="$R_BIND"
+    [ -z "$PORT" ] && PORT=8090   # D22: the settings phase normally fills PORT; this keeps the emitter self-contained
     local out="$REPO/run-server.sh" last="$REPO/run-server.last.sh"
     local log="$REPO/build/llama-cuda/server-$R_ID.log"
     if [ -f "$out" ]; then mv "$out" "$last"; say "previous run-server.sh saved as run-server.last.sh"; fi
@@ -1067,8 +1127,9 @@ emit_run_script() {
             echo "export $R_ENV"
         fi
         echo 'mkdir -p "$(dirname "$LOG")"'
-        local flags="$R_FLAGS"
+        local flags="${R_FLAGS_OUT:-$R_FLAGS}"
         [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
+        [ "$D22_ADDED_INT8" = 1 ] && echo '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
         echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $flags 2>&1 | tee \"\$LOG\""
         echo
         echo '# stop: Ctrl-C in this console.  Health: curl http://127.0.0.1:'"$PORT"'/health'
@@ -1172,6 +1233,43 @@ else
 fi
 pick_recipe
 
+# D22-C: the server port, asked with the other settings (before the heavy
+# work). Default 8090; an explicit --port skips the question.
+if [ -z "$PORT" ]; then
+    if [ "$NI" = 1 ]; then
+        PORT=8090
+    else
+        local_port=''
+        while :; do
+            printf '  Server port? ' >&2
+            read -r local_port || local_port=''
+            local_port="${local_port:-8090}"
+            if [[ "$local_port" =~ ^[0-9]+$ ]] && [ "$local_port" -ge 1 ] && [ "$local_port" -le 65535 ]; then
+                PORT="$local_port"; break
+            fi
+            printf '  (port must be a number 1-65535; got %s)\n' "$local_port" >&2
+        done
+    fi
+fi
+
+# D22-A/B: complete the row's flags (pure; see complete_row_flags). The
+# compute capability is for the card the run will use; on failure the row
+# is emitted as measured (the int8 tile is a performance approximation, not
+# a correctness requirement).
+GPU_CC=''
+if GPU_CC=$(detect_gpu_arch); then
+    say "card compute capability: $GPU_CC"
+else
+    say 'compute capability unavailable (nvidia-smi); the row flags stay as measured (no D22 additions)'
+fi
+R_FLAGS_OUT=$(complete_row_flags "$R_FLAGS" "$R_ENV" "$GPU_CC")
+# the note is about the flag being ADDED (the subshell above cannot set
+# globals): present in the output and absent from the measured row
+D22_ADDED_INT8=0
+case "$R_FLAGS_OUT" in *'--lm-prefill-attn-int8'*)
+    case "$R_FLAGS" in *'--lm-prefill-attn-int8'*) ;; *) D22_ADDED_INT8=1 ;; esac ;;
+esac
+
 # --- parallel phase (SDD D20): build leg and download leg ------------------
 BUILD_BIN="$REPO/build/llama-cuda/bin/llama-server"
 build_needed=1
@@ -1224,7 +1322,7 @@ else
     fi
 fi
 
-check_row_flags "$BUILD_BIN" "$R_FLAGS" "$R_ID"
+check_row_flags "$BUILD_BIN" "${R_FLAGS_OUT:-$R_FLAGS}" "$R_ID"
 emit_run_script
 start_server_now
 

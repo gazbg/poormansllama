@@ -1849,7 +1849,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--lm-evict-layers"}, "N",
         "with --lm-resident-layers: N of the resident layers (spread evenly, never the last layer) are loaded in HOST memory and get a VRAM slot of their own for decode steps (computed on the device like resident layers). "
         "The layer-major pass (--lm-prefill) frees those slots, which gives it the room it needs when the card is full, and streams the layers from host memory like any host layer; the first decode step fills the slots again "
-        "(about 30 ms per layer). Each evicted layer needs its host copy in RAM. Needs the decode ring (the default with --lm-resident-layers)",
+        "(about 30 ms per layer). Each evicted layer needs its host copy in RAM. Not set: defaults to --lm-resident-layers minus 2, so two resident layers stay in VRAM permanently (the last layer is never evicted). "
+        "Needs the decode ring (the default with --lm-resident-layers)",
         [](common_params & params, int value) {
             params.lm_evict_layers = value;
         }

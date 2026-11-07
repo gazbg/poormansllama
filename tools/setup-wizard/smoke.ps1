@@ -13,11 +13,11 @@
 #      tail has no access violation.
 #
 # Run it under the GPU mutex (one explicit run, tag swz-smoke):
-#   & tools\with-gpu-lock.ps1 -Command 'powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-wizard\smoke.ps1 -Row R5 -Model "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" -Port 8033' -VerdictTag swz-smoke
+#   & tools\with-gpu-lock.ps1 -Command 'powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-wizard\smoke.ps1 -Row R5 -Model "C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" -Port 8090' -VerdictTag swz-smoke
 param(
     [string]$Row = 'R5',
     [Parameter(Mandatory = $true)][string]$Model,
-    [int]$Port = 8033,
+    [int]$Port = 8090,   # the wizard's default port (D22)
     [int]$HealthTimeoutSec = 300
 )
 $ErrorActionPreference = 'Stop'

@@ -667,7 +667,7 @@ struct common_params {
     bool        lm_prefill         = false;
     std::string lm_decode_stream;             // dense models: decoder layers (a subset of lm_prefill_host_layers) that decode steps compute on the device from a ring of VRAM slots; empty = off
     int32_t     lm_decode_slots    = 2;       // slots in that ring
-    int32_t     lm_evict_layers    = 0;       // with lm_resident_layers: how many of the resident layers are loaded in host memory with a dedicated VRAM slot, released for the layer-major pass; 0 = none
+    int32_t     lm_evict_layers    = 0;       // with lm_resident_layers: how many of the resident layers are loaded in host memory with a dedicated VRAM slot, released for the layer-major pass; 0 = not set (llama-server defaults it to lm_resident_layers - 2 when the decode ring is on)
     int32_t     lm_resident_layers = 0;      // dense models: how many layers stay in VRAM, spread evenly (end-aligned); the others are host layers; 0 = off (--lm-prefill-host-layers decides)
     std::string lm_prefill_host_layers;       // dense models: decoder layers whose weights stay in host memory and stream through the slot window ("N" = the first N layers, or ranges "0-21,30"); empty = placement as given by -ngl / -ot
     // H94 (private fork): the sequence split of the layer-major prefill over two GPUs (needs --lm-prefill): a second context of the model on this CUDA device, with a context of
