@@ -165,14 +165,17 @@ def text_control(fx):
 
 # ----------------------------------------------------------------------------- configs
 
-def mkcfg(arm, exe, free_all=False, np_=1, extra_args=(), env=()):
+STOCK_ARGS = ["-c", "32768", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "-np", "1", "-ngl", "99", "-ncmoe", "37", "-fit", "off", "-lv", "4"]   # the stock placement: no hybrid engine, no layer-major pass
+
+
+def mkcfg(arm, exe, free_all=False, np_=1, extra_args=(), env=(), wrap=(), stock=False):
     args = ["--model", MODEL]
     if arm != "novis":
         args += ["--mmproj", MMPROJ]
-    args += list(R8_ARGS)
+    args += list(STOCK_ARGS if stock else R8_ARGS)
     if np_ != 1:
         args[args.index("-np") + 1] = str(np_)
-    if free_all:
+    if free_all and not stock:
         args.append("--hybrid-moe-prefill-free-all")
     if arm == "cpuv":
         args.append("--no-mmproj-offload")
@@ -184,7 +187,10 @@ def mkcfg(arm, exe, free_all=False, np_=1, extra_args=(), env=()):
         k, v = kv.split("=", 1)
         e[k] = v
     root = os.getcwd().replace("\\", "/")
-    return {"exe": exe if os.path.isabs(exe) else root + "/" + exe, "args": args, "env": e}
+    cfg = {"exe": exe if os.path.isabs(exe) else root + "/" + exe, "args": args, "env": e}
+    if wrap:
+        cfg["wrap"] = list(wrap)   # a command prefix (e.g. compute-sanitizer and its options), one word per entry
+    return cfg
 
 
 # ----------------------------------------------------------------------------- log scrapes
@@ -373,6 +379,396 @@ def cmd_compare(a):
             print("     %-14s image_tokens %-5s prompt_ms %-9.1f ok %s" % (k, v[0].get("image_tokens"), pm[len(pm) // 2], all(x["graded_ok"] for x in v)))
 
 
+
+# ----------------------------------------------------------------------------- acceptance session (VOD-2): one fixed request sequence per arm
+
+def filler(n, start=0):
+    """deterministic filler text, ~25 tokens per sentence"""
+    return " ".join("Entry %d: the measured value of channel %d was %d units at station %d." % (i, i % 17, (i * 7919) % 1000, i % 5) for i in range(start, start + n))
+
+
+def logtext(out):
+    try:
+        return open(os.path.join(out, "server.log"), "rb").read().replace(b"\x00", b"").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def log_counts(out):
+    t = logtext(out)
+    images = sum(int(m) for m in re.findall(r"vod: encode slot=\d+ chunks=(\d+)", t)) + sum(int(m) for m in re.findall(r"vod: window: (\d+) image chunks", t))
+    return {"images_encoded": images, "windows": len(re.findall(r"vod: window:", t)), "windows_failed": len(re.findall(r"vod: window:.*FAILED", t)), "no_room": len(re.findall(r"lm-prefill: no room", t)),
+            "pass_armed": len(re.findall(r"lm-prefill: armed for", t)), "pass_declined_ordinary": len(re.findall(r"this batch takes the ordinary path", t)),
+            "vod_waiting": len(re.findall(r"vod: waiting for", t)), "cache_resizes": len(re.findall(r"cache resized to", t))}
+
+
+def rec_short(rec):
+    tm = rec.get("timings") or {}
+    return {"status": rec.get("status"), "content": rec.get("content"), "finish": rec.get("finish"), "wall_s": rec.get("wall_s"), "prompt_tokens": (rec.get("usage") or {}).get("prompt_tokens"),
+            "completion_tokens": (rec.get("usage") or {}).get("completion_tokens"), "prompt_n": tm.get("prompt_n"), "cache_n": tm.get("cache_n"), "predicted_n": tm.get("predicted_n"),
+            "prompt_ms": tm.get("prompt_ms"), "prompt_per_second": tm.get("prompt_per_second"), "predicted_per_second": tm.get("predicted_per_second"), "error": rec.get("error")}
+
+
+def cmd_acc(a):
+    from server_mt import Server, load_cfg
+    cfg = load_cfg(a.config)
+    os.makedirs(a.out, exist_ok=True)
+    fixtures = make_fixtures([724, 1024, 1448])
+    srv = Server(cfg, a.out, port=a.port)
+    rep = {"phase": "acc", "config": cfg, "provenance": provenance(cfg["exe"]), "steps": [], "idle": {}}
+    ok = True
+    has_vision = "--mmproj" in cfg["args"]
+
+    def snap(name):
+        time.sleep(3.0)
+        rep["idle"][name] = {"smi_used_mib": smi_used_mib(), "counts": log_counts(a.out)}
+
+    last_images = [0]
+
+    def step(name, rec, **extra):
+        r = rec_short(rec)
+        r.update(extra)
+        r["name"] = name
+        r["counts_after"] = log_counts(a.out)
+        r["images_in_step"] = r["counts_after"]["images_encoded"] - last_images[0]   # image chunks encoded since the previous step (BASE: lazy encodes, OD: windows), needs LLAMA_VOD_LOG=1
+        last_images[0] = r["counts_after"]["images_encoded"]
+        rep["steps"].append(r)
+        print("%-24s status %s  prompt_n %-5s cache_n %-5s pred_n %-4s imgs %-2s pp %-8s tg %-7s  %r" % (name, r["status"], r["prompt_n"], r["cache_n"], r["predicted_n"], r["images_in_step"],
+              ("%.0f" % r["prompt_per_second"]) if r["prompt_per_second"] else "-", ("%.1f" % r["predicted_per_second"]) if r["predicted_per_second"] else "-", (r["content"] or "")[:40]))
+        return r
+
+    try:
+        rep["t_ready_s"] = round(srv.start(), 2)
+        snap("ready")
+        # 1. text smoke: a short, a mid and a long prompt (the long one engages the layer-major pass; its PP / TG are the text-turn numbers)
+        texts = [("text-short", "Reply with the single word: ready", 0, 16), ("text-mid", "Reply with the single word: done", 60, 16),
+                 ("text-long", "Count from 1 to 60 separated by commas, nothing else.", 240, 64)]
+        for name, q, n_sent, mt in texts:
+            content = (filler(n_sent) + "\n\n" if n_sent else "") + q
+            r = step(name, srv.chat([{"role": "user", "content": content}], max_tokens=mt, cache_prompt=False))
+            ok = ok and r["status"] == 200
+        snap("after_text")
+        # 2. the fixtures (cold prefill each)
+        if has_vision:
+            for f in fixtures:
+                rec = srv.chat(message_for(f), max_tokens=a.max_tokens, cache_prompt=False)
+                r = step("fix-" + f["name"], rec, expect=f["expect"], graded_ok=grade(rec.get("content"), f["expect"]))
+                ok = ok and r["status"] == 200 and r["graded_ok"]
+            snap("after_fixtures")
+            # 3. a three-turn image conversation with the prompt cache on: turn 2 must hit the cache with ZERO encodes, turn 3 (a new image) must open exactly one window
+            f_a, f_b = fixtures[1], fixtures[4]          # digits-724 then colour-1448
+            hist = message_for(f_a)
+            rec1 = srv.chat(hist, max_tokens=16, cache_prompt=True)
+            step("mt-turn1-image", rec1, expect=f_a["expect"], graded_ok=grade(rec1.get("content"), f_a["expect"]))
+            hist = hist + [{"role": "assistant", "content": rec1.get("content") or ""}, {"role": "user", "content": "Add 1 to that number. Answer with the digits only."}]
+            n_before = log_counts(a.out)["windows"]
+            rec2 = srv.chat(hist, max_tokens=16, cache_prompt=True)
+            step("mt-turn2-text", rec2, windows_in_turn=log_counts(a.out)["windows"] - n_before, expect=str(int(f_a["expect"]) + 1), graded_ok=grade(rec2.get("content"), str(int(f_a["expect"]) + 1)))
+            hist = hist + [{"role": "assistant", "content": rec2.get("content") or ""}, {"role": "user", "content": message_for(f_b)[0]["content"]}]
+            n_before = log_counts(a.out)["windows"]
+            rec3 = srv.chat(hist, max_tokens=16, cache_prompt=True)
+            step("mt-turn3-new-image", rec3, windows_in_turn=log_counts(a.out)["windows"] - n_before, expect=f_b["expect"], graded_ok=grade(rec3.get("content"), f_b["expect"]))
+            snap("after_mt")
+    finally:
+        srv.stop()
+    rep["log"] = scrape_log(os.path.join(a.out, "server.log"))
+    rep["log_counts_final"] = log_counts(a.out)
+    rep["smi_free_mib_min"] = srv.sampler.min_free if srv.sampler else None
+    json.dump(rep, open(os.path.join(a.out, "report.json"), "w"), indent=1)
+    print("report:", os.path.join(a.out, "report.json"))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_acc_compare(a):
+    """identity table of acceptance reports: the first dir is the reference"""
+    reps = [(d, json.load(open(os.path.join(d, "report.json")))) for d in a.dirs]
+    ref_d, ref = reps[0]
+    print("reference: %s" % ref_d)
+    for d, r in reps[1:]:
+        print("== %s against %s" % (d, ref_d))
+        by_ref = {s["name"]: s for s in ref["steps"]}
+        n_same = 0
+        n_all = 0
+        for s in r["steps"]:
+            q = by_ref.get(s["name"])
+            if q is None:
+                continue
+            n_all += 1
+            same_txt = s["content"] == q["content"]
+            same_cnt = (s["prompt_n"], s["cache_n"], s["predicted_n"]) == (q["prompt_n"], q["cache_n"], q["predicted_n"])
+            # the image-encode counts come from the LLAMA_VOD_LOG lines: compared only when both runs have them (a pristine binary has none)
+            same_img = (s.get("images_in_step") == q.get("images_in_step")) if (r["log_counts_final"]["images_encoded"] > 0 and ref["log_counts_final"]["images_encoded"] > 0) else True
+            same_cnt = same_cnt and same_img
+            n_same += 1 if (same_txt and same_cnt) else 0
+            pp = (s["prompt_per_second"] / q["prompt_per_second"]) if s.get("prompt_per_second") and q.get("prompt_per_second") else None
+            tg = (s["predicted_per_second"] / q["predicted_per_second"]) if s.get("predicted_per_second") and q.get("predicted_per_second") else None
+            print("  %-24s text %-5s counts %-5s (%s | %s)  pp ratio %s  tg ratio %s" % (s["name"], "same" if same_txt else "DIFF", "same" if same_cnt else "DIFF",
+                  (s["prompt_n"], s["cache_n"], s["predicted_n"], s.get("images_in_step")), (q["prompt_n"], q["cache_n"], q["predicted_n"], q.get("images_in_step")), ("%.3f" % pp) if pp else "-", ("%.3f" % tg) if tg else "-"))
+        print("  identical (text and counts): %d of %d steps" % (n_same, n_all))
+        for k in ("ready", "after_text", "after_fixtures", "after_mt"):
+            if k in r["idle"] and k in ref["idle"]:
+                print("  idle %-15s smi used %s vs %s MiB   counts %s" % (k, r["idle"][k]["smi_used_mib"], ref["idle"][k]["smi_used_mib"], r["idle"][k]["counts"]))
+        print("  free-watch lines:", [w["mib"] for w in r["log"].get("free_watch", [])][-4:], "reference:", [w["mib"] for w in ref["log"].get("free_watch", [])][-4:])
+
+
+# ----------------------------------------------------------------------------- fault injection and soak (VOD-2: VOD-5 / VOD-6 criteria)
+
+def health_poller(srv):
+    """polls /health every 0.2 s on its own thread; stop with .stop = True. Records how many polls failed and the slowest answer."""
+    import threading
+    import urllib.request
+
+    class Poller(threading.Thread):
+        def __init__(self):
+            super().__init__(daemon=True)
+            self.stop, self.n, self.bad, self.max_ms = False, 0, 0, 0.0
+
+        def run(self):
+            while not self.stop:
+                t0 = time.time()
+                try:
+                    st = urllib.request.urlopen(srv.base + "/health", timeout=5).status
+                except Exception:
+                    st = None
+                self.max_ms = max(self.max_ms, (time.time() - t0) * 1000.0)
+                self.n += 1
+                self.bad += 0 if st == 200 else 1
+                time.sleep(0.2)
+    p = Poller()
+    p.start()
+    return p
+
+
+def cmd_fault(a):
+    """a.mode: room (LLAMA_VOD_FAIL_ROOM=N in the config env: the request waits and then succeeds), encode (LLAMA_VOD_FAIL_ENCODE=1: that request is HTTP 500, the next one succeeds),
+    timeout (LLAMA_VOD_FAIL_ROOM=1000 and --mmproj-wait-timeout 3: HTTP 500 after ~3 s, the server lives)"""
+    from server_mt import Server, load_cfg
+    cfg = load_cfg(a.config)
+    os.makedirs(a.out, exist_ok=True)
+    f = make_fixtures([724])[1]      # digits-724
+    srv = Server(cfg, a.out, port=a.port)
+    rep = {"phase": "fault", "mode": a.mode, "config": cfg, "provenance": provenance(cfg["exe"]), "steps": [], "checks": []}
+    ok = True
+
+    def check(name, cond, detail=""):
+        nonlocal ok
+        ok = ok and bool(cond)
+        rep["checks"].append({"name": name, "ok": bool(cond), "detail": detail})
+        print(("ok   " if cond else "FAIL ") + name + ((" (" + detail + ")") if detail else ""))
+    try:
+        rep["t_ready_s"] = round(srv.start(), 2)
+        time.sleep(3.0)
+        rep["smi_used_ready"] = smi_used_mib()
+        poll = health_poller(srv)
+        r1 = srv.chat(message_for(f), max_tokens=a.max_tokens, cache_prompt=False)
+        r2 = srv.chat(message_for(f), max_tokens=a.max_tokens, cache_prompt=False)
+        r3 = srv.chat([{"role": "user", "content": "Reply with the single word: ready"}], max_tokens=8, cache_prompt=False)
+        poll.stop = True
+        time.sleep(0.4)
+        time.sleep(3.0)
+        rep["smi_used_end"] = smi_used_mib()
+        rep["health"] = {"polls": poll.n, "bad": poll.bad, "max_ms": round(poll.max_ms, 1)}
+        for name, r in (("img-1", r1), ("img-2", r2), ("text", r3)):
+            d = rec_short(r)
+            d["name"] = name
+            rep["steps"].append(d)
+            print("%-8s status %s wall %.2fs %r %s" % (name, d["status"], d["wall_s"] or 0, (d["content"] or "")[:30], (d["error"] or "") if d["status"] != 200 else ""))
+        lc = log_counts(a.out)
+        rep["log_counts"] = lc
+        right = grade(r1.get("content"), f["expect"])
+        check("server alive after the scenario", srv.alive())
+        check("text request after the scenario answered", r3.get("status") == 200)
+        if a.mode == "room":
+            check("request 1 succeeded after waiting and the answer is right", r1.get("status") == 200 and right, "wall %.2f s" % r1["wall_s"])
+            check("request 1 waited (WARN lines + slow)", lc["vod_waiting"] >= 1 and r1["wall_s"] >= 2.0, "waiting lines %d" % lc["vod_waiting"])
+            check("request 2 did not wait", r2.get("status") == 200 and r2["wall_s"] < 0.8 * r1["wall_s"] + 0.5, "wall %.2f s" % r2["wall_s"])
+            check("/health answered during the wait", poll.bad == 0 and poll.n >= 5, "polls %d bad %d max %.0f ms" % (poll.n, poll.bad, poll.max_ms))
+        elif a.mode == "encode":
+            check("request 1 failed with an HTTP 500", r1.get("status") == 500, "status %s" % r1.get("status"))
+            check("request 2 succeeded and the answer is right", r2.get("status") == 200 and grade(r2.get("content"), f["expect"]))
+            check("the failed window is logged and the projector was parked again", lc["windows_failed"] >= 1 and lc["windows"] >= 2, "windows %d failed %d" % (lc["windows"], lc["windows_failed"]))
+        elif a.mode == "timeout":
+            check("request 1 failed with an HTTP 500 after about the timeout", r1.get("status") == 500 and 2.5 <= r1["wall_s"] <= 9.0, "status %s wall %.2f s" % (r1.get("status"), r1["wall_s"]))
+            check("request 2 failed too (the injection counter is not used up)", r2.get("status") == 500)
+            check("/health answered during the waits", poll.bad == 0, "polls %d bad %d" % (poll.n, poll.bad))
+    finally:
+        srv.stop()
+    rep["log"] = scrape_log(os.path.join(a.out, "server.log"))
+    json.dump(rep, open(os.path.join(a.out, "report.json"), "w"), indent=1)
+    print("report:", os.path.join(a.out, "report.json"))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_soak(a):
+    """a.n mixed text / image requests (seeded), a share of them cancelled by closing the connection mid-request; then the same short requests as at the start: the idle memory must be the same"""
+    import http.client
+    import random
+    from server_mt import Server, load_cfg
+    cfg = load_cfg(a.config)
+    os.makedirs(a.out, exist_ok=True)
+    fixtures = make_fixtures([724, 1024])
+    singles = [f for f in fixtures if f["kind"] != "trio"]
+    trio = [f for f in fixtures if f["kind"] == "trio"][0]
+    srv = Server(cfg, a.out, port=a.port)
+    rng = random.Random(a.seed)
+    rep = {"phase": "soak", "n": a.n, "seed": a.seed, "config": cfg, "provenance": provenance(cfg["exe"]), "kinds": {}, "idle": {}}
+    ok = True
+    n_ok = n_bad = n_cancel = n_graded = n_graded_ok = 0
+    errors = []
+
+    def body_for(messages, max_tokens):
+        return {"messages": messages, "max_tokens": max_tokens, "temperature": 0.0, "seed": 1, "cache_prompt": False, "chat_template_kwargs": {"enable_thinking": False}}
+
+    def cancel(body, delay):
+        conn = http.client.HTTPConnection("127.0.0.1", a.port, timeout=30)
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
+        time.sleep(delay)
+        conn.close()
+
+    def settle():
+        for _ in range(2):
+            srv.chat([{"role": "user", "content": "Reply with the single word: ready"}], max_tokens=8, cache_prompt=False)
+        time.sleep(3.0)
+        return smi_used_mib()
+    try:
+        rep["t_ready_s"] = round(srv.start(), 2)
+        rep["idle"]["start"] = settle()
+        t_begin = time.time()
+        for i in range(a.n):
+            r = rng.random()
+            do_cancel = rng.random() < a.cancel_rate
+            if r < 0.40:
+                n_sent = rng.choice([0, 0, 20, 60, 120])
+                content = (filler(n_sent, start=i * 7) + "\n\n" if n_sent else "") + "Reply with the single word: ok"
+                msgs, kind, fx = [{"role": "user", "content": content}], "text", None
+            elif r < 0.92:
+                fx = rng.choice(singles)
+                msgs, kind = message_for(fx), "image"
+            else:
+                fx = trio
+                msgs, kind = message_for(fx), "image3"
+            body = body_for(msgs, 16)
+            rep["kinds"][kind] = rep["kinds"].get(kind, 0) + 1
+            if do_cancel:
+                cancel(body, rng.uniform(0.05, 0.9))
+                n_cancel += 1
+                continue
+            rec = srv.chat(msgs, max_tokens=16, cache_prompt=False)
+            if rec["status"] == 200:
+                n_ok += 1
+                if fx is not None:
+                    n_graded += 1
+                    n_graded_ok += 1 if grade(rec.get("content"), fx["expect"]) else 0
+            else:
+                n_bad += 1
+                errors.append({"i": i, "kind": kind, "status": rec["status"], "error": str(rec.get("error"))[:200]})
+            if (i + 1) % 20 == 0:
+                print("  %d / %d requests, %d cancelled, %d failed, %.0f s" % (i + 1, a.n, n_cancel, n_bad, time.time() - t_begin))
+        rep["idle"]["end"] = settle()
+        rep["soak_s"] = round(time.time() - t_begin, 1)
+    finally:
+        srv.stop()
+    lc = log_counts(a.out)
+    rep["log_counts"] = lc
+    rep["log"] = scrape_log(os.path.join(a.out, "server.log"))
+    rep["n_ok"], rep["n_failed"], rep["n_cancelled"], rep["graded"], rep["graded_ok"], rep["errors"] = n_ok, n_bad, n_cancel, n_graded, n_graded_ok, errors[:20]
+
+    def check(name, cond, detail=""):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(("ok   " if cond else "FAIL ") + name + ((" (" + detail + ")") if detail else ""))
+    check("no failed request", n_bad == 0, "%d ok, %d failed, %d cancelled of %d" % (n_ok, n_bad, n_cancel, a.n))
+    check("every graded image answer is right", n_graded_ok == n_graded, "%d of %d" % (n_graded_ok, n_graded))
+    check("no CUDA error / assert in the log", not rep["log"]["cuda_errors"], str(rep["log"]["cuda_errors"][:2]))
+    check("idle memory at the end equals the start (within 64 MiB)", rep["idle"]["start"] is not None and rep["idle"]["end"] is not None and abs(rep["idle"]["end"] - rep["idle"]["start"]) < 64,
+          "%s -> %s MiB (nvidia-smi)" % (rep["idle"]["start"], rep["idle"]["end"]))
+    json.dump(rep, open(os.path.join(a.out, "report.json"), "w"), indent=1)
+    print("report:", os.path.join(a.out, "report.json"), " windows:", lc["windows"], " failed windows:", lc["windows_failed"], " waits:", lc["vod_waiting"])
+    sys.exit(0 if ok else 1)
+
+
+# ----------------------------------------------------------------------------- equivalence of two prefill paths (VOD-4 / VOD-5): per-token logprobs of fixed image prompts
+
+EQ_QUESTIONS = [("answer", None, 16), ("describe", "Describe the image in one sentence.", 48)]
+
+
+def cmd_eq(a):
+    """greedy 16 / 48 token continuations with top-5 logprobs for every fixture (cache_prompt false), saved per token: report.json['eq'][name] = [[token, logprob, [[tok, lp] ...]] ...]"""
+    from server_mt import Server, load_cfg
+    cfg = load_cfg(a.config)
+    os.makedirs(a.out, exist_ok=True)
+    fixtures = make_fixtures([int(x) for x in a.sides.split(",")])
+    srv = Server(cfg, a.out, port=a.port)
+    rep = {"phase": "eq", "config": cfg, "provenance": provenance(cfg["exe"]), "eq": {}, "status": {}}
+    ok = True
+    try:
+        rep["t_ready_s"] = round(srv.start(), 2)
+        time.sleep(2.0)
+        for f in fixtures:
+            for qname, qtext, mt in EQ_QUESTIONS:
+                msgs = message_for(f)
+                if qtext is not None:
+                    msgs[0]["content"][-1]["text"] = qtext
+                rec = srv.chat(msgs, max_tokens=mt, cache_prompt=False, logprobs=True)
+                key = "%s/%s" % (f["name"], qname)
+                rep["eq"][key] = [[t[0], t[1], [[x[0], x[1]] for x in t[2]]] for t in (rec.get("tokens") or [])]
+                rep["status"][key] = {"status": rec.get("status"), "content": rec.get("content"), "prompt_n": (rec.get("timings") or {}).get("prompt_n")}
+                ok = ok and rec.get("status") == 200
+                print("%-24s status %s  %d tokens  %r" % (key, rec.get("status"), len(rep["eq"][key]), (rec.get("content") or "")[:50]))
+        time.sleep(1.0)
+    finally:
+        srv.stop()
+    rep["log"] = scrape_log(os.path.join(a.out, "server.log"))
+    rep["log_counts"] = log_counts(a.out)
+    json.dump(rep, open(os.path.join(a.out, "report.json"), "w"), indent=1)
+    print("report:", os.path.join(a.out, "report.json"), " passes:", len(re.findall(r"lm-prefill: pass \d+:", logtext(a.out))), " ordinary-path embedding batches:", len(re.findall(r"carries embeddings", logtext(a.out))))
+    sys.exit(0 if ok else 1)
+
+
+def eq_compare_pair(ref, cand, near_tie=0.25):
+    """per prompt: first-token top-1 logprob delta, identical prefix length, and for the first differing token the reference's logprob margin between its pick and the candidate's pick"""
+    rows = []
+    for key in sorted(ref):
+        r, c = ref[key], cand.get(key)
+        if not c or not r:
+            rows.append((key, None, None, None, "missing"))
+            continue
+        d_first = abs(r[0][1] - c[0][1])
+        n = min(len(r), len(c))
+        k = 0
+        while k < n and r[k][0] == c[k][0]:
+            k += 1
+        if k == n and len(r) == len(c):
+            rows.append((key, d_first, len(r), None, "identical"))
+        else:
+            if k < n:
+                top = {x[0]: x[1] for x in r[k][2]}
+                margin = abs(r[k][1] - top[c[k][0]]) if c[k][0] in top else None
+            else:
+                margin = None
+            rows.append((key, d_first, k, margin, "near-tie flip" if (margin is not None and margin < near_tie) else "FLIP"))
+    return rows
+
+
+def cmd_eq_compare(a):
+    reps = [(d, json.load(open(os.path.join(d, "report.json")))["eq"]) for d in a.dirs]
+    ref_d, ref = reps[0]
+    print("reference: %s" % ref_d)
+    ok = True
+    for d, cand in reps[1:]:
+        rows = eq_compare_pair(ref, cand)
+        n_id = sum(1 for r in rows if r[4] == "identical")
+        n_nt = sum(1 for r in rows if r[4] == "near-tie flip")
+        n_fl = sum(1 for r in rows if r[4] not in ("identical", "near-tie flip"))
+        firsts = sorted(r[1] for r in rows if r[1] is not None)
+        print("== %s: %d prompts: %d identical, %d near-tie flips (< 0.25 nats at the first difference), %d other; first-token |dlogprob| median %.4f max %.4f" % (
+            d, len(rows), n_id, n_nt, n_fl, firsts[len(firsts) // 2] if firsts else float("nan"), firsts[-1] if firsts else float("nan")))
+        for key, d1, k, margin, verdict in rows:
+            if verdict != "identical" or a.verbose:
+                print("   %-26s first-token delta %s  identical prefix %s tokens  margin %s  %s" % (key, "%.4f" % d1 if d1 is not None else "-", k, ("%.3f" % margin) if margin is not None else "-", verdict))
+        ok = ok and n_fl == 0 and (not firsts or firsts[-1] <= 0.25)
+    sys.exit(0 if ok else 1)
+
 # ----------------------------------------------------------------------------- selftest
 
 def cmd_selftest(_a):
@@ -418,6 +814,13 @@ def cmd_selftest(_a):
                             "encode slot=0 chunks=1 tokens=529 res=0 t_encode_ms=88.43", "decode_chunk slot=0 idx=4 tokens=529 res=0 t_decode_ms=1440.64",
                             "encode slot=0 chunks=1 tokens=529 res=0 t_encode_ms=86.87", "decode_chunk slot=0 idx=4 tokens=529 res=0 t_decode_ms=1289.95"])
     check("vod stats parse", init is not None and init["delta_mib"] == 1112.0 and len(rows) == 1 and rows[0]["n"] == 3 and rows[0]["enc_min"] == 86.87 and rows[0]["enc_med"] == 88.43 and abs(rows[0]["dec_tok_s"] - 529 / 1.44064) < 0.01)
+    t = filler(3)
+    check("filler is deterministic", t == filler(3) and t.startswith("Entry 0:") and filler(3, 2).startswith("Entry 2:"))
+    check("rec_short picks the timing fields", rec_short({"status": 200, "content": "x", "usage": {"prompt_tokens": 5, "completion_tokens": 1}, "timings": {"prompt_n": 5, "cache_n": 0, "predicted_n": 1}})["prompt_n"] == 5)
+    ra = {"p/a": [["x", -0.1, [["x", -0.1], ["y", -1.5]]], ["a", -0.2, [["a", -0.2], ["b", -0.4]]]]}
+    check("eq compare identical", eq_compare_pair(ra, {"p/a": [["x", -0.1, []], ["a", -0.2, []]]})[0][4] == "identical")
+    check("eq compare near-tie flip", eq_compare_pair(ra, {"p/a": [["x", -0.12, []], ["b", -0.4, []]]})[0][4] == "near-tie flip")
+    check("eq compare real flip", eq_compare_pair(ra, {"p/a": [["y", -1.5, []], ["b", -0.4, []]]})[0][4] == "FLIP")
     print("selftest:", "PASS" if fails == 0 else "FAIL (%d)" % fails)
     sys.exit(1 if fails else 0)
 
@@ -437,6 +840,8 @@ def main():
     p.add_argument("--np", type=int, default=1)
     p.add_argument("--extra-arg", action="append", default=[])
     p.add_argument("--env", action="append", default=[])
+    p.add_argument("--wrap", action="append", default=[])
+    p.add_argument("--stock", action="store_true", help="the stock placement (-ngl 99 -ncmoe 37 -fit off) instead of the R8 hybrid recipe")
     p = sp.add_parser("run")
     p.add_argument("--config", required=True)
     p.add_argument("--out", required=True)
@@ -449,6 +854,34 @@ def main():
     p.add_argument("dirs", nargs="+")
     p = sp.add_parser("compare")
     p.add_argument("dirs", nargs="+")
+    p = sp.add_parser("acc")
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--max-tokens", type=int, default=24)
+    p.add_argument("--port", type=int, default=18080)
+    p = sp.add_parser("acc-compare")
+    p.add_argument("dirs", nargs="+")
+    p = sp.add_parser("eq")
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--sides", default="724,1024,1448")
+    p.add_argument("--port", type=int, default=18080)
+    p = sp.add_parser("eq-compare")
+    p.add_argument("dirs", nargs="+")
+    p.add_argument("--verbose", action="store_true")
+    p = sp.add_parser("fault")
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--mode", required=True, choices=["room", "encode", "timeout"])
+    p.add_argument("--max-tokens", type=int, default=24)
+    p.add_argument("--port", type=int, default=18080)
+    p = sp.add_parser("soak")
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--n", type=int, default=120)
+    p.add_argument("--seed", type=int, default=11)
+    p.add_argument("--cancel-rate", type=float, default=0.10)
+    p.add_argument("--port", type=int, default=18080)
     a = ap.parse_args()
     if a.cmd == "selftest":
         cmd_selftest(a)
@@ -459,7 +892,7 @@ def main():
                 open(os.path.join(a.out, "%s-%d.png" % (f["name"], i)), "wb").write(png)
             print(f["name"], "expect", f["expect"])
     elif a.cmd == "mkcfg":
-        cfg = mkcfg(a.arm, a.exe, a.free_all, a.np, a.extra_arg, a.env)
+        cfg = mkcfg(a.arm, a.exe, a.free_all, a.np, a.extra_arg, a.env, a.wrap, a.stock)
         json.dump(cfg, open(a.out, "w"), indent=1)
         print(a.out, a.arm, "args:", len(cfg["args"]))
     elif a.cmd == "run":
@@ -468,6 +901,18 @@ def main():
         cmd_table(a)
     elif a.cmd == "compare":
         cmd_compare(a)
+    elif a.cmd == "acc":
+        cmd_acc(a)
+    elif a.cmd == "acc-compare":
+        cmd_acc_compare(a)
+    elif a.cmd == "eq":
+        cmd_eq(a)
+    elif a.cmd == "eq-compare":
+        cmd_eq_compare(a)
+    elif a.cmd == "fault":
+        cmd_fault(a)
+    elif a.cmd == "soak":
+        cmd_soak(a)
 
 
 if __name__ == "__main__":

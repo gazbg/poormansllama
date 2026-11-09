@@ -555,6 +555,23 @@ bool llama_hybrid_active(void) {
 #endif
 }
 
+bool llama_hybrid_vram_acquire(struct llama_context * ctx, int64_t need_bytes) {
+#ifdef LLAMA_LAYER_STREAMING
+    return hybrid_lm_vram(ctx, need_bytes, 1);
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(need_bytes);
+    return false;
+#endif
+}
+
+void llama_hybrid_vram_release(struct llama_context * ctx) {
+#ifdef LLAMA_LAYER_STREAMING
+    hybrid_lm_vram(ctx, 0, 0);
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
 bool llama_hybrid_auto_size(struct llama_context * ctx, int32_t keep_free_mib, int32_t safety_mib, int32_t min_slots, int32_t max_slots,
                             int32_t * slots_before, int32_t * slots_after, int32_t * free_before_mib) {
 #ifdef LLAMA_LAYER_STREAMING

@@ -607,6 +607,8 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+    bool mmproj_on_demand = false;              // --mmproj-on-demand (server): the projector lives parked in page-locked host memory and is on the device only while a request's images are encoded
+    int32_t mmproj_wait_timeout_s = 0;          // --mmproj-wait-timeout: seconds an image request waits for device memory for the projector (0 = without limit)
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;

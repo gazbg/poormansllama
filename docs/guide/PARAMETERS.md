@@ -123,6 +123,17 @@ Hybrid decode, with the pass for the prefill (50.7k tokens: prefill about 3.3k t
 | `LLAMA_MOE_HYBRID_ROUTE_CHECK` | off | Debug: the hybrid hook also builds the stock router on the same input and the debug callback logs `ROUTE_CHECK il=N ids=EQ/NE` and `w=EQ/NE` per layer and decode step. Slow (the callback copies tensors to the host) |
 | `LLAMA_DEBUG_LAYER_HASH` | off | Debug: FNV hash of every layer's output, for `tools/flint-layerhash.py` |
 
+### 4.3 Vision projector on demand (`--mmproj-on-demand`)
+
+Experimental, server only, default off. Plan and evidence: `docs/plans/vision-on-demand-plan.md`, `docs/plans/vision-on-demand-results.md`.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--mmproj-on-demand` | off | The vision projector (`--mmproj`) lives parked in page-locked host memory (about 0.84 GiB) and is on the GPU only while the images of a request are encoded. Between requests it holds no device memory, and with `--hybrid-moe` it does not raise the keep-free margin (a resident projector adds its estimate to the margin and never releases it; measured on the 24 GiB RTX 5090 Laptop with `-fitt 16000 --hybrid-moe-prefill-free-all`: the cache sizes to 38 slots instead of 54 and every layer-major pass is refused, 464 against 1,641 tok/s on a 5.7k-token text prompt). An image request pays one window: room is made (the expert cache shrinks, as for a pass), the projector is unparked (about 80 ms), every image the prompt cache does not hold is encoded, the embeddings stay on the host, the projector is parked and the room handed back. Needs `--mmproj` on the GPU; refused with `--no-mmproj-offload` / `-mmdev none` and for projectors with audio. Works with or without `--hybrid-moe` |
+| `--mmproj-wait-timeout SECONDS` | `0` | With `--mmproj-on-demand`: how long an image request waits for device memory for the projector before it fails with HTTP 500. `0` = no limit; a warning is logged every ~10 s while it waits and `/health` keeps answering. In the server nothing competes for the memory (one compute at a time), so a wait means another process holds the GPU |
+
+Environment variables (diagnostics and fault injection, not for normal use): `LLAMA_VOD_LOG=1` prints timing lines for the projector (init, encode, the ordinary-path decode of an image chunk); `LLAMA_VOD_FAIL_ROOM=N` makes the first N room attempts of the encode window report "no room"; `LLAMA_VOD_FAIL_ENCODE=1` makes the next window fail (that request gets HTTP 500, the projector is parked again); `LLAMA_MTMD_PARK_KEEP_BACKEND=1` keeps the projector's CUDA backend instance when it is parked (it holds 106 to 128 MiB, so this defeats the purpose).
+
 ## 5. Environment variables for the engine
 
 These are read by the engine. `--hybrid-moe` sets the ones it needs. Set them by

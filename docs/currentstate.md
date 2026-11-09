@@ -24,6 +24,16 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (vision on demand, VOD-2 done: `--mmproj-on-demand` in llama-server; idle memory equals a server without a projector; layer-major pass no longer refused)
+
+**Asked.** Owner /goal (autonomous), task VOD-2: a real server runs the request flow: projector parked between requests, one window per image request.
+
+**Answer.** `--mmproj-on-demand` (default off, works with or without `--hybrid-moe`) and `--mmproj-wait-timeout`: the projector starts parked in page-locked host memory, is not added to the hybrid margin, and for each request whose prompt holds images the cache does not cover, `vod_prepare_slot` makes the room (the expert cache shrinks as for a pass, `llama_hybrid_vram_acquire`), unparks (~80 ms), encodes every such image, parks, hands the room back and keeps the embeddings in the slot. Measured on the RTX 5090 Laptop with the owner's flags (`-fitt 16000`, free-all): with a RESIDENT projector the margin is 17,109 MiB, the cache 38 slots and every layer-major pass is refused (PP 464 tok/s on a 5.7k-token text prompt); with OD the cache is 54 slots, the pass is armed and taken (PP 1,641-1,649 tok/s), idle nvidia-smi memory equals a server without a projector (7,015 MiB after the text steps, +30 MiB after image requests), the in-process free-watch minimum is 16,297 MiB. Image requests cost a fixed +0.48..0.52 s over a resident projector (window 0.12 s + expert-cache regrow 0.37 s). A loaded projector turns the fused one-pass prefill off for ALL prompts (`has_mtmd` gate): text PP 1,641 vs 2,611 tok/s without a projector (VOD-5 candidate). Correction: an image conversation re-processes and re-encodes its images on every turn in BASE as well (no checkpoint after an image chunk), so windows open on every image turn.
+
+**Validated.** Default-off identity A B B A (pristine vs the new build without the flag): 13/13 steps identical x3, PP within 0.1%, TG within 0.6%; OD vs resident projector: 13/13 identical in text, counts and image chunks encoded per turn; fault injection (wait then succeed, encode failure -> HTTP 500 and the next request fine, timeout -> HTTP 500 after 3 s, `/health` answering); soak of 120 mixed requests (12 cancelled mid-request): 0 failed, 68/68 image answers right, idle memory +4 MiB after 76 windows; stock placement smoke 7/7; `compute-sanitizer --tool memcheck`: 0 errors with `GGML_CUDA_DISABLE_GRAPHS=1` (the 16 graph-update reports with graphs on are identical in the pristine control). Details in `docs/plans/vision-on-demand-results.md`.
+
+**Scope / known gaps.** The image tokens still take the ordinary prefill path (370-430 tok/s): VOD-4. The full host ctest list (78/78) is run at the closeout. Wait-for-room was exercised by fault injection only (no second GPU process).
+
 ## 2026-11-09 (vision on demand, VOD-1 done: mtmd park / unpark, 300 of 300 byte-identical rounds, 0.0 MiB residue after park)
 
 **Asked.** Owner /goal (autonomous), task VOD-1: the vision projector must be able to live parked in pinned host RAM and come to the device and back without changing its output.
