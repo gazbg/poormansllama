@@ -169,7 +169,7 @@ Escalation. Embeddings differ after unpark: find the cause (fattn variant select
 
 ### VOD-2: server flag, encode window, wait rule
 
-Status: done (2026-11-09, autonomous run; results in the results file, section "VOD-2"). Dependencies: VOD-1. Commit: see the progress log.
+Status: done (2026-11-09, autonomous run; results in the results file, section "VOD-2"). Dependencies: VOD-1. Commit: `69384eab`.
 
 Goal. `--mmproj-on-demand` runs the request flow above with a real server.
 
@@ -189,7 +189,7 @@ Escalation. A fix that needs a change to a normal (flag-off) execution path is r
 
 ### VOD-3: closeout of phase 1 (record and summary)
 
-Status: planned. Dependencies: VOD-2. Commit: unfilled.
+Status: done (2026-11-09, autonomous run; the Owner Summary of phase 1 is in the results file, section "VOD-3"). Dependencies: VOD-2. Commit: see the progress log.
 
 Goal. The phase-1 evidence is complete and the Owner Summary is written, so the owner can decide whether phase 1 ships before phase 2 starts.
 

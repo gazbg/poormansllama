@@ -128,3 +128,56 @@ How it works: after a slot has decided how much of its prompt the cache holds (`
 - **Text prompts, pass engagement** (DL-8; the long step is a 5,746-token prompt, `cache_prompt:false`): BASE (resident projector) takes NO pass (1 declined arming at start-up + 4 declined batches: `no room for ... margin 17269 MiB`), PP 464-465 tok/s; OD takes passes (1,403 tokens at 924-926 tok/s, 4,096 tokens at 2,181 tok/s, 1,650 tokens at 1,069 tok/s), PP 1,641-1,649 tok/s (3.5x BASE); NOVIS takes passes with the FUSED one-pass prefill (`lm-fuse: ... in one batch`), PP 2,611 tok/s. The gap between OD and NOVIS has a cause in the code, not in the memory: any server started with `--mmproj` sets `slot.prompt.tokens.has_mtmd`, and the fuse gate requires it to be false (`server-context.cpp:5631`), so with a projector loaded the fused prefill is OFF even for text-only prompts (the prompt is cut at its checkpoint, 4,096 + 1,650, two bank streams). Candidate for VOD-5 (phase 3): fuse text-only prompts on a projector server under `--mmproj-on-demand`.
 - **TG after a pass**: the 64-token step decodes at 63.9-65.5 tok/s in OD and NOVIS (pass, cache regrown) against 90-96 tok/s in BASE (no pass, cache never shrunk): a property of the pass (the cache is re-learned), not of the projector. Short outputs (2-5 tokens) give meaningless TG numbers and are not compared.
 - **Startup** (OD): the cache is sized to 54 slots as in NOVIS (BASE: 38), the pass is armed (134 ms; BASE: refused), the projector is parked (init 519-536 ms from disk to pinned memory, 0.0 MiB on the device), ready in 6.1 s with a warm file cache.
+
+## VOD-3: phase-1 closeout and Owner Summary (the agent's own autonomous acceptance of phase 1, not owner approval)
+
+Scope of this acceptance: it certifies exactly the criteria of the plan's contract for phase 1 (VOD-1 .. VOD-6 and VOD-9) on this machine (RTX 5090 Laptop, Windows, mains power), with Qwen3.6-35B-A3B Q4_K_S and its BF16 projector, with the flags listed under Conventions. It does NOT certify other models or cards, a physical 8 GiB card, `-np > 1`, audio, video, or any speed gain: performance is report-only (D10). Phase 1 leaves the image tokens on the ordinary prefill path.
+
+### 1. Original goal
+
+The owner asked whether the project's idea for model layers ("load the part that is needed when it is needed, then unload it") could also serve the vision projector, so that it does not occupy VRAM between image requests and the freed memory goes back to the expert cache, without making image requests slow (goal (a) text-turn VRAM, goal (b) image-request speed, weighted equally).
+
+### 2. How it works, in plain words
+
+The projector is the small neural network that turns a picture into the numbers the language model reads. It is about 0.84 GiB. Normally the server keeps it on the graphics card for as long as it runs, and (under `--hybrid-moe`) it also reserves another ~1.1 GiB as "keep free" margin, so the card holds it twice over. With `--mmproj-on-demand` the server keeps the projector's weights in ordinary (page-locked) RAM instead. When a request arrives that contains pictures the server has not seen in its cache, it makes room on the card (the same shrink of the expert cache that a layer-major prefill already uses), copies the projector in (about 80 ms), turns every picture of the request into numbers, throws the projector off the card again, gives the room back and continues with the normal text processing. Between requests nothing of the projector is on the card.
+
+### 3. Glossary
+
+- **Projector (mmproj):** the image encoder, a separate model file used for vision.
+- **Expert cache:** the part of VRAM that holds the most used experts of the mixture-of-experts model so that the card can serve them without waiting for the host RAM.
+- **Margin / keep-free:** the VRAM the server promises to leave unused (here 16,000 MiB, `-fitt 16000`).
+- **Layer-major pass:** the fast prefill that loads each layer's weights once for the whole prompt. It needs temporary VRAM and is refused when the margin leaves no room.
+- **PP / TG:** prompt processing speed and token generation speed, in tokens per second.
+- **Window:** the short time in which the projector sits on the card for one request.
+- **Park / unpark:** move the projector's device side away / back.
+- **Free-watch:** the server's in-process measure of the lowest free VRAM ever seen (cudaMemGetInfo).
+- **BASE / NOVIS / OD:** the server with the projector resident / without any projector / with `--mmproj-on-demand`.
+
+### 4. Pros and cons (measured / expected / unproven)
+
+Pros:
+- Between image requests the projector costs 0 MiB of VRAM: idle used memory of OD equals NOVIS (7,015 = 7,015 MiB after the text steps; +30 MiB after image requests). **Measured**, `vod2-acc-od1/od2` against `vod2-acc-novis`.
+- The expert cache keeps its full size: 54 slots at sizing and 52 at idle, against 38 and 20-21 with a resident projector. **Measured**, same sessions.
+- With a resident projector this card, at `-fitt 16000` and free-all, REFUSES the layer-major prefill every time (the double-counted margin leaves 750 MiB too little); with OD it is taken. On a 5.7k-token text prompt PP goes 464 -> 1,641-1,649 tok/s (3.5x). **Measured**, one prompt, two sessions per arm; the cause (margin double count, 1,109 MiB) is confirmed from the code and the log lines (`no room for ... margin 17269 MiB`).
+- Outputs are not changed: with the flag off the server is identical to the pristine build (13/13 steps, A B B A); with the flag on all image answers equal the resident projector's, per turn, including the number of images encoded. **Measured.**
+- The CPU option (`--no-mmproj-offload`) is 13-20x slower on the encode and 1.7-2.8x on the whole image request; OD keeps the encode on the GPU. **Measured** (VOD-0).
+- It survives the failure cases tried: no room (waits, health stays up), encode failure (HTTP 500, projector parked, next request fine), timeout, 12 cancelled requests in a 120-request soak, a stock-placement server. **Measured.**
+
+Cons and limits:
+- Every image request costs a fixed +0.48..0.52 s over a resident projector (0.12 s window + 0.37 s regrow of the expert cache, which `--hybrid-moe-prefill-free-all` empties). For a 1.6 s request that is +30%, for a 7.7 s request +6%. **Measured.** It is the price of the freed VRAM, and it is paid on EVERY image turn because an image conversation is re-processed and re-encoded on each turn (also with a resident projector). Without free-all the shrink would be smaller (**expected, unproven**).
+- The image tokens themselves still prefill at 370-430 tok/s on the ordinary path (phase 2 targets this, unproven).
+- With any projector loaded the fused one-pass prefill stays off for all prompts (text PP 1,641 vs 2,611 tok/s without a projector); not changed by phase 1 (phase 3 candidate).
+- 0.84 GiB of page-locked RAM for the life of the server. **Measured size.**
+- The flag is refused with `--no-mmproj-offload`/`-mmdev none` and for projectors with audio. `-np > 1`, other models and a real 8 GiB card are not tested.
+- The memcheck run needs `GGML_CUDA_DISABLE_GRAPHS=1` to read `0 errors`; with CUDA graphs on, the sanitizer reports 16 API-level graph-update events in the pristine server too. **Measured.**
+- A wait for room was exercised by fault injection only (no second process held the GPU).
+
+### 5. Recommendation
+
+Keep it: phase 1 is worth adopting for anyone who runs `--hybrid-moe` with a projector at a crowded VRAM margin, because it gives the VRAM and the layer-major prefill back at a fixed +0.5 s per image request. Keep experimenting with phases 2 and 3 (image tokens through the pass, fused prefill with projector loaded), which are what can remove the +0.5 s and the image-prefill gap. To decide for your own card, repeat `tools/run-server-vision.sh` with `SV_CMD=acc` on `--arm base` and `--arm od` and compare the idle memory and the pass lines.
+
+### VOD-9 (no regression) at the phase-1 closeout, tree `69384eab`
+
+- Full build of every target (`cmake --build build/llama-cuda --config Release`, `build/vod-build-all.log`, exit 0).
+- The host ctest list (`ctest --test-dir build/llama-cuda -C Release -R <the host suite's Include> -E 'tail513-(lm|bm)(-run)?$'`, run directly because the suite halts at its doc-size guard): **78/78 passed**. `test-layer-streaming-(route-topk|host-mem)$`: **2/2**. `ctest -R mtmd`: **2/2** (`test-mtmd-c-api`, `test-mtmd-impl`). `python tools/server_vision.py selftest`: PASS.
+- Default-off identity at server level: VOD-2 table above (A B B A, 13/13).
