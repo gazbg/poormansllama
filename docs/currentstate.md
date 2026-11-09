@@ -24,6 +24,14 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (hybrid thread defaults: expert team = physical cores - 1, `-t` = 1 with `--hybrid-moe`; owner request, host-only check, no GPU run)
+
+- **Asked (owner, chat):** "default moe threads should be physical cores -1 and the -t should be by default = 1". Not an autonomous-mode task; nothing staged or committed.
+- **Expert team** (`src/llama-moe-hybrid.cpp`, `moe_hybrid_default_threads()`): default = physical cores the process may use minus one, at least 1, no cap at 8 (was `min(8, cores)`). Unreadable topology still gives 8. With the default pinning (logical CPU 2 up, stride 2) that is every physical core except core 0, the interrupt core (G16). The "defaults to N threads" WARN line is now printed on every default run, not only below 8.
+- **`-t`** (`common/arg.cpp`, `common/common.h`): with `--hybrid-moe` and no `-t` / `LLAMA_ARG_THREADS`, `cpuparams.n_threads = 1` (new `n_threads_set`). `-tb` keeps the stock default (a batch under 32 tokens, e.g. the `--lm-prefill-ckpt-chunk 24` tail, still computes its experts on the CPU). The MTP draft head inherits `-t`, so it now runs on 1 thread unless `-td` is given. Without `--hybrid-moe` nothing changes.
+- **Checked (CPU only, `CUDA_VISIBLE_DEVICES=-1`, missing model path, `llama-server.exe` Release build exit 0):** `--hybrid-moe` -> `n_threads = 1 (n_threads_batch = 16)`; `--hybrid-moe -t 6` -> 6 / 6; `--hybrid-moe -tb 4` -> 1 / 4; no flag -> 16 / 16; `-t 3` -> 3 / 3 (this machine: 16 physical cores).
+- **Not measured:** any decode or prefill speed. The team default here goes from 8 to 15 threads (all earlier tuning used 8; on the 4-core i7-4770K the measured good size was 4, the new default there is 3). The MTP draft head at 1 thread and the 24-token checkpoint chunk are the two paths that could slow down. Edited docs: `docs/guide/PARAMETERS.md`, `docs/guide/LINUX-PASCAL.md`; older entries below that say "at most 8" are history.
+
 ## 2026-11-07 (setup wizard D22: Pascal-or-lower int8 attention, --lm-prefill-prearm always for all profiles, port input defaulting to 8090)
 
 **Asked.** Owner: (1) 'for Pascal architecture and lower add --lm-prefill-attn-int8 if it is different from the env LLAMA_FATTN_TILE_Q8QK=1, if not different just make sure the env is set for all older architectures'; (2) 'for all profiles add --lm-prefill-prearm always'; (3) 'add in the setup wizard port input from the user, leave default to 8090'.
