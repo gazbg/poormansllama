@@ -174,9 +174,35 @@ struct clip_ctx {
 
     bool support_batch = false;
 
+    // VOD-1 park / unpark (docs/plans/vision-on-demand-plan.md). A parked context holds the weights in a page-locked host mirror and NOTHING on the device: no weights buffer,
+    // no compute buffers, no backend instance (its memory pool and cuBLAS state go with it). The tensors of ctx_data are unallocated while parked.
+    struct park_ent {
+        ggml_tensor * t;     // the tensor in ctx_data
+        size_t        off;   // offset of its bytes in buf_host
+        size_t        n;     // ggml_nbytes
+    };
+    bool park_on_init = false;                 // requested by clip_context_params
+    bool parked = false;
+    ggml_backend_dev_t dev_gpu = nullptr;      // device of the accelerated backend, nullptr when the context runs on the CPU
+    ggml_backend_buffer_ptr buf_host;          // page-locked mirror of all weights (kept for the life of a park_on_init context)
+    std::vector<park_ent> park_ents;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
+
+    // (re)create the scheduler over the current backend_ptrs
+    void make_sched() {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true));
+        if (cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+        }
+    }
+
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        park_on_init = ctx_params.park_on_init;
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -198,6 +224,7 @@ struct clip_ctx {
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
             backend_ptrs.push_back(backend);
             backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+            dev_gpu = ggml_backend_get_device(backend);
         } else {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
@@ -225,7 +252,10 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
-        ggml_backend_free(backend);
+        // a parked context has no accelerated backend (backend == nullptr)
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
         }
@@ -4208,6 +4238,57 @@ struct clip_model_loader {
                 total_data_size += ggml_nbytes(t);
             }
 
+            if (ctx_clip.park_on_init) {
+                // VOD-1: the weights go straight into a page-locked host mirror; the tensors of ctx_data stay unallocated until clip_unpark()
+                if (ctx_clip.dev_gpu == nullptr) {
+                    throw std::runtime_error(string_format("%s: park_on_init needs an accelerated backend (this context runs on the CPU)\n", __func__));
+                }
+                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ctx_clip.dev_gpu);
+                if (host_buft == nullptr) {
+                    LOG_WRN("%s: no page-locked buffer type for %s, the host mirror is pageable memory (slower unpark)\n", __func__, ggml_backend_dev_name(ctx_clip.dev_gpu));
+                    host_buft = ggml_backend_get_default_buffer_type(ctx_clip.backend_cpu);
+                }
+                std::vector<clip_ctx::park_ent> ents;
+                size_t total = 0;
+                for (auto & t : tensors_to_load) {
+                    ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+                    GGML_ASSERT(cur && "tensor not found in ctx_data");
+                    total = GGML_PAD(total, 64);
+                    ents.push_back({ cur, total, ggml_nbytes(cur) });
+                    total += ggml_nbytes(cur);
+                }
+                ctx_clip.buf_host.reset(ggml_backend_buft_alloc_buffer(host_buft, total));
+                if (!ctx_clip.buf_host) {
+                    throw std::runtime_error(string_format("%s: failed to allocate the %.1f MiB host mirror of the weights\n", __func__, total / 1024.0 / 1024.0));
+                }
+                uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(ctx_clip.buf_host.get());
+                if (!ctx_clip.no_alloc) {
+                    size_t data_loaded = 0;
+                    for (auto & e : ents) {
+                        auto it_off = tensor_offset.find(e.t->name);
+                        GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
+                        fin.seekg(it_off->second, std::ios::beg);
+                        if (!fin) {
+                            throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, e.t->name));
+                        }
+                        fin.read(reinterpret_cast<char *>(base + e.off), e.n);
+                        if (!fin) {
+                            throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, e.t->name));
+                        }
+                        data_loaded += e.n;
+                        if (progress_callback && total_data_size > 0) {
+                            if (!progress_callback((float) data_loaded / (float) total_data_size, progress_callback_user_data)) {
+                                throw std::runtime_error(string_format("%s: model loading cancelled by progress_callback\n", __func__));
+                            }
+                        }
+                    }
+                }
+                ctx_clip.park_ents = std::move(ents);
+                LOG_INF("%s: parked: %.1f MiB of weights in a %s host mirror, nothing on the device\n", __func__, total / 1024.0 / 1024.0, ggml_backend_buft_name(host_buft));
+                fin.close();
+                return;
+            }
+
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
@@ -4566,6 +4647,32 @@ struct clip_model_loader {
     }
 };
 
+// VOD-1: free everything the context holds on the device: the compute buffers (scheduler), the weights buffer and the accelerated backend with its memory pool.
+// The weights stay in the host mirror; the tensors of ctx_data become unallocated. Used by clip_init (the first park) and clip_park.
+// LLAMA_MTMD_PARK_KEEP_BACKEND=1 keeps the backend instance (diagnostic: measures what the pool and the handles hold).
+static void clip_release_device(clip_ctx * ctx) {
+    static const bool keep_backend = std::getenv("LLAMA_MTMD_PARK_KEEP_BACKEND") != nullptr && std::atoi(std::getenv("LLAMA_MTMD_PARK_KEEP_BACKEND")) > 0;
+    const bool has_accel = ctx->backend != nullptr && ctx->backend != ctx->backend_cpu;
+    if (has_accel) {
+        ggml_backend_synchronize(ctx->backend);
+    }
+    ctx->sched.reset();
+    ctx->is_allocated = false;
+    ctx->mem_compute.clear();
+    ctx->buf.reset();
+    for (auto & e : ctx->park_ents) {
+        e.t->data   = nullptr;
+        e.t->buffer = nullptr;
+    }
+    if (has_accel && !keep_backend) {
+        ggml_backend_free(ctx->backend);
+        ctx->backend = nullptr;
+        ctx->backend_ptrs[0] = nullptr;
+        ctx->backend_buft[0] = nullptr;
+    }
+    ctx->parked = true;
+}
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
@@ -4578,13 +4685,21 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_params.progress_callback_user_data);
         bool skip_audio = false;
 
+        if (ctx_params.park_on_init && (loader.has_audio || loader.has_gen_audio)) {
+            throw std::runtime_error("park_on_init supports vision-only projectors, this one has audio contexts");
+        }
+
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_params.park_on_init) {
                 loader.warmup(*ctx_vision);
+            }
+            if (ctx_params.park_on_init) {
+                // the compute buffers are reserved by the first encode after clip_unpark(), for the batch it gets
+                clip_release_device(ctx_vision);
             }
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
@@ -4653,6 +4768,72 @@ void clip_free(clip_ctx * ctx) {
         return;
     }
     delete ctx;
+}
+
+bool clip_is_parked(const clip_ctx * ctx) {
+    return ctx != nullptr && ctx->parked;
+}
+
+bool clip_park(clip_ctx * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (ctx->parked) {
+        return true;
+    }
+    if (ctx->park_ents.empty() || !ctx->buf_host) {
+        LOG_ERR("%s: this context was not created with park_on_init, it has no host mirror of its weights and cannot be parked\n", __func__);
+        return false;
+    }
+    clip_release_device(ctx);
+    return true;
+}
+
+bool clip_unpark(clip_ctx * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (!ctx->parked) {
+        return true;
+    }
+    GGML_ASSERT(ctx->dev_gpu != nullptr && ctx->buf_host && !ctx->park_ents.empty());
+
+    // back to the parked state on any failure below: the context never ends up half unparked
+    auto undo = [&]() {
+        clip_release_device(ctx);
+    };
+
+    // the accelerated backend (a parked context has freed it, unless LLAMA_MTMD_PARK_KEEP_BACKEND is set)
+    if (ctx->backend == nullptr) {
+        ggml_backend_t be = ggml_backend_dev_init(ctx->dev_gpu, nullptr);
+        if (be == nullptr) {
+            LOG_ERR("%s: failed to initialize the \"%s\" backend\n", __func__, ggml_backend_dev_name(ctx->dev_gpu));
+            return false;
+        }
+        ctx->backend         = be;
+        ctx->backend_ptrs[0] = be;
+        ctx->backend_buft[0] = ggml_backend_get_default_buffer_type(be);
+    }
+
+    // the weights buffer: all tensors of ctx_data are unallocated, one allocation places them like the resident load did
+    ctx->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), ctx->backend_buft[0]));
+    if (!ctx->buf) {
+        LOG_ERR("%s: failed to allocate the device buffer for the weights (out of device memory?)\n", __func__);
+        undo();
+        return false;
+    }
+    ggml_backend_buffer_set_usage(ctx->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(ctx->buf_host.get());
+    for (const auto & e : ctx->park_ents) {
+        ggml_backend_tensor_set_async(ctx->backend, e.t, base + e.off, 0, e.n);
+    }
+    ggml_backend_synchronize(ctx->backend);
+
+    ctx->make_sched();
+    ctx->is_allocated = false; // clip_encode() reserves the compute buffers for the batch it gets
+    ctx->parked = false;
+    return true;
 }
 
 const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
@@ -5222,6 +5403,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
     if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
+        return false;
+    }
+
+    if (ctx->parked) {
+        LOG_ERR("%s: the projector is parked, call mtmd_unpark() first\n", __func__);
         return false;
     }
 

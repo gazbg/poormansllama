@@ -380,6 +380,10 @@ llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
 
+# VOD-1 (docs/plans/vision-on-demand-plan.md): park / unpark of the vision projector. GPU test that needs a projector and a model path: built, NOT registered with ctest.
+# Run: test-mtmd-park <mmproj.gguf> <text-model.gguf> [cycles] under tools/with-gpu-lock.ps1
+llama_build(test-mtmd-park.cpp LINK mtmd)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

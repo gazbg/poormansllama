@@ -121,7 +121,7 @@ Order: VOD-0 -> VOD-1 -> VOD-2 -> VOD-3 (-> VOD-4 phase 2 -> VOD-5 phase 3) and 
 
 ### VOD-0: measure and verify the hypotheses, build the harness
 
-Status: done (2026-11-09, autonomous run under the owner's /goal; results in [vision-on-demand-results.md](vision-on-demand-results.md)). Dependencies: none. Commit: see the progress log (the verdict commit lands with this status change).
+Status: done (2026-11-09, autonomous run under the owner's /goal; results in [vision-on-demand-results.md](vision-on-demand-results.md)). Dependencies: none. Commit: `150a8fbf`.
 
 Goal. Turn the open questions into numbers before any engine edit, and create the harness every later task uses.
 
@@ -147,7 +147,7 @@ Escalation. If M1 shows the projector costs far more than ~1.5 GiB of cache (or 
 
 ### VOD-1: park / unpark in mtmd and clip (library)
 
-Status: planned. Dependencies: VOD-0. Commit: unfilled.
+Status: done (2026-11-09, autonomous run; results in the results file, section "VOD-1"). Dependencies: VOD-0. Commit: see the progress log.
 
 Goal. The projector can live parked: weights in a pinned host buffer, nothing on the device, and be brought to the device and back without changing its output.
 
@@ -278,9 +278,13 @@ Format: question, options considered, choice, reason, reversible?, evidence.
 - **DL-6 trio fixture.** Q: the digit trio fixture was misread by the CONTROL (BASE) itself (5206 -> 5246 at 724 px, 3917 -> 291 at 1024 px), so it cannot discriminate arms. Options: keep it and exclude it from comparisons, or replace it. Chose: replace it with three colour squares at 724 px (read reliably), BEFORE any acceptance run; keep the single-image colour and digit fixtures. Reason: a fixture the control fails proves nothing about OD. This changes a fixture, not a criterion (the criterion is "OD answers wherever BASE answers"). Reversible: yes. Evidence: `vod0-base`, `vod0-baselog1/2` (digit trio wrong in BASE), `vod0-fixchk` (7 of 7 right, negative control fails as designed).
 - **DL-7 VOD-0 escalation.** The plan's VOD-0 escalation ("if M1 shows the projector costs far more than ~1.5 GiB of cache, or less than ~0.3 GiB, stop for the owner") becomes a recorded decision under the autonomous grant. Measured: 16 slots = 1,112 MiB of cache (0.3-1.5 GiB band) plus a refused startup pass arming. Chose: continue to VOD-1 unchanged. Reversible: n/a (a go decision). Evidence: results file M1/M2.
 - **DL-8 added report-only line.** Phase 0 showed that the consequence of the double-counted margin reaches the pass (declined arming). Added to the REPORT-ONLY list (not to the hard criteria, so no criterion is weakened or tightened): "pass engagement on a long text prompt (passes taken vs declined, `LLAMA_LM_LOG=1`), BASE vs OD vs NOVIS". Decided before any VOD-2/3 run. Reversible: yes.
+- **DL-9 park frees the accelerated backend.** Q: on `clip_park`, keep the CUDA backend instance (cheap re-init) or free it? Options: keep, free. Chose: free it. Reason: measured with `LLAMA_MTMD_PARK_KEEP_BACKEND=1` (diagnostic knob kept in the code): 106-128 MiB stay resident after park (the backend's memory pool and handles), which fails the < 64 MiB residue criterion; freeing it costs nothing measurable (unpark 76.7 ms including the re-init). Reversible: yes. Evidence: `vod1-keepbe` vs `vod1-park100`.
+- **DL-10 compute buffer per batch.** Q: reserve the worst-case compute buffer at unpark (248.1 MiB, as the resident warm-up does) or let the first encode reserve it for its batch? Chose: per batch (the existing lazy `warmup()` in `clip_encode`), because embeddings stay byte-identical (300/300) and the buffer is 23-92 MiB at 196-784 tokens. For the room request VOD-2 still asks for weights + the worst-case buffer + 128 MiB backend state until a tighter bound exists. Reversible: yes. Evidence: results file VOD-1.
+- **DL-11 test registration.** `test-mtmd-park` needs a model and a projector path, so it is built but NOT registered with ctest (it would fail the host ctest list without arguments, like the model-backed layer-streaming `-run` targets AGENTS.md warns about). Reversible: yes.
 - **DL-4 VOD-0 engine edit.** The plan allows a log-only, env-gated change (`LLAMA_VOD_LOG=1`). It is applied to a COPY of the control: BASE (`bin/vod-base`) is side-copied from the pristine build before the edit, so M1 uses the untouched binary and the timing arms use the log build.
 
 ## Progress log
 
+- 2026-11-09 (autonomous run, VOD-1 done): `park_on_init` / `mtmd_park` / `mtmd_unpark` / `mtmd_is_parked` (+ clip equivalents) and `tests/test-mtmd-park.cpp`. 300 of 300 rounds byte-identical embeddings over 100 cycles x 3 fixtures, residue after park 0.0 MiB, unpark 76.7 ms, park 6.0 ms, memcheck `ERROR SUMMARY: 0 errors`, `ctest -R mtmd` 2/2. Decisions DL-9..DL-11. VOD-0 commit `150a8fbf`; VOD-1 verdict commit recorded in the next progress entry.
 - 2026-11-09 (autonomous run, VOD-0 done): CUDA build in this worktree (`bin/vod-base` pristine, digest 1B3F05238E46FC48; `bin/vod0` log-only, 82C1449B1E58B90E); harness `tools/server_vision.py` + `tools/run-server-vision.sh`; seven server sessions (`vod0-*`). H1 CONFIRMED: the resident projector (1,112 MiB measured) raises the hybrid margin to 17,109 MiB, cache 38 vs 54 slots, and the startup pass arming is refused (750 MiB short). GPU encode 85 / 249 / 835 ms vs CPU 1.73 / 4.03 / 11.08 s at 529 / 1,024 / 2,025 tokens; ordinary-path image prefill ~370-430 tok/s. Decisions DL-5..DL-8. Detail: results file.
 - 2026-11-09: discussion with the owner (four question rounds), decisions D1-D13 recorded above, code read as listed in F1-F11, public Hugging Face tree listings read (no download), local projector hashed. No engine file touched, no GPU workload run.

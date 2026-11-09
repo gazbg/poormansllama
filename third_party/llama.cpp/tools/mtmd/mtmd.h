@@ -132,6 +132,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // VOD-1 (docs/plans/vision-on-demand-plan.md): start PARKED. The vision projector's weights then live in a page-locked host buffer and nothing is on the device until
+    // mtmd_unpark(). Vision-only projectors on an accelerated backend; mtmd_init_from_file() fails for a projector that also has audio. (Added last: positional initialisation.)
+    bool park_on_init;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -145,6 +149,13 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+// VOD-1: bring the projector to the device / take it back (see mtmd_context_params::park_on_init).
+// Both succeed as a no-op when the context already is in the requested state. mtmd_unpark() returns false (the context stays parked) when the device memory cannot be allocated.
+// Only a context created with park_on_init can be parked. While parked, mtmd_tokenize() works (it is host-only) and mtmd_encode*() / mtmd_batch_encode() fail.
+MTMD_API bool mtmd_park(mtmd_context * ctx);
+MTMD_API bool mtmd_unpark(mtmd_context * ctx);
+MTMD_API bool mtmd_is_parked(const mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk

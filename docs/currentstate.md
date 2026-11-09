@@ -24,6 +24,16 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (vision on demand, VOD-1 done: mtmd park / unpark, 300 of 300 byte-identical rounds, 0.0 MiB residue after park)
+
+**Asked.** Owner /goal (autonomous), task VOD-1: the vision projector must be able to live parked in pinned host RAM and come to the device and back without changing its output.
+
+**Answer.** `park_on_init`, `mtmd_park()` / `mtmd_unpark()` / `mtmd_is_parked()` (and the `clip_*` equivalents) in `third_party/llama.cpp/tools/mtmd/`; a parked-init context reads its 861 MiB of weights into a `CUDA_Host` buffer and holds nothing on the device (no weights, no compute buffers, no backend instance); unpark re-creates the backend, allocates and fills the weights from the mirror and re-creates the scheduler; the first encode reserves the compute buffer for its batch (23 / 39 / 92 MiB at 196 / 336 / 784 tokens against 248 MiB worst case). New test `tests/test-mtmd-park.cpp` (built, not registered with ctest: needs a model and a projector path).
+
+**Validated.** `test-mtmd-park` under `tools/with-gpu-lock.ps1`: 100 cycles x 3 fixtures = 300 rounds, embeddings byte-identical to a resident context in 300 of 300, residue after park 0.0 MiB (cudaMemGetInfo), mean unpark 76.7 ms, park 6.0 ms; `compute-sanitizer --tool memcheck`: `ERROR SUMMARY: 0 errors`; diagnostic with the backend kept alive leaves 106-128 MiB (hence the backend is freed on park); `ctest -R mtmd` 2/2. Details in `docs/plans/vision-on-demand-results.md`.
+
+**Scope / known gaps.** Library level only: no server integration yet (VOD-2), no real out-of-memory exercised in `clip_unpark`, vision-only projectors on an accelerated backend (audio refused at init). The full host ctest list (78/78) is run at the closeout of the goal.
+
 ## 2026-11-09 (vision on demand, VOD-0 done: H1 confirmed, projector costs 1,112 MiB + a refused startup pass arming; GPU vs CPU encode measured)
 
 **Asked.** Owner /goal (autonomous): implement the vision projector on demand per `docs/plans/vision-on-demand-plan.md`; VOD-0 is the measurement task.

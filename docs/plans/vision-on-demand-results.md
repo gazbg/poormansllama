@@ -72,3 +72,29 @@ Median decode time of an image chunk (`mtmd_helper_decode_image_chunk`, `vod: de
 ## VOD-0 status
 
 Acceptance (plan): M1-M5 tabulated with commands, build digests, GPU probes, power state and VRAM units; H1 stated. Met. The log-only engine change is behind `LLAMA_VOD_LOG`; the default-off identity of the final build is re-checked in VOD-2 (criterion VOD-1) on the final binary. No speed or VRAM claim beyond the measurements above is made.
+
+## VOD-1: park / unpark in mtmd and clip (library)
+
+Change (engine, `third_party/llama.cpp`): `tools/mtmd/clip.{h,cpp}` (`clip_context_params::park_on_init`, `clip_park`, `clip_unpark`, `clip_is_parked`, `clip_release_device`, a parked-load branch in `load_tensors`, a guard in `clip_encode`), `tools/mtmd/mtmd.{h,cpp}` (`mtmd_context_params::park_on_init`, `mtmd_park`, `mtmd_unpark`, `mtmd_is_parked`), `tests/test-mtmd-park.cpp` (+ CMake: built, not registered with ctest). New struct members are appended LAST (both structs are initialised positionally). Behaviour with `park_on_init == false` is the previous code path (the resident branch of `load_tensors` is untouched; `clip_encode` only gained the parked guard).
+
+How it works: a parked-init context reads the 861.0 MiB of weights straight into a page-locked host buffer (`CUDA_Host`), leaves every tensor of `ctx_data` unallocated, skips the warm-up, and frees its scheduler and its accelerated backend instance. `clip_unpark` re-creates the backend, allocates the device buffer for all tensors in one `ggml_backend_alloc_ctx_tensors_from_buft`, copies the weights with async sets from the host mirror, re-creates the scheduler; the first encode then reserves the compute buffers for ITS batch (the existing lazy `warmup()` of `clip_encode`). `clip_park` frees scheduler, device buffer and backend and nulls the tensors' data pointers. An audio-bearing projector is refused at init.
+
+Test: `test-mtmd-park <mmproj> <text model> [cycles]` (the text model is loaded vocab-only), GPU, three fixtures (448x448, 672x512, 896x896 px = 196 / 336 / 784 tokens). Command: `pwsh -NoProfile -File tools/with-gpu-lock.ps1 -AllowUnprovenanced -VerdictTag <tag> -Command "build\llama-cuda\bin\Release\test-mtmd-park.exe C:/Models/ALL/other/qwen-3.6/mmproj-qwen-35b-tq3-BF16.gguf C:/Models/ALL/other/qwen-3.6/Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf <cycles>"` with `MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"` exported (Git Bash otherwise rewrites the `C:/...` arguments: first run `vod1-park3` died on the mangled path). The wrapper attested the test binary (`PROVENANCE GATE ... 1 complete, 0 refused`, source digest `7D4B511BC3147E7B`, `llama.dll` hash prefix `EF1D618600F9C8A9`).
+
+| Session | cycles | rounds | embeddings byte-identical (memcmp) | max residue after park (cudaMemGetInfo) | result |
+|---------|--------|--------|------------------------------------|-----------------------------------------|--------|
+| `vod1-park3` | 3 | 9 | 9 of 9 | 0.0 MiB | ALL PASS |
+| `vod1-park100` | 100 | 300 | **300 of 300** | **0.0 MiB** | ALL PASS |
+| `vod1-memcheck` (compute-sanitizer memcheck, `--print-limit 500`) | 2 | 6 | 6 of 6 | 0.0 MiB | ALL PASS, `ERROR SUMMARY: 0 errors` |
+| `vod1-keepbe` (diagnostic, `LLAMA_MTMD_PARK_KEEP_BACKEND=1`) | 3 | 9 | 9 of 9 | **128.0 MiB** (106 / 124 / 128) | the < 64 MiB criterion FAILS as expected |
+
+Timings (`vod1-park100`, 300 rounds, mean): parked init 490.5 ms (disk to pinned host), **unpark 76.7 ms**, encode 83.6 ms (includes the compute-buffer allocation of the batch), **park 6.0 ms**. Device memory while unparked (cudaMemGetInfo, baseline = no projector): 992.0 / 1,026.0 / 1,082.0 MiB for 196 / 336 / 784 tokens = 861.0 MiB weights + the per-batch compute buffer (22.98 / 39.40 / 91.92 MiB, from the `reserve_compute_meta` lines) + ~108-130 MiB of backend state and pool. A parked context holds exactly the baseline (23,121.0 MiB free before and after).
+
+Findings:
+- **H5 resolved (embeddings identical):** the parked/unparked context reserves a different compute buffer than the resident one (22.98-91.92 MiB per batch against the 248.10 MiB worst-case warm-up) and still produces byte-identical embeddings in every round: the kernel selection does not depend on the reserve shape here.
+- **H3 resolved:** the worst-case compute buffer (248.1 MiB) is far above what a small request needs (23-92 MiB). The window can allocate per batch; for the room request (`need_bytes`) VOD-2 uses weights + the worst-case buffer + 128 MiB of backend state until it has a better bound.
+- **H4 resolved for the CUDA allocator:** after `clip_park` the free memory returns to the baseline exactly (0.0 MiB residue over 300 rounds). Freeing the backend is REQUIRED for that: with the backend kept, 106-128 MiB stay (pool and handles).
+- A parked projector has to be given back the same way after any failure: `clip_unpark` returns the context to the parked state on an allocation failure (not exercised on a real OOM here; the fault-injection arm of VOD-2 covers the server's reaction).
+- Host tests: `ctest -R mtmd` 2/2 (`test-mtmd-c-api`, `test-mtmd-impl`). The full host ctest list (78/78) is run once at the closeout on the final tree.
+
+VOD-1 acceptance (plan): VOD-2 (embeddings identical over 100 cycles) MET at library level; VOD-3 (i)/(ii) idle bytes and no leak MET at library level (0.0 MiB residue; server-level idle comparison is VOD-2/VOD-3's); VOD-1 default-off identity is checked at server level on the final binary (VOD-2). Memcheck on the library path: 0 errors.
