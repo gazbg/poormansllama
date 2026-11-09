@@ -37,9 +37,9 @@ has_int8() {
 echo "  main marker at line $CUT_AT"
 
 # iterate over the exact rows like the wizard does: (model, vram, ctx, quant)
-ROWS='qwen38 full 262k q4k_m qwen38 16g 262k q4k_m qwen38 8g 128k q4k_m flint full 262k q5k_xl qwen36 full 262k q8k_xl qwen36 16g 262k q8k_xl qwen36 8g 262k q4k_m qwen36 16g 262k q4k_m'
+ROWS='qwen38 full 262k q4k_m qwen38 16g 262k q4k_m qwen38 8g 128k q4k_m flint full 262k q5k_xl qwen36 full 262k q8k_xl qwen36 16g 262k q8k_xl qwen36 8g 262k q4k_m qwen36 16g 262k q4k_m apex35 full 262k q5k_m'
 i=0
-while [ $i -lt 8 ]; do
+while [ $i -lt 9 ]; do
     m=$(echo "$ROWS" | cut -d' ' -f$((i*4+1)))
     v=$(echo "$ROWS" | cut -d' ' -f$((i*4+2)))
     c=$(echo "$ROWS" | cut -d' ' -f$((i*4+3)))
@@ -79,5 +79,5 @@ unset SETUP_WIZARD_GPU_CC
 
 echo
 if [ "$FAIL" -gt 0 ]; then echo "D22 sh: $FAIL check(s) FAILED"; exit 1; fi
-echo "D22 sh: all 8x6x4 + 3 checks passed"
+echo "D22 sh: all 9x6x4 + 3 checks passed"
 exit 0

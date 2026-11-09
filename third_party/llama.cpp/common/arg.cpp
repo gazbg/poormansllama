@@ -1794,7 +1794,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_HYBRID_MOE_SLOW_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--hybrid-moe-threads"}, "N",
-        "with --hybrid-moe: size of the host expert team, the threads that compute the expert misses on the CPU (the last one is the engine thread). Default: the physical cores, at most 8. Set it to the physical core count on a slower CPU",
+        "with --hybrid-moe: size of the host expert team, the threads that compute the expert misses on the CPU (the last one is the engine thread). Default: 1 with 4 or fewer physical cores, 2 with 5 to 8, 3 with more than 8. Set it to the physical core count on a slower CPU",
         [](common_params & params, int value) {
             params.hybrid_moe_threads = value;
         }
