@@ -1495,19 +1495,36 @@ bool llama_kv_cache::lazy_commit_rows(uint32_t rows, llama_context * lctx) {
     return true;
 }
 
-int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why) const {
+int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why, uint32_t * n_old_out) const {
     auto no = [&](const std::string & s) -> int64_t {
         if (why != nullptr) {
             *why = s;
         }
         return -1;
     };
+    if (n_old_out != nullptr) {
+        *n_old_out = 0;
+    }
     if (other || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0 || n_new == 0) {
         return no("unsupported cache (shared cells, several streams, sliding window or a bad sequence id)");
     }
     const auto & cells = v_cells[seq_to_stream[seq_id]];
     const uint32_t size  = cells.size();
-    const uint32_t n_old = (uint32_t) p0;
+    // VOD-4: the cells the sequence holds. For a sequence of text tokens that is p0 (one cell per position); the rows of an M-RoPE image all carry the image's temporal position, so a sequence
+    // with images holds MORE cells than positions. The pass addresses keys by cell index relative to the cell of position 0, so what it needs is a run of cells in order, not cell == position.
+    uint32_t n_old = (uint32_t) p0;
+    if (p0 > 0) {
+        uint32_t n_seq_cells = 0;
+        for (uint32_t i = 0; i < size; ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+                n_seq_cells++;
+            }
+        }
+        if (n_seq_cells < n_old) {
+            return no("the sequence holds " + std::to_string(n_seq_cells) + " cells for " + std::to_string(p0) + " positions");
+        }
+        n_old = n_seq_cells;
+    }
     if ((uint64_t) n_old + n_new > size) {
         return no("the batch does not fit the cache (" + std::to_string(n_old) + " + " + std::to_string(n_new) + " > " + std::to_string(size) + ")");
     }
@@ -1543,11 +1560,22 @@ int64_t llama_kv_cache::lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_n
     if ((uint64_t) c0 + n_old + n_new > size) {
         return no("the block at cell " + std::to_string(c0) + " leaves no room for " + std::to_string(n_new) + " more cells before the end of the cache");
     }
+    // text only (one cell per position): cell == c0 + position, as before. With M-RoPE image rows (more cells than positions): the run of cells is the whole sequence, in order, its positions never
+    // decrease (a later cell is never attended by an earlier position, so the causal order by cell index equals the ordinary path's by position) and the last one is the newest position
+    const bool strict = n_old == (uint32_t) p0;
+    llama_pos  prev   = -1;
     for (uint32_t i = 0; i < n_old; ++i) {
         const uint32_t c = c0 + i;
-        if (cells.is_empty(c) || cells.seq_count(c) != 1 || cells.seq_get(c) != seq_id || cells.pos_get(c) != (llama_pos) i) {
-            return no("the block starting at cell " + std::to_string(c0) + " breaks at cell " + std::to_string(c) + " (" + who(c) + ", expected seq " + std::to_string(seq_id) + " pos " + std::to_string(i) + ")");
+        if (cells.is_empty(c) || cells.seq_count(c) != 1 || cells.seq_get(c) != seq_id || (strict && cells.pos_get(c) != (llama_pos) i) || cells.pos_get(c) < prev) {
+            return no("the block starting at cell " + std::to_string(c0) + " breaks at cell " + std::to_string(c) + " (" + who(c) + ", expected seq " + std::to_string(seq_id) + (strict ? " pos " + std::to_string(i) : std::string(" a position not below ") + std::to_string(prev)) + ")");
         }
+        prev = cells.pos_get(c);
+    }
+    if (prev != p0 - 1) {
+        return no("the block starting at cell " + std::to_string(c0) + " ends at position " + std::to_string(prev) + ", not " + std::to_string(p0 - 1));
+    }
+    if (n_old_out != nullptr) {
+        *n_old_out = n_old;
     }
     for (uint32_t i = 0; i < n_new; ++i) {
         if (!cells.is_empty(c0 + n_old + i)) {

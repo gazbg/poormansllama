@@ -24,6 +24,34 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (vision on demand, VOD-4 done: the layer-major pass takes image embeddings, images 2 and 3 of a request and the text behind an image)
+
+**Asked.** Owner /goal (autonomous), task VOD-4 (phase 2): prefill the image rows through the layer-major pass instead of the 370-430 tok/s ordinary path.
+
+**Answer.** The pass plans an embedding-only batch (`llama_lm_plan::embd`), counts the cells the sequence holds separately from its positions (`n_old`; an M-RoPE image gives all its rows one position), so it also takes images 2 and 3 of a request (positions 4 / 38 / 72) and a text batch behind an image, and (DL-18) cuts the chunks of such a batch from the batch start like the ordinary path. Rates (hybrid recipe, medians): 1,024 rows 702 tok/s, 2,025 rows 1,283-1,300, 5,116 rows 2,450-2,570. Sessions `vod4*`, builds `vod4a` / `vod4b` / `vod4c` (final, digest F96CCCEBEF3C46EB).
+
+**Validated.** Acc 13/13 steps identical to the resident-projector control (text, `prompt_n / cache_n / predicted_n`, image chunks per turn); soak 120 requests (12 cancelled) 0 failed, 68/68 answers right, idle 7,027 -> 7,031 MiB; free-watch minimum 16,297 MiB (in-process, cudaMemGetInfo); compute-sanitizer memcheck (graphs off) over 15 passes `ERROR SUMMARY: 0 errors`. Equivalence on the stock placement (no expert cache; the ordinary arm repeats exactly): pass at chunk 512 vs ordinary 512 bit-identical on 14 prompts, at 2,048 max first-token delta 0.1977 (bound 0.25), the ordinary path's own 512 -> 2,048 change up to 0.7272. Diagnosis (DL-17): attention numerics ruled out (two switches, identical to the digit); the pass cut an image batch on an absolute-position grid (508 / 512 / 4 at position 4) where the ordinary path cuts 512 / 512 -> fixed.
+
+**Scope / known gaps.** On the hybrid expert cache, pass-vs-ordinary and ordinary-vs-ordinary differ by 0.2-0.6 nats on knife-edge "answer" prompts and depend on the request history even in frozen mode (reported, not a pass property); one prompt exceeds 0.25 there (0.2856). Two prompts differ by 0.17-0.20 at 2,048 with equal shapes (below the bound, not root-caused). Mixed token / embedding batches and split / window-cache passes are not taken. Default-off identity and the host ctest list are re-run at the closeout of the goal. VOD-5 (fuse and prearm with image prompts) is next.
+
+## 2026-11-09 (vision on demand, VOD-6 done: the setup wizard downloads the projector with the model and emits the flags)
+
+**Asked.** Owner /goal (autonomous), task VOD-6: `setup.ps1` / `setup.sh` fetch `mmproj-BF16.gguf` from the SAME Hugging Face repo as the chosen Qwen3.6-35B-A3B file and emit `--mmproj <path> --mmproj-on-demand`.
+
+**Answer.** The model table gains `Mmproj` / `MmprojBytes` (902,822,624 B for the non-MTP repo, 902,822,528 B for the MTP repo); a settings question "Vision support?" (default yes) for the Qwen3.6 rows without `--spec-type`; `-NoVision` / `--no-vision` and `-MmprojFile` / `--mmproj-file`; the projector joins the parallel download phase with the existing resume logic; the emitted script defines `$mmproj` and the flags carry `--mmproj $mmproj --mmproj-on-demand` exactly once. SDD D23, `docs/SETUP.md`, `docs/plans/setup-wizard-plan.md`.
+
+**Validated.** Host dry-run tests only: `tools/setup-wizard/test-vod.ps1` (125 checks) and `test-vod.sh` (123); the D22 tests unchanged (53 / 195); `bash -n setup.sh` and the PowerShell parser clean.
+
+**Scope / known gaps.** No real download and no Linux machine run were done (dry runs announce the download). Vision is offered only for the non-MTP Qwen3.6 rows (DL-14).
+
+## 2026-11-09 (vision on demand, VOD-3 done: phase-1 closeout, Owner Summary of phase 1, host regression 78/78)
+
+**Asked.** Owner /goal (autonomous), task VOD-3: close phase 1 with the full evidence and the Owner Summary.
+
+**Answer.** `docs/plans/vision-on-demand-results.md` section VOD-3: the original goal, the mechanism in plain words, the glossary, pros and cons labelled measured / expected / unproven, the recommendation (keep phase 1 for anyone who runs `--hybrid-moe` with a projector at a crowded margin), and the VOD-9 regression at tree `69384eab`: full build, host ctest list 78/78, `test-layer-streaming-(route-topk|host-mem)$` 2/2, `ctest -R mtmd` 2/2, `server_vision.py selftest` PASS.
+
+**Scope / known gaps.** Superseded by the final closeout of the goal for VOD-4 / VOD-5 (the regression is re-run on the final tree).
+
 ## 2026-11-09 (vision on demand, VOD-2 done: `--mmproj-on-demand` in llama-server; idle memory equals a server without a projector; layer-major pass no longer refused)
 
 **Asked.** Owner /goal (autonomous), task VOD-2: a real server runs the request flow: projector parked between requests, one window per image request.

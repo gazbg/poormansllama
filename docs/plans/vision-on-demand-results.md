@@ -200,3 +200,63 @@ Validation (host-only; no GPU, no download; both shells):
 Decision DL-14 (autonomous, recorded here and as SDD D23): vision is offered only for the Qwen3.6 table entries whose recipe row has no `--spec-type` (R7, R8). The MTP rows (R5, R6) were never measured with a projector, the dense Qwen3.8 rows and flint are outside the acceptance scope (D7), and the wizard "emits only measured combinations"; the vision flags are labelled in the emitted script as an addition to the measured row. Reversible: yes. A real download and a Linux machine run (`ssh-mcp`) were NOT done in this task; the dry runs announce the download and the existing resume / Range / token logic is reused unchanged.
 
 VOD-6 acceptance (plan): for every `qwen36` row x vision yes / no x both shells the emitted script has the projector flags iff vision is yes and the download list gains exactly one file of the table's size (dry-run announcement); the D22 tests pass unchanged; dry-run exit 0. MET within the stated limits.
+
+## VOD-4: the layer-major pass takes image embeddings (phase 2)
+
+Builds (all side-copied under `build/llama-cuda/bin/<dir>/` with a `PROVENANCE.txt`; the engine source digest is the one of `tools/source-revision.ps1`): `vod4a` 45FD921F03039B66 (the pass accepts an embedding-only batch), `vod4b` 7CE588D41DB933A8 (DL-16: images 2 and 3 of a request and the text behind an image), `vod4c` F96CCCEBEF3C46EB (DL-18: chunk grid of an image batch, the FINAL VOD-4 build). All sessions `gpu_pre=clean gpu_post=clean`, mains power, `-AllowUnprovenanced` (DL-5). Decisions DL-15 .. DL-18 are in the plan.
+
+### What was built
+
+- `llama_lm_plan::embd` (a batch with `embd` and no `token` is planned, a batch that mixes the two or a split / window-cache pass declines loudly), `llama_lm_plan::n_old` / `pos0`, `llama_kv_cache::lm_block(..., n_old_out)` (a run of cells in order whose positions never decrease; text-only sequences keep the exact old rule cell == position), the pass's cell addressing by `n_old`, RoPE positions from the batch, and (DL-18) the chunks of an image batch and of a batch behind an image cut from the batch start. Files: `src/llama-lm-prefill.cpp`, `src/llama-context.h`, `src/llama-kv-cache.cpp/.h`, `src/llama-graph.h` (comment).
+- Harness: `tools/server_vision.py` `eq` / `eq-compare` (per-token logprobs of fixed prompts, cache_prompt off), `make_eq_fixtures` (colour / digits at 1024 and 1448 px, a three-image request at 1024 px, an image followed by a ~4,600-token text, and a text-only control of the same length).
+
+### Pass engagement (log: `LLAMA_LM_LOG=1`; VOD-7 "the image-bearing batch TAKEN")
+
+| Case | Evidence (server.log of the session) | Result |
+|------|--------------------------------------|--------|
+| one image after text (1,024 and 2,025 rows) | `lm-prefill: pass N: 1024 tokens at position 4 in 1 chunks` (1.36-1.46 s, 700-750 t/s), `2025 tokens at position 4` (1.47-1.58 s, 1,280-1,390 t/s) | TAKEN |
+| three images in one request (`vod4b-eq-E2`, `vod4c-memcheck`) | passes at positions 4, 38 and 72 (the M-RoPE rule: 32 positions per 32 x 32 image plus the two text tokens between the images) | all three TAKEN (on `vod4a` images 2 and 3 declined: `the block ... breaks at cell 5 (seq 0 pos 4, expected seq 0 pos 5)`) |
+| an image followed by a ~4,600-token text | pass 1: the image (1,024 rows); pass 2: `5116 tokens at position 5 in 3 chunks`, 2.09 s, 2,450 t/s | both TAKEN |
+| acc (`vod4c-acc-od1`) / soak (`vod4c-soak-od`) | 8 and 45 passes, 0 `pass_declined_ordinary`; every image batch of >= 1,024 rows taken | MET |
+
+### Hard criteria (VOD-7 and the re-runs the plan asks for)
+
+Method note (DL-17, written before the diagnosis arms ran): the first-token bound is judged where the pass is the only variable. The hybrid expert cache is not: the same ordinary arm gave different numbers for the same prompt depending on which requests ran before it (frozen mode included, `vod4b-eq-F0` vs `-T0` up to 0.16, `-F1` vs `-T1` up to 0.45), because the window and the pass shrink and regrow the cache and the regrow chooses by popularity. So the judged arms run the STOCK placement (`--stock`: `-ngl 99 -ncmoe 37 -fit off`, no expert cache), where the ordinary arm repeats exactly. The hybrid-cache arms are reported beside them.
+
+| Criterion | Evidence | Result |
+|-----------|----------|--------|
+| VOD-7 at an equal chunk shape, 512 (stock placement, 14 prompts, 64-token greedy continuations) | `vod4b-eq-S0c` (ordinary, `-ub 512`) vs `vod4b-eq-S1c` (pass, `--lm-prefill-ubatch 512`): **14 identical, first-token \|dlogprob\| max 0.0000** | MET (bound 0.25) |
+| VOD-7 at an equal chunk shape, 2,048 (pass 2,048 and server `-ub 2,048`) | `vod4b-eq-S3c` vs `vod4c-eq-S4c`: 14 identical, median 0.0000, **max 0.1977** (`image-then-text-1024/answer`; `colour-1448/answer` 0.1659; text-only control 0.0006) | MET (bound 0.25) |
+| the ordinary path's own shape change beside it (calibration, as LM-3) | `S0c` vs `S3c` (512 -> 2,048): 13 identical, 1 near-tie flip (margin 0.069), **max 0.7272** (`trio-1024/answer`), median 0.0722 | the bound cannot be met by ANY path with another shape; reported |
+| the ordinary arm is deterministic and the build change did not touch it | `S0` vs `S0r`: 14 prompts, every delta 0.0000; `S0` vs `S0c` and `S3` vs `S3c` (vod4b vs vod4c binaries): 0.0000 | MET |
+| position after an image equals the ordinary path's | the pass's start positions 4 / 38 / 72 are the M-RoPE rule, computed by `server_tokens::pos_next` (host bookkeeping the pass does not touch); the next batch passed `llama_batch_allocr`'s consistency check (X < Y / X <= Y) in every run; identical answers | MET |
+| answers (VOD-4): every fixture question right where BASE is right; negative control fails as designed | acc `vod4c-acc-od1`: text and counts identical to the resident-projector control in 13 of 13 steps (`prompt_n / cache_n / predicted_n` and image chunks encoded per turn: 557 / 588 / 2,649, 1 / 1 / 2) | MET |
+| VOD-3 re-run with the pass taking images: free-watch minimum >= 16,000 MiB; idle memory | in-process free-watch (cudaMemGetInfo) lowest 16,297 MiB in the acc and in the soak; nvidia-smi poller idle used 5,029 / 7,015 MiB at ready / after the text steps (equal to NOVIS), 5,229 / 7,045 after image requests | MET |
+| VOD-6 re-run: soak >= 100 requests, cancelled mid-encode | `vod4c-soak-od`: 120 requests (12 cancelled), 108 OK, 0 failed, 68 of 68 graded answers right, 76 windows, 0 failed windows, idle 7,027 -> 7,031 MiB (+4), 45 passes | MET |
+| VOD-6 memcheck with the pass taking images (criterion kept literal, DL-13: graphs off) | `vod4c-memcheck` (15 passes: single images, three images at positions 4 / 38 / 72, the image + 4,600-token text, the text-only prompt): **`ERROR SUMMARY: 0 errors`** (the wrapper's exit 1 is the stopped target, `Target application returned an error`) | MET |
+| VOD-1 default-off identity | NOT re-run here: no code outside the pass's own `lm_make_plan` / `lm_block` / `lm_run` changed; it is re-run on the final build of the goal | at the closeout |
+
+### Report-only: the equivalence on the hybrid cache (dynamic recipe, production configuration, 64-token continuations)
+
+`vod4-eq64-E0` (ordinary 512) vs E1 (pass 512) vs E2 (pass 2,048) vs E3 (ordinary 2,048), `vod4a`, 14 prompts: E1 14 identical (first token max 0.2352), E2 14 identical (max 0.1659), E3 13 identical + 1 near-tie flip (max 0.1580). `vod4b-eq-E*` (new fixtures, 12 prompts): E0 vs E0r 0.0000 on every prompt (the ordinary arm repeats when the request history repeats); E1 11 identical + 1 near-tie flip, max **0.2856** (`colour-1448/answer`, reference margin 0.010; E1 vs E1r 0.0000, so the pass arm repeats too); E2 11 + 1, max 0.5419 on the same prompt; E3 (the ordinary shape change) 10 + 2, max **0.6024** on the same prompt. In the production configuration the dynamic cache's residency (which experts run on the GPU, which on the host) decides the first-token distribution of a knife-edge prompt and moves it by 0.2-0.6 nats with ANY change of arithmetic; one prompt exceeds 0.25 in the pass-vs-ordinary pair and the same prompt exceeds it by more in the ordinary path's own shape change. This is the G33-G36 floor, not a property of the pass: on the stock placement the same pair is bit-identical.
+
+### Diagnosis log of the first-token exceedance (DL-17, nothing hidden)
+
+1. Hypothesis: residency noise. Frozen cache arms: pass vs ordinary still up to 0.39 -> not sufficient. 2. `LLAMA_LM_NO_IMPLICIT=1` (ordinary masked attention inside the pass) and `FAFIX_CAUSAL_GQA=1` in the process environment: every delta identical to the digit -> attention numerics are not the cause. 3. Text-only control of the same length: 0.0014 / 0.0075 at equal shape -> the pass is faithful on text. 4. The same ordinary frozen arm differs by up to 0.45 between two request histories -> the frozen hybrid cache is not history-free; stock placement chosen. 5. On stock placement the pass at 512 differed by up to 0.56 (about the ordinary path's own shape effect 0.73) -> found: the pass cut an image at position 4 as 508 / 512 / 4 (absolute-position grid, G35) where the ordinary path cuts 512 / 512. Fixed (DL-18); the same comparison is then bit-identical. 6. Residual: at 2,048 with equal server and pass shapes two "answer" prompts still differ by 0.17-0.20 (`colour-1448`, `image-then-text`), below the bound and below the ordinary path's shape effect on the same prompts (0.16, 0.12); its cause is NOT isolated (the `-ub` of the server, which the ordinary tail depends on, moves the same prompt by 0.1659 between two pass arms). Reported as a limit.
+
+### Report-only: rate of the pass on image tokens
+
+| Rows | Ordinary path (VOD-0 M5, hybrid recipe) | Pass (`vod4c-acc-od1`, `-soak-od`, medians) |
+|------|------------------------------------------|----------------------------------------------|
+| ~1,024 (one image) | 370-430 tok/s | 702-704 tok/s (1.36-1.46 s: the fixed cost of one bank stream, 40 x 432 MiB, dominates) |
+| ~2,025 (one image) | 370-430 tok/s | 1,283-1,300 tok/s |
+| ~5,100 (text behind an image) | - | 2,450-2,570 tok/s (stock arms `vod4b-eq-S2c` 2,570) |
+
+A request's total time also pays the window (+0.12 s) and the cache shrink and regrow (VOD-2 report-only); a three-image request now runs three passes, each paying its own bank stream (1.46 s each at 1,024 rows), so for small images the pass is not faster than the ordinary path per image; the gain is at >= 2,000 rows per batch. NOT claimed: any end-to-end speedup of an image request.
+
+### Known gaps / limits (VOD-4)
+
+- A batch behind an image on a split (two-GPU) pass or a window-cache model declines loudly (not tested: single-GPU machine, Qwen3.6 only).
+- Mixed token / embedding batches (a single `llama_decode` carrying text and image rows) are not taken by the pass; the server never builds one for this model.
+- Under the hybrid cache the first-token distribution of knife-edge prompts depends on the request history (above); no claim of equivalence is made for that configuration beyond the measured table.
+- The residual 2,048-chunk deltas of two prompts (0.17-0.20) are below the bound and not root-caused.

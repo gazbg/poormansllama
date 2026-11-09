@@ -140,6 +140,21 @@ def make_fixtures(sides):
     return fx
 
 
+def make_eq_fixtures(sides):
+    """make_fixtures() plus (VOD-4, DL-16) the prompts that put a batch of >= 1,024 rows BEHIND an image: a long text after one image (the text batch follows an M-RoPE position jump)"""
+    fx = make_fixtures(sides)
+    side = sides[0]
+    filler = " ".join("Note %d: the apple is on the table." % i for i in range(1, 421))     # ~4,000 tokens of text that has nothing to do with the question
+    col = list(COLORS)[0]
+    fx.append({"name": "image-then-text-%d" % side, "kind": "longtext", "side": side, "images": [colour_image(side, col)],
+               "question": "Read the following notes and ignore them.\n" + filler + "\nNow answer: what is the colour of the square in the image? Answer with one word.", "expect": col})
+    # DL-17 control: the same kind of long text WITHOUT an image, and a question the model is unsure about (a spread-out first-token distribution shows arithmetic differences the most). It tells whether a
+    # pass-vs-ordinary difference belongs to image rows or to the pass in general (the text pass was bit-near-equal to the ordinary path in G32).
+    fx.append({"name": "text-4k", "kind": "textonly", "side": 0, "images": [],
+               "question": "Read the following notes and ignore them.\n" + filler + "\nNow pick a number between 1 and 10 and answer with the number only.", "expect": ""})
+    return fx
+
+
 def norm(s):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())).strip()
 
@@ -689,7 +704,7 @@ def cmd_soak(a):
 
 # ----------------------------------------------------------------------------- equivalence of two prefill paths (VOD-4 / VOD-5): per-token logprobs of fixed image prompts
 
-EQ_QUESTIONS = [("answer", None, 16), ("describe", "Describe the image in one sentence.", 48)]
+EQ_QUESTIONS = [("answer", None, 16), ("describe", "Describe the image in one sentence.", 64)]   # 64 tokens: the length of the contract (VOD-7)
 
 
 def cmd_eq(a):
@@ -697,7 +712,7 @@ def cmd_eq(a):
     from server_mt import Server, load_cfg
     cfg = load_cfg(a.config)
     os.makedirs(a.out, exist_ok=True)
-    fixtures = make_fixtures([int(x) for x in a.sides.split(",")])
+    fixtures = make_eq_fixtures([int(x) for x in a.sides.split(",")])
     srv = Server(cfg, a.out, port=a.port)
     rep = {"phase": "eq", "config": cfg, "provenance": provenance(cfg["exe"]), "eq": {}, "status": {}}
     ok = True

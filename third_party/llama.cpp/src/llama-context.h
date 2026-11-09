@@ -36,10 +36,13 @@ struct llama_dense_stream_params;
 struct llama_lm_plan {
     bool                 ok          = false;
     llama_seq_id         seq         = 0;
-    llama_pos            p0          = 0;     // position of the batch's first token
-    int64_t              c0          = 0;     // KV cell of position 0 of the sequence (the pass addresses keys relative to it)
+    llama_pos            p0          = 0;     // the sequence's next position (newest position + 1); the chunk boundaries are cut at multiples of the chunk width in it
+    llama_pos            pos0        = 0;     // VOD-4: the position of the batch's first row (== p0, except behind an M-RoPE image, which advances the position by the image's extent)
+    uint32_t             n_old       = 0;     // VOD-4: the cells the sequence holds behind the batch (== p0, except with M-RoPE image rows, which share one position): the batch's cells start at c0 + n_old
+    int64_t              c0          = 0;     // KV cell of the sequence's first position (the pass addresses keys relative to it)
     int32_t              n           = 0;
     bool                 want_logits = false; // the last token's logits are wanted
+    bool                 embd        = false; // VOD-4: the batch carries embeddings only (the rows of an image chunk), no token ids
     std::vector<int32_t> widths;              // chunk widths, in order
     std::vector<int32_t> snap_cuts;           // G42: token counts at which the recurrent state is kept (each one is a chunk boundary)
     std::vector<int32_t> snap_chunk;          // G42: the chunk that ends at each of them
