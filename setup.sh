@@ -301,12 +301,37 @@ recipe_exact() {
 recipe_for() {
     local m="$1" v="$2" c="$3" q="${4:-}" dq
     R_QUANT_FALLBACK=0
+    R_CLASS_FALLBACK=0
     if recipe_exact "$m" "$v" "$c" "$q"; then R_QUANT="$q"; return 0; fi
     dq=$(default_quant "$m")
     if [ -n "$dq" ] && [ "$dq" != "$q" ] && recipe_exact "$m" "$v" "$c" "$dq"; then
         R_QUANT="$dq"; R_QUANT_FALLBACK=1; return 0
     fi
+    # SDD D24: a MoE model with no row of its own at 8g takes the shared 8g MoE profile
+    if is_moe_model "$m" && moe_class_row "$v" "$c"; then
+        R_CLASS_FALLBACK=1; return 0
+    fi
     return 1
+}
+
+is_moe_model() {  # is_moe_model KEY -> 0 when any table entry of the model says MoE (SDD D24)
+    local i
+    for i in 0 1 2 3 4 5 6 7; do
+        if [ "${M_KEYS[$i]}" = "$1" ]; then
+            case "${M_KINDS[$i]}" in *MoE*) return 0 ;; esac
+        fi
+    done
+    return 1
+}
+
+# moe_class_row VRAM CTX -> loads the shared 8g MoE profile (SDD D24): EVERY MoE model, whatever its name
+# and whether or not it was benchmarked, takes the owner's 8 GiB GTX 1070 row (R7, qwen36 q4k_m) at 8g.
+# Other VRAM targets keep their per-model rows. Sets R_QUANT to the row's own quant.
+moe_class_row() {
+    [ "$1" = 8g ] || return 1
+    recipe_exact qwen36 8g "$2" q4k_m || return 1
+    R_QUANT=q4k_m
+    return 0
 }
 
 default_quant() {  # default_quant MODEL -> the model's default-quant (SDD D19)
@@ -329,6 +354,10 @@ recipe_avail() {  # recipe_avail MODEL -> prints the available rows (all quants)
             done
         done
     done
+    # SDD D24: every MoE model also has the shared 8g profile
+    if is_moe_model "$m" && moe_class_row 8g 262k; then
+        printf '    %-3s %-5s %-6s %-7s %s\n' "$R_ID" 8g 262k 'any MoE' "(shared 8g profile of every MoE model) $R_MEASURED"
+    fi
 }
 
 # --- step 1: environment check (SDD 4.1) ------------------------------------
@@ -748,7 +777,7 @@ pick_model() {
     for i in 0 1 2 3 4 5 6 7; do
         qtag="${M_QUANTS[$i]}"
         [ "${M_DEFAULTS[$i]}" = 1 ] || qtag="$qtag (alt)"
-        opts+=("$(printf '%d) %s: %s - %s, %s GiB [Q: %s]' "$((i+1))" "${M_KEYS[$i]}" "${M_KINDS[$i]}" "${M_FILES[$i]}" "${M_SIZES_GIB[$i]}" "$qtag")")
+        opts+=("$(printf '%s: %s - %s, %s GiB [Q: %s]' "${M_KEYS[$i]}" "${M_KINDS[$i]}" "${M_FILES[$i]}" "${M_SIZES_GIB[$i]}" "$qtag")")
     done
     if [ "$NI" = 1 ]; then MI_IDX=1; return 0; fi   # default: qwen36 q4k_m (the vehicle model)
     local sel
@@ -1032,7 +1061,10 @@ pick_recipe() {
         fail 'no measured recipe for the chosen model/quant/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)' 3
     fi
     # SDD D21/D19: a fallback row (the model's default quant) was measured on another file
-    if [ "$R_QUANT" != "${M_QUANTS[$MI_IDX]}" ]; then
+    if [ "${R_CLASS_FALLBACK:-0}" = 1 ]; then
+        # SDD D24: the shared 8g MoE profile, measured on another model
+        warn "row $R_ID is the shared 8g profile of every MoE model (measured on qwen36 / $R_QUANT); applied to ${M_KEYS[$MI_IDX]} / ${M_QUANTS[$MI_IDX]} (${M_FILES[$MI_IDX]}) - its speed/VRAM numbers are for the measured model"
+    elif [ "$R_QUANT" != "${M_QUANTS[$MI_IDX]}" ]; then
         warn "row $R_ID was measured on quant $R_QUANT; you chose ${M_QUANTS[$MI_IDX]} (${M_FILES[$MI_IDX]}) - its speed/VRAM numbers are for $R_QUANT"
     fi
     say "recipe $R_ID: $R_MEASURED"
