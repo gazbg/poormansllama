@@ -26,8 +26,8 @@
 param(
     [switch]$DryRun,
     [switch]$NonInteractive,
-    [string]$Model = '',            # qwen38 | qwen36 | flint | apex35 | 1-8
-    [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl | q5k_m | q6k_l (SDD D19, D23); default = the model's row quant
+    [string]$Model = '',            # qwen38 | qwen36 | flint | apex35 | 1-7
+    [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl | q5k_m (SDD D19, D23); default = the model's row quant
     [ValidateSet('full', '16g', '8g')][string]$Vram = '',
     [ValidateSet('262k', '128k')][string]$Context = '',
     [string]$Port = '',            # '' = ask (default 8090); an explicit value suppresses the question (D22)
@@ -268,13 +268,10 @@ $script:MODELS = @(
         DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe-mtp'; Default=$false },
     # SDD D23 (2026-11-09): Apex-35B-V1.0 (qwen35moe, 41 blocks incl. 1 MTP layer). Sizes and the
     # resolve-endpoint Content-Length checked against the Hugging Face API on 2026-11-09
-    # (25,347,532,640 and 32,775,817,376 bytes).
+    # (25,347,532,640 bytes for Q5_K_M). The Q6_K_L build was offered as entry 8 and removed on 2026-11-09.
     [pscustomobject]@{ Key='apex35'; Quant='q5k_m'; Label='Apex-35B-V1.0 MoE + MTP (Apexintelligence-AI Q5_K_M)'
         Repo='Apexintelligence-AI/Apex-35B-V1.0-GGUF'; File='Apex-35B-V1.0-Q5_K_M.gguf'; SizeGib=23.6
-        DefaultDir='C:/Models/ALL/other/apex'; Kind='moe-mtp'; Default=$true },
-    [pscustomobject]@{ Key='apex35'; Quant='q6k_l'; Label='Apex-35B-V1.0 MoE + MTP (Apexintelligence-AI Q6_K_L)'
-        Repo='Apexintelligence-AI/Apex-35B-V1.0-GGUF'; File='Apex-35B-V1.0-Q6_K_L.gguf'; SizeGib=30.5
-        DefaultDir='C:/Models/ALL/other/apex'; Kind='moe-mtp'; Default=$false }
+        DefaultDir='C:/Models/ALL/other/apex'; Kind='moe-mtp'; Default=$true }
 )
 
 # Recipe rows: MEASURED, verbatim (SDD section 4.6, decision D4/D11).
@@ -320,7 +317,7 @@ $script:RECIPES = @(
     [pscustomobject]@{ Id='R9'; Model='apex35'; Vram='full'; Ctx='262k'; Quant='q5k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
         Device='auto'; Bind='0.0.0.0'; Measured='TG ~100-110 tok/s (600-token greedy reply), PP ~3,900 t/s on a 20.7k-token prompt (2026-11-09, RTX 5090 Laptop 24 GiB, Windows, on Apex-35B-V1.0-Q5_K_S.gguf)'
-        Note='measured on Apex-35B-V1.0-Q5_K_S.gguf, NOT on the offered Q5_K_M or Q6_K_L (same architecture qwen35moe, 41 blocks with 1 MTP layer; both offered files carry the blk.40.nextn tensors, GGUF headers read 2026-11-09). Windows only, one MoE family; the q6k_l choice reuses this row with the D19 fallback warning' }
+        Note='measured on Apex-35B-V1.0-Q5_K_S.gguf, NOT on the offered Q5_K_M (same architecture qwen35moe, 41 blocks with 1 MTP layer; the offered file carries the blk.40.nextn tensors, GGUF header read 2026-11-09). Windows only, one MoE family' }
 )
 
 function DefaultQuant([string]$m) {
@@ -950,13 +947,13 @@ function Test-DiskSpace {
 function Pick-Model {
     param([string]$key)
     # SDD D19: flat (model, quant) entries. -Model picks the model; -Quant
-    # picks the quant (default = the model's Default entry); numeric keys 1-8
+    # picks the quant (default = the model's Default entry); numeric keys 1-7
     # address the flat list directly.
     if ($key) {
         $pool = $script:MODELS | Where-Object { $_.Key -eq $key }
         if (-not $pool) {
-            if ($key -match '^[1-8]$') { return $script:MODELS[[int]$key - 1] }
-            ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, apex35, or 1-8)"
+            if ($key -match '^[1-7]$') { return $script:MODELS[[int]$key - 1] }
+            ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, apex35, or 1-7)"
         }
         if ($Quant) {
             $m = $pool | Where-Object { $_.Quant -eq $Quant } | Select-Object -First 1
@@ -1158,6 +1155,10 @@ function Check-RecipeQuant {
         Warn "row $($r.Id) was measured on quant $($r.Quant); you chose $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for $($r.Quant)"
     }
     return $r
+        # SDD D25 (2026-11-09): the owner's own run of this model through the shared profile
+        if ($m.Key -eq 'apex35' -and $m.Quant -eq 'q5k_m' -and $r.Vram -eq '8g') {
+            Say "measured on $($m.File) with this row (owner, 8 GiB card, Linux): prompt 51,885 tokens at 537.42 t/s (96.5 s), 1,400 generated tokens at 30.88 t/s (32.39 ms per token)"
+        }
 }
 
 function Get-GitShort {

@@ -42,10 +42,9 @@ Case 'qwen36' 'q5k_xl' '8g' '262k' 'R7'
 Case 'qwen36' 'q8k_xl' '8g' '262k' 'R7'
 Case 'flint'  'q5k_xl' '8g' '262k' 'R7'
 Case 'apex35' 'q5k_m'  '8g' '262k' 'R7'
-Case 'apex35' 'q6k_l'  '8g' '262k' 'R7'
 
 # the profile is the same row object for every MoE model
-$ids = @(@('qwen36','q4k_m'), @('flint','q5k_xl'), @('apex35','q6k_l')) | ForEach-Object { (RecipeFor $_[0] '8g' '262k' $_[1]).Flags } | Select-Object -Unique
+$ids = @(@('qwen36','q4k_m'), @('flint','q5k_xl'), @('apex35','q5k_m')) | ForEach-Object { (RecipeFor $_[0] '8g' '262k' $_[1]).Flags } | Select-Object -Unique
 Check 'all MoE models at 8g/262k get the identical flag text' (@($ids).Count -eq 1)
 
 # not widened: other targets and contexts keep their rows or refuse
@@ -57,6 +56,11 @@ Case 'apex35' 'q5k_m'  'full' '262k' 'R9'
 Case 'flint'  'q5k_xl' 'full' '262k' 'R4'
 Case 'qwen36' 'q4k_m'  '16g'  '262k' 'R8'
 Case 'qwen36' 'q8k_xl' 'full' '262k' 'R5'
+
+# D25: the apex35 Q6_K_L build is no longer offered (the flat list has 7 entries, picks are 1-7)
+Check 'model table: 7 entries' (@($script:MODELS).Count -eq 7)
+Check 'model table: no q6k_l entry' (-not (@($script:MODELS | Where-Object { $_.Quant -eq 'q6k_l' }).Count))
+Check 'model table: apex35 has only q5k_m' ((@($script:MODELS | Where-Object { $_.Key -eq 'apex35' } | ForEach-Object { $_.Quant }) -join ',') -eq 'q5k_m')
 
 # dense models are not MoE: their 8g row stays R3 (128k only)
 Case 'qwen38' 'q4k_m'  '8g' '128k' 'R3'

@@ -43,16 +43,15 @@ kase qwen36 q5k_xl 8g 262k R7
 kase qwen36 q8k_xl 8g 262k R7
 kase flint  q5k_xl 8g 262k R7
 kase apex35 q5k_m  8g 262k R7
-kase apex35 q6k_l  8g 262k R7
 
 # the profile is the same flag text for every MoE model
 recipe_for qwen36 8g 262k q4k_m >/dev/null 2>&1; A="$R_FLAGS"
 recipe_for flint  8g 262k q5k_xl >/dev/null 2>&1; B="$R_FLAGS"
-recipe_for apex35 8g 262k q6k_l >/dev/null 2>&1; C="$R_FLAGS"
+recipe_for apex35 8g 262k q5k_m >/dev/null 2>&1; C="$R_FLAGS"
 [ -n "$A" ] && [ "$A" = "$B" ] && [ "$B" = "$C" ]; check 'all MoE models at 8g/262k get the identical flag text' $?
 
 # the shared profile flags itself, so the caller can warn (and a per-model row does not)
-recipe_for apex35 8g 262k q6k_l >/dev/null 2>&1; [ "$R_CLASS_FALLBACK" = 1 ]; check 'apex35 8g: class-profile flag set' $?
+recipe_for apex35 8g 262k q5k_m >/dev/null 2>&1; [ "$R_CLASS_FALLBACK" = 1 ]; check 'apex35 8g: class-profile flag set' $?
 recipe_for qwen36 8g 262k q4k_m >/dev/null 2>&1; [ "$R_CLASS_FALLBACK" = 0 ]; check 'qwen36 q4k_m 8g: exact row, no class flag' $?
 
 # not widened: other targets and contexts keep their rows or refuse
@@ -64,6 +63,12 @@ kase apex35 q5k_m  full 262k R9
 kase flint  q5k_xl full 262k R4
 kase qwen36 q4k_m  16g  262k R8
 kase qwen36 q8k_xl full 262k R5
+
+# D25: the apex35 Q6_K_L build is no longer offered (the flat list has 7 entries, picks are 1-7)
+[ "${#M_KEYS[@]}" = 7 ] && [ "${#M_QUANTS[@]}" = 7 ] && [ "${#M_FILES[@]}" = 7 ] && [ "${#M_REPOS[@]}" = 7 ] && [ "${#M_SIZES_GIB[@]}" = 7 ] && [ "${#M_SIZES_GIB_INT[@]}" = 7 ] && [ "${#M_KINDS[@]}" = 7 ] && [ "${#M_DIRS[@]}" = 7 ] && [ "${#M_DEFAULTS[@]}" = 7 ]; check 'model table: 7 entries in every array' $?
+case " ${M_QUANTS[*]} " in *" q6k_l "*) false ;; *) true ;; esac; check 'model table: no q6k_l entry' $?
+OUT=$( (mi apex35 q6k_l) 2>&1 ); echo "$OUT" | grep -q "no 'q6k_l' build for apex35 (available: q5k_m)"; check "mi apex35 q6k_l is refused with the available list" $?
+OUT=$( (mi 8) 2>&1 ); echo "$OUT" | grep -q "or 1-7"; check 'mi 8 is refused (picks are 1-7)' $?
 
 # dense models are not MoE: their 8g row stays R3 (128k only)
 kase qwen38 q4k_m  8g 128k R3

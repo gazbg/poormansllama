@@ -91,7 +91,7 @@ void ggml_backend_cuda_moe_hybrid_set_xdump(void * dev_ptr, int n_tok);
 //                             initial cache fill and as the EMA tie-break
 //   LLAMA_MOE_HYBRID_B        max promotions per token (default 16, 0 = static cache, < 0 = unlimited)
 //   LLAMA_MOE_HYBRID_LAMBDA   EMA decay (default 0.97)
-//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default: 1 with <= 4 physical cores, 2 with 5-8, 3 with more)
+//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default: the physical cores the process may use, minus one)
 //   LLAMA_MOE_HYBRID_FIRST    first logical CPU of the engine (default 0)
 //   LLAMA_MOE_HYBRID_STRIDE   logical CPU stride between engine threads (default 2)
 //   LLAMA_MOE_HYBRID_POLL     engine threadpool poll level (default 100)
@@ -147,8 +147,11 @@ static std::vector<int> moe_hybrid_core_cpus() {
     return cpus;
 }
 
-// The default size of the expert team, from the physical cores this process may use: 1 with 4 or fewer,
-// 2 with 5 to 8, 3 with more than 8 (set 2026-11-09; the earlier default was 8, capped at the physical cores).
+// The default size of the expert team, from the physical cores this process may use: the cores MINUS ONE, at least 1, no cap
+// (owner decision, later on 2026-11-09 than the tiered 1 / 2 / 3 rule of ac9f6e04, which it replaces; before both it was min(8, cores)).
+// With the default pinning (logical CPU 2 up, stride 2) that is every physical core except core 0, the interrupt core (G16); the
+// engine thread is the last team member. Measured on a 16-core machine with the tiered rule's session: team 3 about 107-109 tok/s,
+// team 14 110.8; the 4-core i7-4770K's good size was 4, and cores - 1 gives 3 there (not measured).
 // The workers busy-spin, so more of them than the physical cores makes them preempt each other and the decoding,
 // engine and driver threads for a whole scheduler timeslice (2.4-3.7 ms in the stall log). When the topology
 // cannot be read the default is 3.
@@ -189,13 +192,7 @@ static int moe_hybrid_default_threads() {
     if (cores <= 0) {
         return 3;
     }
-    if (cores <= 4) {
-        return 1;
-    }
-    if (cores <= 8) {
-        return 2;
-    }
-    return 3;
+    return std::max(1, cores - 1);
 }
 
 struct moe_hybrid_pf_abort_ctx {

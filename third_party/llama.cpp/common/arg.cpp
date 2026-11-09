@@ -891,6 +891,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    // private fork: with --hybrid-moe the target's experts run on the host expert team (--hybrid-moe-threads), so the ggml CPU thread count only serves the few host-side nodes of a
+    // decode step and the MTP draft head (-td inherits -t): one thread unless -t was given. Prompt batches keep the stock default (-tb): a batch of fewer than 32 tokens, such as the
+    // --lm-prefill-ckpt-chunk tail, still computes its experts on the CPU.
+    if (params.hybrid_moe && !params.n_threads_set) {
+        if (params.cpuparams_batch.n_threads < 0) {
+            params.cpuparams_batch = params.cpuparams;   // what postprocess_cpu_params would copy
+            if (params.cpuparams_batch.n_threads < 0) {
+                params.cpuparams_batch.n_threads = common_cpu_get_num_math();
+            }
+        }
+        params.cpuparams.n_threads = 1;
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -1529,6 +1542,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
         [](common_params & params, int value) {
             params.cpuparams.n_threads = value;
+            params.n_threads_set = true;
             if (params.cpuparams.n_threads <= 0) {
                 params.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -1737,7 +1751,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--hybrid-moe"},
         "hybrid MoE decode (private fork, CUDA): the expert banks stay on the host and a VRAM expert cache, sized so that the --fit-target margin stays free, serves most experts; "
-        "also sets the engine environment variables you did not set, turns --fit off, takes -ub 2048 unless -ub is given and, for -np > 1, the unified KV cache unless -kvu/-no-kvu is given",
+        "also sets the engine environment variables you did not set, turns --fit off, takes -ub 2048 unless -ub is given, takes -t 1 unless -t is given (the expert team has its own --hybrid-moe-threads) and, for -np > 1, the unified KV cache unless -kvu/-no-kvu is given",
         [](common_params & params) {
             params.hybrid_moe = true;
         }
@@ -1794,7 +1808,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_HYBRID_MOE_SLOW_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--hybrid-moe-threads"}, "N",
-        "with --hybrid-moe: size of the host expert team, the threads that compute the expert misses on the CPU (the last one is the engine thread). Default: 1 with 4 or fewer physical cores, 2 with 5 to 8, 3 with more than 8. Set it to the physical core count on a slower CPU",
+        "with --hybrid-moe: size of the host expert team, the threads that compute the expert misses on the CPU (the last one is the engine thread). Default: the physical cores this process may use minus one (at least 1). -t is a separate setting and defaults to 1 with --hybrid-moe",
         [](common_params & params, int value) {
             params.hybrid_moe_threads = value;
         }
