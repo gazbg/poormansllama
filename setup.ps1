@@ -329,6 +329,18 @@ function DefaultQuant([string]$m) {
     return ''
 }
 
+function IsMoeModel([string]$m) {
+    return [bool]($script:MODELS | Where-Object { $_.Key -eq $m -and $_.Kind -like 'moe*' } | Select-Object -First 1)
+}
+
+function MoeClassRow([string]$v, [string]$c) {
+    # SDD D24: the 8g profile is shared by EVERY MoE model, whatever its name and whether or not it
+    # was benchmarked: it is the owner's 8 GiB GTX 1070 row (R7, qwen36 q4k_m). Other VRAM targets
+    # keep their per-model rows.
+    if ($v -ne '8g') { return $null }
+    return ($script:RECIPES | Where-Object { $_.Model -eq 'qwen36' -and $_.Vram -eq '8g' -and $_.Ctx -eq $c -and $_.Quant -eq 'q4k_m' } | Select-Object -First 1)
+}
+
 function RecipeFor([string]$m, [string]$v, [string]$c, [string]$q) {
     # SDD D21: an exact (model, VRAM, ctx, quant) row first; otherwise the model's
     # default-quant row (the caller warns that it was measured on another file)
@@ -336,8 +348,11 @@ function RecipeFor([string]$m, [string]$v, [string]$c, [string]$q) {
     if ($hit) { return $hit }
     $dq = DefaultQuant $m
     if ($dq -and $dq -ne $q) {
-        return ($script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $dq } | Select-Object -First 1)
+        $hit = $script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $dq } | Select-Object -First 1
+        if ($hit) { return $hit }
     }
+    # SDD D24: a MoE model with no row of its own at 8g takes the shared 8g MoE profile
+    if (IsMoeModel $m) { return (MoeClassRow $v $c) }
     return $null
 }
 
@@ -1123,6 +1138,10 @@ function Pick-Recipe {
         foreach ($a in $avail) {
             Write-Host ("    {0}  {1,-5} {2,-6} {3,-7} {4}" -f $a.Id, $a.Vram, $a.Ctx, $a.Quant, $a.Measured)
         }
+        if (IsMoeModel $m.Key) {
+            $cls = MoeClassRow '8g' '262k'
+            if ($cls) { Write-Host ("    {0}  {1,-5} {2,-6} {3,-7} {4}" -f $cls.Id, $cls.Vram, $cls.Ctx, 'any MoE', ('(shared 8g profile of every MoE model) ' + $cls.Measured)) }
+        }
         ExitCode 3 'no measured recipe for the chosen model/quant/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)'
     }
     return (Check-RecipeQuant $r $m)
@@ -1131,7 +1150,11 @@ function Pick-Recipe {
 function Check-RecipeQuant {
     param([object]$r, [object]$m)
     # SDD D21/D19: a fallback row (the model's default quant) was measured on a different file
-    if ($r.Quant -ne $m.Quant) {
+    if ($r.Model -ne $m.Key) {
+        # SDD D24: the shared 8g MoE profile, measured on another model
+        Warn "row $($r.Id) is the shared 8g profile of every MoE model (measured on $($r.Model) / $($r.Quant)); applied to $($m.Key) / $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for the measured model"
+    }
+    elseif ($r.Quant -ne $m.Quant) {
         Warn "row $($r.Id) was measured on quant $($r.Quant); you chose $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for $($r.Quant)"
     }
     return $r

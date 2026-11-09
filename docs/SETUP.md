@@ -122,7 +122,14 @@ file (e.g. a different quant); the recipe is still chosen by `-Model`.
 | R6  | qwen36 | 16g  | 262k | RTX 5090 Laptop 24 GiB (q8k_xl MTP)  | PP 2000 t/s, TG 51 t/s @200k (Windows, one MoE model) |
 | R7  | qwen36 | 8g   | 262k | GTX 1070 8 GiB (q4k_m)               | PP 590 t/s, TG 33 t/s @20k (Windows, one MoE model) |
 | R8  | qwen36 | 16g  | 262k | RTX 5090 Laptop 24 GiB (q4k_m, G42)  | TG 3.0-3.7x stock, PP 3.65-4.11x stock (USAGE.md) |
-| R9  | apex35 | full | 262k | RTX 5090 Laptop 24 GiB (measured on Apex Q5_K_S, not on q5k_m/q6k_l) | TG ~100-110 tok/s, PP ~3,900 t/s at 20.7k (2026-11-09, Windows); 16g/8g are refused (exit 3) |
+| R9  | apex35 | full | 262k | RTX 5090 Laptop 24 GiB (measured on Apex Q5_K_S, not on q5k_m/q6k_l) | TG ~100-110 tok/s, PP ~3,900 t/s at 20.7k (2026-11-09, Windows); 16g is refused (exit 3); 8g uses the shared MoE profile R7 (D24) |
+
+**8g is one profile for every MoE model (D24).** At the `8g` target, 262k, a MoE
+model (qwen36, flint, apex35, and any added later) takes R7 whatever its name
+and whether or not it has its own benchmark; the wizard prints a warning that
+R7's numbers were measured on qwen36 (GTX 1070). `full` and `16g` keep their
+per-model rows. 8g + 128k is still refused for a MoE model (R7 exists at 262k
+only); dense models keep R3.
 
 Full flag text per row: the recipe tables in `setup.ps1` / `setup.sh` and
 [docs/setup-wizard-sdd.md](setup-wizard-sdd.md) section 3.
