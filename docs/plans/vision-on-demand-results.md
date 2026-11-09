@@ -192,7 +192,7 @@ Validation (host-only; no GPU, no download; both shells):
 
 | Command | Result |
 |---------|--------|
-| `powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-wizard	est-vod.ps1` | 125 checks passed (table columns, `Test-VisionOffered` over all 8 rows, `Complete-RowFlags` with vision: exactly once, idempotent, equals the vision-off flags plus the suffix, for 3 compute capabilities per row; dry runs: default, `-NoVision`, `-MmprojFile` missing / present / contradicting, an MTP row, the dense model, the dashed spelling) |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-wizard\test-vod.ps1` | 125 checks passed (table columns, `Test-VisionOffered` over all 8 rows, `Complete-RowFlags` with vision: exactly once, idempotent, equals the vision-off flags plus the suffix, for 3 compute capabilities per row; dry runs: default, `-NoVision`, `-MmprojFile` missing / present / contradicting, an MTP row, the dense model, the dashed spelling) |
 | `bash tools/setup-wizard/test-vod.sh` | 123 checks passed (same matrix under Git Bash) |
 | `test-d22.ps1` / `bash test-d22.sh` (unchanged) | 53 / 195 checks passed |
 | `bash -n setup.sh`, PowerShell parser on `setup.ps1` | clean |
