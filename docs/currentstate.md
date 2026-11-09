@@ -24,6 +24,16 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (vision projector on demand: plan written, owner decisions D1-D13, no code or GPU run)
+
+**Asked.** Owner: apply the layer-residency idea to vision: instead of keeping the multimodal projector in VRAM (or on the CPU via `--no-mmproj-offload`), load it into VRAM only while a request's images are encoded, then unload it; "discussion and a plan".
+
+**Answer.** `docs/plans/vision-on-demand-plan.md` (tasks VOD-0 .. VOD-6, acceptance contract written before any run). Findings from reading the code: the projector (~0.84 GiB weights + a worst-case compute buffer) stays on CUDA0 for the server's life; under `--hybrid-moe` its estimate is added to `fit_params_target`, which the hybrid engine reads as its permanent keep-free margin and, unlike the speculative-context estimate, never releases (possible double count, UNVERIFIED, VOD-0 M1); the layer-major pass declines every batch that carries embeddings (`src/llama-lm-prefill.cpp:157`), so image tokens take the slow ordinary path; `hybrid_lm_vram` already shrinks the expert cache for a pass and can serve an encode window. Owner decisions: both goals equally, park the weights in pinned host RAM, unload right after the encode, wait (no timeout) when room cannot be made, image embeddings through the pass (phase 2) and fuse with images (phase 3) included, own flag `--mmproj-on-demand` default off, performance report-only with hard correctness gates, Qwen3.6-35B-A3B only, the setup wizard downloads the projector with the model (VOD-6). The test projector is `C:/Models/ALL/other/qwen-3.6/mmproj-qwen-35b-tq3-BF16.gguf` (SHA-256 `da63cb47...cfa`, byte-identical to `mmproj-BF16.gguf` in `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`).
+
+**Validated.** Nothing run: planning only. Public Hugging Face tree listings were read (no download) and the local projector files were hashed against the published LFS oids.
+
+**Scope / known gaps.** No claim of any speedup or VRAM saving. VOD-0 (measurements and harness) is `ready`; everything else is `planned`. Open unknowns are listed in the plan's "Risks and unknowns" (mixed token / embedding batch, compute-buffer size, WDDM memory return, the H1 double count).
+
 ## 2026-11-07 (setup wizard D22: Pascal-or-lower int8 attention, --lm-prefill-prearm always for all profiles, port input defaulting to 8090)
 
 **Asked.** Owner: (1) 'for Pascal architecture and lower add --lm-prefill-attn-int8 if it is different from the env LLAMA_FATTN_TILE_Q8QK=1, if not different just make sure the env is set for all older architectures'; (2) 'for all profiles add --lm-prefill-prearm always'; (3) 'add in the setup wizard port input from the user, leave default to 8090'.
