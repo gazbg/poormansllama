@@ -181,3 +181,22 @@ Keep it: phase 1 is worth adopting for anyone who runs `--hybrid-moe` with a pro
 - Full build of every target (`cmake --build build/llama-cuda --config Release`, `build/vod-build-all.log`, exit 0).
 - The host ctest list (`ctest --test-dir build/llama-cuda -C Release -R <the host suite's Include> -E 'tail513-(lm|bm)(-run)?$'`, run directly because the suite halts at its doc-size guard): **78/78 passed**. `test-layer-streaming-(route-topk|host-mem)$`: **2/2**. `ctest -R mtmd`: **2/2** (`test-mtmd-c-api`, `test-mtmd-impl`). `python tools/server_vision.py selftest`: PASS.
 - Default-off identity at server level: VOD-2 table above (A B B A, 13/13).
+
+## VOD-6: setup wizard downloads the projector with the model and emits the flags
+
+Change: `setup.ps1`, `setup.sh` (projector columns of the Qwen3.6 table entries, `Test-VisionOffered` / `vision_offered`, the vision append in `Complete-RowFlags` / `complete_row_flags`, the "Vision support?" question in the settings phase, `-NoVision` / `--no-vision`, `-MmprojFile` / `--mmproj-file`, `Download-Mmproj` / `download_mmproj`, `$mmproj` / `MMPROJ` in the emitted script, the flag gate checking `--mmproj` and `--mmproj-on-demand` in the built binary), tests `tools/setup-wizard/test-vod.ps1` and `test-vod.sh`, `docs/SETUP.md`, `docs/setup-wizard-sdd.md` (D23), `docs/plans/setup-wizard-plan.md`.
+
+Table (read from the Hugging Face tree API on 2026-11-09): `unsloth/Qwen3.6-35B-A3B-GGUF` (Q4_K_M, Q5_K_XL rows) `mmproj-BF16.gguf` 902,822,624 B; `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` (Q8_K_XL row) `mmproj-BF16.gguf` 902,822,528 B.
+
+Validation (host-only; no GPU, no download; both shells):
+
+| Command | Result |
+|---------|--------|
+| `powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-wizard	est-vod.ps1` | 125 checks passed (table columns, `Test-VisionOffered` over all 8 rows, `Complete-RowFlags` with vision: exactly once, idempotent, equals the vision-off flags plus the suffix, for 3 compute capabilities per row; dry runs: default, `-NoVision`, `-MmprojFile` missing / present / contradicting, an MTP row, the dense model, the dashed spelling) |
+| `bash tools/setup-wizard/test-vod.sh` | 123 checks passed (same matrix under Git Bash) |
+| `test-d22.ps1` / `bash test-d22.sh` (unchanged) | 53 / 195 checks passed |
+| `bash -n setup.sh`, PowerShell parser on `setup.ps1` | clean |
+
+Decision DL-14 (autonomous, recorded here and as SDD D23): vision is offered only for the Qwen3.6 table entries whose recipe row has no `--spec-type` (R7, R8). The MTP rows (R5, R6) were never measured with a projector, the dense Qwen3.8 rows and flint are outside the acceptance scope (D7), and the wizard "emits only measured combinations"; the vision flags are labelled in the emitted script as an addition to the measured row. Reversible: yes. A real download and a Linux machine run (`ssh-mcp`) were NOT done in this task; the dry runs announce the download and the existing resume / Range / token logic is reused unchanged.
+
+VOD-6 acceptance (plan): for every `qwen36` row x vision yes / no x both shells the emitted script has the projector flags iff vision is yes and the download list gains exactly one file of the table's size (dry-run announcement); the D22 tests pass unchanged; dry-run exit 0. MET within the stated limits.
