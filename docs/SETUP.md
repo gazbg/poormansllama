@@ -57,7 +57,7 @@ Run the wizard from outside a checkout and it clones the repository itself
    and tells you; the flag-capability check below then decides which rows the
    resulting binary can run.
 3. **Settings (asked BEFORE anything heavy runs)** — model + quant
-   (qwen38 / qwen36 / flint, each in its default quant or a `q5k_xl` alt build
+   (qwen38 / qwen36 / flint / apex35, each in its default quant or an alt build: `q5k_xl`, `q8k_xl`, and for apex35 `q5k_m` / `q6k_l`,
    via `-Quant`/`--quant`), the local model path (other `*.gguf` files in the
    directory are offered), a disk-space check, the VRAM target, and the
    context. **An unmeasured model/VRAM/context combination is refused HERE
@@ -88,8 +88,8 @@ Run the wizard from outside a checkout and it clones the repository itself
 ## Models (SDD table D7/D13/D19)
 
 Flat (model, quant) table; `-Model` picks the model, `-Quant`/`--quant`
-(`q4k_m` or `q5k_xl`) picks the quant for qwen38/qwen36 (default = the model's
-default entry), and numeric picks `1-5` address the rows directly:
+(`q4k_m`, `q5k_xl`, `q8k_xl`; apex35: `q5k_m`, `q6k_l`) picks the quant (default = the model's
+default entry), and numeric picks `1-8` address the rows directly:
 
 | #  | key    | quant       | Hugging Face repo            | file                                | size    | type        |
 |----|--------|-------------|------------------------------|-------------------------------------|---------|-------------|
@@ -99,6 +99,8 @@ default entry), and numeric picks `1-5` address the rows directly:
 | 4  | qwen38 | q5k_xl (alt)| unsloth/Qwen3.8-27B-GGUF     | Qwen3.8-27B-UD-Q5_K_XL.gguf         | 19.4 GiB| dense       |
 | 5  | qwen36 | q5k_xl (alt)| unsloth/Qwen3.6-35B-A3B-GGUF | Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf     | 24.7 GiB| MoE (A3B)   |
 | 6  | qwen36 | q8k_xl (alt, MTP)| unsloth/Qwen3.6-35B-A3B-MTP-GGUF | Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf | 36.4 GiB| MoE (A3B) + MTP head |
+| 7  | apex35 | q5k_m (def) | Apexintelligence-AI/Apex-35B-V1.0-GGUF | Apex-35B-V1.0-Q5_K_M.gguf   | 23.6 GiB| MoE (qwen35moe) + MTP head |
+| 8  | apex35 | q6k_l (alt) | Apexintelligence-AI/Apex-35B-V1.0-GGUF | Apex-35B-V1.0-Q6_K_L.gguf   | 30.5 GiB| MoE (qwen35moe) + MTP head |
 
 Recipe rows are keyed on the MODEL only (their flags do not depend on the
 quant) and were measured on the default entries; picking an alt quant prints
@@ -120,6 +122,7 @@ file (e.g. a different quant); the recipe is still chosen by `-Model`.
 | R6  | qwen36 | 16g  | 262k | RTX 5090 Laptop 24 GiB (q8k_xl MTP)  | PP 2000 t/s, TG 51 t/s @200k (Windows, one MoE model) |
 | R7  | qwen36 | 8g   | 262k | GTX 1070 8 GiB (q4k_m)               | PP 590 t/s, TG 33 t/s @20k (Windows, one MoE model) |
 | R8  | qwen36 | 16g  | 262k | RTX 5090 Laptop 24 GiB (q4k_m, G42)  | TG 3.0-3.7x stock, PP 3.65-4.11x stock (USAGE.md) |
+| R9  | apex35 | full | 262k | RTX 5090 Laptop 24 GiB (measured on Apex Q5_K_S, not on q5k_m/q6k_l) | TG ~100-110 tok/s, PP ~3,900 t/s at 20.7k (2026-11-09, Windows); 16g/8g are refused (exit 3) |
 
 Full flag text per row: the recipe tables in `setup.ps1` / `setup.sh` and
 [docs/setup-wizard-sdd.md](setup-wizard-sdd.md) section 3.
