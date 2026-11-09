@@ -658,7 +658,7 @@ struct common_params {
     int32_t     hybrid_moe_prefill_min    = 1024; // smallest batch (tokens) that opens the prefill window
     int32_t     hybrid_moe_seed           = 16;   // tokens of the prompt's tail whose routing seeds the expert cache's popularity (0 = off)
     int32_t     hybrid_moe_slow_ms        = -1;   // host requests and DMA submissions slower than this (ms) are logged, 0 = never; -1 = not given (LLAMA_MOE_HYBRID_SLOW_MS, default 5)
-    int32_t     hybrid_moe_threads        = 0;    // host expert team size (--hybrid-moe-threads): 0 = auto, the physical cores at most 8
+    int32_t     hybrid_moe_threads        = 0;    // host expert team size (--hybrid-moe-threads): 0 = auto, 1 with <= 4 physical cores, 2 with 5-8, 3 with more
     bool        hybrid_moe_prefill_free_all = false; // --hybrid-moe-prefill-free-all: a layer-major pass frees the expert cache to its floor before it starts
     bool        n_ubatch_set     = false; // -ub / LLAMA_ARG_UBATCH was given
     bool        n_batch_set      = false; // -b / LLAMA_ARG_BATCH was given

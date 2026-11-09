@@ -50,7 +50,7 @@ These are stock llama.cpp flags. The values below are the ones the record uses.
 | `--hybrid-moe-prefill-min N` | `1024` | Smallest batch, in tokens, that opens the hybrid prefill window |
 | `--hybrid-moe-seed N` | `16` | Seed the expert popularity counts with the routing of the last `N` prompt tokens. `0` off |
 | `--hybrid-moe-slow-ms N` | `5` | Log a host expert request or DMA submission that takes longer than `N` ms (`0` = never). Only the log lines change, not the speed. Without the flag, `LLAMA_MOE_HYBRID_SLOW_MS` applies, or 5 |
-| `--hybrid-moe-threads N` | auto | Size of the host expert team: the threads that compute expert misses on the CPU; the last one is the engine thread. Auto = the physical cores, at most 8, on Windows and Linux. Set it to the physical core count on a slower CPU. Takes precedence over `LLAMA_MOE_HYBRID_THREADS`, which is still read when the flag is not given |
+| `--hybrid-moe-threads N` | auto | Size of the host expert team: the threads that compute expert misses on the CPU; the last one is the engine thread. Auto = 1 with 4 or fewer physical cores, 2 with 5 to 8, 3 with more than 8, on Windows and Linux (set 2026-11-09; was 8). Set it to the physical core count on a slower CPU. Takes precedence over `LLAMA_MOE_HYBRID_THREADS`, which is still read when the flag is not given |
 | `--hybrid-moe-prefill-free-all` | off | Experimental. A layer-major pass frees the expert cache to its floor before it starts. Measured on flint on this card (2026-11-03, one session per arm): at `-fitt 8000` (106 slots at start) +3.5% per request, because the regrow re-uploads about 10 GB at the first decode; at `-fitt 16000` +0.4%, inside the replicate band. Keep it off. With `--lm-prefill-prearm always` on flint it is +9.7% per run (2026-11-03), so keep it off there too |
 | `--hybrid-moe-freq FILE` | uniform prior | Expert frequency table (layers by experts, whitespace separated) that fills the cache at start |
 
@@ -152,8 +152,8 @@ turns on int8 QK attention (a q8_0 K cache, head size 256, a GPU without fast FP
 off by default). `LLAMA_FATTN_TILE_Q8CFG` picks the block configuration of that
 kernel, 0 to 6, default 0. `LLAMA_MOE_HYBRID_LEAN_CPUS` lists the logical CPUs of
 the expert team, the last one for the engine thread. The CPUs are pinned on Windows only; on
-Linux only the number of entries counts, as the team size. The team defaults to the physical
-cores the process may use, at most 8, on Linux (a flat 8 elsewhere); `LLAMA_MOE_HYBRID_THREADS`
+Linux only the number of entries counts, as the team size. The team defaults to 1 with 4 or fewer
+physical cores, 2 with 5 to 8, 3 with more than 8, on Windows and Linux (set 2026-11-09; was 8); `LLAMA_MOE_HYBRID_THREADS`
 overrides it. A team larger than the physical cores made decode 4 to 5 times slower on an
 i7-4770K (LINUX-PASCAL.md section 3.2). `LLAMA_MOE_HYBRID_LEAN_BATCH` (default 1) serves the
 requests that the rows of an MTP verify step post for one layer as one job of the team, so each

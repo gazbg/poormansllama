@@ -24,6 +24,16 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (default host expert team by physical cores: 1 / 2 / 3)
+
+**Asked.** Owner: "set the default team to 3", then (mid-turn) "if the physical cpu cores is 4 set team to 1 if it is 8 set to 2 for more than 8 set to 3".
+
+**Answer.** `moe_hybrid_default_threads()` (`third_party/llama.cpp/src/llama-moe-hybrid.cpp`) now maps the physical core count of this process to the default `--hybrid-moe-threads` (env `LLAMA_MOE_HYBRID_THREADS` and the flag still override): 4 or fewer cores -> 1, 5 to 8 -> 2, more than 8 -> 3, unknown topology -> 3. Before, it was min(8, physical cores). The count comes from `moe_hybrid_physical_cores()` (Linux sysfs sibling lists, Windows core-CPU list). The 5-7 and below-4 rows are not in the owner's text: 1 and 2 were chosen by the nearest stated rule. The engine's default log line now always prints the chosen team and core count. Help text (`common/arg.cpp`), `common/common.h` comment and `docs/guide/PARAMETERS.md` updated.
+
+**Validated.** Built in the worktree (`cmake -S third_party/llama.cpp -B build/llama-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_LAYER_STREAMING=ON`, target `llama-server`, 0 errors; trap: a configure without `LLAMA_LAYER_STREAMING=ON` compiles but fails in `llama-context.cpp` because the hybrid members sit behind that macro). Five legs on the rebuilt server, GPU mutex, all wrapper exit 0 and provenance-clean: flag not passed x3 -> log `the expert team defaults to 3 threads (16 physical cores ...)` and `lean host leg mode 1, 3 threads on CPUs 2,4,6`; `--hybrid-moe-threads 3` -> same team; `--hybrid-moe-threads 1` -> 1 thread (the override still wins). Decode of the 600-token greedy request: default 97.4 (first run after the build), 108.6, 107.4 tok/s; explicit 3: 107.0; explicit 1: 104.5; identical text in all five. Only the more-than-8 branch ran (this machine has 16 physical cores); the 1 and 2 branches are verified by reading the code, not executed.
+
+**Scope / known gaps.** Only the default changes; no speed claim. On this machine (16 physical cores) the default becomes 3, where before it was 8. Tests and measurements in this session all passed the team explicitly, so none of them is affected. Uncommitted on `claude/apex-35b-prefill-optimization-d7e0cb`. The main-checkout binary (`build/llama-cuda/bin/Release`, which the user's server runs) does not contain this change until the branch is merged and rebuilt.
+
 ## 2026-11-07 (setup wizard D22: Pascal-or-lower int8 attention, --lm-prefill-prearm always for all profiles, port input defaulting to 8090)
 
 **Asked.** Owner: (1) 'for Pascal architecture and lower add --lm-prefill-attn-int8 if it is different from the env LLAMA_FATTN_TILE_Q8QK=1, if not different just make sure the env is set for all older architectures'; (2) 'for all profiles add --lm-prefill-prearm always'; (3) 'add in the setup wizard port input from the user, leave default to 8090'.
