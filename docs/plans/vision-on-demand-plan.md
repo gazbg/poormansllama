@@ -109,7 +109,7 @@ Hard correctness criteria (each gates its task):
 - **VOD-8 fuse with images (phase 3).** The checkpoint blobs a fused image prompt writes at aligned positions outside image regions are byte-identical to the legacy path's (hash equality); `prompt_n / cache_n` and checkpoints restored / created / erased equal BASE's over the image multi-turn scenario; prearm does not change either.
 - **VOD-9 no regression.** Host ctest list 78/78 plus `test-layer-streaming-(route-topk|host-mem)$` 2/2 (run directly: the suite halts at its doc-size guard, AGENTS.md); the default-off identity (VOD-1) re-run on the final build; the wizard host tests pass.
 
-Report-only (measured, tabulated, NO threshold, NO claim): image-request time to first token and its breakdown (shrink, unpark, encode, park, regrow, prefill) for OD vs BASE vs CPUV with 1 / 2 / 3 screenshots at the three sizes; text-turn TG and PP for OD vs NOVIS vs BASE; GPU encode time vs CPU encode time; unpark cost from pinned RAM (and a reload from disk for reference); compute-buffer size; pass rate on image tokens vs the ordinary path.
+Report-only (measured, tabulated, NO threshold, NO claim): pass engagement on a long text prompt, BASE vs OD vs NOVIS (DL-8); image-request time to first token and its breakdown (shrink, unpark, encode, park, regrow, prefill) for OD vs BASE vs CPUV with 1 / 2 / 3 screenshots at the three sizes; text-turn TG and PP for OD vs NOVIS vs BASE; GPU encode time vs CPU encode time; unpark cost from pinned RAM (and a reload from disk for reference); compute-buffer size; pass rate on image tokens vs the ordinary path.
 
 Claims allowed: exactly what is measured, on this machine (RTX 5090 Laptop, Windows), this model, these flags. NOT claimed: other architectures, other projectors, audio, video, multi-GPU, `-np > 2`, a physical 8 GiB card, any speedup (D10), non-causal image attention (Gemma-style), deepstack models.
 
@@ -121,7 +121,7 @@ Order: VOD-0 -> VOD-1 -> VOD-2 -> VOD-3 (-> VOD-4 phase 2 -> VOD-5 phase 3) and 
 
 ### VOD-0: measure and verify the hypotheses, build the harness
 
-Status: ready. Dependencies: none. Commit: unfilled.
+Status: done (2026-11-09, autonomous run under the owner's /goal; results in [vision-on-demand-results.md](vision-on-demand-results.md)). Dependencies: none. Commit: see the progress log (the verdict commit lands with this status change).
 
 Goal. Turn the open questions into numbers before any engine edit, and create the harness every later task uses.
 
@@ -139,7 +139,7 @@ Measurements.
 
 Acceptance. M1-M5 tabulated in the results file with the exact commands, build digest, GPU pre / post probe, power state (mains), and the unit of every VRAM figure. H1 is stated as confirmed or falsified.
 
-Validation. `bash tools/run-server-vision.sh <tag> "--phase p0" -- --exe=build/llama-cuda/bin/<build>/llama-server.exe ...` (arguments completed when the script exists). Expected: exit 0, `report.json` with the M1-M5 fields, no `CUDA error` in `server.log`. `python tools/server_vision.py --selftest` (no GPU): PNG writer round-trips, grader accepts the right answer and rejects the negative control.
+Validation. `bash tools/run-server-vision.sh <tag> "--phase p0" -- --exe=build/llama-cuda/bin/<build>/llama-server.exe ...` (arguments completed when the script exists). Expected: exit 0, `report.json` with the M1-M5 fields, no `CUDA error` in `server.log`. `python tools/server_vision.py selftest` (no GPU; the subcommand is `selftest`, not a flag): PNG writer round-trips, grader accepts the right answer and rejects the negative control, log scrapers parse.
 
 State updates. `docs/currentstate.md` entry; results file section "P0".
 
@@ -254,7 +254,7 @@ Escalation. A repo whose tree does not publish `mmproj-BF16.gguf`: the row falls
 ## Risks and unknowns (stated, not resolved)
 
 - H1 (F3) margin double-count: unverified; VOD-0 M1 decides. It would also mean today's always-resident vision loses about twice the projector's bytes of cache.
-- H2 mixed token / embedding batch in one decode: unknown for this model (VOD-4 first step).
+- H2 mixed token / embedding batch in one decode: RESOLVED BY INSPECTION 2026-11-09 (autonomous run): `llm_arch_supports_mixed_batch()` (`src/llama-arch.cpp:1339`) returns true for `qwen35moe` (only COGVLM, DEEPSEEK4/41, GRANITE_SWITCH, EAGLE3, DFLASH, GEMMA4_ASSISTANT, LIMITE return false), the default context is built with `allow_mixed` (`llama-context.cpp:269`) and `build_inp_embd` has a per-row token / embedding path (`llama-graph.cpp:2775`). So `llama_decode` accepts `[text, image embeddings, text]` in one batch for this model. The server uses that path (`add_prompt_mixed`, `server-context.cpp:5621`) only when `use_mixed_batch()` (memory-less or non-causal context), so a causal Qwen3.6 image chunk still goes through `process_mtmd_chunk` as an embedding-only batch today. What is still open for VOD-4 is the PASS's own embed piece with mixed rows, not the batch container.
 - H3 the worst-case compute buffer may be much larger than a real request needs; reserving per request in unpark may shrink the window (and cost a graph build per request). Measured in VOD-0 / VOD-1.
 - H4 WDDM may not return freed device memory immediately; the idle check (VOD-3 i) is the test.
 - H5 a different reserve shape can change the flash-attention variant and so the embeddings (VOD-2 catches it).
@@ -267,6 +267,20 @@ Escalation. A repo whose tree does not publish `mmproj-BF16.gguf`: the row falls
 
 `docs/currentstate.md` (observed behaviour, evidence, gaps, risk), the results file `docs/plans/vision-on-demand-results.md` (commands, build digest, GPU pre / post probe, power state, VRAM unit), `docs/guide/PARAMETERS.md` for the new flags, and each task's `Commit:` field once its verdict commit lands.
 
+## Decision log (autonomous run, owner's /goal of 2026-11-09)
+
+Format: question, options considered, choice, reason, reversible?, evidence.
+
+- **DL-1 build tree.** Q: where does the BASE/OD binary come from? Options: (a) reuse the main checkout's `build/llama-cuda` (other source state, an unknown digest, cannot be relocated into this worktree); (b) build in this worktree at the pinned head. Chose (b): configure `cmake -S third_party/llama.cpp -B build/llama-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DLLAMA_LAYER_STREAMING=ON -DCMAKE_BUILD_TYPE=Release` (the main cache's own options; wizard adds `-DLLAMA_LAYER_STREAMING=ON`), generator `Visual Studio 18 2026` as in the main cache. Reason: the BASE control must be built from exactly the sources the plan was written against. Reversible: yes (build output is ignored by git). Evidence: `build/vod-configure.log`.
+- **DL-2 harness reuse.** Q: new server driver or extend an existing one? Chose: `tools/server_vision.py` imports `Server` / `load_cfg` from `tools/server_mt.py` (same start, stop, free sampler, log capture) and adds fixtures, grading and log scrapes. Reason: one process-handling code path across the harnesses. Reversible: yes.
+- **DL-3 fixtures without Pillow.** Pillow is not installed; PNGs are written with `zlib` + `struct`; digits come from a 5x7 glyph table. No new dependency (AGENTS.md dependency policy).
+- **DL-5 wrapper provenance waiver.** Q: how to handle `PROVENANCE GATE ... refused (binary_state=not-supplied)` on the server path? Options: (a) attest the exe through the runner's `--attest` mechanism (it belongs to the layer-streaming runner's command line, not `llama-server`); (b) `-AllowUnprovenanced` as every G31/G32 server session did, plus self-recorded identity. Chose (b): each `report.json` stores SHA-256 prefixes of the exe and the engine DLLs and the directory's `PROVENANCE.txt` (source digest, build log). Reason: the gate cannot see a server binary; the waiver is recorded by the wrapper. Reversible: yes. Evidence: `build/llama-cuda/verdicts/provenance-waivers.log`.
+- **DL-6 trio fixture.** Q: the digit trio fixture was misread by the CONTROL (BASE) itself (5206 -> 5246 at 724 px, 3917 -> 291 at 1024 px), so it cannot discriminate arms. Options: keep it and exclude it from comparisons, or replace it. Chose: replace it with three colour squares at 724 px (read reliably), BEFORE any acceptance run; keep the single-image colour and digit fixtures. Reason: a fixture the control fails proves nothing about OD. This changes a fixture, not a criterion (the criterion is "OD answers wherever BASE answers"). Reversible: yes. Evidence: `vod0-base`, `vod0-baselog1/2` (digit trio wrong in BASE), `vod0-fixchk` (7 of 7 right, negative control fails as designed).
+- **DL-7 VOD-0 escalation.** The plan's VOD-0 escalation ("if M1 shows the projector costs far more than ~1.5 GiB of cache, or less than ~0.3 GiB, stop for the owner") becomes a recorded decision under the autonomous grant. Measured: 16 slots = 1,112 MiB of cache (0.3-1.5 GiB band) plus a refused startup pass arming. Chose: continue to VOD-1 unchanged. Reversible: n/a (a go decision). Evidence: results file M1/M2.
+- **DL-8 added report-only line.** Phase 0 showed that the consequence of the double-counted margin reaches the pass (declined arming). Added to the REPORT-ONLY list (not to the hard criteria, so no criterion is weakened or tightened): "pass engagement on a long text prompt (passes taken vs declined, `LLAMA_LM_LOG=1`), BASE vs OD vs NOVIS". Decided before any VOD-2/3 run. Reversible: yes.
+- **DL-4 VOD-0 engine edit.** The plan allows a log-only, env-gated change (`LLAMA_VOD_LOG=1`). It is applied to a COPY of the control: BASE (`bin/vod-base`) is side-copied from the pristine build before the edit, so M1 uses the untouched binary and the timing arms use the log build.
+
 ## Progress log
 
+- 2026-11-09 (autonomous run, VOD-0 done): CUDA build in this worktree (`bin/vod-base` pristine, digest 1B3F05238E46FC48; `bin/vod0` log-only, 82C1449B1E58B90E); harness `tools/server_vision.py` + `tools/run-server-vision.sh`; seven server sessions (`vod0-*`). H1 CONFIRMED: the resident projector (1,112 MiB measured) raises the hybrid margin to 17,109 MiB, cache 38 vs 54 slots, and the startup pass arming is refused (750 MiB short). GPU encode 85 / 249 / 835 ms vs CPU 1.73 / 4.03 / 11.08 s at 529 / 1,024 / 2,025 tokens; ordinary-path image prefill ~370-430 tok/s. Decisions DL-5..DL-8. Detail: results file.
 - 2026-11-09: discussion with the owner (four question rounds), decisions D1-D13 recorded above, code read as listed in F1-F11, public Hugging Face tree listings read (no download), local projector hashed. No engine file touched, no GPU workload run.

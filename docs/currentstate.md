@@ -24,6 +24,16 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+## 2026-11-09 (vision on demand, VOD-0 done: H1 confirmed, projector costs 1,112 MiB + a refused startup pass arming; GPU vs CPU encode measured)
+
+**Asked.** Owner /goal (autonomous): implement the vision projector on demand per `docs/plans/vision-on-demand-plan.md`; VOD-0 is the measurement task.
+
+**Answer.** Built the pristine control and a log-only (`LLAMA_VOD_LOG=1`) build in this worktree, wrote `tools/server_vision.py` / `tools/run-server-vision.sh`, ran seven server sessions. Results in `docs/plans/vision-on-demand-results.md`: with `--mmproj` resident the hybrid keep-free margin is 17,109 MiB (16,000 + the projector's 1,109 MiB estimate, never released), the expert cache sizes to 38 slots instead of 54, the cache is 21 slots at ready instead of the 2-slot armed floor, and the startup pass arming is declined (`no room for 2228 MiB + margin 17269 MiB: free 16317 -> 18747`). The projector's measured device cost is 1,112 MiB (861 MiB weights + 248 MiB compute buffer). GPU encode 85 / 249 / 835 ms vs CPU encode 1.73 / 4.03 / 11.08 s at 529 / 1,024 / 2,025 image tokens; the ordinary path prefills image embeddings at ~370-430 tok/s.
+
+**Validated.** `python tools/server_vision.py selftest` 22/22; seven wrapper sessions PASS with `gpu_pre=clean gpu_post=clean`, mains power; the wrapper's binary-provenance gate is waived (`-AllowUnprovenanced`, server path) and replaced by hashes in each report. Final fixture set 7 of 7 right on the control, negative control fails as designed.
+
+**Scope / known gaps.** No speed or VRAM claim beyond the measurements. Whether a long text prompt is also declined at request time with the projector resident is not measured yet (VOD-3 report-only line). The only engine change is the env-gated log lines in `tools/server/server-context.cpp`. VOD-1 (park/unpark in mtmd) is next.
+
 ## 2026-11-09 (vision projector on demand: plan written, owner decisions D1-D13, no code or GPU run)
 
 **Asked.** Owner: apply the layer-residency idea to vision: instead of keeping the multimodal projector in VRAM (or on the CPU via `--no-mmproj-offload`), load it into VRAM only while a request's images are encoded, then unload it; "discussion and a plan".

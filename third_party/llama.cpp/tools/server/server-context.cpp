@@ -1000,6 +1000,24 @@ struct server_slot {
     }
 };
 
+// VOD-0 (docs/plans/vision-on-demand-plan.md): env-gated timing lines for the projector, LLAMA_VOD_LOG=1. Log only, no behaviour change.
+static bool vod_log_on() {
+    static const bool on = getenv("LLAMA_VOD_LOG") != nullptr && atoi(getenv("LLAMA_VOD_LOG")) > 0;
+    return on;
+}
+
+// free / total bytes of the first GPU device as the CUDA runtime reports them (cudaMemGetInfo); false when there is none
+static bool vod_dev_free(size_t & free_b, size_t & total_b) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            return true;
+        }
+    }
+    return false;
+}
+
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
 static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
@@ -1013,6 +1031,7 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
 
     // try batching as much as possible
     int n_added = 1;
+    size_t n_added_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
     size_t idx_cur = idx;
     while (res == 0) {
         auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
@@ -1021,6 +1040,9 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
         }
         res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
         n_added += (res == 0 ? 1 : 0);
+        if (res == 0) {
+            n_added_tokens += mtmd_input_chunk_get_n_tokens(next_chunk->get());
+        }
         idx_cur = next_idx;
         SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
         // if res != 0, batch is full or chunk is not compatible -> this loop breaks
@@ -1029,7 +1051,11 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t vod_t0 = ggml_time_us();
     res = mtmd_batch_encode(mbatch.get());
+    if (vod_log_on()) {
+        LOG_WRN("vod: encode slot=%d chunks=%d tokens=%zu res=%d t_encode_ms=%.2f\n", slot.id, n_added, n_added_tokens, (int) res, (ggml_time_us() - vod_t0) / 1000.0);
+    }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -1075,6 +1101,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
+                const int64_t vod_t0 = ggml_time_us();
                 res = mtmd_helper_decode_image_chunk(
                     mctx,
                     slot.ctx_tgt,
@@ -1087,6 +1114,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     cb,
                     &cb_data
                 );
+                if (vod_log_on()) {
+                    LOG_WRN("vod: decode_chunk slot=%d idx=%zu tokens=%zu res=%d t_decode_ms=%.2f\n", slot.id, idx, (size_t) mtmd_input_chunk_get_n_tokens(chunk.get()), (int) res, (ggml_time_us() - vod_t0) / 1000.0);
+                }
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
                     return -1;
@@ -2081,12 +2111,23 @@ private:
                 }
             }
 
+            size_t vod_free0 = 0, vod_free1 = 0, vod_total = 0;
+            const bool vod_dev = vod_log_on() && vod_dev_free(vod_free0, vod_total);
+            const int64_t vod_t_init0 = ggml_time_us();
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            if (vod_dev && vod_dev_free(vod_free1, vod_total)) {
+                size_t est = 0;
+                for (const auto & kv : mmproj_usage.backend_mem_usage) {
+                    est += kv.second;
+                }
+                LOG_WRN("vod: projector init t_init_ms=%.1f device_free_before_mib=%.1f device_free_after_mib=%.1f delta_mib=%.1f estimate_mib=%.1f (unit: cudaMemGetInfo of the first GPU)\n",
+                        (ggml_time_us() - vod_t_init0) / 1000.0, vod_free0 / 1048576.0, vod_free1 / 1048576.0, ((double) vod_free0 - (double) vod_free1) / 1048576.0, est / 1048576.0);
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
