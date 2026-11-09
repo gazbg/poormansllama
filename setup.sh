@@ -38,7 +38,7 @@ CONTEXT=''
 PORT=''   # empty = ask (default 8090); an explicit --port suppresses the question (D22)
 BIND=''
 DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
-QUANT=''      # q4k_m|q5k_xl|q8k_xl|q5k_m|q6k_l (SDD D19, D23); empty = the model's default
+QUANT=''      # q4k_m|q5k_xl|q8k_xl|q5k_m (SDD D19, D23); empty = the model's default
 MODEL_FILE=''
 MODEL_DIR=''
 CLONE_DIR=''   # empty = in-repo detection / default path (see invoke_clone)
@@ -66,7 +66,7 @@ usage() {
     cat <<'EOF'
 usage: setup.sh [options]
   --model qwen38|qwen36|flint|apex35   model to use (asked if omitted)
-  --quant q4k_m|q5k_xl|q8k_xl|q5k_m|q6k_l   quant build (qwen38/qwen36: q4k_m q5k_xl q8k_xl; apex35: q5k_m q6k_l; default: the row's own)
+  --quant q4k_m|q5k_xl|q8k_xl|q5k_m   quant build (qwen38/qwen36: q4k_m q5k_xl q8k_xl; apex35: q5k_m; default: the row's own)
   --vram full|16g|8g            VRAM target (asked if omitted)
   --context 262k|128k           context size (asked if omitted)
   --port N                      server port (default 8090, asked if omitted; D22)
@@ -185,24 +185,25 @@ ask_choice() {
 # --- model table (SDD 4.5; links verified 2026-11-04, Q5_K_XL 2026-11-05) ----
 # SDD D19: flat over (model, quant); the Default entries are the files the
 # recipe rows were measured on. MI_IDX indexes this flat list.
-# SDD D23 (2026-11-09): entries 7 and 8 are Apex-35B-V1.0 (qwen35moe, 1 MTP layer); sizes and the
-# resolve-endpoint Content-Length checked against the Hugging Face API (25,347,532,640 / 32,775,817,376 bytes).
-M_KEYS=(qwen38 qwen36 flint qwen38 qwen36 qwen36 apex35 apex35)
-M_QUANTS=(q4k_m q4k_m q5k_xl q5k_xl q5k_xl q8k_xl q5k_m q6k_l)
-M_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF' 'unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF' 'Apexintelligence-AI/Apex-35B-V1.0-GGUF' 'Apexintelligence-AI/Apex-35B-V1.0-GGUF')
-M_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf' 'Qwen3.8-27B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf' 'Apex-35B-V1.0-Q5_K_M.gguf' 'Apex-35B-V1.0-Q6_K_L.gguf')
-M_SIZES_GIB=(15.4 20.6 27.9 19.4 24.7 36.4 23.6 30.5)
-M_SIZES_GIB_INT=(16 21 28 20 25 37 24 31)
-M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE' 'MoE + MTP' 'MoE + MTP' 'MoE + MTP')
-M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/qwen-3.6" "$HOME/models/apex" "$HOME/models/apex")
-M_DEFAULTS=(1 1 1 0 0 0 1 0)
+# SDD D23 (2026-11-09): entry 7 is Apex-35B-V1.0 Q5_K_M (qwen35moe, 1 MTP layer); its size and the
+# resolve-endpoint Content-Length were checked against the Hugging Face API (25,347,532,640 bytes).
+# The Q6_K_L build was entry 8 and was removed on 2026-11-09.
+M_KEYS=(qwen38 qwen36 flint qwen38 qwen36 qwen36 apex35)
+M_QUANTS=(q4k_m q4k_m q5k_xl q5k_xl q5k_xl q8k_xl q5k_m)
+M_REPOS=('unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/flint-GGUF' 'unsloth/Qwen3.8-27B-GGUF' 'unsloth/Qwen3.6-35B-A3B-GGUF' 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF' 'Apexintelligence-AI/Apex-35B-V1.0-GGUF')
+M_FILES=('Qwen3.8-27B-UD-Q4_K_M.gguf' 'Qwen3.6-35B-A3B-UD-Q4_K_M.gguf' 'flint-UD-Q5_K_XL.gguf' 'Qwen3.8-27B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf' 'Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf' 'Apex-35B-V1.0-Q5_K_M.gguf')
+M_SIZES_GIB=(15.4 20.6 27.9 19.4 24.7 36.4 23.6)
+M_SIZES_GIB_INT=(16 21 28 20 25 37 24)
+M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE' 'MoE + MTP' 'MoE + MTP')
+M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/qwen-3.6" "$HOME/models/apex")
+M_DEFAULTS=(1 1 1 0 0 0 1)
 
 mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
     case "$1" in
-        1|2|3|4|5|6|7|8) MI_IDX=$(( $1 - 1 )) ;;
+        1|2|3|4|5|6|7) MI_IDX=$(( $1 - 1 )) ;;
         qwen38|qwen36|flint|apex35)
             local k="$1" i q="${2:-}" avail=''
-            for i in 0 1 2 3 4 5 6 7; do
+            for i in 0 1 2 3 4 5 6; do
                 [ "${M_KEYS[$i]}" = "$k" ] || continue
                 if [ -z "$q" ]; then
                     [ "${M_DEFAULTS[$i]}" = 1 ] && { MI_IDX=$i; return 0; }
@@ -210,11 +211,11 @@ mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
                 avail="$avail ${M_QUANTS[$i]}"
             done
             if [ -z "$q" ]; then
-                fail "unknown model '$k' (choose qwen38, qwen36, flint, apex35, or 1-8)" 1
+                fail "unknown model '$k' (choose qwen38, qwen36, flint, apex35, or 1-7)" 1
             else
                 fail "no '$q' build for $k (available:$avail)" 1
             fi ;;
-        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, apex35, or 1-8)" 1 ;;
+        *) fail "unknown model '$1' (choose qwen38, qwen36, flint, apex35, or 1-7)" 1 ;;
     esac
 }
 
@@ -290,7 +291,7 @@ recipe_exact() {
         R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
         R_DEVICE=auto
         R_MEASURED='TG ~100-110 tok/s (600-token greedy reply), PP ~3,900 t/s on a 20.7k-token prompt (2026-11-09, RTX 5090 Laptop 24 GiB, Windows, on Apex-35B-V1.0-Q5_K_S.gguf)'
-        R_NOTE='measured on Apex-35B-V1.0-Q5_K_S.gguf, NOT on the offered Q5_K_M or Q6_K_L (same architecture qwen35moe, 41 blocks with 1 MTP layer; both offered files carry the blk.40.nextn tensors, GGUF headers read 2026-11-09). Windows only, one MoE family; the q6k_l choice reuses this row with the D19 fallback warning'
+        R_NOTE='measured on Apex-35B-V1.0-Q5_K_S.gguf, NOT on the offered Q5_K_M (same architecture qwen35moe, 41 blocks with 1 MTP layer; the offered file carries the blk.40.nextn tensors, GGUF header read 2026-11-09). Windows only, one MoE family'
         return 0
     fi
     return 1
@@ -316,7 +317,7 @@ recipe_for() {
 
 is_moe_model() {  # is_moe_model KEY -> 0 when any table entry of the model says MoE (SDD D24)
     local i
-    for i in 0 1 2 3 4 5 6 7; do
+    for i in 0 1 2 3 4 5 6; do
         if [ "${M_KEYS[$i]}" = "$1" ]; then
             case "${M_KINDS[$i]}" in *MoE*) return 0 ;; esac
         fi
@@ -336,7 +337,7 @@ moe_class_row() {
 
 default_quant() {  # default_quant MODEL -> the model's default-quant (SDD D19)
     local i
-    for i in 0 1 2 3 4 5 6 7; do
+    for i in 0 1 2 3 4 5 6; do
         if [ "${M_KEYS[$i]}" = "$1" ] && [ "${M_DEFAULTS[$i]}" = 1 ]; then echo "${M_QUANTS[$i]}"; return 0; fi
     done
     return 1
@@ -347,7 +348,7 @@ recipe_avail() {  # recipe_avail MODEL -> prints the available rows (all quants)
     say "no measured recipe for $m / $VRAM / $CONTEXT / ${QUANT:-default quant} - available rows for $m:"
     for v in full 16g 8g; do
         for c in 262k 128k; do
-            for q in q4k_m q5k_xl q8k_xl q5k_m q6k_l; do
+            for q in q4k_m q5k_xl q8k_xl q5k_m; do
                 if recipe_exact "$m" "$v" "$c" "$q"; then
                     printf '    %-3s %-5s %-6s %-7s %s\n' "$R_ID" "$v" "$c" "$q" "$R_MEASURED"
                 fi
@@ -774,7 +775,7 @@ pick_model() {
         return 0
     fi
     local i qtag opts=()
-    for i in 0 1 2 3 4 5 6 7; do
+    for i in 0 1 2 3 4 5 6; do
         qtag="${M_QUANTS[$i]}"
         [ "${M_DEFAULTS[$i]}" = 1 ] || qtag="$qtag (alt)"
         opts+=("$(printf '%s: %s - %s, %s GiB [Q: %s]' "${M_KEYS[$i]}" "${M_KINDS[$i]}" "${M_FILES[$i]}" "${M_SIZES_GIB[$i]}" "$qtag")")
@@ -787,7 +788,6 @@ pick_model() {
         *qwen36*Q5_K_XL*) MI_IDX=4 ;;
         *qwen36*Q8_K_XL*) MI_IDX=5 ;;
         *apex35*Q5_K_M*) MI_IDX=6 ;;
-        *apex35*Q6_K_L*) MI_IDX=7 ;;
         *qwen38*) MI_IDX=0 ;;
         *qwen36*) MI_IDX=1 ;;
         *flint*)  MI_IDX=2 ;;
@@ -1069,6 +1069,10 @@ pick_recipe() {
     fi
     say "recipe $R_ID: $R_MEASURED"
     [ -n "$R_NOTE" ] && say "note: $R_NOTE"
+        # SDD D25 (2026-11-09): the owner's own run of this model through the shared profile
+        if [ "${M_KEYS[$MI_IDX]}" = apex35 ] && [ "${M_QUANTS[$MI_IDX]}" = q5k_m ] && [ "$VRAM" = 8g ]; then
+            say "measured on ${M_FILES[$MI_IDX]} with this row (owner, 8 GiB card, Linux): prompt 51,885 tokens at 537.42 t/s (96.5 s), 1,400 generated tokens at 30.88 t/s (32.39 ms per token)"
+        fi
     # D12: warning only, threshold by VRAM target. D17: device-pinned rows
     # check the card they will actually use, not nvidia-smi's first line.
     local gpu_mib need=0 card='a 24 GiB card' gpu_line="$GPU_LINE"

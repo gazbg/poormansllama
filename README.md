@@ -48,7 +48,6 @@ Choose the model only:
    5) qwen36: MoE - Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf, 24.7 GiB [Q: q5k_xl (alt)]
    6) qwen36: MoE + MTP - Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf, 36.4 GiB [Q: q8k_xl (alt)]
    7) apex35: MoE + MTP - Apex-35B-V1.0-Q5_K_M.gguf, 23.6 GiB [Q: q5k_m]
-   8) apex35: MoE + MTP - Apex-35B-V1.0-Q6_K_L.gguf, 30.5 GiB [Q: q6k_l (alt)]
 
 You should not see a difference in speed between Q4 and Q5 models , the main difference is how much free RAM will it leave when loaded for your needs. 
 
