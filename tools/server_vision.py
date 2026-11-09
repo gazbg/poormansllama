@@ -183,11 +183,17 @@ def text_control(fx):
 STOCK_ARGS = ["-c", "32768", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "-np", "1", "-ngl", "99", "-ncmoe", "37", "-fit", "off", "-lv", "4"]   # the stock placement: no hybrid engine, no layer-major pass
 
 
-def mkcfg(arm, exe, free_all=False, np_=1, extra_args=(), env=(), wrap=(), stock=False):
+def mkcfg(arm, exe, free_all=False, np_=1, extra_args=(), env=(), wrap=(), stock=False, drop=()):
     args = ["--model", MODEL]
     if arm != "novis":
         args += ["--mmproj", MMPROJ]
-    args += list(STOCK_ARGS if stock else R8_ARGS)
+    base_args = list(STOCK_ARGS if stock else R8_ARGS)
+    for spec in drop:      # 'flag' or 'flag:N' (the flag and the N values after it are removed from the recipe)
+        flag, _, n = spec.partition(':')
+        if flag in base_args:
+            i = base_args.index(flag)
+            del base_args[i:i + 1 + int(n or 0)]
+    args += base_args
     if np_ != 1:
         args[args.index("-np") + 1] = str(np_)
     if free_all and not stock:
@@ -702,6 +708,150 @@ def cmd_soak(a):
     sys.exit(0 if ok else 1)
 
 
+# ----------------------------------------------------------------------------- fuse with images (VOD-5 / VOD-8): the checkpoints of the legacy flow and of the fused flow
+
+RE_CK_CREATED = re.compile(r"created context checkpoint (\d+) of (\d+) \(pos_min = (-?\d+), pos_max = (-?\d+), n_tokens = (\d+), size = ([\d.]+) MiB\)")
+RE_CK_FUSE = re.compile(r"lm-fuse: checkpoint n_tokens = (\d+), pos_min = (-?\d+), pos_max = (-?\d+), (\d+) bytes, fnv ([0-9a-f]+), taken (.*?) \(")
+RE_CK_RESTORED = re.compile(r"restored context checkpoint \(pos_min = (-?\d+), pos_max = (-?\d+), n_tokens = (\d+)")
+RE_CK_ERASED = re.compile(r"erasing old context checkpoint \(pos_min = (-?\d+), pos_max = (-?\d+), n_tokens = (\d+)|erased invalidated context checkpoint \(pos_min = (-?\d+), pos_max = (-?\d+), n_tokens = (\d+)")
+RE_PASS = re.compile(r"lm-prefill: pass (\d+): (\d+) tokens at position (\d+) in (\d+) chunks")
+RE_FUSE_PLAN = re.compile(r"lm-fuse: (\d+) tokens from (\d+) in one batch")
+
+
+def fuse_requests(side=1024):
+    def img(png):
+        return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}}
+
+    def txt(s):
+        return {"type": "text", "text": s}
+    red, green = colour_image(side, "red"), colour_image(side, "green")
+    long_a = filler(150, 0)       # ~3,700 tokens each
+    long_b = filler(150, 500)
+    q_val = "\nWhat is the measured value of channel 7 in entry 7? Answer with the number only."
+    q_col = "\nWhat is the colour of the square in the image? Answer with one word."
+    img_long = [{"role": "user", "content": [img(red), txt(long_b + q_col)]}]
+    return [
+        ("text-long", [{"role": "user", "content": long_a + q_val}]),
+        ("img-long", list(img_long)),
+        ("img-long-turn2", img_long + [{"role": "assistant", "content": "red"}, {"role": "user", "content": "Repeat the word you just answered, in capital letters."}]),
+        ("img-between", [{"role": "user", "content": [txt(filler(100, 2000)), img(red), txt(filler(100, 3000)), img(green), txt("Which colours were the two images, in order? Answer with two words.")]}]),
+        ("img-short", [{"role": "user", "content": [img(red), txt("What is the colour of the square? One word.")]}]),
+        ("text-long-again", [{"role": "user", "content": long_a + q_val}]),
+        ("img-long-again", list(img_long)),
+        # longer prompts: the canonical checkpoint (the last multiple of the chunk size below the end) lies BEHIND an image, in the text
+        ("img-vlong", [{"role": "user", "content": [img(red), txt(filler(300, 700) + q_col)]}]),
+        ("img-vlong-b", [{"role": "user", "content": [txt(filler(60, 4000)), img(green), txt(filler(300, 1500) + q_col)]}]),
+        ("img-vlong-turn2", [{"role": "user", "content": [img(red), txt(filler(300, 700) + q_col)]}, {"role": "assistant", "content": "red"}, {"role": "user", "content": "Repeat the word you just answered, in capital letters."}]),
+    ]
+
+
+def fuse_events(chunk):
+    """the checkpoint and pass events of one request, from the slice of the server log it produced"""
+    ev = {"created": [], "fuse_ck": [], "restored": [], "erased": [], "passes": [], "fuse_plan": []}
+    for l in chunk.splitlines():
+        m = RE_CK_CREATED.search(l)
+        if m:
+            ev["created"].append({"idx": int(m.group(1)), "pos_min": int(m.group(3)), "pos_max": int(m.group(4)), "n_tokens": int(m.group(5)), "mib": float(m.group(6))})
+        m = RE_CK_FUSE.search(l)
+        if m:
+            ev["fuse_ck"].append({"n_tokens": int(m.group(1)), "pos_min": int(m.group(2)), "pos_max": int(m.group(3)), "bytes": int(m.group(4)), "fnv": m.group(5), "taken": m.group(6)})
+        m = RE_CK_RESTORED.search(l)
+        if m:
+            ev["restored"].append({"pos_min": int(m.group(1)), "pos_max": int(m.group(2)), "n_tokens": int(m.group(3))})
+        m = RE_CK_ERASED.search(l)
+        if m:
+            g = [x for x in m.groups() if x is not None]
+            ev["erased"].append({"pos_min": int(g[0]), "pos_max": int(g[1]), "n_tokens": int(g[2])})
+        m = RE_PASS.search(l)
+        if m:
+            ev["passes"].append({"n": int(m.group(2)), "pos": int(m.group(3)), "chunks": int(m.group(4))})
+        m = RE_FUSE_PLAN.search(l)
+        if m:
+            ev["fuse_plan"].append({"n": int(m.group(1)), "from": int(m.group(2))})
+    return ev
+
+
+def cmd_fuse(a):
+    """the scripted request sequence of VOD-8; per request: answer, prompt_n / cache_n / predicted_n and the checkpoint events of the server log"""
+    from server_mt import Server, load_cfg
+    cfg = load_cfg(a.config)
+    os.makedirs(a.out, exist_ok=True)
+    srv = Server(cfg, a.out, port=a.port)
+    rep = {"phase": "fuse", "config": cfg, "provenance": provenance(cfg["exe"]), "requests": {}}
+    logp = os.path.join(a.out, "server.log")
+    ok = True
+    try:
+        rep["t_ready_s"] = round(srv.start(), 2)
+        time.sleep(2.0)
+        only = [x for x in (a.only or '').split(',') if x]
+        for name, msgs in fuse_requests(a.side):
+            if only and name not in only:
+                continue
+            off = os.path.getsize(logp) if os.path.exists(logp) else 0
+            rec = srv.chat(msgs, max_tokens=a.max_tokens, cache_prompt=True)
+            time.sleep(1.0)
+            chunk = open(logp, "rb").read()[off:].replace(b"\x00", b"").decode("utf-8", "replace") if os.path.exists(logp) else ""
+            r = rec_short(rec)
+            r["events"] = fuse_events(chunk)
+            rep["requests"][name] = r
+            ok = ok and rec.get("status") == 200
+            ev = r["events"]
+            print("%-16s status %s  prompt_n %s cache_n %s  passes %s  created %s  restored %s  erased %s  answer %r" % (name, rec.get("status"), r["prompt_n"], r["cache_n"], [(p["n"], p["pos"]) for p in ev["passes"]],
+                  [(c["n_tokens"], c["pos_max"]) for c in ev["created"]], [c["n_tokens"] for c in ev["restored"]], [c["n_tokens"] for c in ev["erased"]], (rec.get("content") or "")[:24]))
+        time.sleep(1.0)
+    finally:
+        srv.stop()
+    rep["log"] = scrape_log(logp)
+    rep["log_counts"] = log_counts(a.out)
+    json.dump(rep, open(os.path.join(a.out, "report.json"), "w"), indent=1)
+    print("report:", os.path.join(a.out, "report.json"))
+    sys.exit(0 if ok else 1)
+
+
+def fuse_compare_pair(ref, cand):
+    """per request: the answer, prompt_n / cache_n / predicted_n, the created / restored / erased checkpoints (n_tokens, pos_min, pos_max) and, where both runs hashed, the checkpoint hashes. Returns rows and the totals"""
+    rows = []
+    for name in ref:
+        r, c = ref[name], cand.get(name)
+        if c is None:
+            rows.append((name, "missing"))
+            continue
+        same_ans = r["content"] == c["content"]
+        same_cnt = (r["prompt_n"], r["cache_n"], r["predicted_n"]) == (c["prompt_n"], c["cache_n"], c["predicted_n"])
+        key = lambda lst: [(x["n_tokens"], x["pos_min"], x["pos_max"]) for x in lst]
+        cr = key(r["events"]["created"]) == key(c["events"]["created"])
+        rs = key(r["events"]["restored"]) == key(c["events"]["restored"])
+        er = key(r["events"]["erased"]) == key(c["events"]["erased"])
+        hr = {x["n_tokens"]: x["fnv"] for x in r["events"]["fuse_ck"]}
+        hc = {x["n_tokens"]: x["fnv"] for x in c["events"]["fuse_ck"]}
+        both = [k for k in hr if k in hc and set(hr[k]) != {"0"} and set(hc[k]) != {"0"}]
+        h_eq = sum(1 for k in both if hr[k] == hc[k])
+        rows.append((name, same_ans, same_cnt, cr, rs, er, h_eq, len(both), (r["prompt_n"], r["cache_n"], r["predicted_n"]), (c["prompt_n"], c["cache_n"], c["predicted_n"]), key(r["events"]["created"]), key(c["events"]["created"])))
+    return rows
+
+
+def cmd_fuse_compare(a):
+    ref = json.load(open(os.path.join(a.dirs[0], "report.json")))["requests"]
+    print("reference:", a.dirs[0])
+    for d in a.dirs[1:]:
+        cand = json.load(open(os.path.join(d, "report.json")))["requests"]
+        rows = fuse_compare_pair(ref, cand)
+        n_ok = n_hash = n_hash_all = 0
+        print("== %s against %s" % (d, a.dirs[0]))
+        for r in rows:
+            if len(r) == 2:
+                print("  %-16s %s" % r)
+                continue
+            name, same_ans, same_cnt, cr, rs, er, h_eq, h_n, cnt_r, cnt_c, k_r, k_c = r
+            good = same_ans and same_cnt and cr and rs and er
+            n_ok += 1 if good else 0
+            n_hash += h_eq
+            n_hash_all += h_n
+            print("  %-16s answer %s  counts %s  created %s  restored %s  erased %s  hashes %d/%d equal%s" % (name, "same" if same_ans else "DIFF", "same" if same_cnt else "DIFF %s | %s" % (cnt_r, cnt_c),
+                  "same" if cr else "DIFF %s | %s" % (k_r, k_c), "same" if rs else "DIFF", "same" if er else "DIFF", h_eq, h_n, "" if good else "   <-- differs"))
+        print("  requests identical (answer, counts, created / restored / erased checkpoints): %d of %d;  checkpoint hashes equal: %d of %d" % (n_ok, len(rows), n_hash, n_hash_all))
+
+
 # ----------------------------------------------------------------------------- equivalence of two prefill paths (VOD-4 / VOD-5): per-token logprobs of fixed image prompts
 
 EQ_QUESTIONS = [("answer", None, 16), ("describe", "Describe the image in one sentence.", 64)]   # 64 tokens: the length of the contract (VOD-7)
@@ -857,6 +1007,7 @@ def main():
     p.add_argument("--env", action="append", default=[])
     p.add_argument("--wrap", action="append", default=[])
     p.add_argument("--stock", action="store_true", help="the stock placement (-ngl 99 -ncmoe 37 -fit off) instead of the R8 hybrid recipe")
+    p.add_argument("--drop-arg", action="append", default=[], help="remove a flag of the R8 recipe: FLAG or FLAG:N for a flag with N values")
     p = sp.add_parser("run")
     p.add_argument("--config", required=True)
     p.add_argument("--out", required=True)
@@ -881,6 +1032,15 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--sides", default="724,1024,1448")
     p.add_argument("--port", type=int, default=18080)
+    p = sp.add_parser("fuse")
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--side", type=int, default=1024)
+    p.add_argument("--only", default="", help="comma-separated request names of the fuse scenario (memcheck runs a subset)")
+    p.add_argument("--max-tokens", type=int, default=8)
+    p.add_argument("--port", type=int, default=18080)
+    p = sp.add_parser("fuse-compare")
+    p.add_argument("dirs", nargs="+")
     p = sp.add_parser("eq-compare")
     p.add_argument("dirs", nargs="+")
     p.add_argument("--verbose", action="store_true")
@@ -907,7 +1067,7 @@ def main():
                 open(os.path.join(a.out, "%s-%d.png" % (f["name"], i)), "wb").write(png)
             print(f["name"], "expect", f["expect"])
     elif a.cmd == "mkcfg":
-        cfg = mkcfg(a.arm, a.exe, a.free_all, a.np, a.extra_arg, a.env, a.wrap, a.stock)
+        cfg = mkcfg(a.arm, a.exe, a.free_all, a.np, a.extra_arg, a.env, a.wrap, a.stock, a.drop_arg)
         json.dump(cfg, open(a.out, "w"), indent=1)
         print(a.out, a.arm, "args:", len(cfg["args"]))
     elif a.cmd == "run":
@@ -924,6 +1084,10 @@ def main():
         cmd_eq(a)
     elif a.cmd == "eq-compare":
         cmd_eq_compare(a)
+    elif a.cmd == "fuse":
+        cmd_fuse(a)
+    elif a.cmd == "fuse-compare":
+        cmd_fuse_compare(a)
     elif a.cmd == "fault":
         cmd_fault(a)
     elif a.cmd == "soak":

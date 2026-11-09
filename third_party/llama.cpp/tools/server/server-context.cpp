@@ -4524,7 +4524,7 @@ private:
                 cuts.push_back((int32_t) rel);
                 ++it;
             } else if (rel == 0 && off > 0) {
-                create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - *it, (llama_pos) (*it - 1), (llama_pos) (*it - 1));
+                create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - *it, s->prompt.tokens.pos_next(*it) - 1, s->prompt.tokens.pos_next(*it) - 1);     // VOD-5: the position of the last token before the cut (not the token index behind an image)
                 it = s->fuse_at.erase(it);
             } else {
                 ++it;
@@ -4575,7 +4575,7 @@ private:
                 n_lost++;
                 continue;
             }
-            create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - at, (llama_pos) (at - 1), (llama_pos) (at - 1), &blob);
+            create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - at, s->prompt.tokens.pos_next(at) - 1, s->prompt.tokens.pos_next(at) - 1, &blob);     // VOD-5: as above
             n_made++;
         }
         s->fuse_at = later;
@@ -5628,9 +5628,20 @@ private:
                     bool    sim_empty   = slot.prompt.checkpoints.empty();
                     int64_t sim_back    = sim_empty ? -1 : slot.prompt.checkpoints.back().n_tokens;
                     const llama_pos pos_min0 = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    if (params_base.lm_prefill_fuse && !has_mtmd && !slot.prompt.tokens.has_mtmd && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                    // VOD-5: with --mmproj-on-demand a loaded projector no longer turns the fused prefill off for every prompt. The text of a prompt up to its next image chunk (or its end) is fused like any
+                    // text; the image chunks themselves were decoded above (the pass takes them from 1,024 rows, VOD-4). Positions are not token indexes behind an image, so the checkpoint positions below
+                    // come from pos_next() and the rule "no checkpoint right after an image chunk" applies to the first virtual batch only.
+                    const bool fuse_media_ok = !slot.prompt.tokens.has_mtmd || params_base.mmproj_on_demand;
+                    int64_t fuse_seg_end = (int64_t) slot.task->n_tokens();
+                    if (fuse_media_ok && slot.prompt.tokens.has_mtmd) {
+                        const auto next_media = input_tokens.find_next_media_chunk(slot.prompt.n_tokens());
+                        if (next_media.first != nullptr) {
+                            fuse_seg_end = (int64_t) next_media.second;
+                        }
+                    }
+                    if (params_base.lm_prefill_fuse && fuse_media_ok && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         batch.size() == 0) {
-                        const int64_t left = (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens();
+                        const int64_t left = fuse_seg_end - (int64_t) slot.prompt.n_tokens();
                         if (left >= params_base.lm_prefill_fuse_min && (params_base.lm_prefill_fuse_max <= 0 || left < params_base.lm_prefill_fuse_max)) {
                             const int64_t t_arm0 = ggml_time_us();
                             fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
@@ -5650,7 +5661,7 @@ private:
                                     break;
                                 }
                             }
-                            return ckpt_ok && canon_A > 0 && (int) s == canon_A && pmin >= 0 && !has_mtmd && !have;
+                            return ckpt_ok && canon_A > 0 && (int) s == canon_A && pmin >= 0 && !(has_mtmd && s == fuse_first) && !have;      // VOD-5: only the batch right behind an image chunk is without a checkpoint
                         }
                         const bool near_end = N < e + n_ubatch;
                         bool d = ckpt_ok;
@@ -5660,7 +5671,7 @@ private:
                         if (d && pmin < 0) {
                             d = false;
                         }
-                        d = d && !has_mtmd;
+                        d = d && !(has_mtmd && s == fuse_first);      // VOD-5: the legacy flag `has_mtmd` belongs to the first batch of the iteration, the one behind an image chunk
                         if (params_base.lm_prefill_fuse_one_cut && near_end && e != N) {
                             d = false;      // H112: only the checkpoint 4 tokens before the end (the virtual batch that ends at N) is kept
                         }

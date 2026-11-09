@@ -260,3 +260,44 @@ A request's total time also pays the window (+0.12 s) and the cache shrink and r
 - Mixed token / embedding batches (a single `llama_decode` carrying text and image rows) are not taken by the pass; the server never builds one for this model.
 - Under the hybrid cache the first-token distribution of knife-edge prompts depends on the request history (above); no claim of equivalence is made for that configuration beyond the measured table.
 - The residual 2,048-chunk deltas of two prompts (0.17-0.20) are below the bound and not root-caused.
+
+## VOD-5: fuse and prearm with image prompts (phase 3)
+
+Build `vod5a` (digest 8B33CD2980DEF2EB, HEAD `d5b92ba8` + the server edits below; side-copied under `build/llama-cuda/bin/vod5a/`). All sessions `gpu_pre=clean gpu_post=clean`, mains power, `-AllowUnprovenanced` (DL-5).
+
+### What was built (`tools/server/server-context.cpp`, server only; the library already supported a batch behind an image since DL-16)
+
+- With `--mmproj-on-demand` a loaded projector no longer turns the fused prefill (`--lm-prefill-fuse`) off for every prompt (`slot.prompt.tokens.has_mtmd` gate). The text of a prompt up to its next image chunk (or its end) is fused like any text; the image chunks themselves are decoded before it (the pass takes them from 1,024 rows, VOD-4). Without `--mmproj-on-demand` nothing changes (a resident projector keeps the old gate).
+- The legacy rule "no checkpoint right behind an image chunk" belongs to the first batch of an update iteration; the replay of the cut rules (`fuse_decide`) now applies it to the first virtual batch only, in both the default and the canonical rules.
+- Checkpoint positions of a fused batch are the position of the last token before the cut, `pos_next(n) - 1`, not the token index minus one (they differ behind an image); the library's snapshot position is `pos0 + cut - 1` (DL-16).
+
+### Hard criterion VOD-8 (fuse with images)
+
+Scenario (tool `server_vision.py fuse`, 10 requests, `cache_prompt` true, `-lv 5` so restores and erasures are logged, `LLAMA_LM_LOG=1 LLAMA_LM_HASH=1`): a long text-only prompt; an image + ~3,700 tokens of text; its second turn; a prompt with text, image, text, image, question; a short image prompt; the text-only and image prompts repeated; three prompts of 8,000-10,000 tokens whose canonical checkpoint lies behind an image. Sessions `vod5-fuse-H0x` (legacy: `--lm-prefill-fuse` off), `-H1x` (fused, prearm auto), `-H2x` (fused, prearm always), `-Bx` (BASE: the resident projector, the recipe as it is), all `--lm-prefill-canonical`. The first round (7 requests, sessions `vod5-fuse-H0` .. `-B`) gave the same result.
+
+| Criterion | Evidence | Result |
+|-----------|----------|--------|
+| checkpoint blobs written by a fused image prompt at aligned positions are byte-identical to the legacy path's | `fuse-compare H0x H1x`: **4 of 4** hashes equal (text-only 2,048 tokens; image + 3.7k text, checkpoint at 4,096 tokens / position 3,103 BEHIND the image; image + 7.3k text at 8,192 / 7,199; text + image + 7.6k text at 8,192 / 7,199). `H0x H2x`: 4 of 4. First round: 2 of 2. | MET |
+| `prompt_n / cache_n / predicted_n` and the checkpoints created / restored / erased equal BASE's over the scenario | `fuse-compare Bx H0x`: 10 of 10 requests identical (answer, the three counts, the created, restored and erased lists); `H1x`, `H2x` against `H0x`: 10 of 10 | MET |
+| prearm does not change either | `H2x` (prearm always) against `H0x` and `H1x`: 10 of 10 identical | MET |
+| text-only prompts on a projector server: the G42 behaviour | the text-only prompt is now one fused pass (3,562 tokens) instead of two (2,048 + 1,514); its checkpoint hash equals the legacy one; the checkpoints restored on the repeat are the same | MET |
+| boundary-only rule (no checkpoint inside an image region) | `img-between` (7,134 tokens): the canonical cut (6,144) lies inside the second image's rows; no checkpoint is created in any arm | as designed |
+
+Default rules (not canonical; `vod5-fuse-D0` legacy vs `-D1` fused, report-only): created / restored / erased checkpoint positions and the counts are identical on all 7 requests; the blobs are NOT hash-equal there (2 of 11) because the legacy batches and the fused pass cut chunks of different widths in that mode; byte equality is a property of the canonical mode, as in G42.
+
+### Report-only: what the fused flow does to a request (prompt rate = `prompt_per_second` of the request, mains, one session each, no repetition, NOT a speed claim)
+
+| Request (prompt tokens) | BASE (resident projector, no pass) | OD legacy (fuse off) | OD fused | OD fused + prearm always |
+|---|---|---|---|---|
+| text-only 3,562 | 462 | 1,072 | 1,706 | 1,698 |
+| image + 3.7k text, 4,704 | 411 | 750 | 1,035 | 1,039 |
+| text, image, text, image (7,134) | 437 | 1,004 | 1,000 | 1,004 |
+| image + 7.3k text (8,346) | 444 | 1,478 | 1,735 | 1,727 |
+| text, image, 7.6k text (10,163) | 455 | 1,424 | 1,701 | 1,706 |
+| second turn of an image conversation (cache hit, 634 / 180 new tokens) | 310 / 174 | 311 / 175 | 311 / 175 | 311 / 175 |
+
+Passes per request, legacy -> fused: text-only 2 -> 1; image + text 2 -> 2 (the image, then one pass for the whole text instead of a pass plus an ordinary tail); text-image-text 4 -> 3 on the last prompt. A request with two images and short text segments is unchanged (each segment was one pass already).
+
+### Not yet recorded when this section was first written (filled in by the closeout entry below)
+
+The acc, soak, fuse free-watch and memcheck sessions on `vod5a` were refused at the GPU wrapper after the owner started a server on the card (DL-19): they are rerun when the card is free.
