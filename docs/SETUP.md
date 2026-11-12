@@ -196,6 +196,10 @@ For every recipe row that does not already carry `--mmproj` the wizard asks "Vis
 
 The MTP / draft rows are included (the Q8_K_XL MTP command ran with the projector). `--mmproj-on-demand` was measured on Qwen3.6-35B-A3B only (Apex-35B has the same architecture); on Qwen3.8 and Apex the emitted script says "vision on this model is NOT measured", and the first image request is the test: say no to the question, or remove the two vision flags from the script, to go back to text only. The vision flags are an addition to the measured row, not part of it (the emitted script says so).
 
+## Response length cap (SDD D28)
+
+The generated `run-server.ps1` / `run-server.sh` limits one response to 16000 new tokens by default: a `$maxTokens` (`MAX_TOKENS` in the shell script) = 16000 near the top, passed to the server as `-n`. Just before the server starts the script prints "max new tokens per response: 16000 (-n). Edit $maxTokens at the top of this script if you need more (a request that sets max_tokens itself overrides it)." Edit that one number if you need longer answers; `-n -1` removes the limit. A request that sends its own `max_tokens` is not capped by it. A recipe that already sets `-n` keeps its own value.
+
 ## Test hooks (not for daily use)
 
 - `SETUP_WIZARD_FORCE_MISSING='cmake,git'` (env var, both platforms) makes the

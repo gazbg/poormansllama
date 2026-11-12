@@ -1233,6 +1233,14 @@ emit_run_script() {
         fi
         echo "PORT=$PORT"
         echo "LOG=\"$log\""
+        # SDD D28: a default cap on the length of one response. -n is the limit for a request that names none of its own
+        # (a request that sends max_tokens overrides it); a recipe that already sets -n keeps its own.
+        local has_predict=0
+        has_predict_flag "${R_FLAGS_OUT:-$R_FLAGS}" && has_predict=1
+        if [ "$has_predict" = 0 ]; then
+            echo '# max new tokens per response (-n) for a request that sets no max_tokens of its own: 16000. Raise it here if you need longer answers.'
+            echo 'MAX_TOKENS=16000'
+        fi
         if [ -n "$R_ENV" ]; then
             echo "# env (row $R_ID, verbatim): $R_ENV"
             echo "export $R_ENV"
@@ -1241,7 +1249,12 @@ emit_run_script() {
         local flags="${R_FLAGS_OUT:-$R_FLAGS}"
         [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
         [ "$D22_ADDED_INT8" = 1 ] && echo '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
-        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $flags 2>&1 | tee \"\$LOG\""
+        local n_arg=''
+        if [ "$has_predict" = 0 ]; then
+            echo 'echo "max new tokens per response: $MAX_TOKENS (-n). Edit MAX_TOKENS at the top of this script if you need more (a request that sets max_tokens itself overrides it)."'
+            n_arg='-n "$MAX_TOKENS" '
+        fi
+        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $n_arg$flags 2>&1 | tee \"\$LOG\""
         echo
         echo '# stop: Ctrl-C in this console.  Health: curl http://127.0.0.1:'"$PORT"'/health'
         echo '# Pong test (USAGE.md section 5):'
@@ -1273,6 +1286,12 @@ start_server_now() {
         return 0
     fi
     ok 'done. Run it any time with: bash ./run-server.sh'
+}
+
+# SDD D28: does a flag string already set the per-response token limit (-n / --n-predict / --predict)? Pure: returns 0 / 1.
+has_predict_flag() {
+    case " $1 " in *' -n '*|*' --n-predict '*|*' --predict '*|*' -n='*|*' --n-predict='*|*' --predict='*) return 0 ;; esac
+    return 1
 }
 
 # --- main --------------------------------------------------------------------

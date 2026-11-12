@@ -494,6 +494,12 @@ function Test-VisionOffered {
     return $true
 }
 
+# SDD D28: does a flag string already set the per-response token limit (-n / --n-predict / --predict)? Pure.
+function Test-HasPredictFlag {
+    param([string]$Flags)
+    return [bool]($Flags -match '(^|\s)(-n|--n-predict|--predict)(\s|=)')
+}
+
 # --- environment check (SDD 4.1) ----------------------------------------
 $script:EnvTools = @()
 
@@ -1277,6 +1283,13 @@ function Emit-RunScript {
     }
     $lines += '$port = ' + $port
     $lines += '$log = "' + $logName + '"'
+    # SDD D28: a default cap on the length of one response. -n is the limit for a request that names none of its own
+    # (a request that sends max_tokens overrides it); a recipe that already sets -n keeps its own.
+    $hasPredict = Test-HasPredictFlag $script:RowFlags.Flags
+    if (-not $hasPredict) {
+        $lines += '# max new tokens per response (-n) for a request that sets no max_tokens of its own: 16000. Raise it here if you need longer answers.'
+        $lines += '$maxTokens = 16000'
+    }
     if ($r.Env) {
         foreach ($k in $r.Env.Keys) {
             $lines += "# env (row $($r.Id), verbatim): $k=$($r.Env[$k])"
@@ -1288,9 +1301,13 @@ function Emit-RunScript {
     }
     $lines += ''
     $lines += 'if (-not (Split-Path $log -Parent | Test-Path)) { New-Item -ItemType Directory -Path (Split-Path $log -Parent) -Force | Out-Null }'
+    if (-not $hasPredict) {
+        $lines += 'Write-Host "max new tokens per response: $maxTokens (-n). Edit `$maxTokens at the top of this script if you need more (a request that sets max_tokens itself overrides it)."'
+    }
     $flags = $script:RowFlags.Flags
     if ($r.Device) { $flags = $flags + ' --device CUDA' + (Resolve-GpuIndex -VramTarget $r.Vram) }
-    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $flags + ' 2>&1 | Tee-Object -FilePath $log'
+    $nArg = if ($hasPredict) { '' } else { '-n $maxTokens ' }
+    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $nArg + $flags + ' 2>&1 | Tee-Object -FilePath $log'
     $lines += ''
     $lines += '# stop: Ctrl-C in this console.  Health: curl.exe http://127.0.0.1:' + $port + '/health'
     $lines += '# Pong test (USAGE.md section 5): see docs/SETUP.md FAQ'

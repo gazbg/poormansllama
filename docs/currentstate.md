@@ -25,6 +25,16 @@ risk tail.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
 
+## 2026-11-12 (setup wizard D28: default cap of 16000 new tokens per response in the emitted run-server script)
+
+**Asked.** Owner: add to the run server a default of 16000 tokens max inference result, and a line before running it telling the user to edit it if more is needed.
+
+**Answer.** `setup.ps1` / `setup.sh` now emit `$maxTokens = 16000` (`MAX_TOKENS=16000`) near the top of `run-server.ps1` / `run-server.sh`, pass `-n $maxTokens` right after `--port`, and print "max new tokens per response: 16000 (-n). Edit $maxTokens at the top of this script if you need more (a request that sets max_tokens itself overrides it)." just before the server launches. `-n` is the default length for a request that sets no `max_tokens`; a request that sets its own is not capped. A recipe that already carries `-n` / `--n-predict` / `--predict` is left alone (no recipe does). "Start the server now?" runs the same script, so it applies there too.
+
+**Validated.** Host-only: `test-d28.sh` 36 checks and `test-d28.ps1` all checks (helper, definition once, `-n` once on the launch line, notice directly before it, for six model/recipe cases); D22, D24 and VOD tests unchanged; syntax and parser clean. The server itself was not started.
+
+**Scope / known gaps.** Existing generated `run-server` scripts are not touched until the wizard is run again. SDD D28, `docs/SETUP.md`.
+
 ## 2026-11-12 (setup wizard D27: vision offered for every model that has a projector, default yes)
 
 **Asked.** Owner: is there a vision setup option? Vision should download the projector (from the model's provider, or found online) and be on by default for all models that support it; it will be tested, then tried on the server.
