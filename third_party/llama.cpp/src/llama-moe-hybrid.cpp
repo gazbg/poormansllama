@@ -91,7 +91,7 @@ void ggml_backend_cuda_moe_hybrid_set_xdump(void * dev_ptr, int n_tok);
 //                             initial cache fill and as the EMA tie-break
 //   LLAMA_MOE_HYBRID_B        max promotions per token (default 16, 0 = static cache, < 0 = unlimited)
 //   LLAMA_MOE_HYBRID_LAMBDA   EMA decay (default 0.97)
-//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default: the physical cores, at most 8)
+//   LLAMA_MOE_HYBRID_THREADS  host engine threads (default: the physical cores the process may use, minus one)
 //   LLAMA_MOE_HYBRID_FIRST    first logical CPU of the engine (default 0)
 //   LLAMA_MOE_HYBRID_STRIDE   logical CPU stride between engine threads (default 2)
 //   LLAMA_MOE_HYBRID_POLL     engine threadpool poll level (default 100)
@@ -147,16 +147,21 @@ static std::vector<int> moe_hybrid_core_cpus() {
     return cpus;
 }
 
-// The default size of the expert team. The workers busy-spin, so more of them than the physical cores the process may use makes them preempt each other and the decoding, engine and
-// driver threads for a whole scheduler timeslice (2.4-3.7 ms in the stall log): on a 4-core CPU the flat default of 8 gave 6-8 tok/s where 4 threads gave 30-33. 8 is the size the team
-// was tuned with (a machine with 8 or more physical cores keeps it). Linux and Windows: when the topology cannot be read, it stays 8.
-static int moe_hybrid_default_threads() {
-    int n = 8;
+// The default size of the expert team, from the physical cores this process may use: the cores MINUS ONE, at least 1, no cap
+// (owner decision, later on 2026-11-09 than the tiered 1 / 2 / 3 rule of ac9f6e04, which it replaces; before both it was min(8, cores)).
+// With the default pinning (logical CPU 2 up, stride 2) that is every physical core except core 0, the interrupt core (G16); the
+// engine thread is the last team member. Measured on a 16-core machine with the tiered rule's session: team 3 about 107-109 tok/s,
+// team 14 110.8; the 4-core i7-4770K's good size was 4, and cores - 1 gives 3 there (not measured).
+// The workers busy-spin, so more of them than the physical cores makes them preempt each other and the decoding,
+// engine and driver threads for a whole scheduler timeslice (2.4-3.7 ms in the stall log). When the topology
+// cannot be read the default is 3.
+static int moe_hybrid_physical_cores() {
+    int cores = 0;
 #if defined(__linux__)
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-        std::set<int> cores;   // the lowest logical CPU of each sibling group identifies the physical core
+        std::set<int> sets;   // the lowest logical CPU of each sibling group identifies the physical core
         for (int c = 0; c < CPU_SETSIZE; ++c) {
             if (!CPU_ISSET(c, &allowed)) {
                 continue;
@@ -169,22 +174,25 @@ static int moe_hybrid_default_threads() {
                 fclose(f);
             }
             if (!ok) {
-                cores.clear();   // no usable topology: keep the old default
+                sets.clear();   // no usable topology
                 break;
             }
-            cores.insert(first);
+            sets.insert(first);
         }
-        if (!cores.empty()) {
-            n = std::min(n, (int) cores.size());
-        }
+        cores = (int) sets.size();
     }
 #elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601)
-    const int cores = (int) moe_hybrid_core_cpus().size();
-    if (cores > 0) {
-        n = std::min(n, cores);
-    }
+    cores = (int) moe_hybrid_core_cpus().size();
 #endif // defined(__linux__)
-    return n;
+    return cores;
+}
+
+static int moe_hybrid_default_threads() {
+    const int cores = moe_hybrid_physical_cores();
+    if (cores <= 0) {
+        return 3;
+    }
+    return std::max(1, cores - 1);
 }
 
 struct moe_hybrid_pf_abort_ctx {
@@ -698,8 +706,8 @@ void moe_hybrid_engine::init(const llm_graph_context & g, const llama_model & md
     budget     = moe_hybrid_env_int("LLAMA_MOE_HYBRID_B", 16);
     lambda     = moe_hybrid_env_double("LLAMA_MOE_HYBRID_LAMBDA", 0.97);
     n_threads  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_THREADS", moe_hybrid_default_threads());
-    if (const char * te = getenv("LLAMA_MOE_HYBRID_THREADS"); (te == nullptr || *te == '\0') && n_threads < 8) {
-        LLAMA_LOG_WARN("%s: moe_hybrid: the expert team defaults to %d threads, the physical cores this process may use (LLAMA_MOE_HYBRID_THREADS overrides)\n", __func__, n_threads);
+    if (const char * te = getenv("LLAMA_MOE_HYBRID_THREADS"); te == nullptr || *te == '\0') {
+        LLAMA_LOG_INFO("%s: moe_hybrid: the expert team defaults to %d threads (%d physical cores; LLAMA_MOE_HYBRID_THREADS or --hybrid-moe-threads overrides)\n", __func__, n_threads, moe_hybrid_physical_cores());
     }
     cpu_first  = moe_hybrid_env_int("LLAMA_MOE_HYBRID_FIRST", 0);
     cpu_stride = moe_hybrid_env_int("LLAMA_MOE_HYBRID_STRIDE", 2);

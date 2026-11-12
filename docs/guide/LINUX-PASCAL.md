@@ -45,8 +45,9 @@ $REPO/build/llama-cuda/bin/llama-server \
 
 - `-fitt` is left out on purpose. The default 1,024 MiB margin suits an 8 GiB card;
   the 16,000 MiB in the main recipe is for a 24 GiB card.
-- The expert team defaults to the number of physical cores the process may use, at most 8 (Linux, since
-  2026-10-22; section 3.2), so `LLAMA_MOE_HYBRID_LEAN_CPUS` is no longer needed. It never pinned threads on
+- The expert team defaults to the number of physical cores the process may use minus one, at least 1 (Linux,
+  since 2026-10-22 as min(8, cores); minus one and no cap since 2026-11-09, not measured on the 4-core
+  i7-4770K, where 4 threads is the measured good size; section 3.2), so `LLAMA_MOE_HYBRID_LEAN_CPUS` is no longer needed. It never pinned threads on
   Linux (the pinning code is Windows-only); only its number of entries counted, as the team size.
   `LLAMA_MOE_HYBRID_THREADS=n` sets the size explicitly.
 - `LLAMA_FATTN_TILE_Q8QK=1` is the int8 attention path (section 3.4).
@@ -304,7 +305,7 @@ columns they hold; the next step is cheaper fixed work per tile (the unpack of t
 Three settings, no code change, take the owner's command from 32.6 / 31.4 / 35.3 tok/s to 39.6 / 37.6 / 39.3 on three chats and from 24.9 to 31.7 tok/s after a 16k-token prompt:
 
 - `--spec-draft-p-min 0.7` (the command has 0.1). The draft chain stops when the head's best token has a probability below p-min, so a doubtful draft is not verified.
-- `LLAMA_MOE_HYBRID_THREADS=6` (the default is the 4 physical cores).
+- `LLAMA_MOE_HYBRID_THREADS=6` (the default was the 4 physical cores; since 2026-11-09 it is 3, the cores minus one).
 - `-fitt 512` (the default margin is 1,024 MiB; 256 gives a little more and leaves 540 MiB free).
 
 Measured A-B-B-A, the owner's command against the command with these three settings (the two A arms and the two B arms do not overlap in any cell):

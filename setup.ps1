@@ -26,8 +26,8 @@
 param(
     [switch]$DryRun,
     [switch]$NonInteractive,
-    [string]$Model = '',            # qwen38 | qwen36 | flint | 1-5
-    [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl (SDD D19); default = the model's row quant
+    [string]$Model = '',            # qwen38 | qwen36 | flint | apex35 | 1-7
+    [string]$Quant = '',            # q4k_m | q5k_xl | q8k_xl | q5k_m (SDD D19, D23); default = the model's row quant
     [ValidateSet('full', '16g', '8g')][string]$Vram = '',
     [ValidateSet('262k', '128k')][string]$Context = '',
     [string]$Port = '',            # '' = ask (default 8090); an explicit value suppresses the question (D22)
@@ -272,7 +272,13 @@ $script:MODELS = @(
     [pscustomobject]@{ Key='qwen36'; Quant='q8k_xl'; Label='Qwen3.6-35B-A3B MoE + MTP (unsloth UD Q8_K_XL, MTP repo)'
         Repo='unsloth/Qwen3.6-35B-A3B-MTP-GGUF'; File='Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf'; SizeGib=36.4
         Mmproj='mmproj-BF16.gguf'; MmprojBytes=902822528
-        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe-mtp'; Default=$false }
+        DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe-mtp'; Default=$false },
+    # SDD D23 (2026-11-09): Apex-35B-V1.0 (qwen35moe, 41 blocks incl. 1 MTP layer). Sizes and the
+    # resolve-endpoint Content-Length checked against the Hugging Face API on 2026-11-09
+    # (25,347,532,640 bytes for Q5_K_M). The Q6_K_L build was offered as entry 8 and removed on 2026-11-09.
+    [pscustomobject]@{ Key='apex35'; Quant='q5k_m'; Label='Apex-35B-V1.0 MoE + MTP (Apexintelligence-AI Q5_K_M)'
+        Repo='Apexintelligence-AI/Apex-35B-V1.0-GGUF'; File='Apex-35B-V1.0-Q5_K_M.gguf'; SizeGib=23.6
+        DefaultDir='C:/Models/ALL/other/apex'; Kind='moe-mtp'; Default=$true }
 )
 
 # Recipe rows: MEASURED, verbatim (SDD section 4.6, decision D4/D11).
@@ -311,13 +317,32 @@ $script:RECIPES = @(
     [pscustomobject]@{ Id='R8'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         Bind='127.0.0.1'; Measured='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
-        Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13). Kept as R8 (the former R6)' }
+        Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13). Kept as R8 (the former R6)' },
+    # SDD D23: the owner's running command for Apex-35B (the R5 shape, MTP head used). Measured by this
+    # repo on 2026-11-09 with Apex-35B-V1.0-Q5_K_S.gguf - a file the wizard does not offer. No row env:
+    # the measured runs set none.
+    [pscustomobject]@{ Id='R9'; Model='apex35'; Vram='full'; Ctx='262k'; Quant='q5k_m'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
+        Device='auto'; Bind='0.0.0.0'; Measured='TG ~100-110 tok/s (600-token greedy reply), PP ~3,900 t/s on a 20.7k-token prompt (2026-11-09, RTX 5090 Laptop 24 GiB, Windows, on Apex-35B-V1.0-Q5_K_S.gguf)'
+        Note='measured on Apex-35B-V1.0-Q5_K_S.gguf, NOT on the offered Q5_K_M (same architecture qwen35moe, 41 blocks with 1 MTP layer; the offered file carries the blk.40.nextn tensors, GGUF header read 2026-11-09). Windows only, one MoE family' }
 )
 
 function DefaultQuant([string]$m) {
     $d = $script:MODELS | Where-Object { $_.Key -eq $m -and $_.Default } | Select-Object -First 1
     if ($d) { return $d.Quant }
     return ''
+}
+
+function IsMoeModel([string]$m) {
+    return [bool]($script:MODELS | Where-Object { $_.Key -eq $m -and $_.Kind -like 'moe*' } | Select-Object -First 1)
+}
+
+function MoeClassRow([string]$v, [string]$c) {
+    # SDD D24: the 8g profile is shared by EVERY MoE model, whatever its name and whether or not it
+    # was benchmarked: it is the owner's 8 GiB GTX 1070 row (R7, qwen36 q4k_m). Other VRAM targets
+    # keep their per-model rows.
+    if ($v -ne '8g') { return $null }
+    return ($script:RECIPES | Where-Object { $_.Model -eq 'qwen36' -and $_.Vram -eq '8g' -and $_.Ctx -eq $c -and $_.Quant -eq 'q4k_m' } | Select-Object -First 1)
 }
 
 function RecipeFor([string]$m, [string]$v, [string]$c, [string]$q) {
@@ -327,8 +352,11 @@ function RecipeFor([string]$m, [string]$v, [string]$c, [string]$q) {
     if ($hit) { return $hit }
     $dq = DefaultQuant $m
     if ($dq -and $dq -ne $q) {
-        return ($script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $dq } | Select-Object -First 1)
+        $hit = $script:RECIPES | Where-Object { $_.Model -eq $m -and $_.Vram -eq $v -and $_.Ctx -eq $c -and $_.Quant -eq $dq } | Select-Object -First 1
+        if ($hit) { return $hit }
     }
+    # SDD D24: a MoE model with no row of its own at 8g takes the shared 8g MoE profile
+    if (IsMoeModel $m) { return (MoeClassRow $v $c) }
     return $null
 }
 
@@ -944,13 +972,13 @@ function Test-DiskSpace {
 function Pick-Model {
     param([string]$key)
     # SDD D19: flat (model, quant) entries. -Model picks the model; -Quant
-    # picks the quant (default = the model's Default entry); numeric keys 1-5
+    # picks the quant (default = the model's Default entry); numeric keys 1-7
     # address the flat list directly.
     if ($key) {
         $pool = $script:MODELS | Where-Object { $_.Key -eq $key }
         if (-not $pool) {
-            if ($key -match '^[1-5]$') { return $script:MODELS[[int]$key - 1] }
-            ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, or 1-5)"
+            if ($key -match '^[1-7]$') { return $script:MODELS[[int]$key - 1] }
+            ExitCode 1 "unknown model '$key' (choose qwen38, qwen36, flint, apex35, or 1-7)"
         }
         if ($Quant) {
             $m = $pool | Where-Object { $_.Quant -eq $Quant } | Select-Object -First 1
@@ -1142,6 +1170,10 @@ function Pick-Recipe {
         foreach ($a in $avail) {
             Write-Host ("    {0}  {1,-5} {2,-6} {3,-7} {4}" -f $a.Id, $a.Vram, $a.Ctx, $a.Quant, $a.Measured)
         }
+        if (IsMoeModel $m.Key) {
+            $cls = MoeClassRow '8g' '262k'
+            if ($cls) { Write-Host ("    {0}  {1,-5} {2,-6} {3,-7} {4}" -f $cls.Id, $cls.Vram, $cls.Ctx, 'any MoE', ('(shared 8g profile of every MoE model) ' + $cls.Measured)) }
+        }
         ExitCode 3 'no measured recipe for the chosen model/quant/VRAM/context (rows above are the available combinations; the wizard only emits measured rows)'
     }
     return (Check-RecipeQuant $r $m)
@@ -1150,10 +1182,18 @@ function Pick-Recipe {
 function Check-RecipeQuant {
     param([object]$r, [object]$m)
     # SDD D21/D19: a fallback row (the model's default quant) was measured on a different file
-    if ($r.Quant -ne $m.Quant) {
+    if ($r.Model -ne $m.Key) {
+        # SDD D24: the shared 8g MoE profile, measured on another model
+        Warn "row $($r.Id) is the shared 8g profile of every MoE model (measured on $($r.Model) / $($r.Quant)); applied to $($m.Key) / $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for the measured model"
+    }
+    elseif ($r.Quant -ne $m.Quant) {
         Warn "row $($r.Id) was measured on quant $($r.Quant); you chose $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for $($r.Quant)"
     }
     return $r
+        # SDD D25 (2026-11-09): the owner's own run of this model through the shared profile
+        if ($m.Key -eq 'apex35' -and $m.Quant -eq 'q5k_m' -and $r.Vram -eq '8g') {
+            Say "measured on $($m.File) with this row (owner, 8 GiB card, Linux): prompt 51,885 tokens at 537.42 t/s (96.5 s), 1,400 generated tokens at 30.88 t/s (32.39 ms per token)"
+        }
 }
 
 function Get-GitShort {
@@ -1305,7 +1345,7 @@ if ($SkipModel -and -not $Model) {
     $noAsk = $true
 }
 if ($ModelFile -and -not $Model -and -not $noAsk) {
-    ExitCode 1 '-ModelFile requires -Model (qwen38|qwen36|flint) for recipe selection'
+    ExitCode 1 '-ModelFile requires -Model (qwen38|qwen36|flint|apex35) for recipe selection'
 }
 
 if ($noAsk) {
@@ -1313,7 +1353,7 @@ if ($noAsk) {
     # sequentially here (there is no download leg to run in parallel with).
     $exe = Invoke-Build -repo $repo
     Ok "done: environment + repository + build (model/recipe steps skipped: -SkipModel without -Model)"
-    Ok "next: re-run with -Model qwen38|qwen36|flint to pick a recipe and emit run-server.ps1"
+    Ok "next: re-run with -Model qwen38|qwen36|flint|apex35 to pick a recipe and emit run-server.ps1"
     exit 0
 }
 
