@@ -56,8 +56,9 @@ NI=0
 YES_INSTALL=0
 HF_TOKEN="${HF_TOKEN:-}"
 MAX_DL_MIB=0
-# VOD-6 (docs/plans/vision-on-demand-plan.md): vision support. The projector comes from the SAME
-# Hugging Face repo as the model file; the emitted command gets --mmproj "$MMPROJ" --mmproj-on-demand.
+# VOD-6 / SDD D27 (docs/plans/vision-on-demand-plan.md): vision support. The projector comes from the model's own
+# Hugging Face repo (M_MMPROJ_REPOS names another repo when the model's own publishes none); the emitted command
+# gets --mmproj "$MMPROJ" --mmproj-on-demand.
 NO_VISION=0
 MMPROJ_FILE=''   # --mmproj-file: a local projector (implies vision)
 VISION=0         # set by the settings phase
@@ -208,16 +209,17 @@ M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE' 'MoE + MTP' 'MoE + 
 M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/qwen-3.6" "$HOME/models/apex")
 M_DEFAULTS=(1 1 1 0 0 0 1)
 # VOD-6: the vision projector of each entry (same repo as the model file; sizes read from the Hugging
-# Face tree API on 2026-11-09). Empty = no projector offered (dense Qwen3.8, flint and apex35 are not claimed).
-M_MMPROJ=('' 'mmproj-BF16.gguf' '' '' 'mmproj-BF16.gguf' 'mmproj-BF16.gguf' '')
-M_MMPROJ_BYTES=(0 902822624 0 0 902822624 902822528 0)
+# Face tree API on 2026-11-09). Empty = no projector published (flint is text-only; SDD D27).
+M_MMPROJ=('mmproj-BF16.gguf' 'mmproj-BF16.gguf' '' 'mmproj-BF16.gguf' 'mmproj-BF16.gguf' 'mmproj-BF16.gguf' 'mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf')
+M_MMPROJ_BYTES=(931146432 902822624 0 931146432 902822624 902822528 902822560)
+M_MMPROJ_REPOS=('' '' '' '' '' '' 'bartowski/Apexintelligence-AI_Apex-35B-V1.0-GGUF')   # empty = the model's own repo
 
 # vision_offered: is vision offered for the chosen model entry and recipe row? Needs a projector in the
-# table and a recipe measured WITHOUT speculative decoding (the MTP / draft rows were never run with a
-# projector). Uses MI_IDX and R_FLAGS. Pure: returns 0 (offered) / 1.
+# table and a recipe that does not carry --mmproj itself (the MTP / draft rows are included since D27: the
+# owner's own Q8_K_XL MTP command ran with a projector). Uses MI_IDX and R_FLAGS. Pure: returns 0 (offered) / 1.
 vision_offered() {
     [ -n "${M_MMPROJ[$MI_IDX]}" ] || return 1
-    case " $R_FLAGS " in *' --spec-type '*|*' --mmproj '*) return 1 ;; esac
+    case " $R_FLAGS " in *' --mmproj '*) return 1 ;; esac
     return 0
 }
 
@@ -1056,9 +1058,10 @@ download_mmproj() {
     # without vision or when the file is there already.
     [ "$VISION" = 1 ] && [ -n "$MMPROJ_PATH" ] || return 0
     if [ -f "$MMPROJ_PATH" ]; then ok "projector: $MMPROJ_PATH"; return 0; fi
-    local url="https://huggingface.co/${M_REPOS[$MI_IDX]}/resolve/main/${M_MMPROJ[$MI_IDX]}"
+    local mm_repo="${M_MMPROJ_REPOS[$MI_IDX]:-${M_REPOS[$MI_IDX]}}"
+    local url="https://huggingface.co/${mm_repo}/resolve/main/${M_MMPROJ[$MI_IDX]}"
     if [ "$DRY_RUN" = 1 ]; then
-        say "(dry-run: not downloading the projector ${M_MMPROJ[$MI_IDX]} from ${M_REPOS[$MI_IDX]})"
+        say "(dry-run: not downloading the projector ${M_MMPROJ[$MI_IDX]} from ${mm_repo})"
         return 0
     fi
     [ "$SKIP_DOWNLOAD" = 1 ] && fail '--skip-download set but no local projector found (expected '"$MMPROJ_PATH"')' 5
@@ -1226,9 +1229,18 @@ emit_run_script() {
         if [ "$VISION" = 1 ]; then
             echo "MMPROJ=\"$MMPROJ_PATH\""
             echo '# vision (not part of the measured row): --mmproj-on-demand keeps the projector (~0.84 GiB) in host RAM and on the GPU only while a request'\''s images are encoded (docs/plans/vision-on-demand-results.md). For a text-only server remove `--mmproj "$MMPROJ" --mmproj-on-demand` below.'
+            case "${M_KEYS[$MI_IDX]}" in qwen36|apex35) ;; *) echo '# vision on this model is NOT measured: --mmproj-on-demand was measured on Qwen3.6-35B-A3B only (apex35 shares its architecture). The first image request on this model is the test; to go back to text only, remove the two vision flags below.' ;; esac
         fi
         echo "PORT=$PORT"
         echo "LOG=\"$log\""
+        # SDD D28: a default cap on the length of one response. -n is the limit for a request that names none of its own
+        # (a request that sends max_tokens overrides it); a recipe that already sets -n keeps its own.
+        local has_predict=0
+        has_predict_flag "${R_FLAGS_OUT:-$R_FLAGS}" && has_predict=1
+        if [ "$has_predict" = 0 ]; then
+            echo '# max new tokens per response (-n) for a request that sets no max_tokens of its own: 16000. Raise it here if you need longer answers.'
+            echo 'MAX_TOKENS=16000'
+        fi
         if [ -n "$R_ENV" ]; then
             echo "# env (row $R_ID, verbatim): $R_ENV"
             echo "export $R_ENV"
@@ -1237,7 +1249,12 @@ emit_run_script() {
         local flags="${R_FLAGS_OUT:-$R_FLAGS}"
         [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
         [ "$D22_ADDED_INT8" = 1 ] && echo '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
-        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $flags 2>&1 | tee \"\$LOG\""
+        local n_arg=''
+        if [ "$has_predict" = 0 ]; then
+            echo 'echo "max new tokens per response: $MAX_TOKENS (-n). Edit MAX_TOKENS at the top of this script if you need more (a request that sets max_tokens itself overrides it)."'
+            n_arg='-n "$MAX_TOKENS" '
+        fi
+        echo "\"\$EXE\" -m \"\$MODEL\" --host $bind --port \"\$PORT\" $n_arg$flags 2>&1 | tee \"\$LOG\""
         echo
         echo '# stop: Ctrl-C in this console.  Health: curl http://127.0.0.1:'"$PORT"'/health'
         echo '# Pong test (USAGE.md section 5):'
@@ -1269,6 +1286,12 @@ start_server_now() {
         return 0
     fi
     ok 'done. Run it any time with: bash ./run-server.sh'
+}
+
+# SDD D28: does a flag string already set the per-response token limit (-n / --n-predict / --predict)? Pure: returns 0 / 1.
+has_predict_flag() {
+    case " $1 " in *' -n '*|*' --n-predict '*|*' --predict '*|*' -n='*|*' --n-predict='*|*' --predict='*) return 0 ;; esac
+    return 1
 }
 
 # --- main --------------------------------------------------------------------
@@ -1367,7 +1390,7 @@ VISION=0
 MMPROJ_PATH=''
 if [ -n "$MMPROJ_FILE" ]; then
     [ "$NO_VISION" = 1 ] && fail '--mmproj-file and --no-vision contradict each other' 1
-    vision_offered || fail "--mmproj-file: vision is not offered for ${M_KEYS[$MI_IDX]} / recipe $R_ID (only the Qwen3.6 rows without --spec-type)" 1
+    vision_offered || fail "--mmproj-file: vision is not offered for ${M_KEYS[$MI_IDX]} / recipe $R_ID (no projector is published for this model, or the recipe already carries --mmproj)" 1
     [ -f "$MMPROJ_FILE" ] || fail "--mmproj-file does not exist: $MMPROJ_FILE" 1
     VISION=1
     MMPROJ_PATH="$MMPROJ_FILE"
@@ -1375,7 +1398,7 @@ if [ -n "$MMPROJ_FILE" ]; then
 elif vision_offered && [ "$NO_VISION" != 1 ]; then
     if [ "$SKIP_MODEL" = 1 ]; then
         say 'vision: skipped with --skip-model (no download; pass --mmproj-file to use a local projector)'
-    elif confirm "Vision support? Also fetches the projector ${M_MMPROJ[$MI_IDX]} ($(( ${M_MMPROJ_BYTES[$MI_IDX]} / 1048576 )) MiB, same Hugging Face repo); it is parked in host RAM between image requests" y; then
+    elif confirm "Vision support? Also fetches the projector ${M_MMPROJ[$MI_IDX]} ($(( ${M_MMPROJ_BYTES[$MI_IDX]} / 1048576 )) MiB) from ${M_MMPROJ_REPOS[$MI_IDX]:-${M_REPOS[$MI_IDX]}}$([ -n "${M_MMPROJ_REPOS[$MI_IDX]}" ] && echo " (a separate repo: the model's own repo publishes none)" || echo " (the model's repo)"); it is parked in host RAM between image requests" y; then
         VISION=1
         mm_dir="${MODEL_DIR:-${M_DIRS[$MI_IDX]}}"
         [ -n "$MODEL_FILE" ] && mm_dir="$(dirname "$MODEL_FILE")"
@@ -1383,7 +1406,9 @@ elif vision_offered && [ "$NO_VISION" != 1 ]; then
         if [ -f "$MMPROJ_PATH" ]; then ok "projector: $MMPROJ_PATH"; else say "projector: $MMPROJ_PATH (downloaded in the parallel phase)"; fi
     fi
 elif [ -n "${M_MMPROJ[$MI_IDX]}" ] && ! vision_offered; then
-    say 'vision: not offered for this recipe (the MTP / draft rows were not measured with a projector)'
+    say 'vision: not offered for this recipe (it already carries --mmproj)'
+elif [ -z "${M_MMPROJ[$MI_IDX]}" ] && [ "$NO_VISION" != 1 ] && [ -z "$MMPROJ_FILE" ]; then
+    say "vision: not available for ${M_KEYS[$MI_IDX]} (no vision projector is published for it; pass --mmproj-file to use your own)"
 fi
 
 # D22-A/B: complete the row's flags (pure; see complete_row_flags). The

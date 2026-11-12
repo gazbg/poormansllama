@@ -254,6 +254,7 @@ function AskChoice([string]$q, [object[]]$opts, [string]$defKey) {
 $script:MODELS = @(
     [pscustomobject]@{ Key='qwen38'; Quant='q4k_m'; Label='Qwen3.8-27B dense hybrid (unsloth UD Q4_K_M)'
         Repo='unsloth/Qwen3.8-27B-GGUF'; File='Qwen3.8-27B-UD-Q4_K_M.gguf'; SizeGib=15.4
+        Mmproj='mmproj-BF16.gguf'; MmprojBytes=931146432
         DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$true },
     [pscustomobject]@{ Key='qwen36'; Quant='q4k_m'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q4_K_M)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'; SizeGib=20.6
@@ -264,6 +265,7 @@ $script:MODELS = @(
         DefaultDir='C:/Models/ALL/other/flint'; Kind='moe-swa'; Default=$true },
     [pscustomobject]@{ Key='qwen38'; Quant='q5k_xl'; Label='Qwen3.8-27B dense hybrid (unsloth UD Q5_K_XL)'
         Repo='unsloth/Qwen3.8-27B-GGUF'; File='Qwen3.8-27B-UD-Q5_K_XL.gguf'; SizeGib=19.4
+        Mmproj='mmproj-BF16.gguf'; MmprojBytes=931146432
         DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$false },
     [pscustomobject]@{ Key='qwen36'; Quant='q5k_xl'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q5_K_XL)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf'; SizeGib=24.7
@@ -278,6 +280,7 @@ $script:MODELS = @(
     # (25,347,532,640 bytes for Q5_K_M). The Q6_K_L build was offered as entry 8 and removed on 2026-11-09.
     [pscustomobject]@{ Key='apex35'; Quant='q5k_m'; Label='Apex-35B-V1.0 MoE + MTP (Apexintelligence-AI Q5_K_M)'
         Repo='Apexintelligence-AI/Apex-35B-V1.0-GGUF'; File='Apex-35B-V1.0-Q5_K_M.gguf'; SizeGib=23.6
+        MmprojRepo='bartowski/Apexintelligence-AI_Apex-35B-V1.0-GGUF'; Mmproj='mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf'; MmprojBytes=902822560
         DefaultDir='C:/Models/ALL/other/apex'; Kind='moe-mtp'; Default=$true }
 )
 
@@ -480,15 +483,21 @@ function Complete-RowFlags {
     return [pscustomobject]@{ Flags = $f; AddedInt8 = $addedInt8 }
 }
 
-# VOD-6: is vision offered for this model row and recipe? The table row must list a projector
-# (Mmproj, from the SAME Hugging Face repo as the model file), and the recipe must be one that
-# was measured without speculative decoding: the MTP / draft rows (--spec-type) were never run
-# with a projector, so the wizard does not combine them. Returns $true / $false (pure).
+# VOD-6 / SDD D27: is vision offered for this model row and recipe? The table row must list a projector
+# (Mmproj; from the model's own Hugging Face repo, or from MmprojRepo when that repo publishes none), and the
+# recipe must not carry --mmproj itself. The MTP / draft rows (--spec-type) are included since D27: the
+# owner's own Q8_K_XL MTP command ran with a projector (5 of 5 graded fixtures). Returns $true / $false (pure).
 function Test-VisionOffered {
     param([object]$m, [object]$r)
     if (-not $m.PSObject.Properties['Mmproj'] -or -not $m.Mmproj) { return $false }
-    if ($r.Flags -match '(?<!-)--spec-type' -or $r.Flags -match '(?<!-)--mmproj\b') { return $false }
+    if ($r.Flags -match '(?<!-)--mmproj\b') { return $false }
     return $true
+}
+
+# SDD D28: does a flag string already set the per-response token limit (-n / --n-predict / --predict)? Pure.
+function Test-HasPredictFlag {
+    param([string]$Flags)
+    return [bool]($Flags -match '(^|\s)(-n|--n-predict|--predict)(\s|=)')
 }
 
 # --- environment check (SDD 4.1) ----------------------------------------
@@ -1132,7 +1141,8 @@ function Download-Mmproj {
     param([object]$m)
     if (-not $script:Vision -or -not $script:MmprojPath) { return }
     if (Test-Path $script:MmprojPath) { Ok "projector: $($script:MmprojPath)"; return }
-    $mm = [pscustomobject]@{ Repo = $m.Repo; File = $m.Mmproj; SizeGib = [math]::Round($m.MmprojBytes / 1GB, 2) }
+    $mmRepo = if ($m.PSObject.Properties['MmprojRepo'] -and $m.MmprojRepo) { $m.MmprojRepo } else { $m.Repo }
+    $mm = [pscustomobject]@{ Repo = $mmRepo; File = $m.Mmproj; SizeGib = [math]::Round($m.MmprojBytes / 1GB, 2) }
     $null = Download-Model -m $mm -dir (Split-Path $script:MmprojPath -Parent)
 }
 
@@ -1267,9 +1277,19 @@ function Emit-RunScript {
     if ($script:Vision) {
         $lines += '$mmproj = "' + $script:MmprojPath + '"'
         $lines += '# vision (not part of the measured row): --mmproj-on-demand keeps the projector (~0.84 GiB) in host RAM and on the GPU only while a request''s images are encoded (docs/plans/vision-on-demand-results.md). For a text-only server remove "--mmproj $mmproj --mmproj-on-demand" below.'
+        if ($m.Key -notin @('qwen36', 'apex35')) {
+            $lines += '# vision on this model is NOT measured: --mmproj-on-demand was measured on Qwen3.6-35B-A3B only (apex35 shares its architecture). The first image request on this model is the test; to go back to text only, remove the two vision flags below.'
+        }
     }
     $lines += '$port = ' + $port
     $lines += '$log = "' + $logName + '"'
+    # SDD D28: a default cap on the length of one response. -n is the limit for a request that names none of its own
+    # (a request that sends max_tokens overrides it); a recipe that already sets -n keeps its own.
+    $hasPredict = Test-HasPredictFlag $script:RowFlags.Flags
+    if (-not $hasPredict) {
+        $lines += '# max new tokens per response (-n) for a request that sets no max_tokens of its own: 16000. Raise it here if you need longer answers.'
+        $lines += '$maxTokens = 16000'
+    }
     if ($r.Env) {
         foreach ($k in $r.Env.Keys) {
             $lines += "# env (row $($r.Id), verbatim): $k=$($r.Env[$k])"
@@ -1281,9 +1301,13 @@ function Emit-RunScript {
     }
     $lines += ''
     $lines += 'if (-not (Split-Path $log -Parent | Test-Path)) { New-Item -ItemType Directory -Path (Split-Path $log -Parent) -Force | Out-Null }'
+    if (-not $hasPredict) {
+        $lines += 'Write-Host "max new tokens per response: $maxTokens (-n). Edit `$maxTokens at the top of this script if you need more (a request that sets max_tokens itself overrides it)."'
+    }
     $flags = $script:RowFlags.Flags
     if ($r.Device) { $flags = $flags + ' --device CUDA' + (Resolve-GpuIndex -VramTarget $r.Vram) }
-    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $flags + ' 2>&1 | Tee-Object -FilePath $log'
+    $nArg = if ($hasPredict) { '' } else { '-n $maxTokens ' }
+    $lines += '& $exe -m $model --host ' + $bind + ' --port $port ' + $nArg + $flags + ' 2>&1 | Tee-Object -FilePath $log'
     $lines += ''
     $lines += '# stop: Ctrl-C in this console.  Health: curl.exe http://127.0.0.1:' + $port + '/health'
     $lines += '# Pong test (USAGE.md section 5): see docs/SETUP.md FAQ'
@@ -1407,7 +1431,7 @@ $script:MmprojPath = ''
 $visionOffered = Test-VisionOffered -m $m -r $r
 if ($MmprojFile) {
     if ($NoVision) { ExitCode 1 '-MmprojFile and -NoVision contradict each other' }
-    if (-not $visionOffered) { ExitCode 1 "-MmprojFile: vision is not offered for $($m.Key) / recipe $($r.Id) (only the Qwen3.6 rows without --spec-type)" }
+    if (-not $visionOffered) { ExitCode 1 "-MmprojFile: vision is not offered for $($m.Key) / recipe $($r.Id) (no projector is published for this model, or the recipe already carries --mmproj)" }
     if (-not (Test-Path $MmprojFile)) { ExitCode 1 "-MmprojFile does not exist: $MmprojFile" }
     $script:Vision = $true
     $script:MmprojPath = $MmprojFile
@@ -1419,7 +1443,8 @@ elseif ($visionOffered -and -not $NoVision) {
     }
     else {
         $mmMiB = [math]::Round($m.MmprojBytes / 1MB)
-        $script:Vision = Confirm "Vision support? Also fetches the projector $($m.Mmproj) ($mmMiB MiB, same Hugging Face repo); it is parked in host RAM between image requests" $true
+        $mmFrom = if ($m.PSObject.Properties['MmprojRepo'] -and $m.MmprojRepo) { "$($m.MmprojRepo) (a separate repo: the model's own repo publishes none)" } else { "$($m.Repo) (the model's repo)" }
+        $script:Vision = Confirm "Vision support? Also fetches the projector $($m.Mmproj) ($mmMiB MiB) from $mmFrom; it is parked in host RAM between image requests" $true
         if ($script:Vision) {
             $mmDir = $mdir
             if ($ModelFile) { $mmDir = Split-Path $ModelFile -Parent }
@@ -1430,7 +1455,10 @@ elseif ($visionOffered -and -not $NoVision) {
     }
 }
 elseif ($m.PSObject.Properties['Mmproj'] -and $m.Mmproj -and -not $visionOffered) {
-    Say 'vision: not offered for this recipe (the MTP / draft rows were not measured with a projector)'
+    Say 'vision: not offered for this recipe (it already carries --mmproj)'
+}
+elseif (-not $NoVision -and -not $MmprojFile) {
+    Say "vision: not available for $($m.Key) (no vision projector is published for it; pass -MmprojFile to use your own)"
 }
 # D22-A/B: complete the row's flags (pure; see Complete-RowFlags). The
 # compute capability is for the card the run will use; on failure the row
@@ -1491,7 +1519,7 @@ if ($DR) {
         if (-not $script:LOCAL_FILE) { $script:LOCAL_FILE = $script:DOWNLOAD_TARGET }
     }
     if ($script:Vision -and $script:MmprojPath -and -not (Test-Path $script:MmprojPath)) {
-        Say "(dry-run: not downloading the projector $($m.Mmproj) from $($m.Repo))"
+        Say "(dry-run: not downloading the projector $($m.Mmproj) from $(if ($m.PSObject.Properties['MmprojRepo'] -and $m.MmprojRepo) { $m.MmprojRepo } else { $m.Repo }))"
     }
     $exe = $binPath
 }

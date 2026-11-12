@@ -344,6 +344,20 @@ The default-off identity (VOD-1) was re-run on `vod5a` first (`vod5-id-ctlA1/off
 - Most server sessions were not attested by the wrapper (`-AllowUnprovenanced`, DL-5); the harness records the binary hashes itself. The park test was attested.
 - TG of this machine moves 3-7% between sessions for one binary (87.5-94.4 tok/s), which is larger than the 3% bar of VOD-1; the identity is therefore judged on the outputs and on the pooled, pre-registered confirmation (DL-21 .. DL-24), not on a single A B B A; the PP clause is OPEN (DL-24).
 
+## Wizard: vision for every model that has a projector (DL-31; owner request in chat, 2026-11-12)
+
+Question from the owner: "is there a vision setup option?" Answer: yes since VOD-6 ("Vision support?", default yes), but it covered only the Qwen3.6 rows without MTP. Widened as follows; the owner tests it on the server afterwards.
+
+| Model entry | Projector | Taken from | Bytes | How checked |
+|---|---|---|---|---|
+| Qwen3.8-27B (q4k_m, q5k_xl) | `mmproj-BF16.gguf` | `unsloth/Qwen3.8-27B-GGUF` (own repo) | 931,146,432 | tree API 2026-11-12 |
+| Qwen3.6-35B-A3B (q4k_m, q5k_xl) | `mmproj-BF16.gguf` | `unsloth/Qwen3.6-35B-A3B-GGUF` | 902,822,624 | tree API (VOD-6) and 2026-11-12 |
+| Qwen3.6-35B-A3B MTP (q8k_xl) | `mmproj-BF16.gguf` | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` | 902,822,528 | same |
+| Apex-35B-V1.0 (q5k_m) | `mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf` | `bartowski/Apexintelligence-AI_Apex-35B-V1.0-GGUF` (the model's own repo publishes none) | 902,822,560 | tree API + resolve endpoint `X-Linked-Size` (headers only) |
+| flint (q5k_xl) | none | - | - | `pipeline_tag: text-generation` in every flint repo listed; no projector file anywhere |
+
+Behaviour: the question is asked for every recipe row that does not carry `--mmproj` (default yes; `-NoVision` / `--no-vision` declines; `-MmprojFile` uses a local file and is refused for flint); the MTP / draft rows are included (DL-31); the emitted command gets `--mmproj $mmproj --mmproj-on-demand` once; for Qwen3.8 the script adds the comment "vision on this model is NOT measured" (on-demand was measured on Qwen3.6-35B-A3B only; Apex shares its architecture). Validation (host-only, dry runs, no download): `tools/setup-wizard/test-vod.sh` 156 checks and `test-vod.ps1` all checks (table values per entry, `vision_offered` over all nine recipe rows R1-R9, vision flags once and idempotent for each row and compute capability, dry runs for Qwen3.8 at 16g and full, the Q8_K_XL MTP row, Apex, flint, `--no-vision`, `--mmproj-file`), the D22 (PS 59 / sh) and D24 (PS 26 / sh 29) tests unchanged, `bash -n setup.sh`, the PowerShell parser clean. Not tested: a real download, a Qwen3.8 or Apex server with a projector (the owner's test), a Linux machine.
+
 ## Merge of origin/main into the branch (DL-30; owner request "check for conflicts and resolve them", 2026-11-12)
 
 PR #23 was CONFLICTING against `main` (10 commits: PRs #24 Apex wizard entries, #25 the shared 8g profile, #26 hybrid thread defaults). Four files conflicted, one hunk each; the resolution is in DL-30 (plan) and the merge commit `6afb38ba`. Both sides added a decision D23 to `docs/setup-wizard-sdd.md`: main's D23-D25 stay, the projector decision is D26.
