@@ -344,9 +344,28 @@ The default-off identity (VOD-1) was re-run on `vod5a` first (`vod5-id-ctlA1/off
 - Most server sessions were not attested by the wrapper (`-AllowUnprovenanced`, DL-5); the harness records the binary hashes itself. The park test was attested.
 - TG of this machine moves 3-7% between sessions for one binary (87.5-94.4 tok/s), which is larger than the 3% bar of VOD-1; the identity is therefore judged on the outputs and on the pooled, pre-registered confirmation (DL-21 .. DL-24), not on a single A B B A; the PP clause is OPEN (DL-24).
 
+## Merge of origin/main into the branch (DL-30; owner request "check for conflicts and resolve them", 2026-11-12)
+
+PR #23 was CONFLICTING against `main` (10 commits: PRs #24 Apex wizard entries, #25 the shared 8g profile, #26 hybrid thread defaults). Four files conflicted, one hunk each; the resolution is in DL-30 (plan) and the merge commit `6afb38ba`. Both sides added a decision D23 to `docs/setup-wizard-sdd.md`: main's D23-D25 stay, the projector decision is D26.
+
+Checks on the merged tree (build `bin/vod6m`, a side copy of the full build, HEAD `6afb38ba`; the pre-merge evidence above was measured on `vod5b` and is NOT repeated):
+
+| Check | Result |
+|---|---|
+| full build of every target (`build/vod-build-all-merged.log`) | exit 0, 0 compiler / linker errors |
+| host ctest list / `route-topk|host-mem` / `ctest -R mtmd` / `server_vision.py selftest` | 78/78, 2/2, 2/2, PASS |
+| wizard host tests on the merged tree | D22 PS 59 checks and sh, D24 PS 26 / sh 29, test-vod ps1 and sh (123); `setup.sh` syntax and `setup.ps1` parser clean |
+| smoke, flag OFF (`vod6m-acc-off`, base arm) vs the pristine control run `vod5b-cf4-01A` | text and `prompt_n / cache_n / predicted_n` identical in 13 of 13 steps; PP of the long step 461 tok/s as before |
+| smoke, `--mmproj-on-demand` (`vod6m-acc-od`) vs the resident-projector control `vod2-acc-ctl2` | identical in 13 of 13 steps; idle nvidia-smi poller 5,029 / 7,015 MiB; in-process free-watch minimum 16,297 MiB (cudaMemGetInfo); expert cache 54 slots per layer at start |
+| TG after the merge | flag off, default flags: 80.1 tok/s for the 64-token step against 92.4 / 92.3 (controls `vod5b-cf4-01A` / `-02B`), PP unchanged. **Attributed:** the same merged build with the old settings (`--hybrid-moe-threads 8 -t 16`, `vod6m-acc-off-oldthreads`) gives 91.5 tok/s with text and counts identical (13 of 13). The drop comes from main's new defaults (PR #26: `-t 1` and a 15-thread expert team on 16 physical cores, log: `the expert team defaults to 15 threads`), not from this work. One run each, report-only; it is a point for the owner about the new default on this laptop. |
+
+Limits: one run per smoke arm; the GPU evidence of VOD-1 .. VOD-8 stays the pre-merge `vod5b` evidence, the merged build adds a full build, the host regression and two identity smokes.
+
 ## FINAL: Owner Summary and acceptance contract of the whole goal (STATUS 2026-11-12: ACCEPTED - VOD-2 .. VOD-9 by the agent's own autonomous acceptance under the owner's /goal of 2026-11-09, which is NOT owner approval; VOD-1 by the OWNER's decision in chat, DL-28)
 
 **Status (2026-11-12 13:20).** The goal is accepted on these terms: every hard criterion VOD-2 .. VOD-9 is demonstrated on the final build `vod5b` with the recorded commands and is accepted by the AGENT under the owner's grant (this is the agent's own autonomous acceptance, not owner approval); **VOD-1 is accepted by the OWNER**, who answered "Accept VOD-1" in chat to the question of whether the evidence below is enough (DL-28). The reason there was a question: the VOD-1 performance clause (`PP / TG within the A-A spread, <= 3%`) was missed by every pre-registered attempt (DL-21, DL-22, DL-24, DL-25), the agent's own rewording of the clause after a result (DL-23) was withdrawn (DL-24), and the agent did not restate the clause afterwards; the outputs are identical in 76 of 76 runs and every miss traces to a stall of the control or of a first request, none to the code. A further evaluation under a stall-robust protocol on fresh data (DL-27, `vod5b-cf4-*`) was started before the owner's decision and runs as SUPPLEMENTARY evidence; it cannot change the acceptance.
+
+**Supplementary evaluation (DL-27, `vod5b-cf4-*`, 32 fresh runs, report-only after DL-28), outcome DL-29:** outputs identical in 32 of 32 runs; 13 of 14 metrics met under the pre-registered median protocol (TG median ratio 0.9931; PP steps 0.9851-0.9996; all ranges and stall guards); the stall guard of the 19-token `text-short` step is MISSED by one run (B 5 stalled runs against A 2, allowance A + 2). Over all 96 runs of the four identity designs the first-request stalls are control 5/48 and `vod5b` 6/48 (Fisher p = 1.0). It does not change the owner's acceptance (DL-28).
 
 **History of the VOD-1 clause (DL-25 / DL-26, 12:45), kept as recorded:** The last attempt of the VOD-1 performance clause (`vod5b-cf3-*`, 32 runs, the DL-22 rule unchanged, fixed in advance) matched on outputs (identical in 32 of 32 runs) and on TG (B/A = 1.0193, mean(B) inside A's range) but MISSED the PP clause on two steps: `text-short` B/A 1.0584 and `fix-colour-724` 1.0650, the new build being FASTER, because the control stalled in 3 of 16 and 2 of 16 runs (medians 1.0074 and 0.9986). By DL-25 VOD-1 stays OPEN and the decision whether the evidence (outputs identical in 76 of 76 runs of the four attempts, TG within 3% in the large designs, every miss traced to a stall of the control or of the first request, none to the code) is enough is the owner's. Nothing was restated.
 

@@ -25,6 +25,16 @@ risk tail.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
 
+## 2026-11-12 (vision on demand, PR #23: `origin/main` merged into the branch, 4 conflicts resolved; DL-29/DL-30)
+
+**Asked.** Owner: "check for conflicts and resolve them" (PR #23 was CONFLICTING).
+
+**Answer.** Merge commit `6afb38ba`: `docs/currentstate.md` both sides kept; `docs/setup-wizard-sdd.md` both sides added a D23, main's D23-D25 stay and the projector decision is D26 (references updated); `setup.ps1` / `setup.sh` keep the projector fields and main's `apex35` entry (the projector arrays have seven entries, none for apex35). The C++ merged without conflicts (main: hybrid thread defaults).
+
+**Validated.** Full build 0 errors; host ctest 78/78, 2/2, mtmd 2/2, selftest PASS; wizard tests D22 / D24 / VOD pass; smoke on the merged build `vod6m`: flag off and `--mmproj-on-demand` both 13/13 identical to the controls. Main's new thread defaults make hybrid decode 13% slower on this laptop (80.1 against 92.4 tok/s, back to 91.5 with `--hybrid-moe-threads 8 -t 16`); not caused by this work. The DL-27 supplementary evaluation (32 fresh runs) finished: outputs identical, 13 of 14 metrics met, one first-request stall-guard miss (DL-29), pooled stall rate A 5/48 vs B 6/48.
+
+**Scope / known gaps.** The VOD-1 .. VOD-8 GPU evidence is the pre-merge `vod5b` evidence; the merge is checked by a build, the host suites and two smokes. Pushing the merge awaits the owner.
+
 ## 2026-11-12 (vision on demand, VOD-5 done on the final build `vod5b`: fused prefill with images, default-off identity repaired; goal ACCEPTED: VOD-2..VOD-9 by the agent, VOD-1 by the owner, DL-28)
 
 **Asked.** Owner /goal (autonomous), task VOD-5 (phase 3) and the closeout of the whole goal (VOD-1 .. VOD-9).
