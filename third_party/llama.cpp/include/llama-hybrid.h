@@ -34,6 +34,12 @@ LLAMA_API void llama_hybrid_set_margin(struct llama_context * ctx, int32_t keep_
 // expert cache gives the room for its compute buffers back afterwards. Call once, after llama_hybrid_set_margin. ubatch_big <= the context's ubatch: off.
 LLAMA_API void llama_hybrid_set_prefill(struct llama_context * ctx, int32_t ubatch_big, int32_t min_tokens, int32_t max_slots);
 
+// VOD-2 (docs/plans/vision-on-demand-plan.md): a transient user of device memory, such as the vision projector's encode window, asks for need_bytes. The expert cache shrinks as it does for a layer-major
+// pass (to its floor with LLAMA_MOE_HYBRID_PREFILL_FREE_ALL), and the keep-free margin of llama_hybrid_set_margin holds. Returns false, with the cache restored, when the room cannot be made.
+// llama_hybrid_vram_release() ends the window; the cache regrows at the first decode of <= 16 tokens (consecutive windows and passes of one request share one shrink). Call between decodes only.
+LLAMA_API bool llama_hybrid_vram_acquire(struct llama_context * ctx, int64_t need_bytes);
+LLAMA_API void llama_hybrid_vram_release(struct llama_context * ctx);
+
 // Seed the expert cache's popularity statistics from the routing of the last n_tokens tokens of a prompt (read from the 17 .. min_tokens-1 token decodes the server cuts before the end of a prompt), so that
 // the first generated tokens already find the experts of the new prompt. n_tokens <= 0: off. Call once, after llama_hybrid_set_margin.
 LLAMA_API void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens);
@@ -50,6 +56,7 @@ struct llama_lm_prefill_params {
     int32_t device;       // CUDA device index (0)
     int32_t copy_piece_mib;  // paced bank copies: piece size in MiB, 0 = off (one copy per bank), -1 = the default (Flint 64, others off; env LLAMA_LM_COPY_PIECE_MIB)
     int32_t copy_window;     // paced bank copies: pieces in flight, -1 = the default (2; env LLAMA_LM_COPY_WINDOW)
+    int32_t mm_batches;      // VOD-4 (DL-20): 1: the pass also takes the batches of an image prompt (embedding rows, text behind an image: M-RoPE cells outnumber positions); 0 (default): it declines them as before
 };
 LLAMA_API struct llama_lm_prefill_params llama_lm_prefill_default_params(void);
 

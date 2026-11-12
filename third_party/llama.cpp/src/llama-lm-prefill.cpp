@@ -154,8 +154,23 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         pl.why = "below --lm-prefill-min";
         return pl;
     }
-    if (b.token == nullptr || b.embd != nullptr) {
+    // VOD-4 (docs/plans/vision-on-demand-plan.md): a batch of embeddings ONLY (the rows of an image chunk, as mtmd_helper_decode_image_chunk() decodes them) is taken as well. A batch that mixes
+    // token rows and embedding rows is not (the server's image flow does not produce one), and neither is an embedding batch on a split (two-GPU) pass or on a window-cache model.
+    // DL-20: all of it is behind P.mm_batches (the server sets it with --mmproj-on-demand). Without it the decisions below are the ones taken before VOD-4: an embedding batch is declined, the positions
+    // must continue the sequence exactly, the sequence's cells must equal its positions (so the text behind an image is declined too), and the chunk grid is the absolute one.
+    const bool mm = P.mm_batches != 0;
+    pl.embd = mm && b.token == nullptr && b.embd != nullptr;
+    if (!mm && (b.token == nullptr || b.embd != nullptr)) {
         pl.why = "the batch carries embeddings";
+        return pl;
+    }
+    if (!pl.embd && (b.token == nullptr || b.embd != nullptr)) {
+        pl.why = b.token != nullptr ? "the batch mixes token and embedding rows" : "the batch has neither token ids nor embeddings";
+        return pl;
+    }
+    if (pl.embd && (lm_role != 0 || lm_state->peer_ctx != nullptr)) {
+        pl.why = "an embedding batch is not taken by a split (two-GPU) pass";
+        pl.embd = false;
         return pl;
     }
     bool layer_inp = false;
@@ -197,6 +212,11 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         pl.why = "no hybrid memory";
         return pl;
     }
+    if (pl.embd && mem.swa != nullptr) {
+        pl.why = "an embedding batch is not taken by a window-cache model";
+        pl.embd = false;
+        return pl;
+    }
 
     // rollback snapshots (MTP): the pass runs in the plain mode (see lm_run), so the state of the seq must stand in the plain plane
     if (cparams.n_rs_seq != 0 && mem.recr != nullptr && mem.recr->rs_idx[seq] != 0) {
@@ -205,12 +225,28 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     }
 
     const llama_pos p0 = memory->seq_pos_max(seq) + 1;
+    llama_pos pos0 = p0;
     if (b.pos != nullptr) {
+        // section 0 of the positions: a token batch advances by one per token. The rows of an image chunk share the temporal position of the image (VOD-4): their x / y sections order them inside the
+        // image in raster order, which is their cell order, so the pass's causal attention by cell index equals the ordinary path's 2-D mask.
+        pos0 = b.pos[0];
+        bool advancing = true;
+        bool shared    = true;
         for (int32_t i = 0; i < n; ++i) {
-            if (b.pos[i] != p0 + i) {
-                pl.why = "the positions do not continue the sequence";
-                return pl;
-            }
+            advancing = advancing && b.pos[i] == pos0 + i;
+            shared    = shared    && b.pos[i] == pos0;
+        }
+        if (!(advancing || (pl.embd && shared))) {
+            pl.why = "the positions do not continue the sequence";
+            return pl;
+        }
+        // where the batch starts: right behind the sequence, or - on an M-RoPE model, where an image advances the position by its extent and its rows share one position - further ahead (token
+        // rows: newest position < first position, embedding rows: newest <= first, the rule of llama_batch_allocr::init())
+        const bool mrope = mm && model.hparams.n_pos_per_embd() > 1;
+        const bool start_ok = pos0 == p0 || (mrope && (pl.embd ? pos0 >= p0 - 1 : pos0 > p0));
+        if (!start_ok) {
+            pl.why = "the positions do not continue the sequence";
+            return pl;
         }
     }
 
@@ -227,15 +263,44 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         pl.want_logits = true;
     }
 
+    // a pending K-shift would be applied by memory_update after the plan is made
+    if (mem.attn->get_has_shift() || (mem.swa != nullptr && mem.swa->get_has_shift())) {
+        pl.why = "a K-shift is pending";
+        return pl;
+    }
+
+    // the sequence's cells must be one contiguous block (cell == c0 + position) with room behind it, and the recurrent state must stand exactly at p0
+    uint32_t n_old = 0;
+    const int64_t c0 = mem.attn->lm_block(seq, p0, (uint32_t) n, &pl.why_detail, &n_old);
+    if (c0 < 0) {
+        pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
+        return pl;
+    }
+    if (n_old != (uint32_t) p0 && !mm) {
+        // without --mmproj-on-demand: the cells equal the positions or the pass declines (what lm_block's strict rule did before VOD-4)
+        pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
+        return pl;
+    }
+    if (n_old != (uint32_t) p0 && (mem.swa != nullptr || lm_role != 0 || lm_state->peer_ctx != nullptr)) {
+        // behind an M-RoPE image the cells and the positions differ: the split (two-GPU) pass and the window cache count cells by position
+        pl.why = "the sequence has image rows (more cells than positions), which a split pass or a window-cache model does not take";
+        return pl;
+    }
+
     // the chunk layout: chunk boundaries sit at multiples of `ubatch` in ABSOLUTE position (a pass that resumes at p0 starts with the short chunk that reaches the next multiple), so a pass
-    // behind a cached prefix cuts its chunks where a fresh pass over the same prompt cuts them
+    // behind a cached prefix cuts its chunks where a fresh pass over the same prompt cuts them.
+    // VOD-4 (DL-18): the rows of an image chunk, and any batch behind an image, are cut from the START OF THE BATCH, as the ordinary path cuts a batch into ubatches. The server decodes such a batch
+    // after a few text tokens (an image at position 4 would otherwise be cut 508 / 512 / 4 where the ordinary path cuts 512 / 512), so the absolute grid would make the pass's chunks differ from
+    // the ordinary path's at an equal chunk width (stock placement, pass at 512 against ordinary at 512: first-token deltas up to 0.56, as large as the ordinary path's own shape change, 0.73;
+    // the single-chunk comparison at 2,048 is exact to 0.06).
     const int32_t W = P.ubatch;
+    const llama_pos grid0 = (pl.embd || n_old != (uint32_t) p0) ? 0 : p0;
     {
         // G42: a chunk boundary at every requested cut as well (the cuts are ascending); a cut that sits on a multiple of W costs nothing
         const std::vector<int32_t> & cuts = lm_state->snap_req;
         size_t ci = 0;
         for (int32_t t = 0; t < n;) {
-            int32_t w = std::min(W - (int32_t) ((p0 + t) % W), n - t);
+            int32_t w = std::min(W - (int32_t) ((grid0 + t) % W), n - t);
             while (ci < cuts.size() && cuts[ci] <= t) {
                 ci++;
             }
@@ -250,19 +315,6 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
                 ci++;
             }
         }
-    }
-
-    // a pending K-shift would be applied by memory_update after the plan is made
-    if (mem.attn->get_has_shift() || (mem.swa != nullptr && mem.swa->get_has_shift())) {
-        pl.why = "a K-shift is pending";
-        return pl;
-    }
-
-    // the sequence's cells must be one contiguous block (cell == c0 + position) with room behind it, and the recurrent state must stand exactly at p0
-    const int64_t c0 = mem.attn->lm_block(seq, p0, (uint32_t) n, &pl.why_detail);
-    if (c0 < 0) {
-        pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
-        return pl;
     }
     if (mem.recr != nullptr && mem.recr->seq_pos_max(seq) != p0 - 1) {
         pl.why = "the recurrent state is not at the batch's first position";
@@ -283,6 +335,8 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     pl.ok  = true;
     pl.seq = seq;
     pl.p0  = p0;
+    pl.pos0  = pos0;
+    pl.n_old = n_old;
     pl.c0  = c0;
     pl.n   = n;
     return pl;
@@ -1214,7 +1268,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         if (banks_early && lmem.attn != nullptr && lmem.attn->is_lazy()) {
             // commit the segment's KV rows BEFORE the first bank copy is queued: the driver's map / access calls took 60 ms with the copy engine busy and about 10 ms without (FL-3: layer 0 started
             // at 157 ms with the banks queued first, at 110 ms after them). The same rows the chunks' apply() would commit one chunk at a time.
-            const int64_t rows_end = (int64_t) pl.c0 + pl.p0 + chunk_t0[c1 - 1] + pl.widths[c1 - 1];
+            const int64_t rows_end = (int64_t) pl.c0 + pl.n_old + chunk_t0[c1 - 1] + pl.widths[c1 - 1];
             lmem.attn->lazy_commit_rows((uint32_t) std::min<int64_t>(rows_end, (int64_t) lmem.attn->get_size()), this);
         }
         if (banks_early && !preload_banks()) {
@@ -1227,11 +1281,23 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
         double su_apply = 0.0, su_mask = 0.0, su_up = 0.0;     // LLAMA_LM_LOG: where the setup before the first layer goes
         for (int c = c0; c < c1; ++c) {
             const int32_t n_c = pl.widths[c];
+            // VOD-4: an embedding chunk takes its rows of B.embd and its own section-major positions ([n_pos_per_embd][n_c]): B.pos is section-major over the WHOLE batch, a pointer into it would
+            // read the wrong sections of every chunk but the first. The compat layer copies both into the chunk's batch_ext, so the vector can die with the iteration.
+            std::vector<llama_pos> cpos;
+            if (pl.embd) {
+                const uint32_t np = hparams.n_pos_per_embd();
+                cpos.resize((size_t) np * n_c);
+                for (uint32_t j = 0; j < np; ++j) {
+                    for (int32_t i = 0; i < n_c; ++i) {
+                        cpos[(size_t) j * n_c + i] = B.pos[(size_t) j * B.n_tokens + chunk_t0[c] + i];
+                    }
+                }
+            }
             llama_batch cb = {
                 /*.n_tokens =*/ n_c,
-                /*.token    =*/ B.token + chunk_t0[c],
-                /*.embd     =*/ nullptr,
-                /*.pos      =*/ B.pos + chunk_t0[c],
+                /*.token    =*/ pl.embd ? nullptr : B.token + chunk_t0[c],
+                /*.embd     =*/ pl.embd ? B.embd + (size_t) chunk_t0[c] * (size_t) n_embd_io : nullptr,
+                /*.pos      =*/ pl.embd ? cpos.data() : B.pos + chunk_t0[c],
                 /*.n_seq_id =*/ B.n_seq_id + chunk_t0[c],
                 /*.seq_id   =*/ B.seq_id + chunk_t0[c],
                 /*.logits   =*/ nullptr,
@@ -1242,7 +1308,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                 return fail("could not initialise a chunk batch", 1);
             }
             const int64_t su_a0 = ggml_time_us();
-            force_guard.kv->lm_force(pl.c0 + pl.p0 + chunk_t0[c]);
+            force_guard.kv->lm_force(pl.c0 + pl.n_old + chunk_t0[c]);
             auto vmctx = memory->init_batch(vballoc, n_c, output_all);
             if (!vmctx || vmctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
                 return fail("the memory could not take a chunk", 1);
@@ -1490,7 +1556,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
                     lmi.act_type   = S.act_type;
                     lmi.act_in     = half_ptr(il & 1, chunks[c].slab_row);
                     lmi.act_out    = half_ptr((il + 1) & 1, chunks[c].slab_row);
-                    lmi.q_pos_base = (int32_t) (pl.p0 + chunks[c].t0);
+                    lmi.q_pos_base = (int32_t) (pl.n_old + chunks[c].t0);     // the cell index of the chunk's first row relative to the sequence's first cell (VOD-4: not the position, behind image rows)
                     lmi.n_kv_valid = lmi.q_pos_base + chunks[c].n;
                     lmi.kv_cell0   = (int32_t) pl.c0;
                     {
@@ -1706,7 +1772,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             llama_io_write_lm_snap io(sn.blob, snap_rows[k].rows);
             io.write(&k_lm_io_magic, sizeof(k_lm_io_magic));
             io.write(&pl.seq, sizeof(pl.seq));
-            mr->state_pos_override = pl.p0 + pl.snap_cuts[k] - 1;
+            mr->state_pos_override = pl.pos0 + pl.snap_cuts[k] - 1;
             try {
                 mr->state_write(io, pl.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             } catch (const std::exception & e) {
@@ -1717,7 +1783,7 @@ int llama_context::lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all) {
             if (snap_ok) {
                 if (lm_log_on()) {
                     static const bool hash_on = getenv("LLAMA_LM_HASH") != nullptr;     // a byte loop over 63 MiB: ~100 ms, never in a timing run
-                    LLAMA_LOG_WARN("lm-prefill: snapshot %d: %d tokens into the batch (position %d), %zu bytes, fnv %016llx\n", (int) k, (int) pl.snap_cuts[k], (int) (pl.p0 + pl.snap_cuts[k] - 1), sn.blob.size(),
+                    LLAMA_LOG_WARN("lm-prefill: snapshot %d: %d tokens into the batch (position %d), %zu bytes, fnv %016llx\n", (int) k, (int) pl.snap_cuts[k], (int) (pl.pos0 + pl.snap_cuts[k] - 1), sn.blob.size(),
                                    (unsigned long long) (hash_on ? lm_fnv64(sn.blob.data(), sn.blob.size()) : 0));
                 }
                 S.snaps.push_back(std::move(sn));
@@ -2225,6 +2291,7 @@ struct llama_lm_prefill_params llama_lm_prefill_default_params(void) {
     p.device     = 0;
     p.copy_piece_mib = -1;
     p.copy_window    = -1;
+    p.mm_batches     = 0;
     return p;
 }
 

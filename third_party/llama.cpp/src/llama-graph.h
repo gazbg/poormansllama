@@ -800,7 +800,8 @@ struct llama_dense_stream;
 //   kind 1: decoder layer il: act_in -> act_out, with the weights of `layer` (the routed experts are the slot's device bank)
 //   kind 2: head: row act_in (one row) -> final norm -> logits
 // act_in / act_out are device addresses inside the pass's slab (act_buf); the flash attention of kind 1 uses the implicit causal mask:
-// the ubatch's first query is position q_pos_base, keys [kv_cell0, kv_cell0 + n_kv_valid) are live (the sequence's cells are kv_cell0 + position).
+// the ubatch's first query sits in cell kv_cell0 + q_pos_base, keys [kv_cell0, kv_cell0 + n_kv_valid) are live (the sequence's cells are kv_cell0 + the row's index in the sequence, which is its
+// position except behind M-RoPE image rows, which share one position: VOD-4).
 struct llm_graph_lm {
     int                  kind            = 0;
     int                  il              = -1;

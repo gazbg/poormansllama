@@ -547,6 +547,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* park_on_init      */ false,
     };
     return params;
 }
@@ -654,6 +655,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* park_on_init      */ ctx_params.park_on_init && !no_alloc,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -1264,6 +1266,29 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+// VOD-1: park / unpark (vision-only, see clip_park / clip_unpark)
+bool mtmd_park(mtmd_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (ctx->ctx_a || ctx->ctx_gen_a) {
+        LOG_ERR("%s: a projector with audio contexts cannot be parked\n", __func__);
+        return false;
+    }
+    return ctx->ctx_v == nullptr || clip_park(ctx->ctx_v);
+}
+
+bool mtmd_unpark(mtmd_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    return ctx->ctx_v == nullptr || clip_unpark(ctx->ctx_v);
+}
+
+bool mtmd_is_parked(const mtmd_context * ctx) {
+    return ctx != nullptr && ctx->ctx_v != nullptr && clip_is_parked(ctx->ctx_v);
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {

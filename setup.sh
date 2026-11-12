@@ -56,6 +56,12 @@ NI=0
 YES_INSTALL=0
 HF_TOKEN="${HF_TOKEN:-}"
 MAX_DL_MIB=0
+# VOD-6 (docs/plans/vision-on-demand-plan.md): vision support. The projector comes from the SAME
+# Hugging Face repo as the model file; the emitted command gets --mmproj "$MMPROJ" --mmproj-on-demand.
+NO_VISION=0
+MMPROJ_FILE=''   # --mmproj-file: a local projector (implies vision)
+VISION=0         # set by the settings phase
+MMPROJ_PATH=''
 # D20 state: set by resolve_model_file (settings phase), consumed by the
 # parallel phase. Initialized so set -u is happy on every path.
 LOCAL_FILE=''
@@ -73,6 +79,8 @@ usage: setup.sh [options]
   --host ADDR                   bind address (default: the recipe row's own)
   --device N                    CUDA index for device-pinned rows R5/R7 (default: auto)
   --model-file PATH             explicit local GGUF (still needs --model)
+  --mmproj-file PATH            local multimodal projector GGUF (implies vision)
+  --no-vision                   no vision support (no projector download, no --mmproj flags)
   --model-dir DIR               where to look for / download the model
   --clone-dir DIR               clone target (default ~/poormansllama)
   --branch B                    clone branch (default claude/flint-support)
@@ -103,6 +111,8 @@ while [ $# -gt 0 ]; do
         --host) BIND="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
         --model-file) MODEL_FILE="$2"; shift 2 ;;
+        --mmproj-file) MMPROJ_FILE="$2"; shift 2 ;;
+        --no-vision) NO_VISION=1; shift ;;
         --model-dir) MODEL_DIR="$2"; shift 2 ;;
         --clone-dir) CLONE_DIR="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
@@ -197,6 +207,19 @@ M_SIZES_GIB_INT=(16 21 28 20 25 37 24)
 M_KINDS=('dense hybrid' 'MoE' 'SWA MoE' 'dense hybrid' 'MoE' 'MoE + MTP' 'MoE + MTP')
 M_DIRS=("$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/flint" "$HOME/models/qwen-3.8" "$HOME/models/qwen-3.6" "$HOME/models/qwen-3.6" "$HOME/models/apex")
 M_DEFAULTS=(1 1 1 0 0 0 1)
+# VOD-6: the vision projector of each entry (same repo as the model file; sizes read from the Hugging
+# Face tree API on 2026-11-09). Empty = no projector offered (dense Qwen3.8, flint and apex35 are not claimed).
+M_MMPROJ=('' 'mmproj-BF16.gguf' '' '' 'mmproj-BF16.gguf' 'mmproj-BF16.gguf' '')
+M_MMPROJ_BYTES=(0 902822624 0 0 902822624 902822528 0)
+
+# vision_offered: is vision offered for the chosen model entry and recipe row? Needs a projector in the
+# table and a recipe measured WITHOUT speculative decoding (the MTP / draft rows were never run with a
+# projector). Uses MI_IDX and R_FLAGS. Pure: returns 0 (offered) / 1.
+vision_offered() {
+    [ -n "${M_MMPROJ[$MI_IDX]}" ] || return 1
+    case " $R_FLAGS " in *' --spec-type '*|*' --mmproj '*) return 1 ;; esac
+    return 0
+}
 
 mi() {  # mi KEY [QUANT] | NUM -> sets MI_IDX or exits 1 (SDD D19)
     case "$1" in
@@ -695,6 +718,12 @@ complete_row_flags() {
             fi
         fi
     fi
+    # VOD-6: $4 = 1 appends the vision flags, exactly once; $MMPROJ is defined by the emitted script next to
+    # $MODEL (a path with spaces needs no quoting here). The row's own flags never carry --mmproj
+    # (vision_offered refuses a row that does).
+    if [ "${4:-0}" = 1 ]; then
+        case "$f" in *'--mmproj-on-demand'*) ;; *) f="$f"' --mmproj "$MMPROJ" --mmproj-on-demand' ;; esac
+    fi
     echo "$f"
 }
 
@@ -1021,6 +1050,30 @@ download_finalize() {
     LOCAL_FILE="$file"
 }
 
+download_mmproj() {
+    # VOD-6: fetch the vision projector with the model (same repo, curl -C - resume, token as for the
+    # model), synchronously: it is 0.84 GiB, the combined status line is for the model. Nothing to do
+    # without vision or when the file is there already.
+    [ "$VISION" = 1 ] && [ -n "$MMPROJ_PATH" ] || return 0
+    if [ -f "$MMPROJ_PATH" ]; then ok "projector: $MMPROJ_PATH"; return 0; fi
+    local url="https://huggingface.co/${M_REPOS[$MI_IDX]}/resolve/main/${M_MMPROJ[$MI_IDX]}"
+    if [ "$DRY_RUN" = 1 ]; then
+        say "(dry-run: not downloading the projector ${M_MMPROJ[$MI_IDX]} from ${M_REPOS[$MI_IDX]})"
+        return 0
+    fi
+    [ "$SKIP_DOWNLOAD" = 1 ] && fail '--skip-download set but no local projector found (expected '"$MMPROJ_PATH"')' 5
+    command -v curl >/dev/null 2>&1 || fail "curl is required for the download (install it: sudo apt install curl; manual: $url)" 5
+    mkdir -p "$(dirname "$MMPROJ_PATH")" || fail "cannot create $(dirname "$MMPROJ_PATH")" 1
+    say "projector: downloading ${M_MMPROJ[$MI_IDX]} ($(( ${M_MMPROJ_BYTES[$MI_IDX]} / 1048576 )) MiB) from Hugging Face"
+    local auth=()
+    if [ -n "$HF_TOKEN" ]; then auth=(-H "Authorization: Bearer $HF_TOKEN"); fi
+    local part="$MMPROJ_PATH.part"
+    curl -fL -C - --retry 3 --retry-delay 5 ${auth[@]+"${auth[@]}"} -o "$part" "$url" || fail "projector download failed (manual: $url); re-run resumes the .part" 5
+    [ -s "$part" ] || fail 'projector download produced an empty file' 5
+    mv "$part" "$MMPROJ_PATH"
+    ok "projector ready: $MMPROJ_PATH"
+}
+
 wait_build() {
     # collect the build leg after the download finished (a download failure
     # has already exited 5 with the build killed)
@@ -1170,6 +1223,10 @@ emit_run_script() {
         echo 'set -o pipefail'
         echo "EXE=\"$BUILD_BIN\""
         echo "MODEL=\"$LOCAL_FILE\""
+        if [ "$VISION" = 1 ]; then
+            echo "MMPROJ=\"$MMPROJ_PATH\""
+            echo '# vision (not part of the measured row): --mmproj-on-demand keeps the projector (~0.84 GiB) in host RAM and on the GPU only while a request'\''s images are encoded (docs/plans/vision-on-demand-results.md). For a text-only server remove `--mmproj "$MMPROJ" --mmproj-on-demand` below.'
+        fi
         echo "PORT=$PORT"
         echo "LOG=\"$log\""
         if [ -n "$R_ENV" ]; then
@@ -1302,6 +1359,33 @@ if [ -z "$PORT" ]; then
     fi
 fi
 
+# VOD-6: vision support. The projector is fetched from the SAME Hugging Face repo as the model file and
+# the emitted command gets --mmproj "$MMPROJ" --mmproj-on-demand (the projector then sits in host RAM
+# and on the GPU only while a request's images are encoded). Default yes; --no-vision suppresses the
+# question; --mmproj-file uses a local projector.
+VISION=0
+MMPROJ_PATH=''
+if [ -n "$MMPROJ_FILE" ]; then
+    [ "$NO_VISION" = 1 ] && fail '--mmproj-file and --no-vision contradict each other' 1
+    vision_offered || fail "--mmproj-file: vision is not offered for ${M_KEYS[$MI_IDX]} / recipe $R_ID (only the Qwen3.6 rows without --spec-type)" 1
+    [ -f "$MMPROJ_FILE" ] || fail "--mmproj-file does not exist: $MMPROJ_FILE" 1
+    VISION=1
+    MMPROJ_PATH="$MMPROJ_FILE"
+    ok "vision: $MMPROJ_FILE (--mmproj-file)"
+elif vision_offered && [ "$NO_VISION" != 1 ]; then
+    if [ "$SKIP_MODEL" = 1 ]; then
+        say 'vision: skipped with --skip-model (no download; pass --mmproj-file to use a local projector)'
+    elif confirm "Vision support? Also fetches the projector ${M_MMPROJ[$MI_IDX]} ($(( ${M_MMPROJ_BYTES[$MI_IDX]} / 1048576 )) MiB, same Hugging Face repo); it is parked in host RAM between image requests" y; then
+        VISION=1
+        mm_dir="${MODEL_DIR:-${M_DIRS[$MI_IDX]}}"
+        [ -n "$MODEL_FILE" ] && mm_dir="$(dirname "$MODEL_FILE")"
+        MMPROJ_PATH="$mm_dir/${M_MMPROJ[$MI_IDX]}"
+        if [ -f "$MMPROJ_PATH" ]; then ok "projector: $MMPROJ_PATH"; else say "projector: $MMPROJ_PATH (downloaded in the parallel phase)"; fi
+    fi
+elif [ -n "${M_MMPROJ[$MI_IDX]}" ] && ! vision_offered; then
+    say 'vision: not offered for this recipe (the MTP / draft rows were not measured with a projector)'
+fi
+
 # D22-A/B: complete the row's flags (pure; see complete_row_flags). The
 # compute capability is for the card the run will use; on failure the row
 # is emitted as measured (the int8 tile is a performance approximation, not
@@ -1312,7 +1396,7 @@ if GPU_CC=$(detect_gpu_arch); then
 else
     say 'compute capability unavailable (nvidia-smi); the row flags stay as measured (no D22 additions)'
 fi
-R_FLAGS_OUT=$(complete_row_flags "$R_FLAGS" "$R_ENV" "$GPU_CC")
+R_FLAGS_OUT=$(complete_row_flags "$R_FLAGS" "$R_ENV" "$GPU_CC" "$VISION")
 # the note is about the flag being ADDED (the subshell above cannot set
 # globals): present in the output and absent from the measured row
 D22_ADDED_INT8=0
@@ -1346,6 +1430,7 @@ if [ "$DRY_RUN" = 1 ]; then
         # the emitted script must name the file the real run would produce
         LOCAL_FILE="$MODEL_FILE_TARGET"
     fi
+    download_mmproj          # VOD-6: in a dry run it only announces the projector download
 elif [ "$build_needed" = 1 ] && [ -n "$MODEL_FILE_TARGET" ]; then
     step 'Build + download (in parallel; Ctrl-C keeps the .part for resume)'
     build_start
@@ -1354,12 +1439,14 @@ elif [ "$build_needed" = 1 ] && [ -n "$MODEL_FILE_TARGET" ]; then
     prc=$?
     if [ "$prc" = 0 ]; then
         download_finalize
+        download_mmproj      # VOD-6: the projector follows the model while the build leg keeps running
     fi
     # prc = 2: test-hook cap tripped, LOCAL_FILE is the .part (D33 semantics)
     wait_build
 elif [ "$build_needed" = 1 ]; then
     # no download leg: build sequentially in the foreground (live output)
     invoke_build
+    download_mmproj          # VOD-6: the projector, when vision is on and the file is not there yet
 else
     # build fresh/skipped; download only (no combined line needed)
     if [ -n "$MODEL_FILE_TARGET" ]; then
@@ -1370,6 +1457,7 @@ else
         prc=$?
         if [ "$prc" = 0 ]; then download_finalize; fi
     fi
+    download_mmproj          # VOD-6
 fi
 
 check_row_flags "$BUILD_BIN" "${R_FLAGS_OUT:-$R_FLAGS}" "$R_ID"

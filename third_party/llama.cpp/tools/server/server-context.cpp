@@ -27,6 +27,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
@@ -398,6 +399,10 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
 
+    // VOD-2 (--mmproj-on-demand): the embeddings of every image chunk of the request that the prompt cache does not hold, encoded up front in one window while the projector was on the device.
+    // process_mtmd_chunk() looks a chunk up here before it would encode it. Freed with the slot's state in reset().
+    std::vector<mtmd::batch_ptr> vod_batches;
+
     struct tts_ctx {
         mtmd_helper::gen_audio ctx;
         std::vector<float> h_state_prompt; // the first h_state after step_prompt done
@@ -591,6 +596,7 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+        vod_batches.clear();
 
         tts.reset();
 
@@ -1000,6 +1006,24 @@ struct server_slot {
     }
 };
 
+// VOD-0 (docs/plans/vision-on-demand-plan.md): env-gated timing lines for the projector, LLAMA_VOD_LOG=1. Log only, no behaviour change.
+static bool vod_log_on() {
+    static const bool on = getenv("LLAMA_VOD_LOG") != nullptr && atoi(getenv("LLAMA_VOD_LOG")) > 0;
+    return on;
+}
+
+// free / total bytes of the first GPU device as the CUDA runtime reports them (cudaMemGetInfo); false when there is none
+static bool vod_dev_free(size_t & free_b, size_t & total_b) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            return true;
+        }
+    }
+    return false;
+}
+
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
 static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
@@ -1007,12 +1031,18 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
 
+    if (mtmd_is_parked(mctx)) {
+        SLT_ERR(slot, "%s", "an image is not encoded and the projector is parked (--mmproj-on-demand encodes every image of a request up front)\n");
+        return -1;
+    }
+
     mbatch.reset(mtmd_batch_init(mctx));
     int32_t res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
     GGML_ASSERT(res == 0); // we should never have an empty batch
 
     // try batching as much as possible
     int n_added = 1;
+    size_t n_added_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
     size_t idx_cur = idx;
     while (res == 0) {
         auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
@@ -1021,6 +1051,9 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
         }
         res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
         n_added += (res == 0 ? 1 : 0);
+        if (res == 0) {
+            n_added_tokens += mtmd_input_chunk_get_n_tokens(next_chunk->get());
+        }
         idx_cur = next_idx;
         SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
         // if res != 0, batch is full or chunk is not compatible -> this loop breaks
@@ -1029,7 +1062,11 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t vod_t0 = ggml_time_us();
     res = mtmd_batch_encode(mbatch.get());
+    if (vod_log_on()) {
+        LOG_WRN("vod: encode slot=%d chunks=%d tokens=%zu res=%d t_encode_ms=%.2f\n", slot.id, n_added, n_added_tokens, (int) res, (ggml_time_us() - vod_t0) / 1000.0);
+    }
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -1051,8 +1088,18 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     int32_t res = 0;
 
     auto try_decode = [&]() -> int32_t {
-        if (mbatch) {
-            float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+        {
+            // VOD-2: the embeddings encoded up front (--mmproj-on-demand) come first, then the lazily encoded batch
+            float * embd = nullptr;
+            for (const auto & vb : slot.vod_batches) {
+                embd = mtmd_batch_get_output_embd(vb.get(), chunk.get());
+                if (embd) {
+                    break;
+                }
+            }
+            if (embd == nullptr && mbatch) {
+                embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+            }
             if (embd) {
                 struct cb_data_t {
                     common_speculative * spec;
@@ -1075,6 +1122,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
+                const int64_t vod_t0 = ggml_time_us();
                 res = mtmd_helper_decode_image_chunk(
                     mctx,
                     slot.ctx_tgt,
@@ -1087,6 +1135,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     cb,
                     &cb_data
                 );
+                if (vod_log_on()) {
+                    LOG_WRN("vod: decode_chunk slot=%d idx=%zu tokens=%zu res=%d t_decode_ms=%.2f\n", slot.id, idx, (size_t) mtmd_input_chunk_get_n_tokens(chunk.get()), (int) res, (ggml_time_us() - vod_t0) / 1000.0);
+                }
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
                     return -1;
@@ -1383,6 +1434,168 @@ private:
                 before, after, why, free_mib, keep_free_mib, safety_mib, slack_mib, (ggml_time_us() - t0) / 1000.0);
     }
 
+    // ---- VOD-2 (--mmproj-on-demand, docs/plans/vision-on-demand-plan.md) ------------------------------------------------------------------------------------------------------------
+    // The projector lives parked in page-locked host memory. A request whose prompt holds images that the prompt cache does not cover gets ONE window: room is made in the VRAM (with the hybrid
+    // engine the expert cache shrinks as for a layer-major pass, so the window and the pass of one request share one shrink and one regrow), the projector is unparked, every such image is
+    // encoded and its embeddings kept on the host in the slot, the projector is parked again and the room is handed back. The prefill then runs on the embeddings.
+    int64_t vod_need_bytes = 0;              // device bytes of one window (set in load_model)
+    int     vod_fail_room_left = 0;          // fault injection LLAMA_VOD_FAIL_ROOM=N: the first N room attempts report "no room"
+    bool    vod_fail_encode_pending = false; // fault injection LLAMA_VOD_FAIL_ENCODE=1: the next encode window fails
+
+    // can vod_need_bytes be made available now? (with the hybrid engine the cache shrinks for it; otherwise plain free device memory above the fit margin)
+    bool vod_try_room() {
+        if (vod_fail_room_left > 0) {
+            vod_fail_room_left--;
+            return false;
+        }
+        if (params_base.hybrid_moe && llama_hybrid_active()) {
+            return llama_hybrid_vram_acquire(ctx_tgt, vod_need_bytes);
+        }
+        size_t f = 0, t = 0;
+        if (!vod_dev_free(f, t)) {
+            return true; // no GPU device to ask about
+        }
+        const int64_t margin = params_base.fit_params_target.empty() ? (int64_t) 1024 * 1048576 : (int64_t) params_base.fit_params_target[0];
+        return (int64_t) f >= vod_need_bytes + margin;
+    }
+
+    void vod_give_room() {
+        if (params_base.hybrid_moe && llama_hybrid_active()) {
+            llama_hybrid_vram_release(ctx_tgt);
+        }
+    }
+
+    // make the room and unpark the projector, waiting as long as it takes (--mmproj-wait-timeout seconds at most, 0 = no limit). Nothing inside the process competes for the memory (the server runs one
+    // compute at a time), so a wait means another process holds it. The loop thread serves the queue's metrics / health tasks while it sleeps. Returns 0 on success, -1 on timeout.
+    int vod_acquire_projector(const server_slot & slot) {
+        const int64_t t_start = ggml_time_ms();
+        int64_t t_warn = -1;
+        int n_try = 0;
+        for (;;) {
+            n_try++;
+            const bool room = vod_try_room();
+            if (room) {
+                if (mtmd_unpark(mctx)) {
+                    if (n_try > 1) {
+                        SLT_WRN(slot, "vod: the vision projector is on the device after %.1f s and %d attempts\n", (ggml_time_ms() - t_start) / 1000.0, n_try);
+                    }
+                    return 0;
+                }
+                SLT_WRN(slot, "vod: the room was made but the projector could not be unparked (device memory taken meanwhile?); giving the room back and waiting (attempt %d)\n", n_try);
+                vod_give_room();
+            }
+            const int64_t waited_ms = ggml_time_ms() - t_start;
+            if (params_base.mmproj_wait_timeout_s > 0 && waited_ms >= (int64_t) params_base.mmproj_wait_timeout_s * 1000) {
+                SLT_ERR(slot, "vod: no device memory for the vision projector after %.1f s (--mmproj-wait-timeout %d)\n", waited_ms / 1000.0, params_base.mmproj_wait_timeout_s);
+                return -1;
+            }
+            if (t_warn < 0 || waited_ms - t_warn >= 10000) {
+                t_warn = waited_ms;
+                SLT_WRN(slot, "vod: waiting for %.0f MiB of device memory for the vision projector (%.1f s so far, attempt %d); another process may hold it\n", vod_need_bytes / 1048576.0, waited_ms / 1000.0, n_try);
+            }
+            queue_tasks.yield_to_queue([&]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(room ? 1000 : 500));
+            });
+        }
+    }
+
+    // the window of one request. Called when the slot has settled how much of its prompt the cache holds. Returns false when the request failed (the error is sent and the slot released).
+    bool vod_prepare_slot(server_slot & slot) {
+        const auto & input_tokens = slot.task->tokens;
+        auto chunk_at = [&](size_t i) -> const mtmd::input_chunk_ptr * {
+            try {
+                return &input_tokens.find_chunk(i);
+            } catch (const std::exception &) {
+                return nullptr;
+            }
+        };
+
+        // the image chunks that start at or after the first uncached token, in order
+        std::vector<size_t> idxs;
+        const size_t n0 = slot.prompt.n_tokens();
+        if (n0 < input_tokens.size() && input_tokens[n0] == LLAMA_TOKEN_NULL && chunk_at(n0) != nullptr) {
+            idxs.push_back(n0);
+        }
+        for (size_t cur = n0;;) {
+            auto [c, i] = input_tokens.find_next_media_chunk(cur);
+            if (c == nullptr) {
+                break;
+            }
+            idxs.push_back(i);
+            cur = i;
+        }
+        if (idxs.empty()) {
+            return true; // everything is in the cache (or there is no image): the device is not touched
+        }
+
+        size_t n_tok = 0;
+        for (size_t i : idxs) {
+            n_tok += mtmd_input_chunk_get_n_tokens(chunk_at(i)->get());
+        }
+
+        const int64_t t0 = ggml_time_us();
+        // an idle-prepared layer-major pass (--lm-prefill-prearm) holds ~2.2 GiB of the room the window needs: hand it back, the pass of this request acquires its own resources for the text
+        if (llama_lm_prefill_armed(ctx_tgt)) {
+            llama_lm_prefill_disarm(ctx_tgt);
+        }
+        if (vod_acquire_projector(slot) != 0) {
+            send_error(slot, "no device memory for the vision projector (see --mmproj-wait-timeout)", ERROR_TYPE_SERVER);
+            slot.release();
+            return false;
+        }
+        const int64_t t1 = ggml_time_us();
+
+        // encode every chunk: as many chunks per batch as mtmd allows (batch_max_tokens), the embeddings of all batches are kept
+        std::vector<mtmd::batch_ptr> done;
+        int rc = 0;
+        queue_tasks.yield_to_queue([&]() {
+            if (vod_fail_encode_pending) {
+                vod_fail_encode_pending = false;
+                SLT_ERR(slot, "%s", "vod: LLAMA_VOD_FAIL_ENCODE: this window fails on purpose\n");
+                rc = -2;
+                return;
+            }
+            size_t k = 0;
+            while (k < idxs.size()) {
+                mtmd::batch_ptr b(mtmd_batch_init(mctx));
+                if (mtmd_batch_add_chunk(b.get(), chunk_at(idxs[k])->get()) != 0) {
+                    rc = -1;
+                    return;
+                }
+                size_t j = k + 1;
+                while (j < idxs.size() && mtmd_batch_add_chunk(b.get(), chunk_at(idxs[j])->get()) == 0) {
+                    j++;
+                }
+                if (mtmd_batch_encode(b.get()) != 0) {
+                    SLT_ERR(slot, "vod: failed to encode the images from chunk idx = %zu\n", idxs[k]);
+                    rc = -1;
+                    return;
+                }
+                done.push_back(std::move(b));
+                k = j;
+            }
+        });
+        const int64_t t2 = ggml_time_us();
+
+        // park again and give the room back, whatever happened
+        if (!mtmd_park(mctx)) {
+            SLT_ERR(slot, "%s", "vod: the projector could not be parked again\n");
+        }
+        vod_give_room();
+        const int64_t t3 = ggml_time_us();
+
+        SLT_INF(slot, "vod: window: %zu image chunks, %zu tokens, %zu batches: room + unpark %.1f ms, encode %.1f ms, park + release %.1f ms (need %.0f MiB)%s\n",
+                idxs.size(), n_tok, done.size(), (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, vod_need_bytes / 1048576.0, rc == 0 ? "" : " FAILED");
+
+        if (rc != 0) {
+            send_error(slot, "failed to encode the images of the request", ERROR_TYPE_SERVER);
+            slot.release();
+            return false;
+        }
+        slot.vod_batches = std::move(done);
+        return true;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1438,6 +1651,17 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
+        if (params.mmproj_on_demand) {
+            // VOD-2 (docs/plans/vision-on-demand-plan.md): refuse the combinations that cannot work, loudly and before anything is loaded
+            if (!has_mmproj) {
+                SRV_ERR("%s", "--mmproj-on-demand needs --mmproj\n");
+                return false;
+            }
+            if (!params.mmproj_use_gpu) {
+                SRV_ERR("%s", "--mmproj-on-demand parks the projector for the GPU: it conflicts with --no-mmproj-offload / -mmdev none (use the CPU option alone, it keeps the projector in RAM already)\n");
+                return false;
+            }
+        }
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -1488,6 +1712,7 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
+            mparams.park_on_init     = params_base.mmproj_on_demand;   // VOD-2: the projector starts parked, nothing of it on the device
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
@@ -1502,9 +1727,27 @@ private:
             mmproj_usage_t_us = ggml_time_us() - t_start;
         }
 
+        // VOD-2: the device bytes one encode window needs: the projector's weights and worst-case compute buffer (the estimate above) plus its backend instance, memory pool and handles
+        // (measured 106-128 MiB, results file VOD-1). Not added to the margin: the projector is not resident between requests.
+        vod_need_bytes = 0;
+        vod_fail_room_left = getenv("LLAMA_VOD_FAIL_ROOM") != nullptr ? std::max(0, atoi(getenv("LLAMA_VOD_FAIL_ROOM"))) : 0;
+        vod_fail_encode_pending = getenv("LLAMA_VOD_FAIL_ENCODE") != nullptr && atoi(getenv("LLAMA_VOD_FAIL_ENCODE")) > 0;
+        if (has_mmproj && params_base.mmproj_on_demand) {
+            size_t dev_bytes = 0;
+            for (const auto & kv : mmproj_usage.backend_mem_usage) {
+                if (ggml_backend_dev_type(kv.first) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    dev_bytes += kv.second;
+                }
+            }
+            vod_need_bytes = (int64_t) dev_bytes + (int64_t) 128 * 1048576;
+            SRV_INF("vod: --mmproj-on-demand: the projector is parked in host memory; an encode window needs %.1f MiB of device memory (estimate %.1f MiB + 128 MiB backend state), wait timeout %s\n",
+                    vod_need_bytes / 1048576.0, dev_bytes / 1048576.0, params_base.mmproj_wait_timeout_s > 0 ? (std::to_string(params_base.mmproj_wait_timeout_s) + " s").c_str() : "none");
+        }
+
         // optionally fit mmproj memory usage
         // on resume params_base already holds the margin from the first load
-        if (has_mmproj && params_base.fit_params && !is_resume) {
+        // (VOD-2: not with --mmproj-on-demand: the parked projector holds no device memory, so it must not raise the margin the hybrid engine keeps free)
+        if (has_mmproj && params_base.fit_params && !is_resume && !params_base.mmproj_on_demand) {
             const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
             const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {
@@ -1856,6 +2099,7 @@ private:
             lp.segment    = params_base.lm_prefill_segment;
             lp.min_tokens = params_base.lm_prefill_min;
             lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lp.mm_batches = params_base.mmproj_on_demand ? 1 : 0;     // DL-20: the pass takes image batches only with the projector on demand; a resident projector keeps the pre-VOD behaviour
             char err[512] = { 0 };
             if (!llama_lm_prefill_enable(ctx_tgt, &lp, err, sizeof(err))) {
                 SRV_ERR("--lm-prefill: %s\n", err);
@@ -2081,12 +2325,28 @@ private:
                 }
             }
 
+            size_t vod_free0 = 0, vod_free1 = 0, vod_total = 0;
+            const bool vod_dev = vod_log_on() && vod_dev_free(vod_free0, vod_total);
+            const int64_t vod_t_init0 = ggml_time_us();
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            if (params_base.mmproj_on_demand) {
+                // the context must have come up parked: that is the whole point of the flag
+                GGML_ASSERT(mtmd_is_parked(mctx) && "--mmproj-on-demand: the projector did not start parked");
+                SRV_INF("vod: the projector is parked (weights in page-locked host memory, nothing on the device), init %.1f ms\n", (ggml_time_us() - vod_t_init0) / 1000.0);
+            }
+            if (vod_dev && vod_dev_free(vod_free1, vod_total)) {
+                size_t est = 0;
+                for (const auto & kv : mmproj_usage.backend_mem_usage) {
+                    est += kv.second;
+                }
+                LOG_WRN("vod: projector init t_init_ms=%.1f device_free_before_mib=%.1f device_free_after_mib=%.1f delta_mib=%.1f estimate_mib=%.1f (unit: cudaMemGetInfo of the first GPU)\n",
+                        (ggml_time_us() - vod_t_init0) / 1000.0, vod_free0 / 1048576.0, vod_free1 / 1048576.0, ((double) vod_free0 - (double) vod_free1) / 1048576.0, est / 1048576.0);
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -4265,7 +4525,7 @@ private:
                 cuts.push_back((int32_t) rel);
                 ++it;
             } else if (rel == 0 && off > 0) {
-                create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - *it, (llama_pos) (*it - 1), (llama_pos) (*it - 1));
+                create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - *it, s->prompt.tokens.pos_next(*it) - 1, s->prompt.tokens.pos_next(*it) - 1);     // VOD-5: the position of the last token before the cut (not the token index behind an image)
                 it = s->fuse_at.erase(it);
             } else {
                 ++it;
@@ -4316,7 +4576,7 @@ private:
                 n_lost++;
                 continue;
             }
-            create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - at, (llama_pos) (at - 1), (llama_pos) (at - 1), &blob);
+            create_checkpoint(*s, (int64_t) s->prompt.n_tokens() - at, s->prompt.tokens.pos_next(at) - 1, s->prompt.tokens.pos_next(at) - 1, &blob);     // VOD-5: as above
             n_made++;
         }
         s->fuse_at = later;
@@ -5215,6 +5475,13 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // VOD-2: with --mmproj-on-demand the images that the prompt cache does not hold are encoded now, in one window of device memory
+                        if (params_base.mmproj_on_demand && mctx != nullptr && input_tokens.has_mtmd) {
+                            if (!vod_prepare_slot(slot)) {
+                                return;
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -5362,9 +5629,20 @@ private:
                     bool    sim_empty   = slot.prompt.checkpoints.empty();
                     int64_t sim_back    = sim_empty ? -1 : slot.prompt.checkpoints.back().n_tokens;
                     const llama_pos pos_min0 = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    if (params_base.lm_prefill_fuse && !has_mtmd && !slot.prompt.tokens.has_mtmd && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                    // VOD-5: with --mmproj-on-demand a loaded projector no longer turns the fused prefill off for every prompt. The text of a prompt up to its next image chunk (or its end) is fused like any
+                    // text; the image chunks themselves were decoded above (the pass takes them from 1,024 rows, VOD-4). Positions are not token indexes behind an image, so the checkpoint positions below
+                    // come from pos_next() and the rule "no checkpoint right after an image chunk" applies to the first virtual batch only.
+                    const bool fuse_media_ok = !slot.prompt.tokens.has_mtmd || params_base.mmproj_on_demand;
+                    int64_t fuse_seg_end = (int64_t) slot.task->n_tokens();
+                    if (fuse_media_ok && slot.prompt.tokens.has_mtmd) {
+                        const auto next_media = input_tokens.find_next_media_chunk(slot.prompt.n_tokens());
+                        if (next_media.first != nullptr) {
+                            fuse_seg_end = (int64_t) next_media.second;
+                        }
+                    }
+                    if (params_base.lm_prefill_fuse && fuse_media_ok && alora_scale <= 0 && !slot.need_embd() && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         batch.size() == 0) {
-                        const int64_t left = (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens();
+                        const int64_t left = fuse_seg_end - (int64_t) slot.prompt.n_tokens();
                         if (left >= params_base.lm_prefill_fuse_min && (params_base.lm_prefill_fuse_max <= 0 || left < params_base.lm_prefill_fuse_max)) {
                             const int64_t t_arm0 = ggml_time_us();
                             fuse = llama_lm_prefill_arm(ctx_tgt, slot.id, (int32_t) std::min<int64_t>(left, n_batch));
@@ -5384,7 +5662,7 @@ private:
                                     break;
                                 }
                             }
-                            return ckpt_ok && canon_A > 0 && (int) s == canon_A && pmin >= 0 && !has_mtmd && !have;
+                            return ckpt_ok && canon_A > 0 && (int) s == canon_A && pmin >= 0 && !(has_mtmd && s == fuse_first) && !have;      // VOD-5: only the batch right behind an image chunk is without a checkpoint
                         }
                         const bool near_end = N < e + n_ubatch;
                         bool d = ckpt_ok;
@@ -5394,7 +5672,7 @@ private:
                         if (d && pmin < 0) {
                             d = false;
                         }
-                        d = d && !has_mtmd;
+                        d = d && !(has_mtmd && s == fuse_first);      // VOD-5: the legacy flag `has_mtmd` belongs to the first batch of the iteration, the one behind an image chunk
                         if (params_base.lm_prefill_fuse_one_cut && near_end && e != N) {
                             d = false;      // H112: only the checkpoint 4 tokens before the end (the virtual batch that ends at N) is kept
                         }

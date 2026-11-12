@@ -229,7 +229,8 @@ public:
     // G32: where would the layer-major prefill put n_new tokens at position p0 of seq_id? The implicit causal mask of its flash attention addresses keys by cell relative to the sequence's first cell c0, so the
     // sequence's cells must be exactly c0 + position (one sequence per cell, contiguous) with the n_new cells behind them empty. Returns c0 (for a fresh sequence: the start of the first run of n_new empty cells),
     // or -1 when the layout does not allow a pass (the ordinary path then takes the batch).
-    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why = nullptr) const;   // why: the first violated condition, with cell numbers
+    // why: the first violated condition, with cell numbers. n_old_out (VOD-4): the number of cells the sequence holds behind the batch; it equals p0 unless the sequence has M-RoPE image rows, which share one position
+    int64_t lm_block(llama_seq_id seq_id, llama_pos p0, uint32_t n_new, std::string * why = nullptr, uint32_t * n_old_out = nullptr) const;
     // while >= 0, find_slot puts the next ubatch at exactly the cells [cell, cell + n) (and fails when one of them is occupied); the pass sets it before it applies each chunk and clears it afterwards
     void    lm_force(int64_t cell) { lm_force_cell = cell; }
     int64_t lm_force_cell = -1;

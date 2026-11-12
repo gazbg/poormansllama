@@ -24,6 +24,96 @@ risk tail.
   `docs/currentstate/` when the date is unknown.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
+
+## 2026-11-12 (vision on demand, PR #23: `origin/main` merged into the branch, 4 conflicts resolved; DL-29/DL-30)
+
+**Asked.** Owner: "check for conflicts and resolve them" (PR #23 was CONFLICTING).
+
+**Answer.** Merge commit `6afb38ba`: `docs/currentstate.md` both sides kept; `docs/setup-wizard-sdd.md` both sides added a D23, main's D23-D25 stay and the projector decision is D26 (references updated); `setup.ps1` / `setup.sh` keep the projector fields and main's `apex35` entry (the projector arrays have seven entries, none for apex35). The C++ merged without conflicts (main: hybrid thread defaults).
+
+**Validated.** Full build 0 errors; host ctest 78/78, 2/2, mtmd 2/2, selftest PASS; wizard tests D22 / D24 / VOD pass; smoke on the merged build `vod6m`: flag off and `--mmproj-on-demand` both 13/13 identical to the controls. Main's new thread defaults make hybrid decode 13% slower on this laptop (80.1 against 92.4 tok/s, back to 91.5 with `--hybrid-moe-threads 8 -t 16`); not caused by this work. The DL-27 supplementary evaluation (32 fresh runs) finished: outputs identical, 13 of 14 metrics met, one first-request stall-guard miss (DL-29), pooled stall rate A 5/48 vs B 6/48.
+
+**Scope / known gaps.** The VOD-1 .. VOD-8 GPU evidence is the pre-merge `vod5b` evidence; the merge is checked by a build, the host suites and two smokes. Pushing the merge awaits the owner.
+
+## 2026-11-12 (vision on demand, VOD-5 done on the final build `vod5b`: fused prefill with images, default-off identity repaired; goal ACCEPTED: VOD-2..VOD-9 by the agent, VOD-1 by the owner, DL-28)
+
+**Asked.** Owner /goal (autonomous), task VOD-5 (phase 3) and the closeout of the whole goal (VOD-1 .. VOD-9).
+
+**Answer.** `--lm-prefill-fuse` and the idle prearm work for prompts with images under `--mmproj-on-demand`: the text up to the next image chunk is one fused pass with the checkpoints taken inside it (positions by `pos_next() - 1`, the "no checkpoint right behind an image" rule on the first virtual batch only). 10 scenario requests equal to the legacy flow and the resident BASE in answers, counts and checkpoints, 4 of 4 checkpoint hashes byte-identical (canonical mode). **Default-off identity repaired (DL-20):** the identity on the first VOD-5 build (`vod5a`) showed 2.9-5.6% lower PP on image steps of >= 1,024 rows; the pass had started to take image batches for every `--lm-prefill` server. `llama_lm_prefill_params::mm_batches` (set from `--mmproj-on-demand`) restores the old decisions when the flag is off; the final build is `vod5b` (digest `D1E88EEA391E8FF0`).
+
+**Validated (final build, all GPU sessions through the wrapper, mains power).** Outputs identical in 28 identity runs; TG confirmation (16 runs, rule fixed before) B/A 0.9984; PP 12 of 13 steps within 0.8%, one 19-token step 0.02 points past the 3% line (a stall the control shows too, DL-23); the earlier pre-registered 12-run rule FAILED at -3.2% and stays recorded (DL-21/22). Park test 300/300 byte-identical, 0.0 MiB residue; idle OD = NOVIS 5,029 / 7,015 MiB (nvidia-smi poller); free-watch 16,285-16,297 MiB (cudaMemGetInfo); soak 120 requests (12 cancelled) 0 failed; fault room / encode / timeout; memcheck `ERROR SUMMARY: 0 errors` x2; VOD-7 equal-shape max 0.0000 (512) / 0.1977 (2,048); owner's Q8_K_XL MTP command smoke 5/5 fixtures. Host ctest 78/78, route-topk|host-mem 2/2, mtmd 2/2, wizard tests, selftest, `git diff --check`. Evidence and the Owner Summary with the acceptance contract: `docs/plans/vision-on-demand-results.md` (end of file); decisions DL-1 .. DL-23 in the plan.
+
+**Scope / known gaps.** The goal is accepted: VOD-2 .. VOD-9 by the agent's own autonomous acceptance (not owner approval), VOD-1 by the OWNER (chat, 2026-11-12, DL-28). The VOD-1 performance clause was missed in every pre-registered attempt (DL-22 / DL-24 / DL-25; the last one, 32 runs: TG +1.93% inside the bar, two PP steps +5.84% / +6.50% because the control stalled, medians 1.0074 / 0.9986); outputs are identical in 76 of 76 runs and every miss is a stall, none the code; the clause was not restated. A fresh evaluation under a stall-robust protocol (DL-27, `vod5b-cf4-*`) runs as supplementary evidence only. With the hybrid expert cache one pass-vs-ordinary prompt exceeds 0.25 nats (0.2856); a residual 0.17-0.20 at 2,048 is not root-caused. The pass takes image batches only with `--mmproj-on-demand`; mixed token / embedding batches, split passes and window-cache models are declined. Not tested: `-np > 1`, other models, audio / video, a physical 8 GiB card, Linux, a real wizard download, MTP draft acceptance with a projector. TG of one binary moves 3-7% between sessions on this machine (more than the 3% bar of VOD-1). PR #23 on the owner's repo was opened before the closeout; the closeout commits are local until the owner pushes.
+## 2026-11-09 (vision on demand, VOD-4 done: the layer-major pass takes image embeddings, images 2 and 3 of a request and the text behind an image)
+
+**Asked.** Owner /goal (autonomous), task VOD-4 (phase 2): prefill the image rows through the layer-major pass instead of the 370-430 tok/s ordinary path.
+
+**Answer.** The pass plans an embedding-only batch (`llama_lm_plan::embd`), counts the cells the sequence holds separately from its positions (`n_old`; an M-RoPE image gives all its rows one position), so it also takes images 2 and 3 of a request (positions 4 / 38 / 72) and a text batch behind an image, and (DL-18) cuts the chunks of such a batch from the batch start like the ordinary path. Rates (hybrid recipe, medians): 1,024 rows 702 tok/s, 2,025 rows 1,283-1,300, 5,116 rows 2,450-2,570. Sessions `vod4*`, builds `vod4a` / `vod4b` / `vod4c` (final, digest F96CCCEBEF3C46EB).
+
+**Validated.** Acc 13/13 steps identical to the resident-projector control (text, `prompt_n / cache_n / predicted_n`, image chunks per turn); soak 120 requests (12 cancelled) 0 failed, 68/68 answers right, idle 7,027 -> 7,031 MiB; free-watch minimum 16,297 MiB (in-process, cudaMemGetInfo); compute-sanitizer memcheck (graphs off) over 15 passes `ERROR SUMMARY: 0 errors`. Equivalence on the stock placement (no expert cache; the ordinary arm repeats exactly): pass at chunk 512 vs ordinary 512 bit-identical on 14 prompts, at 2,048 max first-token delta 0.1977 (bound 0.25), the ordinary path's own 512 -> 2,048 change up to 0.7272. Diagnosis (DL-17): attention numerics ruled out (two switches, identical to the digit); the pass cut an image batch on an absolute-position grid (508 / 512 / 4 at position 4) where the ordinary path cuts 512 / 512 -> fixed.
+
+**Superseded in one respect (DL-20, 2026-11-12).** The pass takes image batches only with `--mmproj-on-demand` (the first build took them for every `--lm-prefill` server, which cost 2.9-5.6% PP on image steps with a resident projector); the default-off identity is re-run and closed on the final build, see the 2026-11-12 entry.
+
+**Scope / known gaps.** On the hybrid expert cache, pass-vs-ordinary and ordinary-vs-ordinary differ by 0.2-0.6 nats on knife-edge "answer" prompts and depend on the request history even in frozen mode (reported, not a pass property); one prompt exceeds 0.25 there (0.2856). Two prompts differ by 0.17-0.20 at 2,048 with equal shapes (below the bound, not root-caused). Mixed token / embedding batches and split / window-cache passes are not taken. Default-off identity and the host ctest list are re-run at the closeout of the goal. VOD-5 (fuse and prearm with image prompts) is next.
+
+## 2026-11-09 (vision on demand, VOD-6 done: the setup wizard downloads the projector with the model and emits the flags)
+
+**Asked.** Owner /goal (autonomous), task VOD-6: `setup.ps1` / `setup.sh` fetch `mmproj-BF16.gguf` from the SAME Hugging Face repo as the chosen Qwen3.6-35B-A3B file and emit `--mmproj <path> --mmproj-on-demand`.
+
+**Answer.** The model table gains `Mmproj` / `MmprojBytes` (902,822,624 B for the non-MTP repo, 902,822,528 B for the MTP repo); a settings question "Vision support?" (default yes) for the Qwen3.6 rows without `--spec-type`; `-NoVision` / `--no-vision` and `-MmprojFile` / `--mmproj-file`; the projector joins the parallel download phase with the existing resume logic; the emitted script defines `$mmproj` and the flags carry `--mmproj $mmproj --mmproj-on-demand` exactly once. SDD D26, `docs/SETUP.md`, `docs/plans/setup-wizard-plan.md`.
+
+**Validated.** Host dry-run tests only: `tools/setup-wizard/test-vod.ps1` (125 checks) and `test-vod.sh` (123); the D22 tests unchanged (53 / 195); `bash -n setup.sh` and the PowerShell parser clean.
+
+**Scope / known gaps.** No real download and no Linux machine run were done (dry runs announce the download). Vision is offered only for the non-MTP Qwen3.6 rows (DL-14).
+
+## 2026-11-09 (vision on demand, VOD-3 done: phase-1 closeout, Owner Summary of phase 1, host regression 78/78)
+
+**Asked.** Owner /goal (autonomous), task VOD-3: close phase 1 with the full evidence and the Owner Summary.
+
+**Answer.** `docs/plans/vision-on-demand-results.md` section VOD-3: the original goal, the mechanism in plain words, the glossary, pros and cons labelled measured / expected / unproven, the recommendation (keep phase 1 for anyone who runs `--hybrid-moe` with a projector at a crowded margin), and the VOD-9 regression at tree `69384eab`: full build, host ctest list 78/78, `test-layer-streaming-(route-topk|host-mem)$` 2/2, `ctest -R mtmd` 2/2, `server_vision.py selftest` PASS.
+
+**Scope / known gaps.** Superseded by the final closeout of the goal for VOD-4 / VOD-5 (the regression is re-run on the final tree).
+
+## 2026-11-09 (vision on demand, VOD-2 done: `--mmproj-on-demand` in llama-server; idle memory equals a server without a projector; layer-major pass no longer refused)
+
+**Asked.** Owner /goal (autonomous), task VOD-2: a real server runs the request flow: projector parked between requests, one window per image request.
+
+**Answer.** `--mmproj-on-demand` (default off, works with or without `--hybrid-moe`) and `--mmproj-wait-timeout`: the projector starts parked in page-locked host memory, is not added to the hybrid margin, and for each request whose prompt holds images the cache does not cover, `vod_prepare_slot` makes the room (the expert cache shrinks as for a pass, `llama_hybrid_vram_acquire`), unparks (~80 ms), encodes every such image, parks, hands the room back and keeps the embeddings in the slot. Measured on the RTX 5090 Laptop with the owner's flags (`-fitt 16000`, free-all): with a RESIDENT projector the margin is 17,109 MiB, the cache 38 slots and every layer-major pass is refused (PP 464 tok/s on a 5.7k-token text prompt); with OD the cache is 54 slots, the pass is armed and taken (PP 1,641-1,649 tok/s), idle nvidia-smi memory equals a server without a projector (7,015 MiB after the text steps, +30 MiB after image requests), the in-process free-watch minimum is 16,297 MiB. Image requests cost a fixed +0.48..0.52 s over a resident projector (window 0.12 s + expert-cache regrow 0.37 s). A loaded projector turns the fused one-pass prefill off for ALL prompts (`has_mtmd` gate): text PP 1,641 vs 2,611 tok/s without a projector (VOD-5 candidate). Correction: an image conversation re-processes and re-encodes its images on every turn in BASE as well (no checkpoint after an image chunk), so windows open on every image turn.
+
+**Validated.** Default-off identity A B B A (pristine vs the new build without the flag): 13/13 steps identical x3, PP within 0.1%, TG within 0.6%; OD vs resident projector: 13/13 identical in text, counts and image chunks encoded per turn; fault injection (wait then succeed, encode failure -> HTTP 500 and the next request fine, timeout -> HTTP 500 after 3 s, `/health` answering); soak of 120 mixed requests (12 cancelled mid-request): 0 failed, 68/68 image answers right, idle memory +4 MiB after 76 windows; stock placement smoke 7/7; `compute-sanitizer --tool memcheck`: 0 errors with `GGML_CUDA_DISABLE_GRAPHS=1` (the 16 graph-update reports with graphs on are identical in the pristine control). Details in `docs/plans/vision-on-demand-results.md`.
+
+**Scope / known gaps.** The image tokens still take the ordinary prefill path (370-430 tok/s): VOD-4. The full host ctest list (78/78) is run at the closeout. Wait-for-room was exercised by fault injection only (no second GPU process).
+
+## 2026-11-09 (vision on demand, VOD-1 done: mtmd park / unpark, 300 of 300 byte-identical rounds, 0.0 MiB residue after park)
+
+**Asked.** Owner /goal (autonomous), task VOD-1: the vision projector must be able to live parked in pinned host RAM and come to the device and back without changing its output.
+
+**Answer.** `park_on_init`, `mtmd_park()` / `mtmd_unpark()` / `mtmd_is_parked()` (and the `clip_*` equivalents) in `third_party/llama.cpp/tools/mtmd/`; a parked-init context reads its 861 MiB of weights into a `CUDA_Host` buffer and holds nothing on the device (no weights, no compute buffers, no backend instance); unpark re-creates the backend, allocates and fills the weights from the mirror and re-creates the scheduler; the first encode reserves the compute buffer for its batch (23 / 39 / 92 MiB at 196 / 336 / 784 tokens against 248 MiB worst case). New test `tests/test-mtmd-park.cpp` (built, not registered with ctest: needs a model and a projector path).
+
+**Validated.** `test-mtmd-park` under `tools/with-gpu-lock.ps1`: 100 cycles x 3 fixtures = 300 rounds, embeddings byte-identical to a resident context in 300 of 300, residue after park 0.0 MiB (cudaMemGetInfo), mean unpark 76.7 ms, park 6.0 ms; `compute-sanitizer --tool memcheck`: `ERROR SUMMARY: 0 errors`; diagnostic with the backend kept alive leaves 106-128 MiB (hence the backend is freed on park); `ctest -R mtmd` 2/2. Details in `docs/plans/vision-on-demand-results.md`.
+
+**Scope / known gaps.** Library level only: no server integration yet (VOD-2), no real out-of-memory exercised in `clip_unpark`, vision-only projectors on an accelerated backend (audio refused at init). The full host ctest list (78/78) is run at the closeout of the goal.
+
+## 2026-11-09 (vision on demand, VOD-0 done: H1 confirmed, projector costs 1,112 MiB + a refused startup pass arming; GPU vs CPU encode measured)
+
+**Asked.** Owner /goal (autonomous): implement the vision projector on demand per `docs/plans/vision-on-demand-plan.md`; VOD-0 is the measurement task.
+
+**Answer.** Built the pristine control and a log-only (`LLAMA_VOD_LOG=1`) build in this worktree, wrote `tools/server_vision.py` / `tools/run-server-vision.sh`, ran seven server sessions. Results in `docs/plans/vision-on-demand-results.md`: with `--mmproj` resident the hybrid keep-free margin is 17,109 MiB (16,000 + the projector's 1,109 MiB estimate, never released), the expert cache sizes to 38 slots instead of 54, the cache is 21 slots at ready instead of the 2-slot armed floor, and the startup pass arming is declined (`no room for 2228 MiB + margin 17269 MiB: free 16317 -> 18747`). The projector's measured device cost is 1,112 MiB (861 MiB weights + 248 MiB compute buffer). GPU encode 85 / 249 / 835 ms vs CPU encode 1.73 / 4.03 / 11.08 s at 529 / 1,024 / 2,025 image tokens; the ordinary path prefills image embeddings at ~370-430 tok/s.
+
+**Validated.** `python tools/server_vision.py selftest` 22/22; seven wrapper sessions PASS with `gpu_pre=clean gpu_post=clean`, mains power; the wrapper's binary-provenance gate is waived (`-AllowUnprovenanced`, server path) and replaced by hashes in each report. Final fixture set 7 of 7 right on the control, negative control fails as designed.
+
+**Scope / known gaps.** No speed or VRAM claim beyond the measurements. Whether a long text prompt is also declined at request time with the projector resident is not measured yet (VOD-3 report-only line). The only engine change is the env-gated log lines in `tools/server/server-context.cpp`. VOD-1 (park/unpark in mtmd) is next.
+
+## 2026-11-09 (vision projector on demand: plan written, owner decisions D1-D13, no code or GPU run)
+
+**Asked.** Owner: apply the layer-residency idea to vision: instead of keeping the multimodal projector in VRAM (or on the CPU via `--no-mmproj-offload`), load it into VRAM only while a request's images are encoded, then unload it; "discussion and a plan".
+
+**Answer.** `docs/plans/vision-on-demand-plan.md` (tasks VOD-0 .. VOD-6, acceptance contract written before any run). Findings from reading the code: the projector (~0.84 GiB weights + a worst-case compute buffer) stays on CUDA0 for the server's life; under `--hybrid-moe` its estimate is added to `fit_params_target`, which the hybrid engine reads as its permanent keep-free margin and, unlike the speculative-context estimate, never releases (possible double count, UNVERIFIED, VOD-0 M1); the layer-major pass declines every batch that carries embeddings (`src/llama-lm-prefill.cpp:157`), so image tokens take the slow ordinary path; `hybrid_lm_vram` already shrinks the expert cache for a pass and can serve an encode window. Owner decisions: both goals equally, park the weights in pinned host RAM, unload right after the encode, wait (no timeout) when room cannot be made, image embeddings through the pass (phase 2) and fuse with images (phase 3) included, own flag `--mmproj-on-demand` default off, performance report-only with hard correctness gates, Qwen3.6-35B-A3B only, the setup wizard downloads the projector with the model (VOD-6). The test projector is `C:/Models/ALL/other/qwen-3.6/mmproj-qwen-35b-tq3-BF16.gguf` (SHA-256 `da63cb47...cfa`, byte-identical to `mmproj-BF16.gguf` in `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`).
+
+**Validated.** Nothing run: planning only. Public Hugging Face tree listings were read (no download) and the local projector files were hashed against the published LFS oids.
+
+**Scope / known gaps.** No claim of any speedup or VRAM saving. VOD-0 (measurements and harness) is `ready`; everything else is `planned`. Open unknowns are listed in the plan's "Risks and unknowns" (mixed token / embedding batch, compute-buffer size, WDDM memory return, the H1 double count).
+
 ## 2026-11-09 (setup wizard D25: apex35 Q6_K_L removed; Apex Q5_K_M 8g benchmark added)
 
 - **Asked (owner, chat):** "remove the last model from the setup the q6 one", then "also add the benchmark for the apex q5 model to the docs and setup where needed" with two `llama-server` log lines. Not an autonomous-mode task. Committed on branch `claude/hybrid-thread-defaults` (PR #26, owner: "same branch"), without the owner's own uncommitted `Env=` edits to the recipe rows of `setup.ps1` / `setup.sh`, which stay in the working tree.

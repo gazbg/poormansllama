@@ -47,6 +47,8 @@ param(
     [switch]$NoStart,
     [string]$HfToken = $env:HF_TOKEN,
     [string]$ModelFile = '',        # full path to a local gguf (overrides the table file)
+    [string]$MmprojFile = '',       # full path to a local multimodal projector gguf (VOD-6; implies vision)
+    [switch]$NoVision,              # VOD-6: no vision support (no projector download, no --mmproj flags)
     [int]$MaxDownloadMib = 0        # 0 = full file; test hook, see docs/SETUP.md
 )
 
@@ -69,10 +71,11 @@ if ($args.Count -gt 0) {
             '^--?full-clone$'       { $FullClone = $true }
             '^--?full-build$'       { $FullBuild = $true }
             '^--?yes-install$'      { $YesInstall = $true }
+            '^--?no-vision$'        { $NoVision = $true }
             '^--?no-start$'         { $NoStart = $true }
             '^--?start$'            { $Start = $true }
             default {
-                $wantVal = $a -match '^--?(quant|model|vram|context|port|host|device|model-file|model-dir|clone-dir|branch|repo-url|hf-token|max-download-mib)$'
+                $wantVal = $a -match '^--?(quant|model|vram|context|port|host|device|model-file|mmproj-file|model-dir|clone-dir|branch|repo-url|hf-token|max-download-mib)$'
                 if (-not $wantVal) { $rest += $a; break }
                 if ($i + 1 -ge $args.Count) { Write-Host "  [FAIL] missing value for $a"; exit 1 }
                 $v = $args[++$i]
@@ -85,6 +88,7 @@ if ($args.Count -gt 0) {
                     '^--?host$'             { $Bind = $v }
                     '^--?device$'           { $Device = [int]$v }
                     '^--?model-file$'       { $ModelFile = $v }
+                    '^--?mmproj-file$'      { $MmprojFile = $v }
                     '^--?model-dir$'        { $ModelDir = $v }
                     '^--?clone-dir$'        { $CloneDir = $v }
                     '^--?branch$'           { $Branch = $v }
@@ -253,6 +257,7 @@ $script:MODELS = @(
         DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$true },
     [pscustomobject]@{ Key='qwen36'; Quant='q4k_m'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q4_K_M)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'; SizeGib=20.6
+        Mmproj='mmproj-BF16.gguf'; MmprojBytes=902822624
         DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$true },
     [pscustomobject]@{ Key='flint'; Quant='q5k_xl'; Label='Flint SWA MoE (unsloth UD Q5_K_XL)'
         Repo='unsloth/flint-GGUF'; File='flint-UD-Q5_K_XL.gguf'; SizeGib=27.9
@@ -262,9 +267,11 @@ $script:MODELS = @(
         DefaultDir='C:/Models/ALL/other/qwen-3.8'; Kind='dense'; Default=$false },
     [pscustomobject]@{ Key='qwen36'; Quant='q5k_xl'; Label='Qwen3.6-35B-A3B MoE (unsloth UD Q5_K_XL)'
         Repo='unsloth/Qwen3.6-35B-A3B-GGUF'; File='Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf'; SizeGib=24.7
+        Mmproj='mmproj-BF16.gguf'; MmprojBytes=902822624
         DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe'; Default=$false },
     [pscustomobject]@{ Key='qwen36'; Quant='q8k_xl'; Label='Qwen3.6-35B-A3B MoE + MTP (unsloth UD Q8_K_XL, MTP repo)'
         Repo='unsloth/Qwen3.6-35B-A3B-MTP-GGUF'; File='Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf'; SizeGib=36.4
+        Mmproj='mmproj-BF16.gguf'; MmprojBytes=902822528
         DefaultDir='C:/Models/ALL/other/qwen-3.6'; Kind='moe-mtp'; Default=$false },
     # SDD D23 (2026-11-09): Apex-35B-V1.0 (qwen35moe, 41 blocks incl. 1 MTP layer). Sizes and the
     # resolve-endpoint Content-Length checked against the Hugging Face API on 2026-11-09
@@ -426,7 +433,11 @@ function Detect-GpuArch {
 }
 
 function Complete-RowFlags {
-    param([string]$Flags, $EnvText, [string]$ComputeCap)
+    param([string]$Flags, $EnvText, [string]$ComputeCap, [bool]$Vision = $false)
+    # VOD-6 (docs/plans/vision-on-demand-plan.md): with $Vision the vision flags are appended,
+    # ' --mmproj $mmproj --mmproj-on-demand', where $mmproj is the variable the emitted script
+    # defines next to $model (so a path with spaces needs no quoting here). Exactly once; the row's
+    # own flags never carry --mmproj (Test-VisionOffered refuses a row that does).
     # D22-B: every profile emits --lm-prefill-prearm always. An existing
     # occurrence (R3's 'always', R8's 'auto') is REPLACED, otherwise the
     # flag is appended - two occurrences would be a parse hazard.
@@ -463,7 +474,21 @@ function Complete-RowFlags {
             else { Say "row env already sets LLAMA_FATTN_TILE_Q8QK=1 (compute capability $ComputeCap); the env is the emitted config, no flag added" }
         }
     }
+    if ($Vision -and $f -notmatch '(?<!-)--mmproj-on-demand') {
+        $f = $f + ' --mmproj $mmproj --mmproj-on-demand'
+    }
     return [pscustomobject]@{ Flags = $f; AddedInt8 = $addedInt8 }
+}
+
+# VOD-6: is vision offered for this model row and recipe? The table row must list a projector
+# (Mmproj, from the SAME Hugging Face repo as the model file), and the recipe must be one that
+# was measured without speculative decoding: the MTP / draft rows (--spec-type) were never run
+# with a projector, so the wizard does not combine them. Returns $true / $false (pure).
+function Test-VisionOffered {
+    param([object]$m, [object]$r)
+    if (-not $m.PSObject.Properties['Mmproj'] -or -not $m.Mmproj) { return $false }
+    if ($r.Flags -match '(?<!-)--spec-type' -or $r.Flags -match '(?<!-)--mmproj\b') { return $false }
+    return $true
 }
 
 # --- environment check (SDD 4.1) ----------------------------------------
@@ -1101,6 +1126,16 @@ function Download-Model {
     return $file
 }
 
+# VOD-6: fetch the vision projector with the model (same Hugging Face repo, same resume / Range /
+# token logic as the model). Nothing to do without vision or when the file is already there.
+function Download-Mmproj {
+    param([object]$m)
+    if (-not $script:Vision -or -not $script:MmprojPath) { return }
+    if (Test-Path $script:MmprojPath) { Ok "projector: $($script:MmprojPath)"; return }
+    $mm = [pscustomobject]@{ Repo = $m.Repo; File = $m.Mmproj; SizeGib = [math]::Round($m.MmprojBytes / 1GB, 2) }
+    $null = Download-Model -m $mm -dir (Split-Path $script:MmprojPath -Parent)
+}
+
 # --- recipe + emission (SDD 4.6/4.7) --------------------------------------
 function Pick-Recipe {
     param([object]$m)
@@ -1185,6 +1220,12 @@ function Test-RowFlags {
         if ($tok -notmatch '^--[a-z]') { continue }
         if ($help -notmatch [regex]::Escape($tok)) { $missing += $tok }
     }
+    # VOD-6: the vision flags the wizard adds must exist in this binary too
+    if ($script:Vision) {
+        foreach ($tok in @('--mmproj', '--mmproj-on-demand')) {
+            if ($help -notmatch [regex]::Escape($tok)) { $missing += $tok }
+        }
+    }
     if ($missing.Count -gt 0) {
         ExitCode 1 ("binary does not support row $($r.Id) flags: " + ($missing -join ', ') +
             ' — rebuild from a branch that contains them, or pick another row')
@@ -1223,6 +1264,10 @@ function Emit-RunScript {
     $lines += ''
     $lines += '$exe = "' + $exe + '"'
     $lines += '$model = "' + $modelFile + '"'
+    if ($script:Vision) {
+        $lines += '$mmproj = "' + $script:MmprojPath + '"'
+        $lines += '# vision (not part of the measured row): --mmproj-on-demand keeps the projector (~0.84 GiB) in host RAM and on the GPU only while a request''s images are encoded (docs/plans/vision-on-demand-results.md). For a text-only server remove "--mmproj $mmproj --mmproj-on-demand" below.'
+    }
     $lines += '$port = ' + $port
     $lines += '$log = "' + $logName + '"'
     if ($r.Env) {
@@ -1353,6 +1398,40 @@ if (-not $Port) {
         $Port = (Ask 'Server port?' '8090').Trim()
     }
 }
+# VOD-6: vision support. The projector is fetched from the SAME Hugging Face repo as the model
+# file and the emitted command gets --mmproj $mmproj --mmproj-on-demand (the projector then sits
+# in host RAM and on the GPU only while a request's images are encoded). Default yes; -NoVision
+# suppresses the question; -MmprojFile uses a local projector.
+$script:Vision = $false
+$script:MmprojPath = ''
+$visionOffered = Test-VisionOffered -m $m -r $r
+if ($MmprojFile) {
+    if ($NoVision) { ExitCode 1 '-MmprojFile and -NoVision contradict each other' }
+    if (-not $visionOffered) { ExitCode 1 "-MmprojFile: vision is not offered for $($m.Key) / recipe $($r.Id) (only the Qwen3.6 rows without --spec-type)" }
+    if (-not (Test-Path $MmprojFile)) { ExitCode 1 "-MmprojFile does not exist: $MmprojFile" }
+    $script:Vision = $true
+    $script:MmprojPath = $MmprojFile
+    Ok "vision: $MmprojFile (-MmprojFile)"
+}
+elseif ($visionOffered -and -not $NoVision) {
+    if ($SkipModel) {
+        Say 'vision: skipped with -SkipModel (no download; pass -MmprojFile to use a local projector)'
+    }
+    else {
+        $mmMiB = [math]::Round($m.MmprojBytes / 1MB)
+        $script:Vision = Confirm "Vision support? Also fetches the projector $($m.Mmproj) ($mmMiB MiB, same Hugging Face repo); it is parked in host RAM between image requests" $true
+        if ($script:Vision) {
+            $mmDir = $mdir
+            if ($ModelFile) { $mmDir = Split-Path $ModelFile -Parent }
+            $script:MmprojPath = Join-Path $mmDir $m.Mmproj
+            if (Test-Path $script:MmprojPath) { Ok "projector: $($script:MmprojPath)" }
+            else { Say "projector: $($script:MmprojPath) (downloaded in the parallel phase)" }
+        }
+    }
+}
+elseif ($m.PSObject.Properties['Mmproj'] -and $m.Mmproj -and -not $visionOffered) {
+    Say 'vision: not offered for this recipe (the MTP / draft rows were not measured with a projector)'
+}
 # D22-A/B: complete the row's flags (pure; see Complete-RowFlags). The
 # compute capability is for the card the run will use; on failure the row
 # is emitted as measured (the int8 tile is a performance approximation, not
@@ -1360,7 +1439,7 @@ if (-not $Port) {
 $script:GpuCc = Detect-GpuArch
 if (-not $script:GpuCc) { Warn 'compute capability unavailable (nvidia-smi); the row flags stay as measured (no D22 additions)' }
 else { Say "card compute capability: $script:GpuCc" }
-$script:RowFlags = Complete-RowFlags -Flags $r.Flags -EnvText $r.Env -ComputeCap $script:GpuCc
+$script:RowFlags = Complete-RowFlags -Flags $r.Flags -EnvText $r.Env -ComputeCap $script:GpuCc -Vision $script:Vision
 $script:RowFlagsAddedInt8 = $script:RowFlags.AddedInt8
 # D12 (SDD 4.6): warning only, threshold by VRAM target.
 # D17: for device-pinned rows the check runs against the card the row will
@@ -1410,6 +1489,9 @@ if ($DR) {
         Say '(dry-run: not downloading)'
         # the emitted script must name the file the real run would produce
         if (-not $script:LOCAL_FILE) { $script:LOCAL_FILE = $script:DOWNLOAD_TARGET }
+    }
+    if ($script:Vision -and $script:MmprojPath -and -not (Test-Path $script:MmprojPath)) {
+        Say "(dry-run: not downloading the projector $($m.Mmproj) from $($m.Repo))"
     }
     $exe = $binPath
 }
@@ -1463,6 +1545,12 @@ elseif ($buildNeeded -and $script:DOWNLOAD_TARGET) {
         # a 22-minute build does not keep running after an aborted download.
         if ($script:DL_FAILMSG -and $script:BUILD_LEG) { Stop-BuildLeg -leg $script:BUILD_LEG }
     }
+    # VOD-6: the projector (0.84 GiB) follows the model in the foreground while the build leg keeps running
+    try {
+        Download-Mmproj -m $m
+    } finally {
+        if ($script:DL_FAILMSG -and $script:BUILD_LEG) { Stop-BuildLeg -leg $script:BUILD_LEG }
+    }
     # the download succeeded (a failure already exited 5 with the build leg
     # stopped); collect the build result now - Wait-BuildLeg tails + exits 4
     # on a failed stage, prints 'built' on success.
@@ -1492,6 +1580,7 @@ elseif ($buildNeeded) {
     # no download leg: build sequentially in the foreground (the documented
     # command shape of Invoke-Build; same logs, same failure tails)
     $exe = Invoke-Build -repo $repo
+    Download-Mmproj -m $m     # VOD-6: the projector, when vision is on and the file is not there yet
 }
 else {
     # build fresh/skipped; download only (no combined line needed)
@@ -1502,6 +1591,7 @@ else {
         Step 'Download model (Hugging Face; Ctrl-C keeps the .part for resume)'
         Download-Model -m $m -dir $mdir
     }
+    Download-Mmproj -m $m     # VOD-6
     $exe = $binPath
 }
 

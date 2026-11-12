@@ -60,6 +60,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    bool park_on_init; // VOD-1: load the weights into a page-locked host buffer and leave nothing on the device (needs an accelerated backend); added LAST: this struct is initialised positionally
 };
 
 struct clip_init_result {
@@ -74,6 +75,15 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 int clip_get_image_max_tokens(const struct clip_ctx * ctx);
 
 void clip_free(struct clip_ctx * ctx);
+
+// VOD-1 (docs/plans/vision-on-demand-plan.md): park / unpark.
+// A context created with clip_context_params::park_on_init starts PARKED: its weights are in a page-locked host buffer and it holds NO device memory (no weights, no compute buffers,
+// no backend instance with its memory pool). clip_unpark() brings it to the device, clip_park() takes it back. Both are no-ops that succeed when the state already is the requested
+// one. A failed clip_unpark() leaves the context parked. Encoding a parked context fails. The first encode after an unpark reserves the compute buffers for ITS batch.
+// A context that was not created with park_on_init cannot be parked (no host mirror): clip_park() returns false.
+bool   clip_park(struct clip_ctx * ctx);
+bool   clip_unpark(struct clip_ctx * ctx);
+bool   clip_is_parked(const struct clip_ctx * ctx);
 
 // TODO: should be enum, not string
 const char * clip_patch_merge_type(const struct clip_ctx * ctx);

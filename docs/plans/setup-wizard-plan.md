@@ -398,3 +398,7 @@ different numbering spaces, disambiguated by the "SDD" prefix).
   --vram 8g --context 262k --skip-model --no-start` on the 1070 box) is the
   remaining live-hardware confirmation of the D17 auto-device selection on a
   real 2-GPU system; run via ssh-mcp when the box is reachable.
+
+## Post-acceptance change (2026-11-09, VOD-6 of docs/plans/vision-on-demand-plan.md): vision support
+
+SDD D26: the Qwen3.6 table entries list a projector from the same Hugging Face repo; the settings phase asks "Vision support?" (default yes); the projector is downloaded with the model and the emitted command carries `--mmproj <var> --mmproj-on-demand`. Not offered for the MTP rows, the dense rows and flint. Evidence: `tools/setup-wizard/test-vod.ps1` (125 checks) and `test-vod.sh` (123 checks), host-only, plus the unchanged D22 tests (53 / 195 checks); dry runs on Windows and under Git Bash. No download was run (the projector files already exist locally for the model tests; the download path is exercised by the dry-run announcement and the existing resume logic).

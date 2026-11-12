@@ -2959,6 +2959,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-on-demand"},
+        "keep the multimodal projector parked in page-locked host memory and bring it to the device only while the images of a request are encoded, then free the device side again.\n"
+        "the projector's ~1.1 GiB of weights and buffers then stay out of VRAM between image requests (and out of the --hybrid-moe margin); each image request pays a short unpark (about 80 ms) and, with --hybrid-moe, the expert cache shrinks for it as for a layer-major pass\n"
+        "needs --mmproj on the GPU and a vision-only projector. Opt-in, default: off",
+        [](common_params & params) {
+            params.mmproj_on_demand = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_ON_DEMAND"));
+    add_opt(common_arg(
+        {"--mmproj-wait-timeout"}, "SECONDS",
+        "with --mmproj-on-demand: how long an image request waits for device memory for the projector before it fails (default: 0 = without limit; a warning is logged every ~10 s)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--mmproj-wait-timeout must be >= 0");
+            }
+            params.mmproj_wait_timeout_s = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_WAIT_TIMEOUT"));
+    add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"

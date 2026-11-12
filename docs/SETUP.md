@@ -168,6 +168,7 @@ loudly on unknown options.
 | port / bind                | -Port, -Bind   | --port, --host        |
 | CUDA device (R5/R6/R7)     | -Device        | --device              |
 | model dir / explicit file  | -ModelDir, -ModelFile | --model-dir, --model-file |
+| vision (Qwen3.6 rows)      | -NoVision, -MmprojFile | --no-vision, --mmproj-file |
 | clone target / branch / url| -CloneDir, -Branch, -RepoUrl | --clone-dir, --branch, --repo-url |
 | full clone / full build    | -FullClone, -FullBuild | --full-clone, --full-build |
 | skip build / model / download | -SkipBuild, -SkipModel, -SkipDownload | --skip-build, --skip-model, --skip-download |
@@ -180,6 +181,10 @@ loudly on unknown options.
 `-SkipModel` still validates the recipe (exit 3 on an unmeasured combo); it
 only skips model-file resolution and download. With `-SkipModel` and no
 `-Model`, the wizard stops after environment + clone + build (exit 0).
+
+## Vision support (Qwen3.6 rows)
+
+For the Qwen3.6-35B-A3B rows that do not use speculative decoding (R7, R8) the wizard asks "Vision support?" (default yes; `-NoVision` / `--no-vision` skips the question and the download). With vision on it fetches `mmproj-BF16.gguf` (903 MB) from the SAME Hugging Face repo as the model file, next to the model (or next to `-ModelFile`), and the emitted script defines `$mmproj` / `MMPROJ` and adds `--mmproj ... --mmproj-on-demand` to the measured flags: the projector then lives in host RAM and is on the GPU only while a request's images are encoded (docs/guide/PARAMETERS.md section 4.3, evidence in docs/plans/vision-on-demand-results.md). `-MmprojFile` / `--mmproj-file` uses a local projector instead (implies vision). The MTP rows (R5, R6), the dense Qwen3.8 rows and flint are not offered vision: they were not measured with a projector. The vision flags are an addition to the measured row, not part of it (the emitted script says so).
 
 ## Test hooks (not for daily use)
 
