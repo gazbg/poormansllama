@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tools/setup-wizard/test-vod.sh
-# Host-only test for the VOD-6 vision additions of setup.sh (no GPU, no build, no model, no
+# Host-only test for the vision additions of setup.sh (VOD-6, widened by SDD D27; no GPU, no build, no model, no
 # download): the projector columns of the model table, vision_offered, the vision append of
-# complete_row_flags, and the dry-run emission with vision on / off / refused.
+# complete_row_flags, and the dry-run emission with vision on / off / refused, for every model entry.
 #
 # Run: bash tools/setup-wizard/test-vod.sh
 set -u
@@ -27,33 +27,38 @@ count() { # count TEXT FIXED-STRING -> occurrences
     printf '%s' "$1" | grep -o -F -- "$2" | wc -l | tr -d ' '
 }
 
-# --- the table: indexes 0..5 = qwen38 q4k_m, qwen36 q4k_m, flint q5k_xl, qwen38 q5k_xl, qwen36 q5k_xl, qwen36 q8k_xl
-for i in 0 1 2 3 4 5; do
+# --- the table: indexes 0..6 = qwen38 q4k_m, qwen36 q4k_m, flint q5k_xl, qwen38 q5k_xl, qwen36 q5k_xl, qwen36 q8k_xl, apex35 q5k_m
+for i in 0 1 2 3 4 5 6; do
     k="${M_KEYS[$i]}"; q="${M_QUANTS[$i]}"
-    if [ "$k" = qwen36 ]; then
-        [ "${M_MMPROJ[$i]}" = 'mmproj-BF16.gguf' ]; check "$k/$q lists mmproj-BF16.gguf" $?
-        want=902822624
-        [ "${M_REPOS[$i]}" = 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF' ] && want=902822528
-        [ "${M_MMPROJ_BYTES[$i]}" = "$want" ]; check "$k/$q projector size matches its repo (${M_REPOS[$i]})" $?
-    else
-        [ -z "${M_MMPROJ[$i]}" ]; check "$k/$q lists no projector" $?
-    fi
+    case "$k" in
+        qwen36)
+            [ "${M_MMPROJ[$i]}" = 'mmproj-BF16.gguf' ]; check "$k/$q lists mmproj-BF16.gguf" $?
+            want=902822624
+            [ "${M_REPOS[$i]}" = 'unsloth/Qwen3.6-35B-A3B-MTP-GGUF' ] && want=902822528
+            [ "${M_MMPROJ_BYTES[$i]}" = "$want" ]; check "$k/$q projector size matches its repo (${M_REPOS[$i]})" $?
+            [ -z "${M_MMPROJ_REPOS[$i]}" ]; check "$k/$q projector comes from the model's own repo" $? ;;
+        qwen38)
+            [ "${M_MMPROJ[$i]}" = 'mmproj-BF16.gguf' ] && [ "${M_MMPROJ_BYTES[$i]}" = 931146432 ] && [ -z "${M_MMPROJ_REPOS[$i]}" ] && [ "${M_REPOS[$i]}" = 'unsloth/Qwen3.8-27B-GGUF' ]; check "$k/$q lists mmproj-BF16.gguf (unsloth/Qwen3.8-27B-GGUF)" $? ;;
+        apex35)
+            [ "${M_MMPROJ[$i]}" = 'mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf' ] && [ "${M_MMPROJ_BYTES[$i]}" = 902822560 ] && [ "${M_MMPROJ_REPOS[$i]}" = 'bartowski/Apexintelligence-AI_Apex-35B-V1.0-GGUF' ]; check "$k/$q lists the Apex projector from the bartowski repo (the model's own repo publishes none)" $? ;;
+        *)
+            [ -z "${M_MMPROJ[$i]}" ]; check "$k/$q lists no projector (text-only model)" $? ;;
+    esac
 done
+[ "${#M_MMPROJ[@]}" = "${#M_KEYS[@]}" ] && [ "${#M_MMPROJ_BYTES[@]}" = "${#M_KEYS[@]}" ] && [ "${#M_MMPROJ_REPOS[@]}" = "${#M_KEYS[@]}" ]; check 'the three projector arrays have one element per model entry' $?
 
 # --- vision_offered over every recipe row
-ROWS='qwen38 full 262k q4k_m qwen38 16g 262k q4k_m qwen38 8g 128k q4k_m flint full 262k q5k_xl qwen36 full 262k q8k_xl qwen36 16g 262k q8k_xl qwen36 8g 262k q4k_m qwen36 16g 262k q4k_m'
+ROWS='qwen38 full 262k q4k_m qwen38 16g 262k q4k_m qwen38 8g 128k q4k_m flint full 262k q5k_xl qwen36 full 262k q8k_xl qwen36 16g 262k q8k_xl qwen36 8g 262k q4k_m qwen36 16g 262k q4k_m apex35 full 262k q5k_m'
 i=0
-while [ $i -lt 8 ]; do
+while [ $i -lt 9 ]; do
     m=$(echo "$ROWS" | cut -d' ' -f$((i*4+1)))
     v=$(echo "$ROWS" | cut -d' ' -f$((i*4+2)))
     c=$(echo "$ROWS" | cut -d' ' -f$((i*4+3)))
     q=$(echo "$ROWS" | cut -d' ' -f$((i*4+4)))
     recipe_exact "$m" "$v" "$c" "$q" || { echo "[FAIL] row $((i+1)) not found"; exit 1; }
     mi "$m" "$q"
-    want=1
-    if [ "$m" = qwen36 ]; then
-        case " $R_FLAGS " in *' --spec-type '*) want=1 ;; *) want=0 ;; esac
-    fi
+    want=0    # SDD D27: every model with a projector, the MTP / draft rows included
+    [ "$m" = flint ] && want=1
     vision_offered; got=$?
     [ "$got" = "$want" ]; check "$R_ID ($m/$q) vision offered = $([ $want = 0 ] && echo yes || echo no)" $?
 
@@ -87,10 +92,37 @@ OUT=$(bash "$SETUP" "${DR_COMMON[@]}" --mmproj-file "$FAKE" 2>&1); RC=$?
 bash "$SETUP" "${DR_COMMON[@]}" --mmproj-file "$FAKE" --no-vision >/dev/null 2>&1; RC=$?
 [ "$RC" = 1 ]; check 'dry run --mmproj-file with --no-vision: exit 1 (contradiction)' $?
 rm -f "$FAKE"
-OUT=$(bash "$SETUP" --dry-run --non-interactive --model qwen36 --quant q8k_xl --vram full --context 262k --skip-build --model-dir "${TMPDIR:-/tmp}/swz-vod-models" --port 8090 2>&1); RC=$?
-[ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q 'vision: not offered' && [ "$(count "$OUT" '--mmproj')" = 0 ]; check 'dry run on an MTP row (R5): vision is not offered, no vision flag' $?
-OUT=$(bash "$SETUP" --dry-run --non-interactive --model qwen38 --vram 16g --context 262k --skip-build --model-dir "${TMPDIR:-/tmp}/swz-vod-models" --port 8090 2>&1); RC=$?
-[ "$RC" = 0 ] && [ "$(count "$OUT" '--mmproj')" = 0 ]; check 'dry run on the dense model: no vision line, no vision flag' $?
+# SDD D27: every model entry with a projector, default (vision on) and --no-vision; the MTP row R5 and the dense rows included
+dr() { # dr MODEL VRAM CTX QUANT [extra...] -> OUT, RC
+    local m="$1" v="$2" c="$3" q="$4"; shift 4
+    local qa=(); [ -n "$q" ] && qa=(--quant "$q")
+    OUT=$(bash "$SETUP" --dry-run --non-interactive --model "$m" --vram "$v" --context "$c" ${qa[@]+"${qa[@]}"} --skip-build --model-dir "${TMPDIR:-/tmp}/swz-vod-models" --port 8090 "$@" 2>&1); RC=$?
+}
+CASES=(
+    'qwen38|16g|262k|q4k_m|mmproj-BF16.gguf|unsloth/Qwen3.8-27B-GGUF'
+    'qwen38|full|262k|q5k_xl|mmproj-BF16.gguf|unsloth/Qwen3.8-27B-GGUF'
+    'qwen36|full|262k|q8k_xl|mmproj-BF16.gguf|unsloth/Qwen3.6-35B-A3B-MTP-GGUF'
+    'apex35|full|262k|q5k_m|mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf|bartowski/Apexintelligence-AI_Apex-35B-V1.0-GGUF'
+)
+for cs in "${CASES[@]}"; do
+    IFS='|' read -r cm cv cc cq cf cr <<< "$cs"
+    tag="$cm/$cq at $cv"
+    dr "$cm" "$cv" "$cc" "$cq"
+    LAUNCH=$(printf '%s\n' "$OUT" | grep -E '^\s+"\$EXE" ' | head -5)
+    [ "$RC" = 0 ] && [ "$(printf '%s\n' "$LAUNCH" | grep -c .)" = 1 ] && [ "$(count "$LAUNCH" '--mmproj "$MMPROJ" --mmproj-on-demand')" = 1 ]; check "dry run $tag (default): exit 0, one launch line carrying the vision flags once" $?
+    printf '%s' "$OUT" | grep -q -F "projector $cf from $cr"; check "dry run $tag (default): the download is announced as $cf from $cr" $?
+    dr "$cm" "$cv" "$cc" "$cq" --no-vision
+    [ "$RC" = 0 ] && [ "$(count "$OUT" '--mmproj')" = 0 ] && ! printf '%s' "$OUT" | grep -q 'projector'; check "dry run $tag --no-vision: exit 0, no vision flag, no projector line" $?
+done
+# the emitted script says when --mmproj-on-demand is not a measured combination (Qwen3.6-35B-A3B and its Apex fine-tune are)
+dr qwen38 16g 262k q4k_m;  printf '%s' "$OUT" | grep -q 'vision on this model is NOT measured'; check 'dry run qwen38: the emitted script says that vision is not measured on this model' $?
+dr qwen36 16g 262k q4k_m;  ! printf '%s' "$OUT" | grep -q 'vision on this model is NOT measured'; check 'dry run qwen36: no "not measured" line' $?
+dr apex35 full 262k q5k_m; ! printf '%s' "$OUT" | grep -q 'vision on this model is NOT measured'; check 'dry run apex35: no "not measured" line (same architecture as Qwen3.6-35B-A3B)' $?
+# flint is text-only: no projector is published anywhere
+dr flint full 262k q5k_xl
+[ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q 'vision: not available for flint' && [ "$(count "$OUT" '--mmproj "$MMPROJ"')" = 0 ] && [ "$(count "$OUT" '--mmproj-on-demand')" = 0 ]; check 'dry run flint: exit 0, "vision: not available", no vision flag' $?
+dr flint full 262k q5k_xl --mmproj-file "${TMPDIR:-/tmp}/swz-vod-missing.gguf"
+[ "$RC" = 1 ]; check 'dry run flint --mmproj-file: exit 1' $?
 
 echo
 if [ "$FAIL" -gt 0 ]; then echo "VOD sh: $FAIL of $N check(s) FAILED"; exit 1; fi

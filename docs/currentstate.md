@@ -25,6 +25,16 @@ risk tail.
 
 ## Recent entries (2026-10-03 .. 2026-10-10)
 
+## 2026-11-12 (setup wizard D27: vision offered for every model that has a projector, default yes)
+
+**Asked.** Owner: is there a vision setup option? Vision should download the projector (from the model's provider, or found online) and be on by default for all models that support it; it will be tested, then tried on the server.
+
+**Answer.** The option existed (VOD-6) for the Qwen3.6 rows without MTP only. Now (SDD D27, DL-31) every table entry with a published projector offers it: Qwen3.8-27B (`mmproj-BF16.gguf`, 931,146,432 B, unsloth, own repo), Qwen3.6 as before, the Q8_K_XL MTP row too, and Apex-35B-V1.0 (`mmproj-Apexintelligence-AI_Apex-35B-V1.0-bf16.gguf`, 902,822,560 B, from the bartowski repo because the model's own repo publishes none; new table field `MmprojRepo`). flint is text-only (no projector published): "vision: not available for flint". Default yes, `-NoVision` / `--no-vision` declines, the emitted script labels the models on which `--mmproj-on-demand` is not measured.
+
+**Validated.** Host-only dry runs, no download: `test-vod.sh` 156 checks, `test-vod.ps1` all checks, D22 and D24 tests unchanged, syntax and parser clean.
+
+**Scope / known gaps.** `--mmproj-on-demand` is measured on Qwen3.6-35B-A3B only (Apex shares its architecture); Qwen3.8 with a projector, the Apex projector from a third-party repo and the MTP rows with the dense recipes are for the owner's server test. No real download was run.
+
 ## 2026-11-12 (vision on demand, PR #23: `origin/main` merged into the branch, 4 conflicts resolved; DL-29/DL-30)
 
 **Asked.** Owner: "check for conflicts and resolve them" (PR #23 was CONFLICTING).
