@@ -56,6 +56,7 @@ struct llama_lm_prefill_params {
     int32_t device;       // CUDA device index (0)
     int32_t copy_piece_mib;  // paced bank copies: piece size in MiB, 0 = off (one copy per bank), -1 = the default (Flint 64, others off; env LLAMA_LM_COPY_PIECE_MIB)
     int32_t copy_window;     // paced bank copies: pieces in flight, -1 = the default (2; env LLAMA_LM_COPY_WINDOW)
+    int32_t mm_batches;      // VOD-4 (DL-20): 1: the pass also takes the batches of an image prompt (embedding rows, text behind an image: M-RoPE cells outnumber positions); 0 (default): it declines them as before
 };
 LLAMA_API struct llama_lm_prefill_params llama_lm_prefill_default_params(void);
 

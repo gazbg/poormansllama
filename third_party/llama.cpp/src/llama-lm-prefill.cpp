@@ -156,7 +156,14 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     }
     // VOD-4 (docs/plans/vision-on-demand-plan.md): a batch of embeddings ONLY (the rows of an image chunk, as mtmd_helper_decode_image_chunk() decodes them) is taken as well. A batch that mixes
     // token rows and embedding rows is not (the server's image flow does not produce one), and neither is an embedding batch on a split (two-GPU) pass or on a window-cache model.
-    pl.embd = b.token == nullptr && b.embd != nullptr;
+    // DL-20: all of it is behind P.mm_batches (the server sets it with --mmproj-on-demand). Without it the decisions below are the ones taken before VOD-4: an embedding batch is declined, the positions
+    // must continue the sequence exactly, the sequence's cells must equal its positions (so the text behind an image is declined too), and the chunk grid is the absolute one.
+    const bool mm = P.mm_batches != 0;
+    pl.embd = mm && b.token == nullptr && b.embd != nullptr;
+    if (!mm && (b.token == nullptr || b.embd != nullptr)) {
+        pl.why = "the batch carries embeddings";
+        return pl;
+    }
     if (!pl.embd && (b.token == nullptr || b.embd != nullptr)) {
         pl.why = b.token != nullptr ? "the batch mixes token and embedding rows" : "the batch has neither token ids nor embeddings";
         return pl;
@@ -235,7 +242,7 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
         }
         // where the batch starts: right behind the sequence, or - on an M-RoPE model, where an image advances the position by its extent and its rows share one position - further ahead (token
         // rows: newest position < first position, embedding rows: newest <= first, the rule of llama_batch_allocr::init())
-        const bool mrope = model.hparams.n_pos_per_embd() > 1;
+        const bool mrope = mm && model.hparams.n_pos_per_embd() > 1;
         const bool start_ok = pos0 == p0 || (mrope && (pl.embd ? pos0 >= p0 - 1 : pos0 > p0));
         if (!start_ok) {
             pl.why = "the positions do not continue the sequence";
@@ -266,6 +273,11 @@ llama_lm_plan llama_context::lm_make_plan(const llama_batch & b) const {
     uint32_t n_old = 0;
     const int64_t c0 = mem.attn->lm_block(seq, p0, (uint32_t) n, &pl.why_detail, &n_old);
     if (c0 < 0) {
+        pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
+        return pl;
+    }
+    if (n_old != (uint32_t) p0 && !mm) {
+        // without --mmproj-on-demand: the cells equal the positions or the pass declines (what lm_block's strict rule did before VOD-4)
         pl.why = "the sequence's KV cells are not one contiguous block with room behind it (interleaved with another sequence's, a shift, a restored state)";
         return pl;
     }
@@ -2279,6 +2291,7 @@ struct llama_lm_prefill_params llama_lm_prefill_default_params(void) {
     p.device     = 0;
     p.copy_piece_mib = -1;
     p.copy_window    = -1;
+    p.mm_batches     = 0;
     return p;
 }
 

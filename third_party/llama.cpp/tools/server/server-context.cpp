@@ -2099,6 +2099,7 @@ private:
             lp.segment    = params_base.lm_prefill_segment;
             lp.min_tokens = params_base.lm_prefill_min;
             lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lp.mm_batches = params_base.mmproj_on_demand ? 1 : 0;     // DL-20: the pass takes image batches only with the projector on demand; a resident projector keeps the pre-VOD behaviour
             char err[512] = { 0 };
             if (!llama_lm_prefill_enable(ctx_tgt, &lp, err, sizeof(err))) {
                 SRV_ERR("--lm-prefill: %s\n", err);
