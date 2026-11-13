@@ -20,13 +20,13 @@
   <text x="100" y="500" font-size="96" font-weight="800" fill="url(#acc)">600+</text>
   <text x="365" y="465" font-size="28" font-weight="700" fill="#fff">tok/s</text>
   <text x="365" y="500" font-size="26" fill="#c9d1ea">prefill</text>
-  <text x="100" y="545" font-size="21" fill="#8a94b0">reads long prompts fast</text>
+  <text x="100" y="545" font-size="21" fill="#8a94b0">on a GTX 1070 (8 GB) · reads long prompts</text>
 
   <rect x="630" y="400" width="500" height="170" rx="24" fill="#fff" fill-opacity="0.06" stroke="#ffb84a" stroke-opacity="0.55" stroke-width="2"/>
   <text x="660" y="500" font-size="96" font-weight="800" fill="url(#hot)">30+</text>
   <text x="890" y="465" font-size="28" font-weight="700" fill="#fff">tok/s</text>
   <text x="890" y="500" font-size="26" fill="#c9d1ea">generation</text>
-  <text x="660" y="545" font-size="21" fill="#8a94b0">fast, usable answers</text>
+  <text x="660" y="545" font-size="21" fill="#8a94b0">on a GTX 1070 (8 GB) · usable answers</text>
 
   <!-- PROBLEM / SOLUTION BARS -->
   <text x="70" y="650" font-size="34" font-weight="700" fill="#fff">The problem</text>
