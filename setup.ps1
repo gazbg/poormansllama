@@ -1076,7 +1076,7 @@ function Download-Model {
 
     $resume = $false
     $have = 0
-    if (Test-Path $part) { $have = (Get-Item $part).Length; $resume = $true; Say "resuming: $($have / 1GB) GiB already in $part" }
+    if (Test-Path $part) { $have = (Get-Item $part).Length; $resume = $true; Say ("resuming: {0:N1} MiB already in {1}" -f ($have / 1MB), $part) }
 
     if (-not $resume -and (Test-Path $file)) {
         # a complete file exists (e.g. user placed it): verify size only
@@ -1084,53 +1084,56 @@ function Download-Model {
     }
 
     Say 'downloading ... (Ctrl-C aborts; partial data is kept for resume)'
-    # manual Range request on every PS version: -Resume is unreliable for >2GB
-    # files and 416s on some servers; HttpWebRequest works on 5.1 and 7.
+    # curl.exe (ships with Windows 10 and later) does the transfer. It resumes
+    # with -C - from the .part size, runs as its own process (this thread only
+    # polls the .part size and redraws the status line), and has no per-chunk
+    # sleep. The HF token goes in a header file, not on the command line.
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) { ExitCode 5 'curl.exe not found (it ships with Windows 10 and later)' }
+    $hdrFile = $null
+    if ($HfToken) {
+        $hdrFile = Join-Path ([System.IO.Path]::GetTempPath()) ('hf-hdr-' + [guid]::NewGuid().ToString('N') + '.txt')
+        [System.IO.File]::WriteAllText($hdrFile, "Authorization: Bearer $HfToken`r`n")
+    }
     try {
-            $req = [System.Net.HttpWebRequest]::Create($url)
-            $req.Method = 'GET'
-            if ($have -gt 0) { $req.AddRange([int64]$have); $req.Method = 'GET' }
-            if ($HfToken) { $req.Headers.Add('Authorization', "Bearer $HfToken") }
-            $resp = $req.GetResponse()
-            $len = [int64]$resp.ContentLength
-            if ($have -gt 0 -and $resp.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent) {
-                Say "server accepted Range (continuing at $have)"
-            } elseif ($have -gt 0) {
-                Say 'server ignored Range; restarting from scratch'
-                $have = 0
-                $fs0 = [System.IO.File]::Create($part)
-                $fs0.Close()
-            }
-            $mode = 'Create'
-            if ($have -gt 0) { $mode = 'Append' }
-            $fs = [System.IO.File]::Open($part, $mode)
-            $buf = New-Object byte[] 8MB
-            $read = 0
-            while ($true) {
-                $n = $resp.GetResponseStream().Read($buf, 0, $buf.Length)
-                if ($n -le 0) { break }
-                if ($maxBytes -gt 0 -and ($have + $read + $n) -gt $maxBytes) {
-                    $n = [int]($maxBytes - $have - $read)
-                    if ($n -le 0) { break }
-                }
-                $fs.Write($buf, 0, $n)
-                $read += $n
-                $done = $have + $read
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $cargs = @('-L', '--fail', '-sS', '--retry', '3', '--retry-delay', '5', '-C', '-', '-o', "`"$part`"")
+            if ($hdrFile) { $cargs += @('-H', "`"@$hdrFile`"") }
+            $cargs += "`"$url`""
+            $p = Start-Process -FilePath $curl.Source -ArgumentList $cargs -NoNewWindow -PassThru
+            while (-not $p.HasExited) {
+                $sz = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
+                if ($maxBytes -gt 0 -and $sz -ge $maxBytes) { $p.Kill(); break }
                 if ($Status) { & $Status }
-                else {
-                    $pct = if ($len -gt 0) { [math]::Floor($done * 100 / $len) } else { 0 }
-                    $kb = [math]::Floor($done / 1MB)
-                    Write-Host ("`r    {0,8} MiB  {1,3}%" -f $kb, $pct) -NoNewline
-                }
+                else { Write-Host ("`r    {0,8} MiB" -f [math]::Floor($sz / 1MB)) -NoNewline }
                 Start-Sleep -Milliseconds 500
+                $p.Refresh()
             }
-            $fs.Close()
-            Write-Host ''
-            $script:DL_DONE = $true
-        } catch {
-            $script:DL_FAILMSG = "download failed: $($_.Exception.Message) (manual: $url)"
-            ExitCode 5 $script:DL_FAILMSG
+            $p.WaitForExit()
+            if ($maxBytes -gt 0 -and (Get-Item $part).Length -ge $maxBytes) {
+                # test hook: cut the .part at exactly the requested size
+                $fsT = [System.IO.File]::Open($part, 'Open', 'Write')
+                $fsT.SetLength($maxBytes)
+                $fsT.Close()
+                break
+            }
+            if ($p.ExitCode -eq 0) { break }
+            if ($p.ExitCode -eq 33 -and $attempt -eq 1) {
+                # 33 = server refused byte ranges: start over once
+                Say 'server ignored Range; restarting from scratch'
+                Remove-Item $part -Force
+                continue
+            }
+            throw "curl exited with code $($p.ExitCode)"
         }
+        Write-Host ''
+        $script:DL_DONE = $true
+    } catch {
+        $script:DL_FAILMSG = "download failed: $($_.Exception.Message) (manual: $url)"
+        ExitCode 5 $script:DL_FAILMSG
+    } finally {
+        if ($hdrFile) { Remove-Item $hdrFile -Force -ErrorAction SilentlyContinue }
+    }
 
     # integrity: complete transfer expected
     $got = (Get-Item $part).Length
