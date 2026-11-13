@@ -292,34 +292,39 @@ $script:MODELS = @(
 $script:RECIPES = @(
     [pscustomobject]@{ Id='R1'; Model='qwen38'; Vram='full'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-37 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
-        Bind='127.0.0.1'; Measured='PP 1093.25 t/s, TG 14.95 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
+        Bind='127.0.0.1'; Measured='PP 1093.25 t/s, TG 14.95 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
+        Env=@{ 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1' } },
     [pscustomobject]@{ Id='R2'; Model='qwen38'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --spec-type draft-mtp --spec-draft-p-min 0.6 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 -lv 4'
-        Bind='127.0.0.1'; Measured='PP 1007.87 t/s, TG 9.96 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
+        Bind='127.0.0.1'; Measured='PP 1007.87 t/s, TG 9.96 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
+        Env=@{ 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1' } },
     [pscustomobject]@{ Id='R3'; Model='qwen38'; Vram='8g'; Ctx='128k'; Quant='q4k_m'
         Flags='-c 128000 -ctk q4_0 -ctv q4_0 -fa on -np 1 -t 16 --no-warmup --lm-prefill-host-layers 0-63 --lm-decode-stream dynamic --lm-decode-slots 2 --lm-prefill --lm-prefill-prearm always -lv 4'
-        Bind='127.0.0.1'; Measured='PP 36.95 t/s, TG 9.92 t/s (owner 2026-10-29, RTX 5090 24 GiB)' },
+        Bind='127.0.0.1'; Measured='PP 36.95 t/s, TG 9.92 t/s (owner 2026-10-29, RTX 5090 24 GiB)'
+        Env=@{ 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1' } },
     [pscustomobject]@{ Id='R4'; Model='flint'; Vram='full'; Ctx='262k'; Quant='q5k_xl'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 262000 -ub 2048 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --lm-prefill-copy-piece 64'
-        Bind='0.0.0.0'; Measured='PP 2422.94 t/s, TG 53.80 t/s (owner 2026-11-02, RTX 5090 24 GiB)' },
+        Bind='0.0.0.0'; Measured='PP 2422.94 t/s, TG 53.80 t/s (owner 2026-11-02, RTX 5090 24 GiB)'
+        Env=@{ 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1' } },
     [pscustomobject]@{ Id='R5'; Model='qwen36'; Vram='full'; Ctx='262k'; Quant='q8k_xl'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 65536 --lm-prefill-ubatch 2048 --lm-prefill-segment 65536 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse --no-warmup'
         Device='auto'; Bind='0.0.0.0'; Measured='PP 3600 t/s @50k, 2350 t/s @200k; TG 77 t/s @50k, 66 t/s @200k (owner, GTX 5090 Laptop, Windows)'
-        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4'; 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1'; 'LLAMA_FATTN_TILE_Q8QK' = '1' }
         Note='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags' },
     [pscustomobject]@{ Id='R6'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q8k_xl'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 8 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 3 -lv 4 --hybrid-moe-prefill-free-all --spec-type draft-mtp --spec-draft-p-min 0.1 --spec-draft-n-min 0 --spec-draft-n-max 3 --spec-mtp-defer -ctkd q8_0 -ctvd q8_0 --mtp-draft-vocab 32768 --lm-prefill-fuse'
         Device='auto'; Bind='0.0.0.0'; Measured='PP 2000 t/s, TG 51 t/s @200k (owner, GTX 5090 Laptop, Windows)'
-        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4'; 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1'; 'LLAMA_FATTN_TILE_Q8QK' = '1' }
         Note='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags' },
     [pscustomobject]@{ Id='R7'; Model='qwen36'; Vram='8g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384'
         Device='auto'; Bind='0.0.0.0'; Measured='PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows)'
-        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4' }
+        Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4'; 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1'; 'LLAMA_FATTN_TILE_Q8QK' = '1' }
         Note='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command' },
     [pscustomobject]@{ Id='R8'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         Bind='127.0.0.1'; Measured='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
+        Env=@{ 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1' }
         Note='measured on Qwen3.6-35B-A3B-MTP-UD-Q4_K_S; the wizard offers the closest HF file, Q4_K_M (SDD D13). Kept as R8 (the former R6)' },
     # SDD D23: the owner's running command for Apex-35B (the R5 shape, MTP head used). Measured by this
     # repo on 2026-11-09 with Apex-35B-V1.0-Q5_K_S.gguf - a file the wizard does not offer. No row env:
@@ -1215,15 +1220,15 @@ function Check-RecipeQuant {
     if ($r.Model -ne $m.Key) {
         # SDD D24: the shared 8g MoE profile, measured on another model
         Warn "row $($r.Id) is the shared 8g profile of every MoE model (measured on $($r.Model) / $($r.Quant)); applied to $($m.Key) / $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for the measured model"
+        # SDD D25 (2026-11-09): the owner's own run of this model through the shared profile
+        if ($m.Key -eq 'apex35' -and $m.Quant -eq 'q5k_m' -and $r.Vram -eq '8g') {
+            Say "measured on $($m.File) with this row (owner, 8 GiB card, Linux): prompt 51,885 tokens at 537.42 t/s (96.5 s), 1,400 generated tokens at 30.88 t/s (32.39 ms per token)"
+        }
     }
     elseif ($r.Quant -ne $m.Quant) {
         Warn "row $($r.Id) was measured on quant $($r.Quant); you chose $($m.Quant) ($($m.File)) - its speed/VRAM numbers are for $($r.Quant)"
     }
     return $r
-        # SDD D25 (2026-11-09): the owner's own run of this model through the shared profile
-        if ($m.Key -eq 'apex35' -and $m.Quant -eq 'q5k_m' -and $r.Vram -eq '8g') {
-            Say "measured on $($m.File) with this row (owner, 8 GiB card, Linux): prompt 51,885 tokens at 537.42 t/s (96.5 s), 1,400 generated tokens at 30.88 t/s (32.39 ms per token)"
-        }
 }
 
 function Get-GitShort {
