@@ -909,8 +909,25 @@ function Start-BuildLeg {
     # element (PS scriptblock positional array behavior)
     & $mkBat -Bat $cfgBat -Rc $cfgRc -OutL $cfgOut -ErrL $cfgErr -Exe 'cmake' -Argl @('-S', $src, '-B', $bld, '-DGGML_CUDA=ON', '-DLLAMA_LAYER_STREAMING=ON')
     & $mkBat -Bat $bldBat -Rc $bldRc -OutL $bldOut -ErrL $bldErr -Exe 'cmake' -Argl @('--build', $bld, '--config', 'Release', '--target', 'llama-server', '--parallel', ([string]$nproc), '--', '/nodeReuse:false')
-    $p1 = Start-Process -FilePath $cfgBat -WindowStyle Hidden -PassThru
-    $p2 = Start-Process -FilePath $bldBat -WindowStyle Hidden -PassThru
+    # configure and build MUST be sequential: started as two independent
+    # processes the build raced the configure and died with 'not a CMake build
+    # directory (missing CMakeCache.txt)' (measured 2026-11-13). One driver
+    # .bat runs the configure .bat, then the build .bat only if it succeeded;
+    # a failed configure writes rc 1 into the build rc so the poller stops.
+    $seqBat = Join-Path $bld 'swz-parallel-seq.bat'
+    $seqLines = @(
+        '@echo off',
+        "call `"$cfgBat`"",
+        "set /p CFGRC=<`"$cfgRc`"",
+        'if not "%CFGRC%"=="0 " if not "%CFGRC%"=="0" goto cfgfail',
+        "call `"$bldBat`"",
+        'goto :eof',
+        ':cfgfail',
+        "echo 1 > `"$bldRc`""
+    )
+    [System.IO.File]::WriteAllLines($seqBat, $seqLines, [System.Text.Encoding]::Default)
+    $p1 = Start-Process -FilePath $seqBat -WindowStyle Hidden -PassThru
+    $p2 = $p1
     return [pscustomobject]@{ Bin=$bin; P1=$p1; P2=$p2; CfgRc=$cfgRc; BldRc=$bldRc; CfgOut=$cfgOut; CfgErr=$cfgErr; BldOut=$bldOut; BldErr=$bldErr }
 }
 
