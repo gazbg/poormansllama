@@ -1,5 +1,7 @@
 # Optimized llama cpp for single 8GB and 16GB GPUS for 262k context (for GTX 1070)
 
+<p align="center"><img src="docs/readme-banner.svg" alt="35B model on 8 GB VRAM, 262K context, 600+ tok/s prefill, 30+ tok/s generation" width="900"></p>
+
 ## What it is
 
 I used black magic to make it run almost as fast as it would if the model is fully in the VRAM.

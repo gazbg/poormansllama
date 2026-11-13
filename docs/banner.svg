@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1500" width="1200" height="1500" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0b0f1a"/><stop offset="1" stop-color="#1a1033"/></linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#76e5b5"/><stop offset="1" stop-color="#4aa8ff"/></linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffb84a"/><stop offset="1" stop-color="#ff5c8a"/></linearGradient>
+    <radialGradient id="glow" cx="0.9" cy="0.05" r="0.6"><stop offset="0" stop-color="#4aa8ff" stop-opacity="0.3"/><stop offset="1" stop-color="#4aa8ff" stop-opacity="0"/></radialGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#76e5b5"/></marker>
+  </defs>
+  <rect width="1200" height="1500" fill="url(#bg)"/>
+  <rect width="1200" height="1500" fill="url(#glow)"/>
+
+  <!-- HEADER -->
+  <text x="70" y="90" font-size="26" font-weight="600" fill="#8a94b0" letter-spacing="4">POORMANSLLAMA</text>
+  <text x="70" y="190" font-size="96" font-weight="800" fill="url(#acc)">35B MODEL</text>
+  <text x="70" y="290" font-size="96" font-weight="800" fill="#fff">on 8 GB VRAM</text>
+  <text x="70" y="350" font-size="40" font-weight="600" fill="#c9d1ea">with the <tspan fill="url(#hot)" font-weight="800">FULL 262K CONTEXT</tspan></text>
+
+  <!-- STAT CARDS -->
+  <rect x="70" y="400" width="500" height="170" rx="24" fill="#fff" fill-opacity="0.06" stroke="#76e5b5" stroke-opacity="0.55" stroke-width="2"/>
+  <text x="100" y="500" font-size="96" font-weight="800" fill="url(#acc)">600+</text>
+  <text x="365" y="465" font-size="28" font-weight="700" fill="#fff">tok/s</text>
+  <text x="365" y="500" font-size="26" fill="#c9d1ea">prefill</text>
+  <text x="100" y="545" font-size="21" fill="#8a94b0">reads long prompts fast</text>
+
+  <rect x="630" y="400" width="500" height="170" rx="24" fill="#fff" fill-opacity="0.06" stroke="#ffb84a" stroke-opacity="0.55" stroke-width="2"/>
+  <text x="660" y="500" font-size="96" font-weight="800" fill="url(#hot)">30+</text>
+  <text x="890" y="465" font-size="28" font-weight="700" fill="#fff">tok/s</text>
+  <text x="890" y="500" font-size="26" fill="#c9d1ea">generation</text>
+  <text x="660" y="545" font-size="21" fill="#8a94b0">fast, usable answers</text>
+
+  <!-- PROBLEM / SOLUTION BARS -->
+  <text x="70" y="650" font-size="34" font-weight="700" fill="#fff">The problem</text>
+  <text x="70" y="690" font-size="22" fill="#8a94b0">Expert weights of a 35B MoE model are far bigger than an 8 GB card.</text>
+
+  <rect x="70" y="715" width="1060" height="44" rx="10" fill="#ff5c8a" fill-opacity="0.25" stroke="#ff5c8a" stroke-opacity="0.6"/>
+  <text x="90" y="745" font-size="22" font-weight="600" fill="#ffd3df">Model weights: 20+ GB  - will not fit</text>
+  <rect x="70" y="775" width="400" height="44" rx="10" fill="#76e5b5" fill-opacity="0.25" stroke="#76e5b5" stroke-opacity="0.7"/>
+  <text x="90" y="805" font-size="22" font-weight="600" fill="#d3fbe9">Your GPU: 8 GB</text>
+
+  <!-- HOW IT WORKS -->
+  <text x="70" y="900" font-size="34" font-weight="700" fill="#fff">How it works</text>
+  <text x="70" y="938" font-size="22" fill="#8a94b0">Layer-major prefill: stream one layer at a time, run the whole prompt through it.</text>
+
+  <!-- RAM box -->
+  <rect x="70" y="975" width="300" height="260" rx="20" fill="#fff" fill-opacity="0.06" stroke="#8a94b0" stroke-opacity="0.6" stroke-width="2"/>
+  <text x="220" y="1015" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">System RAM</text>
+  <g fill="#4aa8ff" fill-opacity="0.35" stroke="#4aa8ff" stroke-opacity="0.8">
+    <rect x="95" y="1040" width="250" height="26" rx="6"/><rect x="95" y="1074" width="250" height="26" rx="6"/>
+    <rect x="95" y="1108" width="250" height="26" rx="6"/><rect x="95" y="1142" width="250" height="26" rx="6"/>
+  </g>
+  <text x="220" y="1205" font-size="20" fill="#c9d1ea" text-anchor="middle">all expert layers wait here</text>
+
+  <!-- arrow -->
+  <path d="M385 1105 H 455" stroke="#76e5b5" stroke-width="4" marker-end="url(#arr)"/>
+  <text x="420" y="1085" font-size="18" fill="#76e5b5" text-anchor="middle">PCIe</text>
+
+  <!-- VRAM window -->
+  <rect x="470" y="975" width="300" height="260" rx="20" fill="#76e5b5" fill-opacity="0.08" stroke="#76e5b5" stroke-width="2.5"/>
+  <text x="620" y="1015" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">8 GB VRAM</text>
+  <rect x="495" y="1040" width="250" height="60" rx="8" fill="#ffb84a" fill-opacity="0.35" stroke="#ffb84a"/>
+  <text x="620" y="1077" font-size="20" font-weight="600" fill="#fff" text-anchor="middle">layer N in the slot</text>
+  <rect x="495" y="1114" width="250" height="30" rx="8" fill="#4aa8ff" fill-opacity="0.3" stroke="#4aa8ff"/>
+  <text x="620" y="1135" font-size="17" fill="#fff" text-anchor="middle">layer N+1 loading</text>
+  <rect x="495" y="1158" width="250" height="30" rx="8" fill="#fff" fill-opacity="0.08" stroke="#8a94b0"/>
+  <text x="620" y="1179" font-size="17" fill="#c9d1ea" text-anchor="middle">KV cache (262K ctx)</text>
+  <text x="620" y="1213" font-size="20" fill="#c9d1ea" text-anchor="middle">small sliding window</text>
+
+  <!-- arrow -->
+  <path d="M785 1105 H 855" stroke="#76e5b5" stroke-width="4" marker-end="url(#arr)"/>
+
+  <!-- GPU compute -->
+  <rect x="870" y="975" width="260" height="260" rx="20" fill="#ffb84a" fill-opacity="0.1" stroke="#ffb84a" stroke-width="2"/>
+  <text x="1000" y="1015" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">GPU compute</text>
+  <text x="1000" y="1085" font-size="60" font-weight="800" fill="url(#hot)" text-anchor="middle">All</text>
+  <text x="1000" y="1125" font-size="22" fill="#c9d1ea" text-anchor="middle">prompt chunks</text>
+  <text x="1000" y="1155" font-size="22" fill="#c9d1ea" text-anchor="middle">through each layer,</text>
+  <text x="1000" y="1185" font-size="22" fill="#c9d1ea" text-anchor="middle">in order</text>
+
+  <!-- FEATURES -->
+  <g font-size="24" fill="#fff">
+    <circle cx="90" cy="1305" r="9" fill="#76e5b5"/><text x="115" y="1313"><tspan font-weight="700">Each layer copied once</tspan> <tspan fill="#c9d1ea">per prompt, not per chunk</tspan></text>
+    <circle cx="90" cy="1355" r="9" fill="#4aa8ff"/><text x="115" y="1363"><tspan font-weight="700">Exact weights</tspan> <tspan fill="#c9d1ea">- no re-quantization, same math</tspan></text>
+    <circle cx="90" cy="1405" r="9" fill="#ffb84a"/><text x="115" y="1413"><tspan font-weight="700">Opt-in CUDA path</tspan> <tspan fill="#c9d1ea">- built on llama.cpp</tspan></text>
+  </g>
+  <text x="70" y="1470" font-size="18" fill="#6c7693">Qwen3.6-35B-A3B (MoE) · 262K context · numbers from this repository's measurements</text>
+</svg>
