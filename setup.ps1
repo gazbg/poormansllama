@@ -1101,6 +1101,10 @@ function Download-Model {
             if ($hdrFile) { $cargs += @('-H', "`"@$hdrFile`"") }
             $cargs += "`"$url`""
             $p = Start-Process -FilePath $curl.Source -ArgumentList $cargs -NoNewWindow -PassThru
+            # Windows PowerShell 5.1 returns a null ExitCode unless the handle is
+            # cached right after start (PS 7 does not need it). Without this the
+            # failure message reads 'curl exited with code' with no number.
+            $null = $p.Handle
             while (-not $p.HasExited) {
                 $sz = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
                 if ($maxBytes -gt 0 -and $sz -ge $maxBytes) { $p.Kill(); break }
