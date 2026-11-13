@@ -7,7 +7,7 @@ I used black magic to make it run almost as fast as it would if the model is ful
 The main goal was to have max context on a q5 MOE model for agentic work on an old PC with a GTX 1070. 
 It also will dynamically load the vision if a vision request came in and process it on the GPU. 
 
-[Qwen3.8-35B-A3B-UD-Q5_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf) (26.6 GB ) on GTX 1070 8GB VRAM : 
+[Qwen3.8-35B-A3B-UD-Q5_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf) (26.6 GB ) on GTX 1070 8GB VRAM 262k context + Vision  : 
 ```
 prompt eval time (Prefill)   =    51886 tokens (    1.64 ms per token,   610.73 tokens per second)
 eval time (token generation) =    2328 tokens (    36.31 ms per token,    27.54 tokens per second)
