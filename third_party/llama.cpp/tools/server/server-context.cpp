@@ -5494,6 +5494,17 @@ private:
                         }
                     } // end of SLOT_STATE_STARTED
 
+                    // PAR-1: the choice of lm_big above read the slot's cached length BEFORE the start logic settled it (a slot that held a longer prompt looked small), and it names one slot only.
+                    // A prompt that is big by its settled length never shares a batch: alone now when the batch is empty, else in a later iteration (the choice above then sees it).
+                    if (lm_iso && &slot != lm_big && (lm_canon || slot.task->n_tokens() - slot.prompt.n_tokens() >= params_base.lm_prefill_min)) {
+                        if (lm_big != nullptr || batch.size() > 0) {
+                            return;
+                        }
+                        lm_big = &slot;
+                        lm_prompt_turn = true;
+                        lm_last_prompt_turn = true;
+                    }
+
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
