@@ -32,11 +32,15 @@ Claims allowed: speed ratios on this machine, model and harness only. No quality
 
 | id | idea | state | result |
 |---|---|---|---|
-| C0 | control: one card, owner's R7 command, `-np 1/2/4` (unified KV) | | |
-| C1 | control: existing two-GPU stack (`--hybrid-moe-gpu1 auto`, `--lm-prefill-peer-gpu 1`), `-np 1/2/4` | | |
-| C2 | pool: `-c 524288 -np 2 --kv-unified-per-slot 262144` on the existing stack (lazy KV on GPU 0, experts pushed to GPU 1) | | |
+| C0 | control: one card, owner's R7 command | MEASURED (`build/pascal/par/c0-np1`, `c0-np4`) | solo decode 33.0-33.6 tok/s, prefill 736 / 865 tok/s at 4k / 16k; 2 chats at once 18-21 each (37-41 summed); 4 at once 9.6 each (38); 2 cold 8k prompts at once 198 tok/s summed (they fall off the layer-major pass), 4 at once 169; GPU 0 peak 7.8 GiB |
+| C1 | control: second-GPU expert tier (`--hybrid-moe-gpu1 auto`) | MEASURED (`c1-tier-np4`) | solo 37; 2 at once 25-28 each (50-55); 4 at once 14.4-15.0 each (58-60); simultaneous prefill unchanged (198 / 155) |
+| C1b | tier + two-GPU prefill (`--lm-prefill-peer-gpu 1`) at np 4 | CRASH at start (`c1-peer-np4`) | `g_cuda_input_event` (created on device 0) used on device 1 in `ggml_cuda_input_batch_flush`; fix assigned to worktree agent A |
+| C2 | pool `-c 524288 --kv-unified-per-slot 262144 -np 2` on the tier stack | FAILED at 2 x 60k (`c2-pool524`) | HTTP 500: `lazy_commit_rows: could not commit KV rows [0, 155648): out of device memory` on GPU 0 (peak 7,993 MiB). Cause not yet isolated (row range committed vs. cache not shrinking); open |
+| C3 | BOUND: one full body per card, two processes (`tools/pascal/twoproc_bound.py`) | MEASURED (bound, not a deliverable) | solo 33-34 on either card; 2 chats at once 23-26 each (47-52); 2 cold 8k prompts at once 833 + 842 tok/s (1,675 summed); own 262k window per card (524k total); GPU 5.6 / 6.6 GiB; host RssAnon 0.5 GB per process (weights shared via mmap) |
+| C4 | C3 inside ONE process (an instance per card, dispatch layer) | IN PROGRESS, worktree agent B (interrupted by the usage limit) | |
+| C5 | serialised layer-major passes for simultaneous big prompts at np > 1 (one body) + C1b fix | IN PROGRESS, worktree agent A (interrupted by the usage limit) | |
 
-(further candidates are added after the controls show where parallel decode loses its time)
+Resume: agents' worktrees are under `.claude/worktrees/` (check `git worktree list`); the control binaries are in `build/pascal/base-bin`.
 
 ## Decision log
 

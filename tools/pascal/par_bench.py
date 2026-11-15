@@ -175,13 +175,21 @@ try:
             ans, wall = together([prompt(i * a.par_pp, a.par_pp, 96) for i in range(n)], "/completion")
             summarize(f"parpp{a.par_pp}", n, ans, wall)
     if a.fill:
+        # capacity run: every request holds its own long prompt with its own needle, all at once
         sizes = [int(x) for x in a.fill.split(",")]
         offs = [sum(sizes[:i]) % max(1, len(toks) - max(sizes)) for i in range(len(sizes))]
-        ans, wall = together([prompt(offs[i], sizes[i], 64) for i in range(len(sizes))], "/completion")
-        summarize("fill" + "+".join(str(s) for s in sizes), len(sizes), ans, wall)
-        for x in ans:
-            if x and "content" in x:
-                print("   text:", x["content"][:160].replace("\n", " | "))
+        codes = [f"{w}-{4821 + 137 * i}" for i, w in enumerate(["ZEBRA", "ORCHID", "GRANITE", "FALCON"][:len(sizes)])]
+        nq = post("/tokenize", {"content": "\n\nQuestion: what is the secret access code stated in the text above? Reply with the code only.\n\nAnswer:"})["tokens"]
+        bodies = []
+        for i, n in enumerate(sizes):
+            nd = post("/tokenize", {"content": f"\n\nIMPORTANT NOTE: the secret access code is {codes[i]}.\n\n"})["tokens"]
+            body = toks[offs[i]:offs[i] + n - len(nq) - len(nd)]
+            cut = len(body) // 3
+            bodies.append({"prompt": body[:cut] + nd + body[cut:] + nq, "n_predict": 24, "temperature": 0, "cache_prompt": False})
+        ans, wall = together(bodies, "/completion")
+        hits = [bool(x and codes[i] in x.get("content", "")) for i, x in enumerate(ans)]
+        summarize("fill" + "+".join(str(s) for s in sizes), len(sizes), ans, wall, {"needle_ok": hits})
+        print("   needle:", hits, [(x or {}).get("content", "")[:60].replace("\n", " | ") for x in ans], flush=True)
 finally:
     stop.set()
     srv.send_signal(signal.SIGINT)
