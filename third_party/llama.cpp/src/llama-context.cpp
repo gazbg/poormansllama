@@ -2399,7 +2399,7 @@ static ls_decode_prof_t g_ls_decode_prof;
 #ifdef LLAMA_LAYER_STREAMING
 // G31o: called at the start of every decode with the batch size; llama-hybrid-api.cpp registers it (the hybrid prefill window)
 void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
-extern bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
+extern thread_local bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
 #endif
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {

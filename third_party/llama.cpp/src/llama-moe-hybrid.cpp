@@ -3259,6 +3259,21 @@ void moe_hybrid_engine::shutdown() {
 static std::mutex                                                     g_moe_hybrid_mtx;
 static std::map<ggml_backend_t, std::unique_ptr<moe_hybrid_engine>> g_moe_hybrid_engines;
 
+// One engine per CUDA backend, so one per inference instance (--gpu-instances: one thread, one context and one device each). The thread that built an engine's graphs
+// (moe_hybrid_get) is the one that serves it in the _impl calls below; a thread that never built one falls back to the only engine of the process.
+static thread_local ggml_backend_t g_moe_hybrid_tl_cuda = nullptr;
+
+static moe_hybrid_engine * moe_hybrid_pick() {
+    std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+    if (g_moe_hybrid_tl_cuda != nullptr) {
+        auto it = g_moe_hybrid_engines.find(g_moe_hybrid_tl_cuda);
+        if (it != g_moe_hybrid_engines.end()) {
+            return it->second.get();
+        }
+    }
+    return g_moe_hybrid_engines.size() == 1 ? g_moe_hybrid_engines.begin()->second.get() : nullptr;
+}
+
 static moe_hybrid_engine * moe_hybrid_get(const llm_graph_context & g, const llama_model & model, int n_slot) {
     ggml_backend_t cuda   = nullptr;
     int            n_cuda = 0;
@@ -3274,6 +3289,7 @@ static moe_hybrid_engine * moe_hybrid_get(const llm_graph_context & g, const lla
     }
 
     std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
+    g_moe_hybrid_tl_cuda = cuda;
     auto it = g_moe_hybrid_engines.find(cuda);
     if (it != g_moe_hybrid_engines.end()) {
         if (it->second->model != &model || it->second->n_slot != n_slot) {
@@ -3309,26 +3325,18 @@ public:
 } // namespace
 
 bool llama_moe_hybrid_layer_map_impl(std::vector<int> & eng_of_abs_out) {
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
     eng_of_abs_out = eng->eng_of_abs;
     return true;
 }
 
 bool llama_moe_hybrid_seed_impl(const int32_t * ids, int K, int * n_layer, int * n_used) {
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
     if (ids == nullptr) {
         // the caller asks for the geometry
@@ -3348,14 +3356,20 @@ void llama_moe_hybrid_set_keep_stats(bool keep) {
     g_moe_hybrid_keep_stats.store(keep);
 }
 
+// free / total bytes of the device the calling instance's engine lives on (false: no engine to ask)
+bool llama_moe_hybrid_device_memory_impl(size_t * free_b, size_t * total_b) {
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr || eng->cuda == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_memory(ggml_backend_get_device(eng->cuda), free_b, total_b);
+    return true;
+}
+
 bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot) {
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
     const int slots = eng->info_n_slot.load();
     if (slots <= 0) {
@@ -3370,13 +3384,9 @@ bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_byte
     if (shrunk != nullptr) {
         *shrunk = false;
     }
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
     if (!eng->cache_ready() || eng->cuda == nullptr) {
         return false;
@@ -3412,13 +3422,9 @@ bool llama_moe_hybrid_make_room_impl(int64_t need_free_bytes, int64_t slack_byte
 
 // G31: size the cache to a keep-free target (the rule of the runner's tg_transition(), plus shrinking). All sizes in bytes; slots clamp to [min_slots, min(max_slots, n_expert)].
 bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_bytes, int min_slots, int max_slots, int * slots_before, int * slots_after, int64_t * free_before_bytes) {
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
     if (!eng->cache_ready() || eng->cuda == nullptr) {
         return false;
@@ -3450,22 +3456,18 @@ bool llama_moe_hybrid_auto_resize_impl(int64_t keep_free_bytes, int64_t safety_b
     return llama_moe_hybrid_resize_impl((int) slots);
 }
 
-static std::atomic<bool> g_moe_hybrid_async_fill{false};
+static thread_local bool g_moe_hybrid_async_fill = false;   // per instance thread
 
 void llama_moe_hybrid_set_async_fill(bool on) {
-    g_moe_hybrid_async_fill.store(on);
+    g_moe_hybrid_async_fill = on;
 }
 
 bool llama_moe_hybrid_resize_impl(int n_slot) {
-    moe_hybrid_engine * eng = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
-        if (g_moe_hybrid_engines.size() != 1) {
-            return false;
-        }
-        eng = g_moe_hybrid_engines.begin()->second.get();
+    moe_hybrid_engine * eng = moe_hybrid_pick();
+    if (eng == nullptr) {
+        return false;
     }
-    if (!eng->resize(n_slot, g_moe_hybrid_async_fill.load())) {
+    if (!eng->resize(n_slot, g_moe_hybrid_async_fill)) {
         return false;
     }
     char v[16];

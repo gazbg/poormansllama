@@ -2038,6 +2038,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_PEER_GPU").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--gpu-instances"}, "N",
+        "one complete inference instance per CUDA device (CUDA0 .. CUDA(N-1)) inside this one server process: own model handle (host weights shared through the mmap), context, expert cache, KV cache of the full -c, "
+        "-np slots and decode thread, behind one HTTP endpoint; a request goes to the instance that holds the longest common prompt prefix, else to the least loaded one (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.gpu_instances = value;
+        }
+    ).set_env("LLAMA_ARG_GPU_INSTANCES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lm-prefill-peer-ctx"}, "N",
         "context size of the second GPU's model: the longest prompt batch it can take (default: 33024)",
         [](common_params & params, int value) {
