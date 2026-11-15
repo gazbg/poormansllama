@@ -40,6 +40,7 @@ void llama_moe_hybrid_set_async_fill(bool on);
 
 // bytes the slot cache of the one engine in this process holds now and its slot count (the zero slot makes the size (n_slot + 1) x one slot row). False when there is no engine.
 bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);
+bool llama_moe_hybrid_device_memory_impl(size_t * free_bytes, size_t * total_bytes);   // the device of the calling instance's engine
 
 // G31: shrink the cache so that need_free_bytes of device memory are free (and slack_bytes more when it has to shrink); synchronizes the device first. No-op when they already are free.
 // *shrunk is set when the cache changed. False when there is no engine or the resize failed.

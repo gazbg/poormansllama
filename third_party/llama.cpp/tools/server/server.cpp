@@ -15,6 +15,9 @@
 
 #include <atomic>
 #include <clocale>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -729,6 +732,417 @@ static int server_run_instance(common_params & params, server_role & role, commo
 }
 
 //
+// --gpu-instances N: one complete instance per CUDA device inside this process (own model handle on that device with the host weights shared through the mmap, own llama_context,
+// expert cache, KV cache of the full -c, -np slots and decode thread) behind ONE HTTP front. The instances load one after the other, each on its own thread, and run their loop
+// there (the hybrid / layer-major / lazy-KV state of libllama is per such thread, see llama_hybrid_bind_thread). A request goes to the instance that was sent the longest common
+// prompt prefix before (that instance's slot / prompt cache holds it), else to the least loaded one.
+//
+
+struct gpu_instance {
+    common_params                   params;
+    std::unique_ptr<server_context> ctx;
+    std::unique_ptr<server_routes>  routes;
+    std::thread                     th;
+    std::atomic<int>                in_flight{0};
+    std::atomic<int>                state{0};      // 0 loading, 1 loaded, -1 failed
+    std::atomic<bool>               loop_done{false};
+    std::deque<std::string>         recent;        // fingerprints of the prompts sent here (guarded by the dispatcher's mutex)
+};
+
+static void gpu_inst_text(const json & v, std::string & out) {
+    if (v.is_string()) {
+        out += v.get<std::string>();
+    } else if (v.is_array()) {
+        for (const auto & e : v) {
+            if (e.is_number_integer()) {
+                const int32_t t = e.get<int32_t>();
+                out.append((const char *) &t, sizeof(t));
+            } else {
+                gpu_inst_text(e, out);
+            }
+        }
+    } else if (v.is_object()) {
+        if (v.contains("text")) {
+            gpu_inst_text(v["text"], out);
+        }
+        if (v.contains("content")) {
+            gpu_inst_text(v["content"], out);
+        }
+    }
+}
+
+// the part of a request that becomes the prompt, as one string whose common prefix with an earlier request tells how much of the prompt is cached (a chat grows at its end)
+static std::string gpu_inst_fingerprint(const std::string & body) {
+    std::string fp;
+    try {
+        const json j = json::parse(body);
+        if (j.is_object()) {
+            if (j.contains("tools")) {
+                fp += j["tools"].dump();
+            }
+            for (const char * key : { "messages", "input", "prompt" }) {
+                if (!j.contains(key)) {
+                    continue;
+                }
+                const json & m = j[key];
+                if (m.is_array() && !m.empty() && m[0].is_object()) {
+                    for (const auto & msg : m) {
+                        if (msg.contains("role")) {
+                            gpu_inst_text(msg["role"], fp);
+                            fp += '\x1f';
+                        }
+                        gpu_inst_text(msg, fp);
+                        fp += '\x1e';
+                    }
+                } else {
+                    gpu_inst_text(m, fp);
+                }
+                break;
+            }
+        }
+    } catch (...) {
+    }
+    return fp.empty() ? body : fp;
+}
+
+static size_t gpu_inst_lcp(const std::string & a, const std::string & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+
+// a response that tells its instance when it is over (the load counter of the dispatcher)
+struct gpu_inst_res : server_http_res {
+    server_http_res_ptr   inner;
+    std::function<void()> done;
+    bool                  fired = false;
+
+    gpu_inst_res(server_http_res_ptr r, std::function<void()> d) : inner(std::move(r)), done(std::move(d)) {
+        content_type = inner->content_type;
+        status       = inner->status;
+        data         = inner->data;
+        headers      = inner->headers;
+        if (inner->next) {
+            next = [this](std::string & out) { return inner->next(out); };
+        }
+    }
+    void on_complete() override {
+        inner->on_complete();
+        fire();
+    }
+    void fire() {
+        if (!fired) {
+            fired = true;
+            done();
+        }
+    }
+    ~gpu_inst_res() override {
+        fire();
+    }
+};
+
+static int server_run_gpu_instances(common_params & params, server_role & role, common_models_handler & models_handler, const server_run_opts & opts) {
+    const int n_inst = params.gpu_instances;
+    if (role.is_managed_by_router()) {
+        SRV_ERR("%s", "--gpu-instances is not available to a model managed by the router\n");
+        return 1;
+    }
+    if (params.lm_prefill_peer_gpu >= 0) {
+        SRV_ERR("%s", "--gpu-instances replaces --lm-prefill-peer-gpu: use one of them\n");
+        return 1;
+    }
+    if (opts.resolve_model) {
+        try {
+            common_models_handler_apply(models_handler, params);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to download model: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    std::vector<std::unique_ptr<gpu_instance>> insts;
+    for (int k = 0; k < n_inst; ++k) {
+        char dn[32];
+        snprintf(dn, sizeof(dn), "CUDA%d", k);
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dn);
+        if (dev == nullptr) {
+            SRV_ERR("--gpu-instances %d: no device %s\n", n_inst, dn);
+            return 1;
+        }
+        auto in = std::make_unique<gpu_instance>();
+        in->params = params;
+        in->params.devices.clear();
+        in->params.devices.push_back(dev);
+        in->params.devices.push_back(nullptr);
+        in->params.main_gpu   = 0;
+        in->params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        if (in->params.mmproj_use_gpu) {
+            in->params.mmproj_device = dev;
+        }
+        in->ctx    = std::make_unique<server_context>();
+        in->routes = std::make_unique<server_routes>(in->params, *in->ctx);
+        insts.push_back(std::move(in));
+    }
+
+    server_mcp mcp_mgr;
+    server_tools tools;
+
+    // the front: its handlers are bound to instance 0 (the endpoints that are not per request); the per-request ones are replaced by the dispatcher below
+    server_routes front(insts[0]->params, *insts[0]->ctx);
+
+    std::mutex disp_mtx;
+    size_t     rr = 0;
+    const int  np = std::max(1, params.n_parallel);
+    const size_t min_lcp = 256;
+
+    auto pick = [&](const std::string & fp) -> int {
+        std::lock_guard<std::mutex> lk(disp_mtx);
+        int    best = -1;
+        size_t best_lcp = 0;
+        for (int k = 0; k < n_inst; ++k) {
+            size_t l = 0;
+            for (const auto & s : insts[k]->recent) {
+                l = std::max(l, gpu_inst_lcp(fp, s));
+            }
+            if (l < min_lcp) {
+                continue;
+            }
+            if (best < 0 || l > best_lcp || (l == best_lcp && insts[k]->in_flight < insts[best]->in_flight)) {
+                best = k;
+                best_lcp = l;
+            }
+        }
+        // a hit on a busy instance would queue behind its requests: a free instance wins
+        int chosen = best;
+        if (chosen < 0 || insts[chosen]->in_flight >= np) {
+            int least = -1;
+            for (int j = 0; j < n_inst; ++j) {
+                const int k = (int) ((rr + j) % n_inst);
+                if (least < 0 || insts[k]->in_flight < insts[least]->in_flight) {
+                    least = k;
+                }
+            }
+            rr++;
+            if (chosen < 0 || insts[least]->in_flight < insts[chosen]->in_flight) {
+                chosen = least;
+            }
+        }
+        auto & rec = insts[chosen]->recent;
+        bool replaced = false;
+        for (auto & s : rec) {
+            if (gpu_inst_lcp(fp, s) >= min_lcp && fp.size() >= s.size()) {   // the same conversation, grown
+                s = fp;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            rec.push_back(fp);
+            while (rec.size() > (size_t) std::max(4, 2*np)) {
+                rec.pop_front();
+            }
+        }
+        return chosen;
+    };
+
+    using handler_t = server_http_context::handler_t;
+    auto fwd = [&](handler_t server_routes::* member) -> handler_t {
+        return [&, member](const server_http_req & req) -> server_http_res_ptr {
+            gpu_instance & in = *insts[pick(gpu_inst_fingerprint(req.body))];
+            in.in_flight++;
+            server_http_res_ptr r;
+            try {
+                r = (in.routes.get()->*member)(req);
+            } catch (...) {
+                in.in_flight--;
+                throw;
+            }
+            gpu_instance * pin = &in;
+            return std::make_unique<gpu_inst_res>(std::move(r), [pin]() { pin->in_flight--; });
+        };
+    };
+    front.post_infill             = fwd(&server_routes::post_infill);
+    front.post_completions        = fwd(&server_routes::post_completions);
+    front.post_completions_oai    = fwd(&server_routes::post_completions_oai);
+    front.post_chat_completions   = fwd(&server_routes::post_chat_completions);
+    front.post_responses_oai      = fwd(&server_routes::post_responses_oai);
+    front.post_anthropic_messages = fwd(&server_routes::post_anthropic_messages);
+    front.post_embeddings         = fwd(&server_routes::post_embeddings);
+    front.post_embeddings_oai     = fwd(&server_routes::post_embeddings_oai);
+    front.post_rerank             = fwd(&server_routes::post_rerank);
+
+    server_http_context ctx_http;
+    if (!ctx_http.init(params)) {
+        SRV_ERR("%s", "failed to initialize HTTP server\n");
+        return 1;
+    }
+    server_register_routes(ctx_http, front);
+    server_register_stream_routes(ctx_http,
+        server_stream_make_get_handler(),
+        server_stream_make_lookup_handler(),
+        server_stream_make_delete_handler());
+    if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_INSTANCE)) {
+        return 1;
+    }
+
+    auto terminate_all = [&]() {
+        for (auto & in : insts) {
+            if (in->ctx) {
+                in->ctx->terminate();
+            }
+        }
+    };
+    auto clean_up = [&]() {
+        SRV_INF("%s: cleaning up before exit...\n", __func__);
+        server_stream_session_manager_stop();
+        ctx_http.stop();
+        terminate_all();
+        mcp_mgr.shutdown();
+        llama_backend_free();
+    };
+
+    if (!ctx_http.start()) {
+        clean_up();
+        SRV_ERR("%s", "exiting due to HTTP server error\n");
+        return 1;
+    }
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    go = false;        // all instances loaded: the loops may start
+    bool                    destroy_gate = false;
+    bool                    abort_load = false;
+
+    for (int k = 0; k < n_inst; ++k) {
+        insts[k]->th = std::thread([&, k]() {
+            gpu_instance & in = *insts[k];
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&]() { return k == 0 || insts[k - 1]->state.load() != 0; });   // one load at a time (environment, pinning and VRAM sizing are process wide)
+            }
+            bool ok = !abort_load && (k == 0 || insts[k - 1]->state.load() == 1);
+            if (ok) {
+                SRV_INF("gpu-instances: loading instance %d on %s\n", k, ggml_backend_dev_name(in.params.devices.front()));
+                ok = in.ctx->load_model(in.params);
+                if (ok) {
+                    in.routes->update_meta(*in.ctx);
+                    if (k == 0) {
+                        front.update_meta(*in.ctx);
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                in.state = ok ? 1 : -1;
+            }
+            cv.notify_all();
+            if (ok) {
+                {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    cv.wait(lk, [&]() { return go || abort_load; });
+                }
+                if (!abort_load) {
+                    in.ctx->start_loop();   // blocks until terminate()
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                in.loop_done = true;
+            }
+            cv.notify_all();
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&]() { return destroy_gate; });
+            }
+            in.routes.reset();    // the library's state of this instance is per thread: it goes down on the thread that made it
+            in.ctx.reset();
+        });
+    }
+
+    int rc = 0;
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [&]() {
+            for (auto & in : insts) {
+                if (in->state.load() == 0) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        for (auto & in : insts) {
+            if (in->state.load() != 1) {
+                rc = 1;
+            }
+        }
+        if (rc != 0) {
+            abort_load = true;
+        } else {
+            go = true;
+        }
+    }
+    cv.notify_all();
+
+    shutdown_handler = [&](int) {
+        mcp_mgr.shutdown();
+        terminate_all();
+    };
+
+    if (rc == 0) {
+        ctx_http.is_ready.store(true);
+        SRV_INF("gpu-instances: %d instances loaded, %d slots each\n", n_inst, np);
+        if (opts.install_signal_handlers) {
+            server_install_signal_handlers();
+        }
+        server_connect connect_proc;
+        if (!server_on_listening(ctx_http, params, connect_proc)) {
+            rc = 1;
+        } else {
+            // the first instance whose loop ends (a signal, or a failure) takes the others down with it
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [&]() {
+                for (auto & in : insts) {
+                    if (in->loop_done.load()) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+    } else {
+        SRV_ERR("%s", "exiting due to model loading error\n");
+    }
+
+    clean_up();
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [&]() {
+            for (auto & in : insts) {
+                if (!in->loop_done.load()) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+    ctx_http.join();
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        destroy_gate = true;
+    }
+    cv.notify_all();
+    for (auto & in : insts) {
+        if (in->th.joinable()) {
+            in->th.join();
+        }
+    }
+    return rc;
+}
+
+//
 // entry points
 //
 
@@ -763,7 +1177,7 @@ static int server_run(common_params & params, int argc, char ** argv, server_rol
         case SERVER_ROLE_DOWNLOAD: return server_run_download(params, role);
         case SERVER_ROLE_MEASURE:  return server_run_measure(params, role, models_handler);
         case SERVER_ROLE_ROUTER:   return server_run_router(params, argc, argv, opts);
-        case SERVER_ROLE_INSTANCE: return server_run_instance(params, role, models_handler, opts);
+        case SERVER_ROLE_INSTANCE: return params.gpu_instances > 1 ? server_run_gpu_instances(params, role, models_handler, opts) : server_run_instance(params, role, models_handler, opts);
     }
 
     GGML_ABORT("invalid server role");

@@ -912,7 +912,9 @@ struct ggml_cuda_lazy_buffer {
 };
 
 static std::vector<ggml_cuda_lazy_buffer *> g_cuda_lazy_buffers;
-static bool                                 g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
+static std::mutex                           g_cuda_lazy_mtx;       // several instances (one per device, one thread each) register and commit buffers
+static thread_local int                     g_cuda_lazy_thread_dev = -1; // >= 0: this thread's commit/cost only see the buffers of that device
+static thread_local bool                    g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
 
 struct ggml_backend_cuda_buffer_context {
     int device;
@@ -927,7 +929,10 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
         if (lazy != nullptr) {
-            g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
+            {
+                std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
+                g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
+            }
             delete lazy;
         } else {
             CUDA_CHECK(cudaFree(dev_ptr));
@@ -1053,6 +1058,11 @@ static int ggml_cuda_dbg_free_at() {
 }
 
 // the next device buffer allocation is reserved lazily (set by the KV cache constructor around its allocation, reset right after)
+// the calling thread serves one device (one inference instance per GPU): its commits and cost queries only see that device's lazy buffers (-1: all)
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_thread_device(int device) {
+    g_cuda_lazy_thread_dev = device;
+}
+
 extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
     g_cuda_lazy_next = on;
 }
@@ -1061,7 +1071,11 @@ extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_next_alloc(bool on) 
 // Returns the physical bytes committed in total, or -1 when the driver ran out of memory (the caller fails loudly).
 extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
     int64_t total = 0;
+    std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        if (g_cuda_lazy_thread_dev >= 0 && lz->device != g_cuda_lazy_thread_dev) {
+            continue;
+        }
         for (ggml_tensor * t : lz->tensors) {
             const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
             const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
@@ -1079,7 +1093,11 @@ extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_rows(int64_t r
 // G31: the physical bytes that committing the first `rows` rows of every lazily committed cache tensor would still map (an uncommitted or aliased granule counts once)
 extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
     int64_t total = 0;
+    std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        if (g_cuda_lazy_thread_dev >= 0 && lz->device != g_cuda_lazy_thread_dev) {
+            continue;
+        }
         std::vector<uint8_t> seen(lz->mapped.size(), 0);
         for (ggml_tensor * t : lz->tensors) {
             const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
@@ -1551,7 +1569,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         }
         ggml_backend_cuda_buffer_context * lctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) lz->base);
         lctx->lazy = lz;
-        g_cuda_lazy_buffers.push_back(lz);
+        {
+            std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
+            g_cuda_lazy_buffers.push_back(lz);
+        }
         GGML_LOG_INFO("%s: reserved %.2f MiB of address space for a lazily committed buffer on device %d (granule %.1f MiB)\n", __func__,
                       size / 1024.0 / 1024.0, buft_ctx->device, lz->gran / 1024.0 / 1024.0);
         return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, lctx, size);

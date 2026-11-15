@@ -8,7 +8,7 @@
 extern void (*llama_kv_lazy_pressure_cb)(llama_context * lctx, int64_t commit_bytes);   // llama-kv-cache.cpp
 extern void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens);          // llama-context.cpp
 extern bool (*llama_lm_vram_hook)(llama_context * ctx, int64_t need_bytes, int begin);   // llama-lm-prefill.cpp
-extern bool llama_lm_prefill_pending;                                                    // llama-lm-prefill.cpp
+extern thread_local bool llama_lm_prefill_pending;                                                    // llama-lm-prefill.cpp
 #endif
 
 #include <atomic>
@@ -74,11 +74,12 @@ void llama_hybrid_prepare_env(int32_t initial_slots, const char * freq_path) {
 }
 
 #ifdef LLAMA_LAYER_STREAMING
-static int64_t g_hybrid_keep_free = 0;
-static int64_t g_hybrid_safety    = 0;
-static int64_t g_hybrid_slack     = 0;
-static int     g_hybrid_min_slots = 8;
-static llama_context * g_hybrid_ctx = nullptr;
+// all state below is per instance thread: --gpu-instances runs one engine, one context and one decode thread per device (load_model and the loop run on that thread)
+static thread_local int64_t g_hybrid_keep_free = 0;
+static thread_local int64_t g_hybrid_safety    = 0;
+static thread_local int64_t g_hybrid_slack     = 0;
+static thread_local int     g_hybrid_min_slots = 8;
+static thread_local llama_context * g_hybrid_ctx = nullptr;
 
 #ifdef _WIN32
 // diagnostic only (LLAMA_HYBRID_CRASH_TRACE=1): symbolised stack of an access violation
@@ -141,8 +142,8 @@ struct hybrid_prefill_state {
     double   mib_per_row = 0.0;     // measured growth of the compute buffers per extra ubatch row
     int64_t  n_begin     = 0;
 };
-static hybrid_prefill_state g_hp;
-static bool g_lm_regrow_pending = false;   // G32: the expert cache shrank for a layer-major pass and has not grown back yet
+static thread_local hybrid_prefill_state g_hp;
+static thread_local bool g_lm_regrow_pending = false;   // G32: the expert cache shrank for a layer-major pass and has not grown back yet
 
 static bool hybrid_diag() {
     static const bool d = getenv("LLAMA_HYBRID_FREE_WATCH_MS") != nullptr;
@@ -150,6 +151,12 @@ static bool hybrid_diag() {
 }
 
 static int64_t hybrid_free_bytes() {
+    {
+        size_t f = 0, t = 0;
+        if (llama_moe_hybrid_device_memory_impl(&f, &t)) {   // the device of this instance's engine, not the first GPU of the process
+            return (int64_t) f;
+        }
+    }
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             size_t free_b = 0, total_b = 0;
@@ -273,7 +280,7 @@ struct hybrid_seed_state {
     ggml_backend_sched_eval_callback orig_cb = nullptr;
     void *                orig_ud    = nullptr;
 };
-static hybrid_seed_state g_seed;
+static thread_local hybrid_seed_state g_seed;
 
 static bool hybrid_probe_cb(ggml_tensor * t, bool ask, void * ud) {
     GGML_UNUSED(ud);
@@ -447,6 +454,9 @@ static bool hybrid_lm_vram(llama_context * ctx, int64_t need_bytes, int begin) {
 
 static void hybrid_kv_pressure(llama_context * lctx, int64_t commit_bytes) {
     GGML_UNUSED(lctx);   // not trusted: the registered context is the one whose graphs hold the old cache tensors
+    if (g_hybrid_ctx == nullptr) {
+        return;   // no instance registered on this thread (the hook pointers are process-wide, the state is per thread)
+    }
     bool shrunk = false;
     if (!llama_moe_hybrid_make_room_impl(commit_bytes + g_hybrid_keep_free + g_hybrid_safety, g_hybrid_slack, g_hybrid_min_slots, &shrunk)) {
         LLAMA_LOG_WARN("%s: hybrid-moe: could not make room for a KV commit of %.1f MiB\n", __func__, (double) commit_bytes/1048576.0);
@@ -528,10 +538,26 @@ void llama_hybrid_set_seed(struct llama_context * ctx, int32_t n_tokens) {
 #endif
 }
 
+#ifdef LLAMA_LAYER_STREAMING
+extern "C" {
+#ifdef _WIN32
+__declspec(dllimport)
+#endif
+void ggml_backend_cuda_lazy_set_thread_device(int device);   // ggml-cuda.cu
+}
+#endif
+
+void llama_hybrid_bind_thread(int32_t cuda_ordinal) {
+#ifdef LLAMA_LAYER_STREAMING
+    ggml_backend_cuda_lazy_set_thread_device((int) cuda_ordinal);
+#else
+    GGML_UNUSED(cuda_ordinal);
+#endif
+}
+
 void llama_hybrid_shutdown(void) {
 #ifdef LLAMA_LAYER_STREAMING
-    llama_hybrid_decode_hook = nullptr;
-    g_seed = hybrid_seed_state();
+    g_seed = hybrid_seed_state();   // the process-wide hook pointers stay: they are inert on a thread without a registered context (another instance may still run)
     llama_moe_hybrid_set_keep_stats(false);
     g_hp = hybrid_prefill_state();
     g_watch_stop = true;
@@ -539,8 +565,6 @@ void llama_hybrid_shutdown(void) {
         g_watch.join();
     }
     g_watch_started = false;
-    llama_kv_lazy_pressure_cb = nullptr;
-    llama_lm_vram_hook = nullptr;
     g_hybrid_ctx = nullptr;
 #endif
 }

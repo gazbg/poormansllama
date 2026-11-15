@@ -54,7 +54,7 @@
 bool (*llama_lm_vram_hook)(llama_context * ctx, int64_t need_bytes, int begin) = nullptr;
 
 // true while llama_context::decode() has taken the batch for the layer-major pass (the hybrid prefill window must not open for it)
-bool llama_lm_prefill_pending = false;
+thread_local bool llama_lm_prefill_pending = false;   // per decode thread: one instance per device decodes on its own thread
 
 llama_lm_state::~llama_lm_state() = default;
 
@@ -383,7 +383,7 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
             S.armed        = false;
             S.armed_batch  = false;
             S.cur_w        = wmax;
-            S.free_pre     = lm_dev_free(lm_follower ? S.p.device : -1) + S.slot_total + 2*(int64_t) S.slab_half + (int64_t) S.swa_alloc_bytes;
+            S.free_pre     = lm_dev_free(S.p.device) + S.slot_total + 2*(int64_t) S.slab_half + (int64_t) S.swa_alloc_bytes;
             S.t_acquire_us = 0;
             S.n_arm_used++;
             return true;
@@ -463,7 +463,7 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         // allocator of ggml does not survive a failed reservation, so the check is made BEFORE anything is touched
         const int64_t margin = (int64_t) 96*1048576;
         const int64_t held   = dstream ? (int64_t) dstream->held_bytes() : 0;     // the decode ring of slots gives its memory back for the pass
-        const int64_t free_b = lm_dev_free(lm_follower ? P.device : -1) + held;
+        const int64_t free_b = lm_dev_free(P.device) + held;
         if (free_b < need + margin) {
             LLAMA_LOG_WARN("%s: lm-prefill: %.0f MiB of device memory are free, the pass needs %.0f MiB (slot window %.0f + slab %.0f + compute buffer %.0f + margin %.0f); this batch takes the ordinary path\n",
                            __func__, (double) free_b/1048576.0, (double) (need + margin)/1048576.0, (double) slot_total/1048576.0, 2*(double) half/1048576.0, (double) sched_est/1048576.0, (double) (margin + 64*1048576)/1048576.0);
@@ -474,7 +474,7 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
         dstream->suspend();
         reset_graph_reuse();     // a graph built while the ring is away has no markers and must not be reused after it is back
     }
-    S.free_pre   = lm_dev_free(lm_follower ? P.device : -1);
+    S.free_pre   = lm_dev_free(P.device);
     S.slot_total = slot_total;
     S.cur_w      = wmax;
     S.vram_hooked = vram_hook != nullptr;
@@ -532,7 +532,7 @@ void llama_context::lm_release() {
 
     // G40: what this pass really took on the device besides the slot window and the slab (the next pass asks for it)
     if (S.live && S.free_pre > 0) {
-        const int64_t var = S.free_pre - lm_dev_free(lm_follower ? S.p.device : -1) - S.slot_total - 2*(int64_t) S.slab_half - (int64_t) S.swa_alloc_bytes;
+        const int64_t var = S.free_pre - lm_dev_free(S.p.device) - S.slot_total - 2*(int64_t) S.slab_half - (int64_t) S.swa_alloc_bytes;
         // a pass of a few tokens (the 4-token tail behind a checkpoint) measures only the fixed cost; scaled by the width ratio it asked for 2 GB and starved the next pass (found 2026-10-20)
         if (var > 0 && S.cur_w >= 256) {
             S.var_meas = var;

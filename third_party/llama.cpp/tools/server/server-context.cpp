@@ -1013,7 +1013,18 @@ static bool vod_log_on() {
 }
 
 // free / total bytes of the first GPU device as the CUDA runtime reports them (cudaMemGetInfo); false when there is none
+static thread_local ggml_backend_dev_t g_inst_dev = nullptr;   // --gpu-instances: the device of the instance this thread serves
+
+static int inst_dev_ordinal(ggml_backend_dev_t dev) {
+    int n = -1;
+    return dev != nullptr && sscanf(ggml_backend_dev_name(dev), "CUDA%d", &n) == 1 ? n : -1;
+}
+
 static bool vod_dev_free(size_t & free_b, size_t & total_b) {
+    if (g_inst_dev != nullptr) {
+        ggml_backend_dev_memory(g_inst_dev, &free_b, &total_b);
+        return true;
+    }
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -1645,6 +1656,11 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (params.gpu_instances > 1 && !params.devices.empty() && params.devices.front() != nullptr) {
+            // this thread serves one instance on one device: its hybrid / lazy-KV state is per thread (see llama_hybrid_bind_thread)
+            g_inst_dev = params.devices.front();
+            llama_hybrid_bind_thread(inst_dev_ordinal(g_inst_dev));
+        }
         spec_fit_added.clear();
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -2099,6 +2115,9 @@ private:
             lp.segment    = params_base.lm_prefill_segment;
             lp.min_tokens = params_base.lm_prefill_min;
             lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            if (g_inst_dev != nullptr && inst_dev_ordinal(g_inst_dev) >= 0) {
+                lp.device = inst_dev_ordinal(g_inst_dev);   // --gpu-instances: slot window, slab and copies on this instance's device
+            }
             lp.mm_batches = params_base.mmproj_on_demand ? 1 : 0;     // DL-20: the pass takes image batches only with the projector on demand; a resident projector keeps the pre-VOD behaviour
             char err[512] = { 0 };
             if (!llama_lm_prefill_enable(ctx_tgt, &lp, err, sizeof(err))) {
