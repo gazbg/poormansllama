@@ -38,6 +38,10 @@ ap.add_argument("--par-pp", type=int, default=8192)
 ap.add_argument("--deep", type=int, default=0, help="solo: decode after a prompt of this many tokens")
 ap.add_argument("--fill", default="", help="capacity test: N1,N2,.. tokens; request i holds a prompt of Ni tokens, all at once, then 64 tokens each")
 ap.add_argument("--gpus", default="0,1")
+ap.add_argument("--skip-chat", action="store_true", help="no simultaneous-chat rows")
+ap.add_argument("--check-solo", action="store_true", help="after n simultaneous prompts send each one alone and compare the continuation text")
+ap.add_argument("--stagger", type=float, default=0.0, help="seconds between the starts of the simultaneous prompts")
+ap.add_argument("--mixed", type=int, default=0, help="one chat of this many tokens decoding while one cold --par-pp prompt arrives 3 s later")
 ap.add_argument("--port", type=int, default=8195)
 ap.add_argument("--out", default=os.path.join(REPO, "build/pascal/par"))
 ap.add_argument("--timeout", type=int, default=3600)
@@ -95,13 +99,16 @@ def rec(**kw):
     rows.append(kw)
 
 
-def together(bodies, path):
-    """send all bodies at once; returns (answers, wall seconds)"""
+def together(bodies, path, delays=None):
+    """send all bodies at once (or body i after delays[i] seconds); returns (answers, wall seconds). A body may be (path, body)."""
     ans = [None] * len(bodies)
 
     def one(i):
         try:
-            ans[i] = post(path, bodies[i])
+            if delays:
+                time.sleep(delays[i])
+            b = bodies[i]
+            ans[i] = post(b[0], b[1]) if isinstance(b, tuple) else post(path, b)
         except Exception as e:
             ans[i] = {"error": repr(e)}
 
@@ -159,9 +166,36 @@ try:
     def prompt(off, n, n_pred):
         return {"prompt": toks[off:off + n - len(q)] + q, "n_predict": n_pred, "temperature": 0, "cache_prompt": False}
 
+    def cmp_ans(x, y):
+        """two answers to one prompt: text equality, common token prefix, logprob deltas of the common tokens"""
+        def lps(z):
+            return [(c.get("token"), c.get("logprob")) for c in ((z or {}).get("completion_probabilities") or [])]
+        la, lb = lps(x), lps(y)
+        kt = 0
+        while kt < min(len(la), len(lb)) and la[kt][0] == lb[kt][0]:
+            kt += 1
+        d = [abs(la[j][1] - lb[j][1]) for j in range(kt)]
+        return dict(identical=(x or {}).get("content") is not None and (x or {}).get("content") == (y or {}).get("content"), common_tokens=kt, n_tokens=len(la),
+                    first_delta=round(d[0], 5) if d else None, max_delta=round(max(d), 5) if d else None)
+
+    def fmt_cmp(r):
+        return f"{'IDENTICAL' if r['identical'] else 'DIFFERENT'}, {r['common_tokens']} of {r['n_tokens']} tokens in common, logprob delta first token {r['first_delta']}, max {r['max_delta']}"
+
+    solo_ref = {}
+    if a.check_solo:
+        # every prompt alone, twice (the second run gives the solo-against-solo noise floor), before any simultaneous run
+        for i in range(max(int(x) for x in a.np_list.split(",") if x)):
+            b = prompt(i * a.par_pp, a.par_pp, 96)
+            b["n_probs"] = 1
+            solo_ref[i] = []
+            for r in range(2):
+                one, w1 = together([b], "/completion")
+                summarize(f"solo{i}", 1, one, w1, {"rep": r})
+                solo_ref[i].append(one[0])
+
     post("/v1/chat/completions", chat(7, 16))   # warm-up
     for n in [int(x) for x in a.np_list.split(",") if x]:
-        for rep in range(2):
+        for rep in range(0 if a.skip_chat else 2):
             ans, wall = together([chat(i + rep * n, a.tg) for i in range(n)], "/v1/chat/completions")
             summarize("chat", n, ans, wall, {"rep": rep})
         if n == 1:
@@ -172,8 +206,24 @@ try:
                 ans, wall = together([prompt(1000, a.deep, a.tg)], "/completion")
                 summarize(f"deep{a.deep}", 1, ans, wall)
         else:
-            ans, wall = together([prompt(i * a.par_pp, a.par_pp, 96) for i in range(n)], "/completion")
+            bodies = [prompt(i * a.par_pp, a.par_pp, 96) for i in range(n)]
+            if a.check_solo:
+                for b in bodies:
+                    b["n_probs"] = 1
+            ans, wall = together(bodies, "/completion", [i * a.stagger for i in range(n)] if a.stagger else None)
             summarize(f"parpp{a.par_pp}", n, ans, wall)
+            if a.check_solo:
+                same = []
+                for i in range(n):
+                    r = cmp_ans(ans[i], solo_ref[i][0])
+                    f = cmp_ans(solo_ref[i][1], solo_ref[i][0])
+                    same.append(r)
+                    print(f"   check-solo n={n} req {i}: together vs solo: {fmt_cmp(r)}", flush=True)
+                    print(f"   {'':22s} solo vs solo again:  {fmt_cmp(f)}", flush=True)
+                rec(kind="check_solo", n=n, together_vs_solo=same, solo_vs_solo=[cmp_ans(solo_ref[i][1], solo_ref[i][0]) for i in range(n)])
+    if a.mixed:
+        ans, wall = together([("/v1/chat/completions", chat(0, a.mixed)), ("/completion", prompt(5 * a.par_pp % 1000, a.par_pp, 96))], None, [0, 3.0])
+        summarize(f"mixed{a.par_pp}", 2, ans, wall)
     if a.fill:
         # capacity run: every request holds its own long prompt with its own needle, all at once
         sizes = [int(x) for x in a.fill.split(",")]

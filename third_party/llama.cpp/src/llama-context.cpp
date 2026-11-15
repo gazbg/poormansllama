@@ -16,7 +16,7 @@ extern "C" {
 #ifdef _WIN32
 __declspec(dllimport)
 #endif
-bool ggml_backend_cuda_input_batch_begin(void * compute_stream);
+bool ggml_backend_cuda_input_batch_begin(ggml_backend_t backend);
 #ifdef _WIN32
 __declspec(dllimport)
 #endif
@@ -1740,7 +1740,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (input_batch) {
         for (auto & b : backends) {
             if (ggml_backend_is_cuda(b.get())) {
-                batched = ggml_backend_cuda_input_batch_begin(ggml_backend_cuda_stream_handle(b.get(), 0)); // the compute stream the graph runs on
+                batched = ggml_backend_cuda_input_batch_begin(b.get()); // staged on the compute stream the graph runs on
                 break;
             }
         }

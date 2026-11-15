@@ -1005,12 +1005,17 @@ struct ggml_cuda_input_copy {
 // thread_local: a batch is opened and closed by the thread that sets the inputs of a graph; two threads on two GPUs (the second-GPU tier, the two-GPU prefill) must not share it
 static thread_local bool         g_cuda_input_batch_open = false;
 static thread_local bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
-static thread_local bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
-static thread_local char *       g_cuda_input_stage      = nullptr;
+// per device: an event belongs to the CUDA context of the device it was created on (one thread can decode on two GPUs: the two-GPU prefill's follower warm-up)
+struct ggml_cuda_input_dev {
+    char *      stage     = nullptr;
+    cudaEvent_t event     = nullptr;
+    bool        failed    = false;
+    bool        in_flight = false;   // the previous batch's copies may still be reading the staging area
+};
+static thread_local ggml_cuda_input_dev g_cuda_input_devs[GGML_CUDA_MAX_DEVICES];
+static thread_local ggml_cuda_input_dev * g_cuda_input_dev = nullptr;   // the device of the open batch
 static thread_local size_t       g_cuda_input_stage_used = 0;
-static thread_local bool         g_cuda_input_failed     = false;
 static thread_local cudaStream_t g_cuda_input_stream     = nullptr;
-static thread_local cudaEvent_t  g_cuda_input_event      = nullptr;
 static thread_local ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
 static thread_local size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
 static thread_local size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
@@ -1142,33 +1147,41 @@ extern "C" GGML_CUDA_EXPORT int ggml_backend_cuda_keepalive(int device, int on) 
     return 0;
 }
 
-extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
-    if (g_cuda_input_batch_open || compute_stream == nullptr) {
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_input_batch_begin(ggml_backend_t backend) {
+    if (g_cuda_input_batch_open || backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return false; // no nesting
     }
-    if (!g_cuda_input_failed && (g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr)) {
-        if (g_cuda_input_stage == nullptr && cudaMallocHost((void **) &g_cuda_input_stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
-            (void) cudaGetLastError();
-            g_cuda_input_stage = nullptr;
-        }
-        if (g_cuda_input_event == nullptr && cudaEventCreateWithFlags(&g_cuda_input_event, cudaEventDisableTiming) != cudaSuccess) {
-            (void) cudaGetLastError();
-            g_cuda_input_event = nullptr;
-        }
-        g_cuda_input_failed = g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->device < 0 || cuda_ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
     }
-    if (g_cuda_input_failed) {
+    ggml_cuda_input_dev & d = g_cuda_input_devs[cuda_ctx->device];
+    if (!d.failed && (d.stage == nullptr || d.event == nullptr)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (d.stage == nullptr && cudaMallocHost((void **) &d.stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.stage = nullptr;
+        }
+        if (d.event == nullptr && cudaEventCreateWithFlags(&d.event, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.event = nullptr;
+        }
+        d.failed = d.stage == nullptr || d.event == nullptr;
+    }
+    if (d.failed) {
         return false; // the caller then runs the original per-tensor path
     }
-    if (g_cuda_input_in_flight) {
+    if (d.in_flight) {
         // the previous batch's copies were ordered before a compute that has long finished; this only makes reuse of the staging area safe
-        CUDA_CHECK(cudaEventSynchronize(g_cuda_input_event));
-        g_cuda_input_in_flight = false;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaEventSynchronize(d.event));
+        d.in_flight = false;
     }
+    g_cuda_input_dev        = &d;
     g_cuda_input_stage_used = 0;
     g_cuda_input_n_pending  = 0;
     g_cuda_input_dirty      = false;
-    g_cuda_input_stream     = (cudaStream_t) compute_stream;
+    g_cuda_input_stream     = cuda_ctx->stream(cuda_ctx->device, 0); // the compute stream the graph runs on
     g_cuda_input_batch_open = true;
     return true;
 }
@@ -1183,8 +1196,8 @@ static void ggml_cuda_input_batch_flush(cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(c.dst, c.src, c.size, cudaMemcpyHostToDevice, stream));
     }
     g_cuda_input_n_pending = 0;
-    CUDA_CHECK(cudaEventRecord(g_cuda_input_event, stream)); // fires once the staged copies are done
-    g_cuda_input_in_flight = true;
+    CUDA_CHECK(cudaEventRecord(g_cuda_input_dev->event, stream)); // fires once the staged copies are done
+    g_cuda_input_dev->in_flight = true;
     g_cuda_input_dirty     = true;
 }
 
@@ -1292,8 +1305,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         if (size > 0 && size <= GGML_CUDA_INPUT_STAGE_MAX_COPY && g_cuda_input_n_pending < GGML_CUDA_INPUT_MAX_PENDING) {
             const size_t at = (g_cuda_input_stage_used + 255) & ~(size_t) 255;
             if (at + size <= GGML_CUDA_INPUT_STAGE_BYTES) {
-                memcpy(g_cuda_input_stage + at, data, size); // the caller may reuse its memory as soon as this returns
-                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_stage + at, size };
+                memcpy(g_cuda_input_dev->stage + at, data, size); // the caller may reuse its memory as soon as this returns
+                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_dev->stage + at, size };
                 g_cuda_input_stage_used = at + size;
                 g_cuda_input_n_staged++;
                 return;
