@@ -391,10 +391,40 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
         S.free_pre = 0;     // no pass ran: nothing to measure
         lm_release();
     }
-    return lm_acquire_n(pl.n, wmax);
+    return lm_acquire_n(pl.n, wmax, true);
 }
 
-bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
+// Opt-in (LLAMA_LM_FREE_MAIN_SCHED=1), tried only when the memory guard cannot make room for a pass: the context's own scheduler holds ~1 GiB of compute buffers (a reserve for -ub 512 and the
+// decode graphs) that a pass does not use, because it runs on a scheduler of its own. An empty scheduler takes its place for the duration of the pass; lm_release reserves the real one again
+// (about 1.3 s). Only inside decode(): nothing else runs on this context meanwhile.
+void llama_context::lm_main_sched_free() {
+    auto & S = *lm_state;
+    synchronize();
+    const int64_t f0 = lm_dev_free(S.p.device);
+    const size_t max_nodes = gf_res_reserve ? gf_res_reserve->get_max_nodes() : this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+    sched.reset();                       // frees the compute buffers (the persistent decode graphs point into them: dropped below)
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    sched_new(max_nodes, cparams.pipeline_parallel);   // empty: no buffer until something is allocated on it
+    S.main_freed = true;
+    LLAMA_LOG_WARN("lm-prefill: gave the context's compute buffers back for the pass: free %lld -> %lld MiB\n", (long long) (f0/1048576), (long long) (lm_dev_free(S.p.device)/1048576));
+}
+
+void llama_context::lm_main_sched_back() {
+    auto & S = *lm_state;
+    if (!S.main_freed) {
+        return;
+    }
+    S.main_freed = false;
+    const int64_t t0 = ggml_time_us();
+    sched_need_reserve = true;
+    sched_reserve();
+    LLAMA_LOG_WARN("lm-prefill: the context's compute buffers are reserved again (%.0f ms), free %lld MiB\n", (double) (ggml_time_us() - t0)/1e3, (long long) (lm_dev_free(S.p.device)/1048576));
+}
+
+bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax, bool in_decode) {
     auto & S = *lm_state;
     const auto & P = S.p;
 
@@ -455,8 +485,19 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax) {
 
     auto * const vram_hook = lm_follower ? nullptr : llama_lm_vram_hook;     // H94: the follower's GPU has no hybrid expert cache
     if (vram_hook != nullptr && !vram_hook(this, need, 1)) {
-        LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\n", __func__, (double) need/1048576.0);
-        return false;
+        static const bool free_main = getenv("LLAMA_LM_FREE_MAIN_SCHED") != nullptr;
+        bool made = false;
+        if (free_main && in_decode && !S.main_freed && !sched_need_reserve && sched) {
+            lm_main_sched_free();
+            made = vram_hook(this, need, 1);
+            if (!made) {
+                lm_main_sched_back();
+            }
+        }
+        if (!made) {
+            LLAMA_LOG_WARN("%s: lm-prefill: could not make %.0f MiB of device memory available; this batch takes the ordinary path\n", __func__, (double) need/1048576.0);
+            return false;
+        }
     }
     if (vram_hook == nullptr) {
         // no expert cache to shrink (dense models, MoE without the hybrid engine): the room has to exist already. A pass that runs out of device memory half way has changed the cache, and the
@@ -576,6 +617,7 @@ void llama_context::lm_release() {
         }
         reset_graph_reuse();
     }
+    lm_main_sched_back();     // before the expert cache takes the room back
     const int64_t t_r1 = ggml_time_us();
     if (S.vram_hooked && llama_lm_vram_hook != nullptr) {
         llama_lm_vram_hook(this, 0, 0);
