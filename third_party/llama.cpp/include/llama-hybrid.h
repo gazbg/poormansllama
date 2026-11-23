@@ -57,6 +57,7 @@ struct llama_lm_prefill_params {
     int32_t copy_piece_mib;  // paced bank copies: piece size in MiB, 0 = off (one copy per bank), -1 = the default (Flint 64, others off; env LLAMA_LM_COPY_PIECE_MIB)
     int32_t copy_window;     // paced bank copies: pieces in flight, -1 = the default (2; env LLAMA_LM_COPY_WINDOW)
     int32_t mm_batches;      // VOD-4 (DL-20): 1: the pass also takes the batches of an image prompt (embedding rows, text behind an image: M-RoPE cells outnumber positions); 0 (default): it declines them as before
+    int32_t free_main_sched; // 1 (default): when the memory guard cannot make room for a pass inside decode(), the context's own compute buffers (~1 GiB at -ub 512) are freed for the duration of the pass and reserved again after it (~0.15 s); 0: the batch takes the ordinary path
 };
 LLAMA_API struct llama_lm_prefill_params llama_lm_prefill_default_params(void);
 

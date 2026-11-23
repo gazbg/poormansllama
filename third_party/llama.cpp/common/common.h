@@ -687,6 +687,7 @@ struct common_params {
     int32_t     lm_prefill_copy_piece = -1;   // paced bank copies: piece size in MiB (0 = off, -1 = the default: Flint 64, others off)
     int32_t     lm_prefill_copy_window = -1;  // paced bank copies: pieces in flight (-1 = the default, 2)
     bool        lm_prefill_bf16    = false;   // bf16 activation slab
+    bool        lm_prefill_free_sched = true; // a pass the memory guard would decline gets the context's own compute buffers (~1 GiB) for its duration (reserved again after it)
     bool        fattn_head_tile = false; // LLAMA_FATTN_HEAD_TILE=1: the CUDA TILE / MMA flash attention converts a quantized K/V cache to f16 one KV head at a time (scratch / n_head_kv)
     bool        lm_prefill_attn_int8 = false; // the pass's flash attention computes Q.K^T with int8 dot products (LLAMA_FATTN_TILE_Q8QK=1: head size 256, q8_0 or q4_0 K cache, GPU without fast FP16)
     int32_t     lm_prefill_batch   = 16384;   // -b with --lm-prefill when -b is not given (one pass per batch: a bigger batch streams the banks fewer times)

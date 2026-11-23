@@ -394,7 +394,7 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
     return lm_acquire_n(pl.n, wmax, true);
 }
 
-// Opt-in (LLAMA_LM_FREE_MAIN_SCHED=1), tried only when the memory guard cannot make room for a pass: the context's own scheduler holds ~1 GiB of compute buffers (a reserve for -ub 512 and the
+// On by default (--no-lm-prefill-free-sched turns it off), tried only when the memory guard cannot make room for a pass: the context's own scheduler holds ~1 GiB of compute buffers (a reserve for -ub 512 and the
 // decode graphs) that a pass does not use, because it runs on a scheduler of its own. An empty scheduler takes its place for the duration of the pass; lm_release reserves the real one again
 // (about 1.3 s). Only inside decode(): nothing else runs on this context meanwhile.
 void llama_context::lm_main_sched_free() {
@@ -485,9 +485,8 @@ bool llama_context::lm_acquire_n(int64_t n_tokens, int32_t wmax, bool in_decode)
 
     auto * const vram_hook = lm_follower ? nullptr : llama_lm_vram_hook;     // H94: the follower's GPU has no hybrid expert cache
     if (vram_hook != nullptr && !vram_hook(this, need, 1)) {
-        static const bool free_main = getenv("LLAMA_LM_FREE_MAIN_SCHED") != nullptr;
         bool made = false;
-        if (free_main && in_decode && !S.main_freed && !sched_need_reserve && sched) {
+        if (P.free_main_sched != 0 && in_decode && !S.main_freed && !sched_need_reserve && sched) {
             lm_main_sched_free();
             made = vram_hook(this, need, 1);
             if (!made) {
@@ -2334,6 +2333,7 @@ struct llama_lm_prefill_params llama_lm_prefill_default_params(void) {
     p.copy_piece_mib = -1;
     p.copy_window    = -1;
     p.mm_batches     = 0;
+    p.free_main_sched = 1;
     return p;
 }
 

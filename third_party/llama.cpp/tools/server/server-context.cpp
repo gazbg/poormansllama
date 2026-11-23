@@ -2115,6 +2115,7 @@ private:
             lp.segment    = params_base.lm_prefill_segment;
             lp.min_tokens = params_base.lm_prefill_min;
             lp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lp.free_main_sched = params_base.lm_prefill_free_sched ? 1 : 0;
             if (g_inst_dev != nullptr && inst_dev_ordinal(g_inst_dev) >= 0) {
                 lp.device = inst_dev_ordinal(g_inst_dev);   // --gpu-instances: slot window, slab and copies on this instance's device
             }
@@ -2172,6 +2173,7 @@ private:
             lpp.segment    = params_base.lm_prefill_segment;
             lpp.min_tokens = params_base.lm_prefill_min;
             lpp.act_bf16   = params_base.lm_prefill_bf16 ? 1 : 0;
+            lpp.free_main_sched = params_base.lm_prefill_free_sched ? 1 : 0;
             lpp.device     = params_base.lm_prefill_peer_gpu;
             char perr[512] = { 0 };
             if (!llama_lm_prefill_enable(ctx_peer, &lpp, perr, sizeof(perr)) || !llama_lm_prefill_set_peer(ctx_tgt, ctx_peer, params_base.lm_prefill_peer_min)) {

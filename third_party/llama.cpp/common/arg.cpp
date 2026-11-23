@@ -1906,6 +1906,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LM_PREFILL_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lm-prefill-free-sched"},
+        {"--no-lm-prefill-free-sched"},
+        "with --lm-prefill: when the memory guard cannot make room for a pass (deep context: the KV cache has taken the VRAM), free the context's own compute buffers (~1 GiB at -ub 512) for the duration of the pass and "
+        "reserve them again after it (~0.15 s per batch) instead of sending the batch down the slow ordinary path (default: on). Measured, 2 x 262k prompts: prefill 99 / 92 -> 211 / 190 tok/s",
+        [](common_params & params, bool value) {
+            params.lm_prefill_free_sched = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lm-prefill-copy-piece"}, "MiB",
         "with --lm-prefill: copy each expert bank to the VRAM window in pieces of this many MiB with at most --lm-prefill-copy-window in flight, so a small copy of the compute stream is not queued behind a whole bank "
         "(default: Flint 64, other models 0 = one copy per bank; 0 turns it off). Measured on Flint, crowded, 8.6k tokens: 8 / 16 / 32 / 64 / 128 / 256 MiB = 3,698 / 3,712 / 3,736 / 3,755 / 3,710 / 2,827 tok/s",
