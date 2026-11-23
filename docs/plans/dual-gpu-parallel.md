@@ -72,6 +72,17 @@ All rows: Qwen3.6-35B-A3B-UD-Q5_K_XL + vision on demand, q8 KV, the owner's R7 f
 
 Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 inside one process with the same speed, one shared copy of the weights in RAM, vision and clean shutdown working. C1 / C1b are faster for ONE request but keep one 262k window. Only C1 (decode 37 against 33, +12%) and C1b (prefill at 16k 1,360 against 850-865, +60%) make a single request faster than one card; they keep one 262k window.
 
+## Two requests at once, and one 10 s earlier (`build/pascal/stagger.py`, binary `final-bin6`, 600-700-token chats of counting / prime text; the rate depends on the text, prose gave 23-25 each in `g3-inst2-np2`)
+
+| | two instances, -np 1 each | one card, -np 2 |
+|---|---|---|
+| both chats together, each / summed (tok/s) | 29.3 + 27.9 = 57.2 | 24.9 + 24.9 = 49.7 |
+| A first, B 10 s later: A alone / both / B alone after A | 31.5 / 29.5 + 27.9 = 57.5 / 38.0 | 33.7 / 24.2 + 24.2 = 48.5 / 37.5 |
+| chat decoding, a cold 10.9k-token prompt arrives 10 s later: chat before / during / after | 33.3 / 36.0 / (ended) | 37.2 / **0.2 (stalled 13 s)** / 34.3 |
+| that prompt (tok/s) | 805 | 826 |
+
+A head start of 10 s changes nothing but who is alone for a while: the rates when both decode equal those of a simultaneous start. The decode gain of the second card is 15-25% summed, not 2x (two cards share the host CPU and RAM bandwidth for the expert layers); the gain is that a big prompt on one card no longer stalls the chat on the other. Dispatcher (from the code, NOT measured): a request goes to the instance that holds a prompt prefix of >= 256 characters, unless that instance is full (in_flight >= -np), then to the least loaded one. At -np 1 per instance a shared prefix therefore never queues (the free card wins, the prefix is prefilled again); at -np 2 per instance two requests that share a system prompt both go to the same card while the other idles.
+
 ## Why the fast pass stops near 162k tokens (memory of one 8 GiB card, measured)
 
 CUDA reports 8,107 MiB per card. Measured from the load log (`bufcheck.log`, `-lv 4`) and the memory-guard lines of `g3-inst2-fill262`:
