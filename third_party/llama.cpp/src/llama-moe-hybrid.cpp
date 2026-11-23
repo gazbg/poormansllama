@@ -3262,6 +3262,7 @@ static std::map<ggml_backend_t, std::unique_ptr<moe_hybrid_engine>> g_moe_hybrid
 // One engine per CUDA backend, so one per inference instance (--gpu-instances: one thread, one context and one device each). The thread that built an engine's graphs
 // (moe_hybrid_get) is the one that serves it in the _impl calls below; a thread that never built one falls back to the only engine of the process.
 static thread_local ggml_backend_t g_moe_hybrid_tl_cuda = nullptr;
+static thread_local bool           g_moe_hybrid_instance_thread = false;
 
 static moe_hybrid_engine * moe_hybrid_pick() {
     std::lock_guard<std::mutex> lk(g_moe_hybrid_mtx);
@@ -3292,9 +3293,8 @@ static moe_hybrid_engine * moe_hybrid_get(const llm_graph_context & g, const lla
     g_moe_hybrid_tl_cuda = cuda;
     auto it = g_moe_hybrid_engines.find(cuda);
     if (it != g_moe_hybrid_engines.end()) {
-        // the env value LLAMA_MOE_HYBRID is the slot count of whichever engine resized last: it only identifies THIS engine's count when there is a single engine
-        // (--gpu-instances runs one engine per device, each resizing its own cache)
-        if (it->second->model != &model || (g_moe_hybrid_engines.size() == 1 && it->second->n_slot != n_slot)) {
+        // the env value LLAMA_MOE_HYBRID is the slot count the (single) engine was last resized to; an instance thread (--gpu-instances) keeps its count in its own engine
+        if (it->second->model != &model || (!g_moe_hybrid_instance_thread && it->second->n_slot != n_slot)) {
             GGML_ABORT("moe_hybrid: engine of this backend was created for another model or slot count");
         }
         return it->second.get();
@@ -3325,6 +3325,10 @@ public:
 };
 
 } // namespace
+
+void llama_moe_hybrid_set_instance_thread(bool on) {
+    g_moe_hybrid_instance_thread = on;
+}
 
 bool llama_moe_hybrid_layer_map_impl(std::vector<int> & eng_of_abs_out) {
     moe_hybrid_engine * eng = moe_hybrid_pick();
@@ -3471,6 +3475,9 @@ bool llama_moe_hybrid_resize_impl(int n_slot) {
     }
     if (!eng->resize(n_slot, g_moe_hybrid_async_fill)) {
         return false;
+    }
+    if (g_moe_hybrid_instance_thread) {
+        return true;   // the engine of this thread holds its own count; another instance must not see it as the creation default
     }
     char v[16];
     snprintf(v, sizeof(v), "%d", n_slot);

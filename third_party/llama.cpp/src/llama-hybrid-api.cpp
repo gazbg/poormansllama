@@ -550,6 +550,7 @@ void ggml_backend_cuda_lazy_set_thread_device(int device);   // ggml-cuda.cu
 void llama_hybrid_bind_thread(int32_t cuda_ordinal) {
 #ifdef LLAMA_LAYER_STREAMING
     ggml_backend_cuda_lazy_set_thread_device((int) cuda_ordinal);
+    llama_moe_hybrid_set_instance_thread(true);
 #else
     GGML_UNUSED(cuda_ordinal);
 #endif

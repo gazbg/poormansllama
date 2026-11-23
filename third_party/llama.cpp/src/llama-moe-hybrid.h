@@ -37,6 +37,8 @@ bool llama_moe_hybrid_resize_impl(int n_slot);
 
 // H104: while on, a growing resize queues its host uploads and returns; the new slots are published when their copy has completed (LLAMA_MOE_HYBRID_REGROW_ASYNC must also be set)
 void llama_moe_hybrid_set_async_fill(bool on);
+// --gpu-instances: this thread serves one instance, so its engine count is its own: the process-wide env value LLAMA_MOE_HYBRID (the slot count at engine creation) is neither written nor compared
+void llama_moe_hybrid_set_instance_thread(bool on);
 
 // bytes the slot cache of the one engine in this process holds now and its slot count (the zero slot makes the size (n_slot + 1) x one slot row). False when there is no engine.
 bool llama_moe_hybrid_cache_info_impl(int64_t * cache_bytes, int * n_slot);
