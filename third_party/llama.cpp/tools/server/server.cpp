@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-hybrid.h"
 #include "log.h"
 
 #include <atomic>
@@ -1016,6 +1017,7 @@ static int server_run_gpu_instances(common_params & params, server_role & role, 
     bool                    destroy_gate = false;
     bool                    abort_load = false;
 
+    llama_model_share_mmaps(true);   // one mapping (one copy in RAM, one page-lock registration) of the model file for all instances
     for (int k = 0; k < n_inst; ++k) {
         insts[k]->th = std::thread([&, k]() {
             gpu_instance & in = *insts[k];

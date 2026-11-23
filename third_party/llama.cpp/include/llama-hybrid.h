@@ -118,6 +118,8 @@ LLAMA_API void llama_hybrid_shutdown(void);
 // --gpu-instances: call first on the thread that loads one instance's model and runs its decode loop. The hybrid / layer-major state of this API and the lazily committed KV buffers are
 // per such thread; `cuda_ordinal` is the device that instance lives on (the lazy KV commits of this thread only see that device's buffers).
 LLAMA_API void llama_hybrid_bind_thread(int32_t cuda_ordinal);
+// --gpu-instances: while on, every model load of this process maps a given model file ONCE and shares that mapping (one copy of the host weights, one page-lock registration). Call before the first load
+LLAMA_API void llama_model_share_mmaps(bool on);
 // CUDA flash attention (TILE / MMA kernels) with a quantized K/V cache: convert K and V to f16 one KV head at a time instead of the whole layer (scratch / n_head_kv). Before the first context is created
 LLAMA_API void llama_fattn_head_tile(bool on);
 

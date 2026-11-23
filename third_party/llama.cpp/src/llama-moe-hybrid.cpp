@@ -3292,7 +3292,9 @@ static moe_hybrid_engine * moe_hybrid_get(const llm_graph_context & g, const lla
     g_moe_hybrid_tl_cuda = cuda;
     auto it = g_moe_hybrid_engines.find(cuda);
     if (it != g_moe_hybrid_engines.end()) {
-        if (it->second->model != &model || it->second->n_slot != n_slot) {
+        // the env value LLAMA_MOE_HYBRID is the slot count of whichever engine resized last: it only identifies THIS engine's count when there is a single engine
+        // (--gpu-instances runs one engine per device, each resizing its own cache)
+        if (it->second->model != &model || (g_moe_hybrid_engines.size() == 1 && it->second->n_slot != n_slot)) {
             GGML_ABORT("moe_hybrid: engine of this backend was created for another model or slot count");
         }
         return it->second.get();

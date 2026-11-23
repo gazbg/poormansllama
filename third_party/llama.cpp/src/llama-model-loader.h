@@ -120,6 +120,7 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+    bool        shared_maps = false;   // the mappings are shared with other loads of this process (--gpu-instances): never unmap a fragment of them
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
