@@ -71,6 +71,12 @@ All rows: Qwen3.6-35B-A3B-UD-Q5_K_XL + vision on demand, q8 KV, the owner's R7 f
 
 Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 inside one process with the same speed, one shared copy of the weights in RAM, vision and clean shutdown working. C1 / C1b are faster for ONE request but keep one 262k window. Only C1 (decode 37 against 33, +12%) and C1b (prefill at 16k 1,360 against 850-865, +60%) make a single request faster than one card; they keep one 262k window.
 
+## Why the fast pass stops near 162k tokens (memory of one 8 GiB card, measured)
+
+CUDA reports 8,107 MiB per card. Measured from the load log (`bufcheck.log`, `-lv 4`) and the memory-guard lines of `g3-inst2-fill262`:
+non-expert weights 2,038.8 MiB; scheduler compute buffer 1,010 MiB; recurrent state 62.8 MiB; expert cache floor (2 slots x 40 layers x 2.2 MiB) ~176 MiB; CUDA context and pools ~413 MiB (by subtraction); KV 10.625 KiB per token (2,720 MiB for 262,144 cells), committed as the prompt advances; the layer-major pass asks for 2,546 MiB (two 624 MiB bank slots = 1,248 MiB, the rest slab and the pass's own buffers, split not measured) plus a 176 MiB margin.
+Free VRAM at the guard, with the cache at its floor: 2,710 MiB at 163,840 tokens, 2,392 at 196,608, 2,032 at 229,376, 1,714 at 262k (slope 10.6 KiB per token = the KV). The pass fits while free >= 2,722 MiB, i.e. up to ~162k tokens; at 262k it is ~1.0 GiB short. The run itself fits (peak 7.74 GiB, no error): the later batches take the ordinary path. Untested ways to get the missing ~1 GiB back: release the main scheduler's 1,010 MiB compute buffer while a pass runs; a one-slot pass (about -500 MiB).
+
 ## Owner summary (agent's own autonomous acceptance, not owner approval)
 
 **1. Goal.** One `llama-server` process on both GTX 1070 (8 GiB) cards: more parallel requests (`-np 2`, `-np 4`) and at least 2x today's 262k context (two requests of 262k, or a pool of 524k cells), keeping today's speed where possible, vision on demand, no preset speed bar.
