@@ -83,6 +83,17 @@ Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 
 
 A head start of 10 s changes nothing but who is alone for a while: the rates when both decode equal those of a simultaneous start. The decode gain of the second card is 15-25% summed, not 2x (two cards share the host CPU and RAM bandwidth for the expert layers); the gain is that a big prompt on one card no longer stalls the chat on the other. Dispatcher (from the code, NOT measured): a request goes to the instance that holds a prompt prefix of >= 256 characters, unless that instance is full (in_flight >= -np), then to the least loaded one. At -np 1 per instance a shared prefix therefore never queues (the free card wins, the prefix is prefilled again); at -np 2 per instance two requests that share a system prompt both go to the same card while the other idles.
 
+Host CPU during decode (i7-4770K, 4 cores / 8 threads; same chats; expert threads = `LLAMA_MOE_HYBRID_THREADS`, default physical cores - 1 = 3 per instance; Linux does not pin them; run `cpu-*` of `stagger.py`):
+
+| config | one chat alone (tok/s, CPU mean) | two chats together (tok/s each, summed, CPU mean) |
+|---|---|---|
+| two instances, 3 threads each (default) | 35.4, 50% | 30.5 + 30.3 = 60.7, **93%** (all 8 CPUs 91-95%) |
+| two instances, 2 threads each | 34.5, 38% | 29.8 + 29.8 = 59.6, 73% |
+| two instances, 1 thread each | 30.5, 26% | 31.9 + 29.4 = 61.3, 49% |
+| one card, -np 2 | 36.9, 49% | 26.0 + 26.0 = 52.1, 50% |
+
+The summed speed of two requests does not depend on the team size (60.7 / 59.6 / 61.3), so the core count is not what limits it; the default team spins (93% busy for the same speed as 49%). One request alone needs 2 threads (1 thread: 30.5). The limit is then probably the host RAM bandwidth the missed experts are read at (expected, not measured). `--hybrid-moe-threads 2` per instance gives the same speed with 20 points less CPU.
+
 ## Why the fast pass stops near 162k tokens (memory of one 8 GiB card, measured)
 
 CUDA reports 8,107 MiB per card. Measured from the load log (`bufcheck.log`, `-lv 4`) and the memory-guard lines of `g3-inst2-fill262`:
