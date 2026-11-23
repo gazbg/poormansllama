@@ -50,7 +50,7 @@ Branch `dual-gpu-parallel` has agents A and B merged (C4 fixes 13ab053, 3b6cbd5)
 - D3 GPU runs are serialised with `flock /tmp/gpu-2x1070.lock` (Linux; the Windows mutex wrapper does not apply here); builds in
   worktrees run in parallel.
 - D4 One process on two cards is done as one instance per card (`--gpu-instances N`), not one body with KV on both cards: C2 showed all KV lives on GPU 0 and the hybrid engine allows one CUDA backend per scheduler. Reversible (opt-in flag; default path measured unchanged, A4).
-- D5 (owner, 2026-11-21: "use the same weights in system ram for all requests and gpus, not mapped 2x") All instances of the process share ONE mapping of the model file (`llama_model_share_mmaps`, on only with `--gpu-instances`). Evidence: pinning the same file through a second mapping costs a second copy (2 x 6 GiB registered left 12 GiB less memory; the 23 GB of expert banks cannot be pinned twice in 30 GB, instance 1 died with "out of memory" at its first registration). A shared mapping is never partly unmapped, and uploads from it go through ordinary memory (a copy whose source starts or ends inside a page-lock registration fails with "invalid argument"). Cost: ~0.6 s more load time. Reversible.
+- D5 (owner, 2026-11-21: "use the same weights in system ram for all requests and gpus, not mapped 2x") All instances of the process share ONE mapping of the model file (`llama_model_share_mmaps`, on only with `--gpu-instances`). Evidence: pinning the same file through a second mapping costs a second copy (2 x 6 GiB registered left 12 GiB less memory; the 23 GB of expert banks cannot be pinned twice in 30 GB, instance 1 died with "out of memory" at its first registration). A shared mapping is never partly unmapped, and uploads from it go through ordinary memory (a copy whose source starts or ends inside a page-lock registration fails with "invalid argument"). Reversible.
 - D6 `LLAMA_MOE_HYBRID` (the slot count an engine is created with) is a process-wide env value that every cache resize wrote back; with two instances it made instance 1 start with instance 0's full cache (no room for its layer-major slot buffers at -np 2) and made a decode graph rebuild abort ("engine ... another slot count"). An instance thread neither writes nor compares it. Reversible.
 - D7 The frozen-cache greedy equality check (`--check-solo`) cannot decide here: solo vs solo again already differs (2-26 of 96 tokens in common), because two instances start with different cache contents. Recorded as UNPROVEN, not as a pass; A5 (needle + no errors) is the contract's correctness check and it passes.
 - D8 Capacity fill is 2 x 200k (binary `final-bin2`) and 2 x 260k (final binary); a prompt must leave room for its answer inside 262,144, so 260,000 + 96 is the largest round fill. The agent's own acceptance below covers exactly what is listed there.
@@ -62,14 +62,14 @@ All rows: Qwen3.6-35B-A3B-UD-Q5_K_XL + vision on demand, q8 KV, the owner's R7 f
 | rank by goal fit | id | one process | solo decode / prefill 16k | 2 at once (decode summed) | 4 at once (decode summed) | 2 x cold 8k prefill (summed) | context in flight | GPU peak (MiB) |
 |---|---|---|---|---|---|---|---|---|
 | 1 | C4 instances, shared mapping | yes | 31-33 / 826-863 | 47-48 | 49-52 (np 2 per instance) | 1,588-1,689 | 2 x 262k windows; 2 x 200k prompts verified (needles right) | 7.8 / 7.8 GiB |
-| 2 | C3 two processes (bound, not a deliverable) | no | 33-34 / ~850 | 47-52 | not run | 1,675 | 2 x 262k | 5.6 / 6.6 GiB |
-| 3 | C1b tier + split prefill | yes | 37 / 1,360 | not run | not run | 1,273 | 262k (one KV on GPU 0) | 7.8 / 7.5 GiB |
-| 4 | C1 expert tier on GPU 1 | yes | 37 / ~850 | 50-55 | 58-60 | 198 (155 at four) before C5 | 262k | see `c1-tier-np4` |
-| 5 | C5 big-prompt isolation fix on C0 | yes | 33 / 865 | 37-41 | 38 | 908 (891 at four) | 262k | 7.8 / 0 GiB |
+| 2 | C3 two processes (bound, not a deliverable) | no | 33-34 / not run | 47-52 | not run | 1,675 | 2 x 262k | 5.6 / 6.6 GiB |
+| 3 | C1b tier + split prefill | yes | not run / 1,360 | not run | not run | 1,273 | 262k (one KV on GPU 0) | 7.8 / 7.5 GiB |
+| 4 | C1 expert tier on GPU 1 | yes | 37 / not run | 50-55 | 58-60 | 198 (155 at four) before C5 | 262k | see `c1-tier-np4` |
+| 5 | C5 big-prompt isolation fix on C0 | yes | as C0 (not rerun) | 37-41 | 38 | 908 (891 at four) | 262k | 7.8 / 0 GiB |
 | 6 | C0 control, one card | yes | 33 / 865 | 37-41 | 38 | 198 (169 at four) | 262k | 7.8 / 0 GiB |
 | - | C2 pool of 524k cells in one body | yes | - | - | - | - | CLOSED: KV commit fails near 155k rows (all KV on GPU 0) | 8.0 / - |
 
-Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 inside one process with the same speed, one shared copy of the weights in RAM, vision and clean shutdown working. C1 / C1b are faster for ONE request but keep one 262k window. Nothing here makes a single request faster than one card except C1 / C1b (decode +12%, prefill +60% at 16k).
+Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 inside one process with the same speed, one shared copy of the weights in RAM, vision and clean shutdown working. C1 / C1b are faster for ONE request but keep one 262k window. Only C1 (decode 37 against 33, +12%) and C1b (prefill at 16k 1,360 against 850-865, +60%) make a single request faster than one card; they keep one 262k window.
 
 ## Owner summary (agent's own autonomous acceptance, not owner approval)
 
