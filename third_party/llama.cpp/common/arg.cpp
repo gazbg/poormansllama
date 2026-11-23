@@ -1909,7 +1909,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--lm-prefill-free-sched"},
         {"--no-lm-prefill-free-sched"},
         "with --lm-prefill: when the memory guard cannot make room for a pass (deep context: the KV cache has taken the VRAM), free the context's own compute buffers (~1 GiB at -ub 512) for the duration of the pass and "
-        "reserve them again after it (~0.15 s per batch) instead of sending the batch down the slow ordinary path (default: on). Measured, 2 x 262k prompts: prefill 99 / 92 -> 211 / 190 tok/s",
+        "reserve them again after it (~0.15 s per batch) instead of sending the batch down the slow ordinary path (default: off; the setup's 8 GiB profile turns it on). Measured, 2 x 262k prompts: prefill 99 / 92 -> 211 / 190 tok/s",
         [](common_params & params, bool value) {
             params.lm_prefill_free_sched = value;
         }

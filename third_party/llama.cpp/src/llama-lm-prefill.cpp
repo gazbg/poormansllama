@@ -394,7 +394,7 @@ bool llama_context::lm_acquire(const llama_lm_plan & pl) {
     return lm_acquire_n(pl.n, wmax, true);
 }
 
-// On by default (--no-lm-prefill-free-sched turns it off), tried only when the memory guard cannot make room for a pass: the context's own scheduler holds ~1 GiB of compute buffers (a reserve for -ub 512 and the
+// Opt-in (--lm-prefill-free-sched; the setup's 8g profile passes it), tried only when the memory guard cannot make room for a pass: the context's own scheduler holds ~1 GiB of compute buffers (a reserve for -ub 512 and the
 // decode graphs) that a pass does not use, because it runs on a scheduler of its own. An empty scheduler takes its place for the duration of the pass; lm_release reserves the real one again
 // (about 1.3 s). Only inside decode(): nothing else runs on this context meanwhile.
 void llama_context::lm_main_sched_free() {
@@ -2333,7 +2333,7 @@ struct llama_lm_prefill_params llama_lm_prefill_default_params(void) {
     p.copy_piece_mib = -1;
     p.copy_window    = -1;
     p.mm_batches     = 0;
-    p.free_main_sched = 1;
+    p.free_main_sched = 0;
     return p;
 }
 
