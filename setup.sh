@@ -299,11 +299,11 @@ recipe_exact() {
     fi
     if [ "$m" = qwen36 ] && [ "$v" = 8g ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then
         R_ID=R7; R_BIND=0.0.0.0
-        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384'
+        R_FLAGS='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384 --lm-prefill-free-sched'
         R_DEVICE=auto
         R_MEASURED='PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows)'
         R_ENV='LLAMA_MOE_HYBRID_LEAN_STALL_US=10000 LLAMA_FATTN_GQA8_MAXROWS=4 LLAMA_FATTN_GQA8=1 LLAMA_CUDA_INPUT_BATCH=1 LLAMA_FATTN_TILE_Q8QK=1'
-        R_NOTE='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command'
+        R_NOTE='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command. --lm-prefill-free-sched was added to the owner command (D29): on an 8 GiB card the KV cache of a 160k+ token prompt leaves the layer-major pass too little room, and this lets it take back the 1 GiB compute buffer meanwhile (measured with two GTX 1070 instances, 2 x 262k prompts: prefill 2x; the single-card 262k run is not measured)'
         return 0
     fi
     if [ "$m" = qwen36 ] && [ "$v" = 16g ] && [ "$c" = 262k ] && [ "$q" = q4k_m ]; then

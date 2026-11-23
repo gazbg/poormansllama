@@ -317,10 +317,10 @@ $script:RECIPES = @(
         Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4'; 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1'; 'LLAMA_FATTN_TILE_Q8QK' = '1' }
         Note='needs the MTP build of this quant (unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Measured on Windows with one MoE model only; Linux and other models are not measured with these flags' },
     [pscustomobject]@{ Id='R7'; Model='qwen36'; Vram='8g'; Ctx='262k'; Quant='q4k_m'
-        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384'
+        Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe -fitt 16 --lm-prefill --lm-prefill-ckpt-chunk 24 -b 32768 -ub 512 --lm-prefill-ubatch 2048 --hybrid-moe-prefill-ubatch 0 --lm-prefill-slots 2 -lv 4 --hybrid-moe-prefill-free-all --lm-prefill-segment 16384 --lm-prefill-free-sched'
         Device='auto'; Bind='0.0.0.0'; Measured='PP 590 t/s, TG 33 t/s @20k (owner, GTX 1070 8 GiB, Windows)'
         Env=@{ 'LLAMA_MOE_HYBRID_LEAN_STALL_US' = '10000'; 'LLAMA_FATTN_GQA8_MAXROWS' = '4'; 'LLAMA_FATTN_GQA8' = '1'; 'LLAMA_CUDA_INPUT_BATCH' = '1'; 'LLAMA_FATTN_TILE_Q8QK' = '1' }
-        Note='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command' },
+        Note='measured at 20k context on an 8 GiB card, Windows, one MoE model only; the row is 262k context as the owner ran the command. --lm-prefill-free-sched was added to the owner command (D29): on an 8 GiB card the KV cache of a 160k+ token prompt leaves the layer-major pass too little room, and this lets it take back the 1 GiB compute buffer meanwhile (measured with two GTX 1070 instances, 2 x 262k prompts: prefill 2x; the single-card 262k run is not measured)' },
     [pscustomobject]@{ Id='R8'; Model='qwen36'; Vram='16g'; Ctx='262k'; Quant='q4k_m'
         Flags='-c 262144 -ctk q8_0 -ctv q8_0 -fa on -np 1 --hybrid-moe --lm-prefill --lm-prefill-canonical --lm-prefill-fuse --lm-prefill-prearm auto --lm-prefill-ubatch 2048 --lm-prefill-segment 32768 -b 32768 --hybrid-moe-prefill-ubatch 0 -fitt 16000 --ctx-checkpoints 32'
         Bind='127.0.0.1'; Measured='G42 canonical: TG 3.0-3.7x stock, PP 3.65-4.11x stock (docs/guide/USAGE.md, build s53)'
