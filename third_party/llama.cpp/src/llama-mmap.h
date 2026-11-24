@@ -14,7 +14,7 @@ struct llama_mmap;
 struct llama_mlock;
 
 using llama_files  = std::vector<std::unique_ptr<llama_file>>;
-using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
+using llama_mmaps  = std::vector<std::shared_ptr<llama_mmap>>;   // shared: --gpu-instances maps each model file once per process
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 struct llama_file {

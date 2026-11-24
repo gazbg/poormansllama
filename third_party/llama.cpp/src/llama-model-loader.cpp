@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 
+#include "llama-hybrid.h"
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -12,12 +14,29 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <map>
+#include <mutex>
 #include <regex>
 #include <unordered_set>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// --gpu-instances: the instances of one process share ONE mapping of each model file: one set of host pages and one page-lock registration of the expert banks. A second mapping of the same
+// file costs a second copy of every page-locked page (measured: 2 x 6 GiB registered through two mappings leave 12 GiB less available memory; the 23 GB of expert banks do not fit twice).
+// A shared mapping is never partly unmapped (the next instance still reads the tensors the first one copied to its device).
+static std::mutex g_mmap_share_mu;
+static bool       g_mmap_share = false;
+static std::map<std::pair<uint64_t, uint64_t>, std::weak_ptr<llama_mmap>> g_mmap_shared;
+
+void llama_model_share_mmaps(bool on) {
+    std::lock_guard<std::mutex> lk(g_mmap_share_mu);
+    g_mmap_share = on;
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1441,8 +1460,25 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            std::shared_ptr<llama_mmap> mapping;
+#ifndef _WIN32
+            {
+                std::lock_guard<std::mutex> lk(g_mmap_share_mu);
+                struct stat sb;
+                if (g_mmap_share && use_mmap && !lazy.any() && fstat(file->file_id(), &sb) == 0) {
+                    const std::pair<uint64_t, uint64_t> key((uint64_t) sb.st_dev, (uint64_t) sb.st_ino);
+                    mapping = g_mmap_shared[key].lock();
+                    if (!mapping) {
+                        mapping = std::make_shared<llama_mmap>(file.get(), prefetch_size, is_numa, lazy.for_file(idx));
+                        g_mmap_shared[key] = mapping;
+                    }
+                    shared_maps = true;
+                }
+            }
+#endif
+            if (!mapping) {
+                mapping = std::make_shared<llama_mmap>(file.get(), prefetch_size, is_numa, lazy.for_file(idx));
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1536,7 +1572,7 @@ std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_r
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
-    if (!use_mmap) { return; }
+    if (!use_mmap || shared_maps) { return; }
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
 }
 
@@ -1745,6 +1781,17 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (shared_maps && !ggml_backend_buffer_is_host(cur->buffer)) {
+                // the shared mapping is partly page-locked (an earlier instance registered the expert banks at page granularity): a source range that starts or ends inside a registration
+                // makes cudaMemcpyAsync fail with "invalid argument", so the copy goes through ordinary memory in pieces
+                static thread_local std::vector<uint8_t> stage;
+                const size_t piece = 32 * MiB;
+                stage.resize(std::min(piece, n_size));
+                for (size_t off = 0; off < n_size; off += piece) {
+                    const size_t n = std::min(piece, n_size - off);
+                    memcpy(stage.data(), data + off, n);
+                    ggml_backend_tensor_set(cur, stage.data(), off, n);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1869,7 +1916,7 @@ bool llama_model_loader::load_all_data(
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
-        if (use_mmap) {
+        if (use_mmap && !shared_maps) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);

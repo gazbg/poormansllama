@@ -371,8 +371,10 @@ public:
     void lm_note(const llama_batch & b, const llama_lm_plan & pl) const;   // LLAMA_LM_LOG=1: why a big enough batch was not taken
     bool lm_acquire(const llama_lm_plan & pl);   // false: nothing is held, the batch takes the ordinary path
     void lm_release();
+    void lm_main_sched_free();   // --lm-prefill-free-sched: free the context's own compute buffers for the pass
+    void lm_main_sched_back();   // ... and reserve them again
     int  lm_run(const llama_lm_plan & pl, uint32_t n_outputs_all);   // 0 done, 1 nothing changed (ordinary path), < 0 failed
-    bool lm_acquire_n(int64_t n_tokens, int32_t wmax);               // G42: the resources for a batch of n_tokens whose widest chunk is wmax
+    bool lm_acquire_n(int64_t n_tokens, int32_t wmax, bool in_decode = false);               // G42: the resources for a batch of n_tokens whose widest chunk is wmax
     bool lm_stage_first();                                           // G42: copy the banks of the first streamed layers into the slot window
     bool lm_decode_begin(const llama_batch & b, llama_lm_plan & plan);   // G42: what decode() does about the pass: plan, acquire (true: the resources are held for this decode), or give an armed pass back
     void lm_release_if_live();                                       // G42: the destructor's release of an armed pass

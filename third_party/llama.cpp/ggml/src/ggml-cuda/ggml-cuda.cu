@@ -912,7 +912,9 @@ struct ggml_cuda_lazy_buffer {
 };
 
 static std::vector<ggml_cuda_lazy_buffer *> g_cuda_lazy_buffers;
-static bool                                 g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
+static std::mutex                           g_cuda_lazy_mtx;       // several instances (one per device, one thread each) register and commit buffers
+static thread_local int                     g_cuda_lazy_thread_dev = -1; // >= 0: this thread's commit/cost only see the buffers of that device
+static thread_local bool                    g_cuda_lazy_next = false; // consumed by the next device buffer allocation (set around the KV cache allocation only)
 
 struct ggml_backend_cuda_buffer_context {
     int device;
@@ -927,7 +929,10 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
         if (lazy != nullptr) {
-            g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
+            {
+                std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
+                g_cuda_lazy_buffers.erase(std::remove(g_cuda_lazy_buffers.begin(), g_cuda_lazy_buffers.end(), lazy), g_cuda_lazy_buffers.end());
+            }
             delete lazy;
         } else {
             CUDA_CHECK(cudaFree(dev_ptr));
@@ -1005,12 +1010,17 @@ struct ggml_cuda_input_copy {
 // thread_local: a batch is opened and closed by the thread that sets the inputs of a graph; two threads on two GPUs (the second-GPU tier, the two-GPU prefill) must not share it
 static thread_local bool         g_cuda_input_batch_open = false;
 static thread_local bool         g_cuda_input_dirty      = false;   // copies issued on the compute stream whose completion the host has not waited for
-static thread_local bool         g_cuda_input_in_flight  = false;   // the previous batch's copies may still be reading the staging area
-static thread_local char *       g_cuda_input_stage      = nullptr;
+// per device: an event belongs to the CUDA context of the device it was created on (one thread can decode on two GPUs: the two-GPU prefill's follower warm-up)
+struct ggml_cuda_input_dev {
+    char *      stage     = nullptr;
+    cudaEvent_t event     = nullptr;
+    bool        failed    = false;
+    bool        in_flight = false;   // the previous batch's copies may still be reading the staging area
+};
+static thread_local ggml_cuda_input_dev g_cuda_input_devs[GGML_CUDA_MAX_DEVICES];
+static thread_local ggml_cuda_input_dev * g_cuda_input_dev = nullptr;   // the device of the open batch
 static thread_local size_t       g_cuda_input_stage_used = 0;
-static thread_local bool         g_cuda_input_failed     = false;
 static thread_local cudaStream_t g_cuda_input_stream     = nullptr;
-static thread_local cudaEvent_t  g_cuda_input_event      = nullptr;
 static thread_local ggml_cuda_input_copy g_cuda_input_pending[GGML_CUDA_INPUT_MAX_PENDING];
 static thread_local size_t       g_cuda_input_n_pending  = 0;       // recorded, not yet issued
 static thread_local size_t       g_cuda_input_n_staged   = 0;       // diagnostics (LLAMA_CUDA_INPUT_BATCH=2 prints them when a batch closes)
@@ -1048,6 +1058,11 @@ static int ggml_cuda_dbg_free_at() {
 }
 
 // the next device buffer allocation is reserved lazily (set by the KV cache constructor around its allocation, reset right after)
+// the calling thread serves one device (one inference instance per GPU): its commits and cost queries only see that device's lazy buffers (-1: all)
+extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_thread_device(int device) {
+    g_cuda_lazy_thread_dev = device;
+}
+
 extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_next_alloc(bool on) {
     g_cuda_lazy_next = on;
 }
@@ -1056,7 +1071,11 @@ extern "C" GGML_CUDA_EXPORT void ggml_backend_cuda_lazy_set_next_alloc(bool on) 
 // Returns the physical bytes committed in total, or -1 when the driver ran out of memory (the caller fails loudly).
 extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_rows(int64_t rows) {
     int64_t total = 0;
+    std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        if (g_cuda_lazy_thread_dev >= 0 && lz->device != g_cuda_lazy_thread_dev) {
+            continue;
+        }
         for (ggml_tensor * t : lz->tensors) {
             const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
             const size_t  off = (size_t) ((char *) t->data - (char *) lz->base);
@@ -1074,7 +1093,11 @@ extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_rows(int64_t r
 // G31: the physical bytes that committing the first `rows` rows of every lazily committed cache tensor would still map (an uncommitted or aliased granule counts once)
 extern "C" GGML_CUDA_EXPORT int64_t ggml_backend_cuda_lazy_commit_cost(int64_t rows) {
     int64_t total = 0;
+    std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
     for (ggml_cuda_lazy_buffer * lz : g_cuda_lazy_buffers) {
+        if (g_cuda_lazy_thread_dev >= 0 && lz->device != g_cuda_lazy_thread_dev) {
+            continue;
+        }
         std::vector<uint8_t> seen(lz->mapped.size(), 0);
         for (ggml_tensor * t : lz->tensors) {
             const int64_t r   = std::min<int64_t>(std::max<int64_t>(rows, 0), t->ne[1]);
@@ -1142,33 +1165,41 @@ extern "C" GGML_CUDA_EXPORT int ggml_backend_cuda_keepalive(int device, int on) 
     return 0;
 }
 
-extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_input_batch_begin(void * compute_stream) {
-    if (g_cuda_input_batch_open || compute_stream == nullptr) {
+extern "C" GGML_CUDA_EXPORT bool ggml_backend_cuda_input_batch_begin(ggml_backend_t backend) {
+    if (g_cuda_input_batch_open || backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return false; // no nesting
     }
-    if (!g_cuda_input_failed && (g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr)) {
-        if (g_cuda_input_stage == nullptr && cudaMallocHost((void **) &g_cuda_input_stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
-            (void) cudaGetLastError();
-            g_cuda_input_stage = nullptr;
-        }
-        if (g_cuda_input_event == nullptr && cudaEventCreateWithFlags(&g_cuda_input_event, cudaEventDisableTiming) != cudaSuccess) {
-            (void) cudaGetLastError();
-            g_cuda_input_event = nullptr;
-        }
-        g_cuda_input_failed = g_cuda_input_stage == nullptr || g_cuda_input_event == nullptr;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->device < 0 || cuda_ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
     }
-    if (g_cuda_input_failed) {
+    ggml_cuda_input_dev & d = g_cuda_input_devs[cuda_ctx->device];
+    if (!d.failed && (d.stage == nullptr || d.event == nullptr)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (d.stage == nullptr && cudaMallocHost((void **) &d.stage, GGML_CUDA_INPUT_STAGE_BYTES) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.stage = nullptr;
+        }
+        if (d.event == nullptr && cudaEventCreateWithFlags(&d.event, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.event = nullptr;
+        }
+        d.failed = d.stage == nullptr || d.event == nullptr;
+    }
+    if (d.failed) {
         return false; // the caller then runs the original per-tensor path
     }
-    if (g_cuda_input_in_flight) {
+    if (d.in_flight) {
         // the previous batch's copies were ordered before a compute that has long finished; this only makes reuse of the staging area safe
-        CUDA_CHECK(cudaEventSynchronize(g_cuda_input_event));
-        g_cuda_input_in_flight = false;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaEventSynchronize(d.event));
+        d.in_flight = false;
     }
+    g_cuda_input_dev        = &d;
     g_cuda_input_stage_used = 0;
     g_cuda_input_n_pending  = 0;
     g_cuda_input_dirty      = false;
-    g_cuda_input_stream     = (cudaStream_t) compute_stream;
+    g_cuda_input_stream     = cuda_ctx->stream(cuda_ctx->device, 0); // the compute stream the graph runs on
     g_cuda_input_batch_open = true;
     return true;
 }
@@ -1183,8 +1214,8 @@ static void ggml_cuda_input_batch_flush(cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(c.dst, c.src, c.size, cudaMemcpyHostToDevice, stream));
     }
     g_cuda_input_n_pending = 0;
-    CUDA_CHECK(cudaEventRecord(g_cuda_input_event, stream)); // fires once the staged copies are done
-    g_cuda_input_in_flight = true;
+    CUDA_CHECK(cudaEventRecord(g_cuda_input_dev->event, stream)); // fires once the staged copies are done
+    g_cuda_input_dev->in_flight = true;
     g_cuda_input_dirty     = true;
 }
 
@@ -1292,8 +1323,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         if (size > 0 && size <= GGML_CUDA_INPUT_STAGE_MAX_COPY && g_cuda_input_n_pending < GGML_CUDA_INPUT_MAX_PENDING) {
             const size_t at = (g_cuda_input_stage_used + 255) & ~(size_t) 255;
             if (at + size <= GGML_CUDA_INPUT_STAGE_BYTES) {
-                memcpy(g_cuda_input_stage + at, data, size); // the caller may reuse its memory as soon as this returns
-                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_stage + at, size };
+                memcpy(g_cuda_input_dev->stage + at, data, size); // the caller may reuse its memory as soon as this returns
+                g_cuda_input_pending[g_cuda_input_n_pending++] = { (char *) tensor->data + offset, g_cuda_input_dev->stage + at, size };
                 g_cuda_input_stage_used = at + size;
                 g_cuda_input_n_staged++;
                 return;
@@ -1538,7 +1569,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         }
         ggml_backend_cuda_buffer_context * lctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) lz->base);
         lctx->lazy = lz;
-        g_cuda_lazy_buffers.push_back(lz);
+        {
+            std::lock_guard<std::mutex> lk(g_cuda_lazy_mtx);
+            g_cuda_lazy_buffers.push_back(lz);
+        }
         GGML_LOG_INFO("%s: reserved %.2f MiB of address space for a lazily committed buffer on device %d (granule %.1f MiB)\n", __func__,
                       size / 1024.0 / 1024.0, buft_ctx->device, lz->gran / 1024.0 / 1024.0);
         return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, lctx, size);

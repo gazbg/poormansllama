@@ -103,6 +103,7 @@ struct llama_lm_state {
     bool                   slots_live    = false;
     bool                   vram_hooked   = false;
     bool                   sched_swapped = false;
+    bool                   main_freed    = false;   // --lm-prefill-free-sched: the context's own scheduler gave its compute buffers back for this pass (lm_release reserves it again)
     ggml_backend_buffer_ptr slab;                   // two halves of [n_embd, slab_tokens] activations
     size_t                 slab_half     = 0;
     int64_t                slab_tokens   = 0;

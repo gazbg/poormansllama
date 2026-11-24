@@ -16,7 +16,7 @@ extern "C" {
 #ifdef _WIN32
 __declspec(dllimport)
 #endif
-bool ggml_backend_cuda_input_batch_begin(void * compute_stream);
+bool ggml_backend_cuda_input_batch_begin(ggml_backend_t backend);
 #ifdef _WIN32
 __declspec(dllimport)
 #endif
@@ -1740,7 +1740,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (input_batch) {
         for (auto & b : backends) {
             if (ggml_backend_is_cuda(b.get())) {
-                batched = ggml_backend_cuda_input_batch_begin(ggml_backend_cuda_stream_handle(b.get(), 0)); // the compute stream the graph runs on
+                batched = ggml_backend_cuda_input_batch_begin(b.get()); // staged on the compute stream the graph runs on
                 break;
             }
         }
@@ -2399,7 +2399,7 @@ static ls_decode_prof_t g_ls_decode_prof;
 #ifdef LLAMA_LAYER_STREAMING
 // G31o: called at the start of every decode with the batch size; llama-hybrid-api.cpp registers it (the hybrid prefill window)
 void (*llama_hybrid_decode_hook)(llama_context * ctx, int32_t n_tokens) = nullptr;
-extern bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
+extern thread_local bool llama_lm_prefill_pending;   // G32 (llama-lm-prefill.cpp): the layer-major prefill takes this batch
 #endif
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {

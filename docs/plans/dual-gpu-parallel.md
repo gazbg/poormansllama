@@ -1,0 +1,121 @@
+# Two GTX 1070: parallel requests and 2x context (one llama-server process)
+
+Status: measured, ready for the owner's pick (autonomous mode, owner grant 2026-11-15 for this goal; the agent's own acceptance below, not owner approval). Kept short on the owner's instruction: ideas are
+measured first and documented only when they survive.
+
+## Goal (owner, 2026-11-15)
+
+Use both GTX 1070 (8 GiB each) from ONE `llama-server` process so that more requests can run in parallel and the server
+holds at least 2x the context of today (two requests of 262k each, and / or one pool of >= 524k cells divided among slots; no
+single request above the trained 262,144). The usual load is one request; `-np 2` and more must work. No preset speed bar: every
+candidate is measured against the controls and the OWNER picks the winner (a later hybrid "second card joins when free" mode is
+out of scope now). Model: Qwen3.6-35B-A3B-UD-Q5_K_XL + vision on demand, q8_0 KV. Machine: i7-4770K (4c/8t), 30 GB RAM.
+
+## Acceptance contract (written before the first run)
+
+Outcome: a table, per candidate, from `tools/pascal/par_bench.py` (same prompts, same binary family, GPU idle check before each arm):
+solo decode tok/s (2 chats x 192 tokens), solo cold prefill tok/s at 4,096 and 16,384 tokens, and for n = 2 and 4 simultaneous
+requests the per-request and summed decode tok/s, the prefill of n simultaneous cold 8,192-token prompts, peak memory per GPU;
+plus a capacity run (`--fill`) that holds >= 2 x 262k tokens (or as near as the candidate reaches) and answers from each.
+
+Criteria for calling the goal done (the agent's own acceptance, not owner approval):
+- A1 controls measured: one-card baseline (owner's R7 command) and the existing two-GPU stack, at np 1 / 2 / 4.
+- A2 every candidate in the list below is either measured with the same harness or closed with a measured reason.
+- A3 at least one configuration demonstrably serves 2 simultaneous requests whose contexts sum to >= 524k tokens, or the
+  measured limit and its cause are stated.
+- A4 default behaviour with the new flags off is unchanged (controls rerun on the final binary agree within session noise, ~5%).
+- A5 a capacity / correctness check per surviving candidate: each simultaneous request answers its own needle question
+  (programmatic check), no error lines in the server log.
+Claims allowed: speed ratios on this machine, model and harness only. No quality claim beyond the needle check.
+
+## Candidates
+
+| id | idea | state | result |
+|---|---|---|---|
+| C0 | control: one card, owner's R7 command | MEASURED (`build/pascal/par/c0-np1`, `c0-np4`) | solo decode 33.0-33.6 tok/s, prefill 736 / 865 tok/s at 4k / 16k; 2 chats at once 18-21 each (37-41 summed); 4 at once 9.6 each (38); 2 cold 8k prompts at once 198 tok/s summed (they fall off the layer-major pass), 4 at once 169; GPU 0 peak 7.8 GiB |
+| C1 | control: second-GPU expert tier (`--hybrid-moe-gpu1 auto`) | MEASURED (`c1-tier-np4`) | solo 37; 2 at once 25-28 each (50-55); 4 at once 14.4-15.0 each (58-60); simultaneous prefill unchanged (198 / 155) |
+| C1b | tier + two-GPU split prefill (`--lm-prefill-peer-gpu 1`) | FIXED, MEASURED (agent A, `p2-*`, `p4-peer-check`) | abort fixed (per-device input-batch event, 09edfb7). Needs `LLAMA_MOE_HYBRID_G1_RESERVE_MIB=5700` (4900 starves the follower pass: 4k prompt at 123 tok/s). Solo prefill 16k: 1,360 tok/s vs 850. GPU peak 7.8 / 7.5 GiB |
+| C2 | pool `-c 524288 --kv-unified-per-slot 262144 -np 2` on the tier stack (one body) | CLOSED by measurement (`c2-pool524`) | starts and serves chats, but two 60k prompts fail at the 3rd pass: `lazy_commit_rows: could not commit KV rows [0, 155648) (40.0 MiB more): out of device memory` (GPU 0 peak 7,993 MiB, pass footprint 1,320 MiB). Cause: ALL KV lives on GPU 0 (10.6 KiB/token, so 524k cells = 5.4 GiB) next to the non-expert weights, the pass window and buffers; GPU 1 holds only expert-tier rows. A pool of 2 x 262k needs KV on both cards (C4, or KV placed on CUDA1, which the hybrid engine forbids: one CUDA backend per scheduler). Side result: the two prompts ran strictly one after the other (729 then 425 tok/s) because of the batch-sharing bug agent A fixed |
+| C3 | BOUND: one full body per card, two processes (`tools/pascal/twoproc_bound.py`) | MEASURED (bound, not a deliverable) | solo 33-34 on either card; 2 chats at once 23-26 each (47-52); 2 cold 8k prompts at once 833 + 842 tok/s (1,675 summed); own 262k window per card (524k total); GPU 5.6 / 6.6 GiB; host RssAnon 0.5 GB per process (weights shared via mmap) |
+| C4 | **`--gpu-instances 2`: one inference instance per card inside ONE process, ONE shared mapping of the model file** (opt-in flag; default untouched) | MEASURED (`g3-inst2-np2`, `g-inst2-np1`, `g-inst2-fill`, `g3-inst2-fill260`, `g-inst2-frozen`, `g3-c0-np1`) | one process, 2 x 262,144-token windows (524k cells), every `-np` per instance. np 1 per instance: solo decode 32-33, prefill 723 / 863 tok/s (4k / 16k); 2 chats at once 23.4 + 25.0 = 48 (twoproc bound 47-52); 2 cold 8k prompts at once 845 + 857 = 1,689 summed (bound 1,675). np 2 per instance (4 slots): solo 31, 2 chats 48, 4 chats 12.3 each = 49-52 summed, 2 cold 8k 1,588, 4 cold 8k 1,660 summed. Capacity: two ~200k prompts at once, both needles right (ZEBRA-4821, ORCHID-4958), 162 + 152 tok/s prefill, decode 15.9 + 17.7 at that depth, GPU peak 7.7 / 7.7 GiB; two 262,000-token prompts at once (524,192 cells, `g3-inst2-fill262`): both needles right, 99 + 92 tok/s, 47 min, decode 14.0 + 16.1, 8 declines, no errors; four 120,000-token prompts at once at -np 2 per instance (`g3-inst2-fill4x120`): four needles right, 41 min; two 260,000-token prompts at once (`g3-inst2-fill260`): both needles right, 94 + 100 tok/s prefill over 46 min wall, decode 15.4 + 13.8 at that depth, GPU peak 7.7 / 7.7 GiB, no error lines; the memory guard declined the layer-major pass 8 times (4 per instance: free VRAM fell 2.7 -> 0.4 GiB as KV committed, the pass needs 2.5 GiB + margin) so the later batches took the ordinary path, which is why prefill averages 94-100 tok/s. Host RAM: the weights are mapped ONCE (file pages 24.4 GiB one card, 24.8 GiB two instances; system use +2.1 -> +3.5 GiB, the difference is the vision projector, which each instance parks as its own 1.1 GiB page-locked copy). Vision answered through both instances, SIGINT exits 0. Default path unchanged: one-card control on the final binary decodes 33.4-33.7, prefill 734 / 848 (C0 was 33.0-33.6, 736 / 865) |
+| C5 | one body, simultaneous big prompts keep the layer-major pass at np > 1 (agent A, ec57ac6; on whenever `--lm-prefill -np>1`, no flag) | MEASURED | cause: the isolation pick read the slot's cached length before the start logic settled it, so two big prompts shared a batch and fell to the ordinary path. Two 8k prompts at once: 908 tok/s summed, 24 s wall (control 198, 89 s); four: 891 summed, 48 s (control 169, 205 s). With the split prefill (C1b): 1,273 summed / 17.8 s at n=2, 1,330 / 35 s at n=4. Mixed (chat decoding + 8k prompt arriving): prompt 846 (1,222 with split), the chat decodes at 15.6 (18.1) tok/s meanwhile. 0 declines, 0 errors; first-token logprob deltas 0.001-0.036 (noise floor 0.0001-0.027); texts diverge at near ties as solo-vs-solo does |
+
+Branch `dual-gpu-parallel` has agents A and B merged (C4 fixes 13ab053, 3b6cbd5). Resume: agents' worktrees are under `.claude/worktrees/` (check `git worktree list`); the control binaries are in `build/pascal/base-bin`.
+
+## Decision log
+
+- D1 Baseline model is the Q5_K_XL file without MTP (owner's answer "Q5_K_XL + vision, README numbers"); the MTP recipe is not part
+  of this goal's control. Reversible.
+- D2 Documentation is this one file; per-idea contracts are one table row (owner: do not document ideas that may not work).
+- D3 GPU runs are serialised with `flock /tmp/gpu-2x1070.lock` (Linux; the Windows mutex wrapper does not apply here); builds in
+  worktrees run in parallel.
+- D4 One process on two cards is done as one instance per card (`--gpu-instances N`), not one body with KV on both cards: C2 showed all KV lives on GPU 0 and the hybrid engine allows one CUDA backend per scheduler. Reversible (opt-in flag; default path measured unchanged, A4).
+- D5 (owner, 2026-11-21: "use the same weights in system ram for all requests and gpus, not mapped 2x") All instances of the process share ONE mapping of the model file (`llama_model_share_mmaps`, on only with `--gpu-instances`). Evidence: pinning the same file through a second mapping costs a second copy (2 x 6 GiB registered left 12 GiB less memory; the 23 GB of expert banks cannot be pinned twice in 30 GB, instance 1 died with "out of memory" at its first registration). A shared mapping is never partly unmapped, and uploads from it go through ordinary memory (a copy whose source starts or ends inside a page-lock registration fails with "invalid argument"). Reversible.
+- D6 `LLAMA_MOE_HYBRID` (the slot count an engine is created with) is a process-wide env value that every cache resize wrote back; with two instances it made instance 1 start with instance 0's full cache (no room for its layer-major slot buffers at -np 2) and made a decode graph rebuild abort ("engine ... another slot count"). An instance thread neither writes nor compares it. Reversible.
+- D7 The frozen-cache greedy equality check (`--check-solo`) cannot decide here: solo vs solo again already differs (2-26 of 96 tokens in common), because two instances start with different cache contents. Recorded as UNPROVEN, not as a pass; A5 (needle + no errors) is the contract's correctness check and it passes.
+- D9 (owner, 2026-11-23: 'make it a parameter of llama.cpp, not an environment variable'; then 'make it default not in the binary but on the setup only when the user choses the 8gb profile and the setup adds the parameter to the command') The pass may take the context's own compute buffer back when the memory guard cannot make room: server option `--lm-prefill-free-sched` (field `free_main_sched` of `llama_lm_prefill_params`), DEFAULT OFF in the binary (`--no-lm-prefill-free-sched` exists for symmetry); the setup wizard's 8g profile (R7, which every MoE model shares at 8g, SDD D29) adds it to the command; the env variable is gone. So the goal's 'default behaviour unchanged' holds for the binary again (it was on by default for one day, 2026-11-23, and is not any more). It acts only after a decline, with `--lm-prefill --hybrid-moe`. Checked on `final-bin6`: forced squeeze (-fitt 2500) with no flag 156 / 146 / 144 tok/s (declines, 0 releases), with `--lm-prefill-free-sched` 706 / 841 / 841 (releases), plain default decode 33.3-33.4, prefill 742 / 853 / 851 (control C0: 33.0-33.6, 736 / 865); no error lines. The 2 x 262k result (211 + 190 tok/s, needles right) was measured with the earlier env-variable build of the same code. Reversible.
+- D8 Capacity fills: 2 x 200k (binary `final-bin2`), 2 x 260k, 2 x 262k and 4 x 120k at -np 2 per instance (final binary `final-bin3`). A first version of A3 called 2 x 260,000 a pass although 520,000 is below the 524k bar (corrected after review); 2 x 262,000 + 96 generated is the largest fill that fits (each answer needs room inside its 262,144 window). The agent's own acceptance below covers exactly what is listed there.
+
+## Ranked table (one winner is the owner's call)
+
+All rows: Qwen3.6-35B-A3B-UD-Q5_K_XL + vision on demand, q8 KV, the owner's R7 flags, `tools/pascal/par_bench.py`. Decode = tok/s per request; "summed" = all requests together. 8k prompts are cold and simultaneous.
+
+| rank by goal fit | id | one process | solo decode / prefill 16k | 2 at once (decode summed) | 4 at once (decode summed) | 2 x cold 8k prefill (summed) | context in flight | GPU peak (MiB) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | C4 instances, shared mapping | yes | 31-33 / 826-863 | 47-48 | 49-52 (np 2 per instance) | 1,588-1,689 | 2 x 262k windows; 2 x 200k prompts verified (needles right) | 7.8 / 7.8 GiB |
+| 2 | C3 two processes (bound, not a deliverable) | no | 33-34 / not run | 47-52 | not run | 1,675 | 2 x 262k | 5.6 / 6.6 GiB |
+| 3 | C1b tier + split prefill | yes | not run / 1,360 | not run | not run | 1,273 | 262k (one KV on GPU 0) | 7.8 / 7.5 GiB |
+| 4 | C1 expert tier on GPU 1 | yes | 37 / not run | 50-55 | 58-60 | 198 (155 at four) before C5 | 262k | see `c1-tier-np4` |
+| 5 | C5 big-prompt isolation fix on C0 | yes | as C0 (not rerun) | 37-41 | 38 | 908 (891 at four) | 262k | 7.8 / 0 GiB |
+| 6 | C0 control, one card | yes | 33 / 865 | 37-41 | 38 | 198 (169 at four) | 262k | 7.8 / 0 GiB |
+| - | C2 pool of 524k cells in one body | yes | - | - | - | - | CLOSED: KV commit fails near 155k rows (all KV on GPU 0) | 8.0 / - |
+
+Reading it: only C3 (two processes) and C4 hold two full 262k windows; C4 is C3 inside one process with the same speed, one shared copy of the weights in RAM, vision and clean shutdown working. C1 / C1b are faster for ONE request but keep one 262k window. Only C1 (decode 37 against 33, +12%) and C1b (prefill at 16k 1,360 against 850-865, +60%) make a single request faster than one card; they keep one 262k window.
+
+## Two requests at once, and one 10 s earlier (`build/pascal/stagger.py`, binary `final-bin6`, 600-700-token chats of counting / prime text; the rate depends on the text, prose gave 23-25 each in `g3-inst2-np2`)
+
+| | two instances, -np 1 each | one card, -np 2 |
+|---|---|---|
+| both chats together, each / summed (tok/s) | 29.3 + 27.9 = 57.2 | 24.9 + 24.9 = 49.7 |
+| A first, B 10 s later: A alone / both / B alone after A | 31.5 / 29.5 + 27.9 = 57.5 / 38.0 | 33.7 / 24.2 + 24.2 = 48.5 / 37.5 |
+| chat decoding, a cold 10.9k-token prompt arrives 10 s later: chat before / during / after | 33.3 / 36.0 / (ended) | 37.2 / **0.2 (stalled 13 s)** / 34.3 |
+| that prompt (tok/s) | 805 | 826 |
+
+A head start of 10 s changes nothing but who is alone for a while: the rates when both decode equal those of a simultaneous start. The decode gain of the second card is 15-25% summed, not 2x (two cards share the host CPU and RAM bandwidth for the expert layers); the gain is that a big prompt on one card no longer stalls the chat on the other. Dispatcher (from the code, NOT measured): a request goes to the instance that holds a prompt prefix of >= 256 characters, unless that instance is full (in_flight >= -np), then to the least loaded one. At -np 1 per instance a shared prefix therefore never queues (the free card wins, the prefix is prefilled again); at -np 2 per instance two requests that share a system prompt both go to the same card while the other idles.
+
+Host CPU during decode (i7-4770K, 4 cores / 8 threads; same chats; expert threads = `LLAMA_MOE_HYBRID_THREADS`, default physical cores - 1 = 3 per instance; Linux does not pin them; run `cpu-*` of `stagger.py`):
+
+| config | one chat alone (tok/s, CPU mean) | two chats together (tok/s each, summed, CPU mean) |
+|---|---|---|
+| two instances, 3 threads each (default) | 35.4, 50% | 30.5 + 30.3 = 60.7, **93%** (all 8 CPUs 91-95%) |
+| two instances, 2 threads each | 34.5, 38% | 29.8 + 29.8 = 59.6, 73% |
+| two instances, 1 thread each | 30.5, 26% | 31.9 + 29.4 = 61.3, 49% |
+| one card, -np 2 | 36.9, 49% | 26.0 + 26.0 = 52.1, 50% |
+
+The summed speed of two requests does not depend on the team size (60.7 / 59.6 / 61.3), so the core count is not what limits it; the default team spins (93% busy for the same speed as 49%). One request alone needs 2 threads (1 thread: 30.5). The limit is then probably the host RAM bandwidth the missed experts are read at (expected, not measured). `--hybrid-moe-threads 2` per instance gives the same speed with 20 points less CPU.
+
+## Why the fast pass stops near 162k tokens (memory of one 8 GiB card, measured)
+
+CUDA reports 8,107 MiB per card. Measured from the load log (`bufcheck.log`, `-lv 4`) and the memory-guard lines of `g3-inst2-fill262`:
+non-expert weights 2,038.8 MiB; scheduler compute buffer 1,010 MiB; recurrent state 62.8 MiB; expert cache floor (2 slots x 40 layers x 2.2 MiB) ~176 MiB; CUDA context and pools ~413 MiB (by subtraction); KV 10.625 KiB per token (2,720 MiB for 262,144 cells), committed as the prompt advances; the layer-major pass asks for 2,546 MiB plus a 176 MiB margin; by the formula in `lm_acquire_n` that is two bank slots 2 x (624 MiB + 4 KiB) = 1,248 MiB, the activation slab 2 halves x 2,048 x 16,384 tokens x 4 B (f32) = 256 MiB, the pass's own scheduler buffer ~978 MiB (what the previous pass really took, calibrated by the code) and 64 MiB; the context's own 1,010 MiB compute buffer stays allocated during a pass because its persistent decode graphs were planned in it.
+Free VRAM at the guard, with the cache at its floor: 2,710 MiB at 163,840 tokens, 2,392 at 196,608, 2,032 at 229,376, 1,714 at 262k (slope 10.6 KiB per token = the KV). The pass fits while free >= 2,722 MiB, i.e. up to ~162k tokens; at 262k it is ~1.0 GiB short. The run itself fits (peak 7.74 GiB, no error): the later batches take the ordinary path. MEASURED FIX (`g4-inst2-fill262-ffm`, binary `final-bin4`): `--lm-prefill-free-sched` (opt-in, the 8g setup profile passes it; first an env variable, c941819) frees the context's own 1,010 MiB compute buffer for a pass the guard would decline and reserves it again when the pass ends (103-166 ms). Two 262,000-token prompts at once: both needles right, no error lines, every big batch (at 164k, 197k, 229k tokens, 3 per instance) ran the layer-major pass, prefill 211 + 190 tok/s (was 99 + 92), 23 min wall (was 47); the room left at the last batch is thin (~190 MiB: free 3,042 MiB against 2,850 asked), so it is the whole margin at -np 1; the one remaining 'no room' per instance is the idle-time arm after the prompt, harmless. Other ways (derived from the formula, not needed so far): flags `--lm-prefill-slots 1` (-624 MiB), `--lm-prefill-segment 4096` (-192 MiB), `--lm-prefill-ubatch 1024` (pass buffer about -0.5 GiB, 14-22% slower pass by the G32 notes); a pass that narrows itself (1 slot, smaller chunk) instead of declining; releasing the main 1,010 MiB compute buffer for the pass (covers the gap with ~0 spare, needs the decode graphs re-reserved after, ~1.3 s).
+
+## Owner summary (agent's own autonomous acceptance, not owner approval)
+
+**1. Goal.** One `llama-server` process on both GTX 1070 (8 GiB) cards: more parallel requests (`-np 2`, `-np 4`) and at least 2x today's 262k context (two requests of 262k, or a pool of 524k cells), keeping today's speed where possible, vision on demand, no preset speed bar.
+
+**2. How it works.** `--gpu-instances 2` starts two complete copies of the inference engine in the same process, one per card, each with its own request slots, its own 262k window and its own thread. The model file is mapped into RAM once and both copies read the same pages; the expert weights stay in that shared RAM and are streamed to each card as needed. A small dispatcher sends a request to the copy that already holds its prompt prefix (otherwise to the idler one), so a conversation keeps its cache. A prompt longer than the window of one copy is not split between cards.
+
+**3. Glossary.** PP = prompt processing (prefill), TG = token generation (decode), tok/s = tokens per second; `-np N` = N request slots; KV cache = the stored attention state of a conversation (about 10.6 KiB per token here); window = the 262,144-token context one instance can hold; expert banks = the large mixture-of-experts weights kept in host RAM; mmap = mapping a file into memory so pages are shared and loaded on demand; page-locked (pinned) = RAM the GPU can copy from directly; layer-major prefill = loading each layer's weights once and running the whole prompt through it; needle check = hiding a code word in a long prompt and checking the answer contains it; GiB = 1,024^3 bytes; VRAM = GPU memory.
+
+**4. Pros and cons.**
+- Pro (measured, `g3-inst2-np2`, `g-inst2-np1`): 2 requests at once decode 47-48 tok/s summed against 37-41 on one card; 4 at once 49-52 against 38; 2 cold 8k prompts at once 1,588-1,689 tok/s summed against 198 on one card before the C5 fix (908 after it).
+- Pro (measured, `g-inst2-fill`, `g3-inst2-fill260`): two ~200k prompts at once in one process, both needle answers right; two 262,000-token prompts (524,192 cells) at once on the final binary, both answered their own needle (ZEBRA-4821, ORCHID-4958), and four 120,000-token prompts at once at -np 2 per instance (480k tokens, four needles right), no error lines, in one process.
+- Pro (measured): weights once in RAM (file pages 24.4 -> 24.8 GiB with two instances); vision requests answered through both instances; SIGINT exits 0; the default path (flag off) reproduces the control within 2-3% (`g3-c0-np1`).
+- Con (measured): a single request is no faster than on one card (solo 31-33, prefill 726-863), only throughput under load improves; the vision projector costs 1.1 GiB of page-locked RAM per instance; each card holds nearly all 8 GiB (7.8 GiB), nothing is left for other GPU work (the later "second card joins when free" hybrid is a different design); at 200k tokens a prompt takes 22 minutes (150-160 tok/s) and at 260k 44-47 minutes (92-100 tok/s: the layer-major pass was declined for the later batches, 4 per instance, because the KV had taken the VRAM it needs); decode there is 14-18 tok/s per request.
+- Expected, not measured: balance when one instance is busy with a long prefill and the other idle (the dispatcher prefers prefix match, then load); behaviour over hours; `-np 2` at 70k-token contexts (memory-guard declines were an open item on one card too).
+- Unproven: bit-identical greedy output against one card (D7); a one-card 200k / 260k control for the prefill speed (not run: a single card cannot hold two such requests, and one request alone was not timed).
+
+**5. Recommendation.** Adopt C4 as the way to the goal: keep `--gpu-instances 2` opt-in, use it when two or more requests are expected; keep C0 (or C1 for +12% single-request decode) as the default one-request setup. Owner to decide: the winner among the table rows; whether the vision projector should also be shared across instances (saves 1.1 GiB of RAM, small work); whether a dispatcher policy for uneven load needs tuning after real use.
+
+**6. Decisions** D1-D8 above. **Acceptance of the contract (the agent's own):** A1 controls measured (C0 / C1 / C1b plus the final-binary control `g3-c0-np1`, within 2-3% of C0: pass). A2 every candidate measured or closed with a measured reason (C0, C1, C1b, C3, C4, C5 measured; C2 closed by the commit failure): pass. A3 at least one configuration serves two simultaneous requests with contexts summing to >= 524k: C4 holds 2 x 262,144 = 524,288 cells (configured and loaded) and served two prompts of 262,000 tokens each at once (`g3-inst2-fill262`, final binary): both needles right, 96 tokens generated each, so 2 x 262,096 = 524,192 cells in use, 99.98% of 524,288 (the rest cannot be used: an answer needs room inside its 262,144 window; no request exceeded it). 262,000 tokens in 2,644 s and 2,836 s (99.1 / 92.4 tok/s), decode 14.0 + 16.1 tok/s, no error lines, GPU peak 7.7 / 7.7 GiB: pass. A4 default behaviour unchanged: pass (`g3-c0-np1`). A5 needle check per request and no error lines: pass for the 2 x 200k, 2 x 260k and 2 x 262k fills and for 4 simultaneous 120k requests at -np 2 per instance (`g3-inst2-fill4x120`: ZEBRA-4821, ORCHID-4958, GRANITE-5095, FALCON-5232, each its own; 480k tokens in flight; 2,416 s wall, 50-62 tok/s prefill and 6.7-8.8 tok/s decode per request, 4 layer-major declines, no error lines); the np 1 / np 2 arms have no error lines in their server logs (`build/pascal/par/g3-inst2-np2/server.log`). Scope: this machine, this model, this harness; no quality claim beyond the needle check; not certified for production.
