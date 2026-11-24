@@ -761,6 +761,25 @@ binary_fresh() {
     [ -z "$newer" ]
 }
 
+# SDD D31: the web UI of the server. The prebuilt UI archive the build downloads for the pinned version is no longer on the
+# Hugging Face bucket (404), and the 'latest' archive it falls back to has a layout this engine's checker rejects, so a clean
+# build died in the UI step ("UI: missing required asset(s)"). With npm the UI is built from this tree's own source
+# (-DLLAMA_BUILD_UI=ON); without npm the server is built without the embedded UI (the API works). Either way the build no
+# longer depends on the download. SETUP_WIZARD_NO_NPM=1 simulates a machine without npm (testing).
+ui_cmake_flags() {
+    if [ -z "${SETUP_WIZARD_NO_NPM:-}" ] && command -v npm >/dev/null 2>&1; then
+        echo '-DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF'
+    else
+        echo '-DLLAMA_USE_PREBUILT_UI=OFF'
+    fi
+}
+ui_cmake_note() {
+    case "$(ui_cmake_flags)" in
+        *LLAMA_BUILD_UI=ON*) say 'web UI: built from this tree'\''s source with npm (the prebuilt download is no longer available)' ;;
+        *) warn 'web UI: npm not found - the server is built WITHOUT the embedded web UI (the API works). Install nodejs/npm and run the wizard again for the UI' ;;
+    esac
+}
+
 invoke_build() {
     # SEQUENTIAL form (SDD D20): used for the --skip-model-without-model run
     # and for single-leg (build-only) phases. The parallel phase (step 5)
@@ -787,13 +806,15 @@ invoke_build() {
     mkdir -p "$bld"
     local nproc; nproc=$(nproc 2>/dev/null || echo 4)
     if [ "$DRY_RUN" = 1 ]; then
-        say "(dry-run: cmake -S $src -B $bld -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON -DCMAKE_CUDA_ARCHITECTURES=$arch -DCMAKE_BUILD_TYPE=Release)"
+        say "(dry-run: cmake -S $src -B $bld -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON -DCMAKE_CUDA_ARCHITECTURES=$arch -DCMAKE_BUILD_TYPE=Release $(ui_cmake_flags))"
         say "(dry-run: cmake --build $bld --target llama-server --parallel $nproc)"
         BUILD_BIN="$bin"
         return 0
     fi
+    ui_cmake_note
+    # shellcheck disable=SC2046
     cmake -S "$src" -B "$bld" -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="$arch" -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES="$arch" -DCMAKE_BUILD_TYPE=Release $(ui_cmake_flags) \
         2>&1 | tee "$log"
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
         tail -50 "$log" | sed 's/^/    /'
@@ -908,9 +929,11 @@ build_start() {
     BUILD_RC1="$bld/setup-wizard-rc1.tmp"
     BUILD_RC2="$bld/setup-wizard-rc2.tmp"
     rm -f "$BUILD_RC1" "$BUILD_RC2"
+    ui_cmake_note
     (
+        # shellcheck disable=SC2046
         cmake -S "$src" -B "$bld" -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="$arch" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="$arch" -DCMAKE_BUILD_TYPE=Release $(ui_cmake_flags) \
             > "$BUILD_CFG_LOG" 2>&1
         echo "$?" > "$BUILD_RC1"
         cmake --build "$bld" --target llama-server --parallel "$(nproc 2>/dev/null || echo 4)" \
@@ -1559,7 +1582,7 @@ if [ "$DRY_RUN" = 1 ]; then
             if ! CUDA_ARCH=$(detect_cuda_arch); then CUDA_ARCH='? (nvidia-smi unavailable)'; fi
             say "detected CUDA arch: $CUDA_ARCH"
         fi
-        say "(dry-run: cmake -S $REPO/third_party/llama.cpp -B $REPO/build/llama-cuda -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH -DCMAKE_BUILD_TYPE=Release)"
+        say "(dry-run: cmake -S $REPO/third_party/llama.cpp -B $REPO/build/llama-cuda -DGGML_CUDA=ON -DLLAMA_LAYER_STREAMING=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH -DCMAKE_BUILD_TYPE=Release $(ui_cmake_flags))"
         say "(dry-run: cmake --build $REPO/build/llama-cuda --target llama-server --parallel $(nproc 2>/dev/null || echo 4))"
     fi
     if [ -n "$MODEL_FILE_TARGET" ]; then
