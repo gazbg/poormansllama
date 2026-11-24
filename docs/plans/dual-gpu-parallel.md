@@ -94,6 +94,8 @@ Host CPU during decode (i7-4770K, 4 cores / 8 threads; same chats; expert thread
 
 The summed speed of two requests does not depend on the team size (60.7 / 59.6 / 61.3), so the core count is not what limits it; the default team spins (93% busy for the same speed as 49%). One request alone needs 2 threads (1 thread: 30.5). The limit is then probably the host RAM bandwidth the missed experts are read at (expected, not measured). `--hybrid-moe-threads 2` per instance gives the same speed with 20 points less CPU.
 
+Vision on demand together with `--lm-prefill-free-sched` (`build/pascal/vis_release.py`, forced squeeze `-fitt 2500`, one card, `--mmproj-on-demand`): the vision window (projector unparked, encoded, parked again: 1,237 MiB made by shrinking the expert cache) runs BEFORE the decode of the image rows and uses its own buffers, so the release (which acts inside `llama_decode`) never overlaps it. A 1536 x 1536 image (2,304 image tokens, above the 1,024-token pass threshold): window 196 ms + encode 8.8 s + 27 ms, then the image rows decode in 16.4 s without the release (pass declined, ordinary path) and in 4.5 s with it (one release, 93 ms to reserve again); answers correct in both arms, no error lines. A 448 x 448 image (196 tokens) never reaches the pass: 2.65 s either way. Not tested: an image after a deep (> 160k tokens) prompt, and vision with `--gpu-instances` plus the release.
+
 ## Why the fast pass stops near 162k tokens (memory of one 8 GiB card, measured)
 
 CUDA reports 8,107 MiB per card. Measured from the load log (`bufcheck.log`, `-lv 4`) and the memory-guard lines of `g3-inst2-fill262`:
