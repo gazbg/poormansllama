@@ -167,6 +167,7 @@ loudly on unknown options.
 | context                    | -Context       | --context             |
 | port / bind                | -Port, -Bind   | --port, --host        |
 | CUDA device (R5/R6/R7)     | -Device        | --device              |
+| several cards (8g profile R7, Linux only) | (not available) | --gpus 0,1 or all |
 | model dir / explicit file  | -ModelDir, -ModelFile | --model-dir, --model-file |
 | vision (every model but flint) | -NoVision, -MmprojFile | --no-vision, --mmproj-file |
 | clone target / branch / url| -CloneDir, -Branch, -RepoUrl | --clone-dir, --branch, --repo-url |
@@ -256,3 +257,9 @@ No: the current `run-server.*` is moved to `run-server.last.*` first.
   beyond `core.longpaths` in the cloned repo.
 - `HF_TOKEN` is read from the environment or `-HfToken`, used only for the
   download, never printed or written to files.
+
+## Several GPUs (Linux, 8 GiB profile)
+
+On a machine with two or more NVIDIA cards, `setup.sh` (interactive) lists them with the memory that is free right now and marks the cards that have room for the chosen profile (96% of the card size the row was measured on: 7,864 MiB free for `8g`). Pick one number for one card (`--device CUDAn`, as before), or several numbers (`0 1`) or `all` for one server instance per card inside the one server process (`--gpu-instances N`; each card has its own context window, `-np` counts per instance). The same choice without the menu: `--gpus 0,1` (or `all`); `--device N` keeps meaning one card; a non-interactive run without either keeps the automatic single-card pick. For several cards the script also exports `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES=<the cards>`, so the numbers are the ones `nvidia-smi` shows.
+
+Several cards are offered for the 8g profile (R7) only: that is the configuration measured with two GTX 1070. The server build must have `--gpu-instances` (pull request 34 of this repository); the wizard checks the row's flags against the built binary. `setup.ps1` (Windows) has no multi-card choice: the shared model mapping that the instances rely on is Linux-only for now.

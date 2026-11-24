@@ -38,6 +38,9 @@ CONTEXT=''
 PORT=''   # empty = ask (default 8090); an explicit --port suppresses the question (D22)
 BIND=''
 DEVICE=''     # CUDA index for device-pinned rows R5/R7; empty = auto (SDD D17)
+GPUS=''       # --gpus LIST: the cards to run on (0,1 or all); two or more = --gpu-instances (SDD D30)
+GPU_SEL=''    # the chosen cards, comma list; empty = the automatic single-card pick
+GPU_COUNT=1
 QUANT=''      # q4k_m|q5k_xl|q8k_xl|q5k_m (SDD D19, D23); empty = the model's default
 MODEL_FILE=''
 MODEL_DIR=''
@@ -79,6 +82,7 @@ usage: setup.sh [options]
   --port N                      server port (default 8090, asked if omitted; D22)
   --host ADDR                   bind address (default: the recipe row's own)
   --device N                    CUDA index for device-pinned rows R5/R7 (default: auto)
+  --gpus LIST                   cards to run on, e.g. 0,1 or all (8g profile R7: two or more cards = one server instance per card, --gpu-instances; asked when the machine has several cards)
   --model-file PATH             explicit local GGUF (still needs --model)
   --mmproj-file PATH            local multimodal projector GGUF (implies vision)
   --no-vision                   no vision support (no projector download, no --mmproj flags)
@@ -111,6 +115,7 @@ while [ $# -gt 0 ]; do
         --port) PORT="$2"; shift 2 ;;
         --host) BIND="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
+        --gpus) GPUS="$2"; shift 2 ;;
         --model-file) MODEL_FILE="$2"; shift 2 ;;
         --mmproj-file) MMPROJ_FILE="$2"; shift 2 ;;
         --no-vision) NO_VISION=1; shift ;;
@@ -1105,6 +1110,101 @@ check_disk() {
     fi
 }
 
+# --- GPU selection (SDD D30) -------------------------------------------------
+# A machine with several cards: list them with their free memory, let the user pick the ones that have room, and build the
+# command from the choice. One card -> --device CUDAn (as before); two or more -> --gpu-instances N: one complete server
+# instance per card inside the one process (measured on 2 x GTX 1070, Linux; the 8g profile R7 only). --gpus LIST skips
+# the menu. SETUP_WIZARD_GPUS replaces nvidia-smi for testing: lines "index|name|total MiB|free MiB".
+gpu_table() {
+    if [ -n "${SETUP_WIZARD_GPUS:-}" ]; then printf '%s\n' "$SETUP_WIZARD_GPUS"; return 0; fi
+    nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null |
+        awk -F', *' 'NF >= 4 { printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }'
+}
+
+# MiB that must be free on a card for the row: 96% of the card size the row was measured on (the 8g run peaks at 7,801 MiB)
+gpu_need_free() {
+    case "$1" in full) echo 21626 ;; 16g) echo 9830 ;; 8g) echo 7864 ;; *) echo 0 ;; esac
+}
+
+# gpu_parse_selection INPUT VRAM: INPUT = card numbers separated by commas or spaces (3 or CUDA3), or 'all' (every card with room).
+# Returns 0 and sets GPU_SEL (comma list, ascending) and GPU_COUNT; otherwise prints the reason to stderr and returns 1.
+gpu_parse_selection() {
+    local in="${1//,/ }" vram="$2" need tbl tok line free idx name tot picked=' '
+    need=$(gpu_need_free "$vram"); tbl=$(gpu_table)
+    [ -n "$tbl" ] || { echo '  (no GPU list: nvidia-smi unavailable)' >&2; return 1; }
+    if [ "${in,,}" = all ]; then
+        in=''
+        while IFS='|' read -r idx name tot free; do
+            [ -n "$idx" ] && [ "$free" -ge "$need" ] && in="$in $idx"
+        done <<< "$tbl"
+        [ -n "$in" ] || { echo "  (no card has $need MiB free)" >&2; return 1; }
+    fi
+    [ -n "${in// /}" ] || { echo '  (no card chosen)' >&2; return 1; }
+    for tok in $in; do
+        tok=${tok#CUDA}; tok=${tok#cuda}
+        [[ "$tok" =~ ^[0-9]+$ ]] || { echo "  (not a card number: $tok)" >&2; return 1; }
+        tok=$((10#$tok))
+        line=$(printf '%s\n' "$tbl" | awk -F'|' -v i="$tok" '$1 != "" && $1 + 0 == i { print; exit }')
+        [ -n "$line" ] || { echo "  (no GPU with number $tok)" >&2; return 1; }
+        free=${line##*|}
+        [ "$free" -ge "$need" ] || { echo "  (card $tok has only $free MiB free; the $vram row needs $need MiB)" >&2; return 1; }
+        case "$picked" in *" $tok "*) continue ;; esac
+        picked="$picked$tok "
+    done
+    GPU_SEL=$(printf '%s\n' $picked | sort -n | paste -sd, -)
+    GPU_COUNT=$(printf '%s\n' $picked | grep -c .)
+    return 0
+}
+
+# the card part of the server command line: ' --gpu-instances N' for two or more chosen cards, else ' --device CUDAn'
+gpu_run_flags() {
+    if [ "${GPU_COUNT:-1}" -ge 2 ]; then echo "--gpu-instances $GPU_COUNT"; else echo "--device CUDA$(resolve_gpu_index "$VRAM")"; fi
+}
+
+# select_gpus VRAM: for a row that pins a card (R_DEVICE). --gpus wins, then --device; with 2+ cards in the machine and an
+# interactive run the menu lists them. Non-interactive without --gpus keeps the automatic single-card pick (SDD D17).
+# Sets GPU_SEL / GPU_COUNT / DEVICE (the first chosen card, which the D12 check and the one-card path read).
+select_gpus() {
+    local vram="$1" tbl n idx name tot free need mark def a
+    if [ -n "$GPUS" ]; then
+        gpu_parse_selection "$GPUS" "$vram" || fail "--gpus $GPUS: these cards cannot be used (see above)" 2
+    elif [ -n "$DEVICE" ]; then
+        return 0
+    else
+        tbl=$(gpu_table); n=$(printf '%s\n' "$tbl" | grep -c .)
+        [ "$n" -ge 2 ] || return 0
+        [ "$NI" = 1 ] && return 0
+        need=$(gpu_need_free "$vram")
+        def=$(resolve_gpu_index "$vram" 2>/dev/null)
+        say "GPUs in this machine (free memory now; the $vram row needs $need MiB free on each card it uses):"
+        while IFS='|' read -r idx name tot free; do
+            [ -n "$idx" ] || continue
+            if [ "$free" -ge "$need" ]; then mark='has room'; else mark="NOT ENOUGH free memory (needs $need MiB)"; fi
+            printf '    %s) CUDA%s  %-26s %6s MiB free / %6s MiB   %s\n' "$idx" "$idx" "$name" "$free" "$tot" "$mark" >&2
+        done <<< "$tbl"
+        say 'run on: one number = one card (--device); several numbers (e.g. 0 1) or all = one server instance per card (--gpu-instances)'
+        while :; do
+            printf '  Cards (default %s) ' "$def" >&2
+            read -r a || a=''
+            a="${a:-$def}"
+            gpu_parse_selection "$a" "$vram" || continue
+            if [ "$GPU_COUNT" -ge 2 ] && [ "$R_ID" != R7 ]; then
+                echo "  (several cards are offered for the 8g profile only; recipe $R_ID runs on one card)" >&2; continue
+            fi
+            break
+        done
+    fi
+    if [ "$GPU_COUNT" -ge 2 ] && [ "$R_ID" != R7 ]; then
+        fail "several cards (--gpus $GPUS) are measured for the 8g profile (recipe R7) only; the chosen recipe is $R_ID" 2
+    fi
+    DEVICE="${GPU_SEL%%,*}"
+    if [ "$GPU_COUNT" -ge 2 ]; then
+        say "cards CUDA${GPU_SEL//,/, CUDA}: one server instance per card (--gpu-instances $GPU_COUNT), $GPU_COUNT request slots in total, each card with its own context window"
+        say 'measured with the qwen36 Q5_K_XL build on 2 x GTX 1070 (Linux): two requests at once decode ~48-57 tok/s together (one card: ~37-50), two 262k prompts at once fit; other models, quants and Windows are not measured with several cards'
+        say 'needs a server build that has --gpu-instances (it is in this repository since pull request 34; an older checkout refuses the flag)'
+    fi
+}
+
 # --- steps 6-8: recipe, emission, start (SDD 4.6/4.7) ------------------------
 pick_recipe() {
     # D20: recipe selection is part of the settings phase (no step number).
@@ -1134,6 +1234,8 @@ pick_recipe() {
     fi
     say "recipe $R_ID: $R_MEASURED"
     [ -n "$R_NOTE" ] && say "note: $R_NOTE"
+    # SDD D30: which cards (menu with the free memory of each, or --gpus / --device)
+    if [ -n "$R_DEVICE" ]; then select_gpus "$VRAM"; elif [ -n "$GPUS" ]; then warn "--gpus is ignored: recipe $R_ID does not pin a card"; fi
     # D12: warning only, threshold by VRAM target. D17: device-pinned rows
     # check the card they will actually use, not nvidia-smi's first line.
     local gpu_mib need=0 card='a 24 GiB card' gpu_line="$GPU_LINE"
@@ -1250,9 +1352,14 @@ emit_run_script() {
             echo "# env (row $R_ID, verbatim): $R_ENV"
             echo "export $R_ENV"
         fi
+        if [ -n "$R_DEVICE" ] && [ "${GPU_COUNT:-1}" -ge 2 ]; then
+            echo "# GPUs chosen in the wizard (SDD D30): CUDA${GPU_SEL//,/, CUDA}. --gpu-instances $GPU_COUNT runs one complete server instance on each of the first $GPU_COUNT visible cards; the numbers are nvidia-smi's (PCI bus order); -np is per instance."
+            echo 'export CUDA_DEVICE_ORDER=PCI_BUS_ID'
+            echo "export CUDA_VISIBLE_DEVICES=$GPU_SEL"
+        fi
         echo 'mkdir -p "$(dirname "$LOG")"'
         local flags="${R_FLAGS_OUT:-$R_FLAGS}"
-        [ -n "$R_DEVICE" ] && flags="$flags --device CUDA$(resolve_gpu_index "$VRAM")"
+        [ -n "$R_DEVICE" ] && flags="$flags $(gpu_run_flags)"
         [ "$D22_ADDED_INT8" = 1 ] && echo '# D22: --lm-prefill-attn-int8 was ADDED for this card (compute capability <= 6.1, Pascal or lower): the pass flash attention takes the int8 Q.K^T tile, an approximation of the exact kernel (see the help text of --lm-prefill-attn-int8). Remove it for exact arithmetic.'
         local n_arg=''
         if [ "$has_predict" = 0 ]; then
